@@ -130,7 +130,7 @@ def page_url(base_url: str, page: int) -> str:
     if page <= 1:
         return base_url
     parts = urlsplit(base_url)
-    path = re.sub(r"/(c\d+)$", rf"/seite%3A{page}/\1", parts.path)
+    path = re.sub(r"/(c\d+(?:l\d+)?)$", rf"/seite%3A{page}/\1", parts.path)
     if path == parts.path:
         raise ValueError(f"Unsupported category URL: {base_url}")
     return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))

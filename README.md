@@ -1,4 +1,4 @@
-# Kleinanzeigen Parser Bot v3.0.2
+# Kleinanzeigen Parser Bot v3.0.3
 
 
 v3.0.1 fixes exact-date scanning and keeps all v3.0 product-recognition/view-history features.
@@ -50,6 +50,10 @@ python bot.py
 ```
 
 
-## v3.0.2 — Date Jump Search
+## v3.0.3 — Date Jump Search
 
 Exact-date scans no longer walk every page from page 1. The bot probes pages exponentially, binary-searches the date boundary, then sequentially collects only the selected calendar day. View counters are fetched only for matching listings. Promoted Top/Highlight listings remain excluded before date logic.
+
+
+## v3.0.3 — Smart Date Search
+Если общая выдача категории слишком плотная и Date Jump на странице 1000 всё ещё видит более новую дату, бот не увеличивает лимит. Он автоматически разбивает Германию на 16 федеральных земель, параллельно (по умолчанию до 3 сегментов) находит нужную дату внутри каждой, собирает только объявления выбранного дня и объединяет их обратно в один скан. Это особенно полезно для огромных категорий вроде Film & DVD.
