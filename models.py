@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String
+from sqlalchemy import DateTime, Integer, String, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -20,3 +20,12 @@ class Listing(Base):
     url: Mapped[str] = mapped_column(String(1200), unique=True)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class SelectedCategory(Base):
+    __tablename__ = "selected_categories"
+    __table_args__ = (UniqueConstraint("user_id", "category_key", name="uq_user_category"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(index=True)
+    category_key: Mapped[str] = mapped_column(String(80), index=True)

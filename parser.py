@@ -1,7 +1,11 @@
+from __future__ import annotations
+
+import asyncio
+import logging
 import os
 import re
 from dataclasses import dataclass
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -12,6 +16,11 @@ USER_AGENT = os.getenv(
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
 )
+MAX_PAGES_PER_CATEGORY = max(1, int(os.getenv("MAX_PAGES_PER_CATEGORY", "500")))
+PAGE_DELAY_SECONDS = max(0.0, float(os.getenv("PAGE_DELAY_SECONDS", "0.7")))
+STOP_AFTER_EMPTY_TODAY_PAGES = 2
+
+log = logging.getLogger("kleinanzeigen-parser")
 
 
 @dataclass
@@ -21,6 +30,7 @@ class ParsedListing:
     price_text: str | None
     price_eur: int | None
     url: str
+    posted_text: str | None = None
 
 
 def parse_price(text: str | None) -> int | None:
@@ -47,6 +57,78 @@ def _allowed_url(url: str) -> bool:
     )
 
 
+def page_url(base_url: str, page: int) -> str:
+    if page <= 1:
+        return base_url
+    parts = urlsplit(base_url)
+    path = re.sub(r"/(c\d+)$", rf"/seite%3A{page}/\1", parts.path)
+    if path == parts.path:
+        raise ValueError(f"Unsupported category URL: {base_url}")
+    return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
+
+
+def _extract_posted_text(node) -> str | None:
+    # The visible card text currently contains values like "Heute, 16:42",
+    # "Gestern, 22:10" or a German calendar date. Matching the whole card
+    # keeps this resilient if Kleinanzeigen changes the exact CSS class.
+    text = node.get_text(" ", strip=True)
+    patterns = [
+        r"\bHeute(?:,?\s*\d{1,2}:\d{2})?\b",
+        r"\bGestern(?:,?\s*\d{1,2}:\d{2})?\b",
+        r"\b\d{1,2}\.\d{1,2}\.\d{4}\b",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m:
+            return m.group(0)
+    return None
+
+
+def is_today_text(text: str | None) -> bool:
+    return bool(text and re.search(r"\bHeute\b", text, flags=re.IGNORECASE))
+
+
+def parse_category_html(html_text: str) -> list[ParsedListing]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    items: list[ParsedListing] = []
+    seen_urls: set[str] = set()
+
+    candidates = soup.select("article, li.ad-listitem, .ad-listitem")
+    for node in candidates:
+        link = node.select_one("a[href*='/s-anzeige/']")
+        if not link or not link.get("href"):
+            continue
+
+        full_url = urljoin(BASE_URL, link["href"])
+        if full_url in seen_urls or not _allowed_url(full_url):
+            continue
+        seen_urls.add(full_url)
+
+        title_node = node.select_one("h2, .ellipsis, [class*='title']")
+        title = (title_node or link).get_text(" ", strip=True)
+        if not title:
+            continue
+
+        price_node = node.select_one(
+            "[class*='price'], .aditem-main--middle--price-shipping--price"
+        )
+        price_text = price_node.get_text(" ", strip=True) if price_node else None
+        posted_text = _extract_posted_text(node)
+
+        items.append(
+            ParsedListing(
+                external_id=extract_external_id(full_url),
+                title=title,
+                price_text=price_text,
+                price_eur=parse_price(price_text),
+                url=full_url,
+                posted_text=posted_text,
+            )
+        )
+
+    return items
+
+
 class KleinanzeigenParser:
     def __init__(self) -> None:
         self.client = httpx.AsyncClient(
@@ -55,7 +137,7 @@ class KleinanzeigenParser:
                 "Accept-Language": "de-DE,de;q=0.9,en;q=0.7",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             },
-            timeout=25.0,
+            timeout=30.0,
             follow_redirects=True,
         )
 
@@ -65,45 +147,62 @@ class KleinanzeigenParser:
     async def fetch_html(self, url: str) -> str:
         if not _allowed_url(url):
             raise ValueError("Only public kleinanzeigen.de HTTPS URLs are allowed")
-        response = await self.client.get(url)
-        response.raise_for_status()
-        return response.text
+
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = await self.client.get(url)
+                response.raise_for_status()
+                return response.text
+            except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+                last_error = exc
+                status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+                if attempt >= 2 or (status is not None and status not in {429, 500, 502, 503, 504}):
+                    raise
+                await asyncio.sleep(1.5 * (attempt + 1))
+        raise RuntimeError(str(last_error))
 
     async def parse_category_page(self, url: str) -> list[ParsedListing]:
-        html = await self.fetch_html(url)
-        soup = BeautifulSoup(html, "html.parser")
-        items: list[ParsedListing] = []
-        seen_urls: set[str] = set()
+        return parse_category_html(await self.fetch_html(url))
 
-        candidates = soup.select("article, li.ad-listitem, .ad-listitem")
-        for node in candidates:
-            link = node.select_one("a[href*='/s-anzeige/']")
-            if not link or not link.get("href"):
-                continue
+    async def parse_today(self, base_url: str) -> tuple[list[ParsedListing], int, bool]:
+        """Parse all visible listings marked 'Heute' in newest-first category pages.
 
-            full_url = urljoin(BASE_URL, link["href"])
-            if full_url in seen_urls or not _allowed_url(full_url):
-                continue
-            seen_urls.add(full_url)
+        Returns (items, pages_scanned, hit_safety_limit).
+        We stop after two consecutive pages without today's listings because Kleinanzeigen
+        documents the default no-location order as newest first. A high safety limit exists
+        only to prevent accidental endless scans if the site changes pagination.
+        """
+        found: list[ParsedListing] = []
+        seen_ids: set[str] = set()
+        empty_today_pages = 0
+        pages_scanned = 0
 
-            title_node = node.select_one("h2, .ellipsis, [class*='title']")
-            title = (title_node or link).get_text(" ", strip=True)
-            if not title:
-                continue
+        for page in range(1, MAX_PAGES_PER_CATEGORY + 1):
+            url = page_url(base_url, page)
+            items = await self.parse_category_page(url)
+            pages_scanned = page
 
-            price_node = node.select_one(
-                "[class*='price'], .aditem-main--middle--price-shipping--price"
-            )
-            price_text = price_node.get_text(" ", strip=True) if price_node else None
+            if not items:
+                log.info("page=%s no listings, stop", page)
+                return found, pages_scanned, False
 
-            items.append(
-                ParsedListing(
-                    external_id=extract_external_id(full_url),
-                    title=title,
-                    price_text=price_text,
-                    price_eur=parse_price(price_text),
-                    url=full_url,
-                )
-            )
+            today = [x for x in items if is_today_text(x.posted_text)]
+            for item in today:
+                if item.external_id not in seen_ids:
+                    seen_ids.add(item.external_id)
+                    found.append(item)
 
-        return items
+            log.info("page=%s total=%s today=%s", page, len(items), len(today))
+
+            if today:
+                empty_today_pages = 0
+            else:
+                empty_today_pages += 1
+                if empty_today_pages >= STOP_AFTER_EMPTY_TODAY_PAGES:
+                    return found, pages_scanned, False
+
+            if PAGE_DELAY_SECONDS and page < MAX_PAGES_PER_CATEGORY:
+                await asyncio.sleep(PAGE_DELAY_SECONDS)
+
+        return found, pages_scanned, True
