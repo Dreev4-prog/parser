@@ -1,4 +1,4 @@
-# Kleinanzeigen Parser Bot v2.7.2 — Direct Views Turbo
+# Kleinanzeigen Parser Bot v2.8.0 — Direct Views Turbo
 
 This version tests and enables a faster public view-counter path.
 
@@ -7,7 +7,7 @@ This version tests and enables a faster public view-counter path.
 - The parser first tries the public counter endpoint used by the Kleinanzeigen ad page (`s-vac-inc-get.json?adId=...`) directly.
 - If plain HTTP is accepted, no ad page is rendered for that counter.
 - If plain HTTP is not accepted, the parser tries Playwright's shared `APIRequestContext` (same browser session/cookies, but still without rendering a page).
-- Only counters that cannot be read directly fall back to the lightweight Chromium page method from v2.7.1.
+- Only counters that cannot be read directly fall back to the lightweight Chromium page method from v2.8.0.
 - The working direct mode is probed once per parser instance and then reused for the rest of the scan.
 - Direct counter requests run concurrently; browser fallback remains more conservative.
 - Existing 30-minute view cache remains active, so recently checked listings are not requested again.
@@ -42,3 +42,15 @@ Start command remains:
 ```bash
 python bot.py
 ```
+
+
+## v2.8.0 — User Scan Hub
+
+- Новый простой главный экран: Популярное / Новый скан / Мои сканы / Категории / Настройки.
+- Каждый запуск сохраняется как карточка в `Мои сканы`.
+- Снимок объявлений и исходных просмотров фиксируется в момент завершения.
+- Из карточки можно обновить просмотры, увидеть лидеров и рост, скачать файл именно этого скана или повторить его.
+- Рост считается относительно просмотров на момент завершения скана.
+- Текущий быстрый direct-view механизм v2.7.2 сохранён без изменений.
+
+> Важно: при SQLite история живёт в локальном файле контейнера. Для гарантированного хранения между redeploy/restart перед публичным запуском рекомендуется PostgreSQL.

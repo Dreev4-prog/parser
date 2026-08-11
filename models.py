@@ -114,3 +114,38 @@ class ParserRun(Base):
     stop_reason: Mapped[str] = mapped_column(String(255), default="")
     success: Mapped[bool] = mapped_column(Boolean, default=True)
     error_text: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+
+class UserScan(Base):
+    """Persistent user-facing scan card shown in "Мои сканы"."""
+
+    __tablename__ = "user_scans"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_uid: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(index=True)
+    title: Mapped[str] = mapped_column(String(255))
+    category_keys: Mapped[str] = mapped_column(Text, default="")
+    page_limit: Mapped[int] = mapped_column(Integer, default=25)
+    status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    last_view_refresh_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    completed_categories: Mapped[int] = mapped_column(Integer, default=0)
+    total_categories: Mapped[int] = mapped_column(Integer, default=0)
+    new_count: Mapped[int] = mapped_column(Integer, default=0)
+    result_count: Mapped[int] = mapped_column(Integer, default=0)
+    viewed_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ScanListing(Base):
+    """Snapshot membership + view count at the moment a user scan completed."""
+
+    __tablename__ = "scan_listings"
+    __table_args__ = (UniqueConstraint("scan_id", "external_id", name="uq_scan_listing"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scan_id: Mapped[int] = mapped_column(index=True)
+    external_id: Mapped[str] = mapped_column(String(64), index=True)
+    initial_view_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)

@@ -34,7 +34,7 @@ from filters import (
     sort_rows,
     unique_rows,
 )
-from models import CategoryScanState, Listing, ParserRun, PriceHistory, SelectedCategory, UserSettings, ViewHistory
+from models import CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing, SelectedCategory, UserScan, UserSettings, ViewHistory
 from parser import (
     MAX_PAGES_PER_CATEGORY,
     PAGE_DELAY_SECONDS,
@@ -114,24 +114,45 @@ def allowed(user_id: int) -> bool:
 
 
 def main_keyboard(selected_count: int = 0) -> InlineKeyboardMarkup:
+    """Simple user-facing home screen. Technical/debug actions stay out of the way."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="▶️ Начать парсинг", callback_data="start_scan")],
-        [InlineKeyboardButton(text=f"🗂 Категории ({selected_count})", callback_data="groups")],
-        [InlineKeyboardButton(text="⚙️ Настройки парсинга", callback_data="settings")],
-        [InlineKeyboardButton(text="📦 Получить результат", callback_data="export_smart")],
-        [InlineKeyboardButton(text="⚡ Тест быстрых просмотров", callback_data="view_test")],
-        [InlineKeyboardButton(text="📊 База", callback_data="stats")],
-        [InlineKeyboardButton(text="📋 Что выбрано", callback_data="selected")],
+        [InlineKeyboardButton(text="🔥 Популярное сейчас", callback_data="popular_now")],
+        [InlineKeyboardButton(text="🔎 Новый скан", callback_data="start_scan")],
+        [InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
+        [InlineKeyboardButton(text=f"🗂 Категории ({selected_count})", callback_data="groups"),
+         InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
+        [InlineKeyboardButton(text="📦 Текущий результат", callback_data="export_smart")],
     ])
 
 
-def post_scan_keyboard() -> InlineKeyboardMarkup:
-    """Compact actions shown directly under the automatic result file."""
+def post_scan_keyboard(scan_id: int | None = None) -> InlineKeyboardMarkup:
+    """Actions shown under the automatic result file."""
+    rows = []
+    if scan_id is not None:
+        rows.append([InlineKeyboardButton(text="📊 Открыть этот скан", callback_data=f"scan:{scan_id}")])
+        rows.append([
+            InlineKeyboardButton(text="👁 Обновить просмотры", callback_data=f"scanviews:{scan_id}"),
+            InlineKeyboardButton(text="🔄 Повторить", callback_data=f"scanrepeat:{scan_id}"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="🔥 Топ", callback_data=f"scantop:{scan_id}"),
+            InlineKeyboardButton(text="🚀 Рост", callback_data=f"scangrowth:{scan_id}"),
+        ])
+    else:
+        rows.append([InlineKeyboardButton(text="🔄 Запустить снова", callback_data="start_scan")])
+    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="post_home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def scan_detail_keyboard(scan_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Запустить снова", callback_data="start_scan")],
-        [InlineKeyboardButton(text="📊 Другой режим", callback_data="post_settings"),
-         InlineKeyboardButton(text="📦 Другой результат", callback_data="export_smart")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="post_home")],
+        [InlineKeyboardButton(text="👁 Обновить просмотры", callback_data=f"scanviews:{scan_id}"),
+         InlineKeyboardButton(text="🔄 Пересканировать", callback_data=f"scanrepeat:{scan_id}")],
+        [InlineKeyboardButton(text="🔥 Самые просматриваемые", callback_data=f"scantop:{scan_id}")],
+        [InlineKeyboardButton(text="🚀 Сильнее всего растут", callback_data=f"scangrowth:{scan_id}")],
+        [InlineKeyboardButton(text="📄 Файл этого скана", callback_data=f"scanexport:{scan_id}")],
+        [InlineKeyboardButton(text="⬅️ Мои сканы", callback_data="my_scans"),
+         InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
     ])
 
 
@@ -270,6 +291,130 @@ async def get_selected(user_id: int) -> set[str]:
     async with SessionLocal() as session:
         result = await session.execute(select(SelectedCategory.category_key).where(SelectedCategory.user_id == user_id))
         return {x for x in result.scalars().all() if x in CATEGORIES}
+
+
+def _scan_category_keys(scan: UserScan) -> list[str]:
+    return [x for x in (scan.category_keys or "").split(",") if x]
+
+
+def _scan_title(keys: list[str]) -> str:
+    names = [CATEGORIES[k].name for k in keys if k in CATEGORIES]
+    if not names:
+        return "Скан Kleinanzeigen"
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} + {names[1]}"
+    return f"{names[0]} + ещё {len(names) - 1}"
+
+
+async def create_user_scan(user_id: int, job_uid: str, category_keys: list[str], page_limit: int) -> UserScan:
+    scan = UserScan(
+        job_uid=job_uid,
+        user_id=user_id,
+        title=_scan_title(category_keys),
+        category_keys=",".join(category_keys),
+        page_limit=page_limit,
+        status="queued",
+        total_categories=len(category_keys),
+    )
+    async with SessionLocal() as session:
+        session.add(scan)
+        await session.commit()
+        await session.refresh(scan)
+        return scan
+
+
+async def get_user_scan(user_id: int, scan_id: int) -> UserScan | None:
+    async with SessionLocal() as session:
+        result = await session.execute(select(UserScan).where(UserScan.id == scan_id, UserScan.user_id == user_id))
+        return result.scalar_one_or_none()
+
+
+async def get_user_scans(user_id: int, limit: int = 10) -> list[UserScan]:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(UserScan).where(UserScan.user_id == user_id).order_by(UserScan.created_at.desc()).limit(limit)
+        )
+        return list(result.scalars().all())
+
+
+async def get_scan_rows(scan_id: int) -> list[tuple[Listing, ScanListing]]:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Listing, ScanListing)
+            .join(ScanListing, Listing.external_id == ScanListing.external_id)
+            .where(ScanListing.scan_id == scan_id)
+        )
+        return list(result.all())
+
+
+async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None:
+    if job.scan_id is None:
+        return
+    now = datetime.utcnow()
+    async with db_write_lock:
+        async with SessionLocal() as session:
+            scan = await session.get(UserScan, job.scan_id)
+            if scan is None:
+                return
+            scan.status = "cancelled" if cancelled else "done"
+            scan.finished_at = now
+            scan.completed_categories = job.completed_categories
+            scan.total_categories = len(job.category_keys)
+            scan.new_count = job.total_new
+            if cancelled:
+                await session.commit()
+                return
+
+            start_utc, end_utc = berlin_today_utc_bounds()
+            result = await session.execute(select(Listing).where(
+                Listing.category_key.in_(job.category_keys),
+                Listing.first_seen_at >= start_utc,
+                Listing.first_seen_at < end_utc,
+            ))
+            rows = list(result.scalars().all())
+            scan.result_count = len(rows)
+            scan.viewed_count = sum(1 for row in rows if row.view_count is not None)
+            scan.last_view_refresh_at = now if scan.viewed_count else None
+
+            await session.execute(delete(ScanListing).where(ScanListing.scan_id == scan.id))
+            for row in rows:
+                session.add(ScanListing(
+                    scan_id=scan.id,
+                    external_id=row.external_id,
+                    initial_view_count=row.view_count,
+                    captured_at=now,
+                ))
+            await session.commit()
+
+
+async def update_scan_view_refresh(scan_id: int) -> None:
+    async with SessionLocal() as session:
+        scan = await session.get(UserScan, scan_id)
+        if scan is None:
+            return
+        pairs = await session.execute(
+            select(Listing.view_count).join(ScanListing, Listing.external_id == ScanListing.external_id)
+            .where(ScanListing.scan_id == scan_id)
+        )
+        values = [v for v in pairs.scalars().all()]
+        scan.viewed_count = sum(1 for v in values if v is not None)
+        scan.last_view_refresh_at = datetime.utcnow()
+        await session.commit()
+
+
+def my_scans_keyboard(scans: list[UserScan]) -> InlineKeyboardMarkup:
+    rows = []
+    for scan in scans[:8]:
+        icon = "✅" if scan.status == "done" else ("⏳" if scan.status in {"queued", "running"} else "⚪️")
+        stamp = _berlin_text(scan.finished_at or scan.created_at)
+        short_time = f"{stamp[:5]} {stamp[-5:]}" if len(stamp) >= 16 else stamp
+        label = f"{icon} {scan.title[:24]} · {short_time}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"scan:{scan.id}")])
+    rows.append([InlineKeyboardButton(text="🔎 Новый скан", callback_data="start_scan")])
+    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def toggle_category(user_id: int, key: str) -> set[str]:
@@ -753,10 +898,11 @@ async def send_smart_export(
     selected_count: int,
     *,
     category_keys_override: set[str] | None = None,
+    rows_override: list[Listing] | None = None,
 ) -> int:
     s = await get_settings(user_id)
     mode = s.output_mode
-    all_rows = await today_rows()
+    all_rows = list(rows_override) if rows_override is not None else await today_rows()
     selected_keys = category_keys_override if category_keys_override is not None else await get_selected(user_id)
     if selected_keys:
         all_rows = [row for row in all_rows if row.category_key in selected_keys]
@@ -971,6 +1117,7 @@ class ScanJob:
     started_running_monotonic: float = 0.0
     page_limit: int = 100
     current_progress_key: str = ""
+    scan_id: int | None = None
 
 
 @dataclass
@@ -1562,6 +1709,7 @@ async def edit_job_status(bot: Bot, job: ScanJob, text: str, *, force: bool = Fa
 
 
 async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None:
+    await finalize_user_scan(job, cancelled=cancelled)
     elapsed_seconds = max(0, int((datetime.utcnow() - job.created_at).total_seconds()))
     mins, secs = divmod(elapsed_seconds, 60)
     elapsed_text = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
@@ -1601,7 +1749,7 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
                 bot,
                 job.chat_id,
                 prefix=result_prefix,
-                reply_markup=post_scan_keyboard(),
+                reply_markup=post_scan_keyboard(job.scan_id),
             )
             await send_smart_export(
                 adapter,
@@ -1616,7 +1764,7 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
                     job.chat_id,
                     "⚠️ Парсинг завершён, но автоматическую выгрузку сформировать не удалось. "
                     "Нажми «📦 Получить результат» — данные уже сохранены.",
-                    reply_markup=post_scan_keyboard(),
+                    reply_markup=post_scan_keyboard(job.scan_id),
                 )
             except Exception:
                 pass
@@ -1634,6 +1782,12 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
 
 async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
     job.state = "running"
+    if job.scan_id is not None:
+        async with SessionLocal() as session:
+            scan = await session.get(UserScan, job.scan_id)
+            if scan is not None:
+                scan.status = "running"
+                await session.commit()
     job.worker_id = worker_id
     job.started_running_monotonic = time.monotonic()
     job.warnings = job.warnings or []
@@ -1717,6 +1871,16 @@ async def scan_worker(bot: Bot, worker_id: int) -> None:
         except Exception:
             log.exception("Unhandled scan worker error worker=%s job=%s", worker_id, job.job_id)
             job.state = "failed"
+            if job.scan_id is not None:
+                try:
+                    async with SessionLocal() as session:
+                        scan = await session.get(UserScan, job.scan_id)
+                        if scan is not None:
+                            scan.status = "failed"
+                            scan.finished_at = datetime.utcnow()
+                            await session.commit()
+                except Exception:
+                    log.exception("Could not mark user scan failed scan_id=%s", job.scan_id)
             try:
                 await edit_job_status(bot, job, "❌ <b>Ошибка задания парсинга</b>\nПопробуй запустить ещё раз.", force=True)
             except Exception:
@@ -1731,6 +1895,34 @@ async def scan_worker(bot: Bot, worker_id: int) -> None:
 
 
 
+async def enqueue_user_scan(message: Message, user_id: int, category_keys: list[str], page_limit: int) -> ScanJob:
+    """Create a persistent scan card and queue the network job."""
+    job_uid = uuid.uuid4().hex[:12]
+    scan = await create_user_scan(user_id, job_uid, category_keys, page_limit)
+    status = await message.answer("⏳ <b>Подготавливаю скан…</b>", parse_mode=ParseMode.HTML)
+    job = ScanJob(
+        job_id=job_uid,
+        user_id=user_id,
+        chat_id=message.chat.id,
+        status_message_id=status.message_id,
+        category_keys=category_keys,
+        created_at=datetime.utcnow(),
+        warnings=[],
+        page_limit=page_limit,
+        scan_id=scan.id,
+    )
+    async with job_guard:
+        active_jobs[job.user_id] = job
+        queued_job_ids.append(job.job_id)
+        scan_queue.put_nowait(job)
+    await status.edit_text(
+        render_user_job_status(job),
+        parse_mode=ParseMode.HTML,
+        reply_markup=job_keyboard(job.job_id),
+    )
+    return job
+
+
 
 dp = Dispatcher()
 
@@ -1743,10 +1935,12 @@ async def start(message: Message, state: FSMContext) -> None:
         return
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>Kleinanzeigen Parser v2.7.0</b>\n\n"
-        "Выбери категории и нажми «Начать парсинг». Прогресс будет обновляться автоматически, а после завершения бот сразу пришлёт готовый файл.\n"
-        "После сбора можешь менять режим выдачи без повторного парсинга.\n\n"
-        "🆕 новые · 💎 уникальные · 🔥 частые · ⚡ быстро исчезающие · 💰 ниже рынка · 📉 снижение цены.",
+        "<b>🔍 Kleinanzeigen Parser v2.8.0</b>\n\n"
+        "Здесь всё строится вокруг сохранённых сканов:\n"
+        "🔥 <b>Популярное сейчас</b> — лидеры по просмотрам\n"
+        "🔎 <b>Новый скан</b> — собрать свежие объявления\n"
+        "📊 <b>Мои сканы</b> — вернуться к любому запуску, обновить просмотры и увидеть рост\n\n"
+        "После скана результат не теряется: его карточка остаётся в «Мои сканы».",
         reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML,
     )
 
@@ -1758,7 +1952,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>Kleinanzeigen Parser v2.7.0</b>\n\nВыбери действие:", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v2.8.0</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == "post_settings")
@@ -1779,7 +1973,7 @@ async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
     await callback.message.answer(
-        "<b>Kleinanzeigen Parser v2.7.0</b>\n\nВыбери действие:",
+        "<b>🔍 Kleinanzeigen Parser v2.8.0</b>\n\nЧто хочешь посмотреть?",
         reply_markup=main_keyboard(len(selected)),
         parse_mode=ParseMode.HTML,
     )
@@ -2042,6 +2236,230 @@ async def run_view_test(message: Message, state: FSMContext) -> None:
     )
 
 
+@dp.callback_query(F.data == "popular_now")
+async def popular_now(callback: CallbackQuery) -> None:
+    if not allowed(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True); return
+    await callback.answer()
+    selected = await get_selected(callback.from_user.id)
+    rows = await today_rows()
+    if selected:
+        rows = [r for r in rows if r.category_key in selected]
+    rows = [r for r in rows if r.view_count is not None]
+    rows.sort(key=lambda r: (r.view_count or 0, r.first_seen_at), reverse=True)
+    top = rows[:12]
+    if not top:
+        text = "🔥 <b>Популярное сейчас</b>\n\nПока нет объявлений с просмотрами. Сначала запусти скан."
+    else:
+        lines = ["🔥 <b>Популярное сейчас</b>", "", "Лидеры по просмотрам среди свежих собранных объявлений:", ""]
+        for i, row in enumerate(top, 1):
+            title = html.escape(row.title[:55])
+            price = html.escape(_price_display(row.price_text, row.price_eur))
+            lines.append(f"<b>{i}. {title}</b>\n👁 {row.view_count} · 💶 {price}\n<a href=\"{html.escape(row.url)}\">Открыть объявление</a>")
+        lines.append("\n🚀 Скорость роста появится в карточках «Мои сканы» после повторного обновления просмотров.")
+        text = "\n\n".join(lines)
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=main_keyboard(len(selected)))
+
+
+@dp.callback_query(F.data == "my_scans")
+async def my_scans(callback: CallbackQuery) -> None:
+    if not allowed(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True); return
+    scans = await get_user_scans(callback.from_user.id, 10)
+    await callback.answer()
+    if not scans:
+        await callback.message.edit_text(
+            "<b>📊 Мои сканы</b>\n\nПока пусто. Сделай первый скан — он сохранится здесь, и к нему можно будет вернуться позже.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=my_scans_keyboard([]),
+        )
+        return
+    await callback.message.edit_text(
+        "<b>📊 Мои сканы</b>\n\nОткрой нужный запуск. Внутри можно обновить просмотры, посмотреть рост, топ и повторить скан.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=my_scans_keyboard(scans),
+    )
+
+
+async def render_scan_detail(scan: UserScan) -> str:
+    pairs = await get_scan_rows(scan.id)
+    rows = [listing for listing, _ in pairs]
+    viewed = sum(1 for row in rows if row.view_count is not None)
+    disappeared = sum(1 for row in rows if not row.is_active)
+    growers = 0
+    total_growth = 0
+    for listing, snap in pairs:
+        if listing.view_count is not None and snap.initial_view_count is not None:
+            delta = listing.view_count - snap.initial_view_count
+            if delta > 0:
+                growers += 1
+                total_growth += delta
+    new_since = 0
+    if scan.finished_at is not None:
+        keys = _scan_category_keys(scan)
+        if keys:
+            async with SessionLocal() as session:
+                new_since = (await session.execute(select(func.count(Listing.id)).where(
+                    Listing.category_key.in_(keys), Listing.first_seen_at > scan.finished_at
+                ))).scalar_one()
+    status_label = {"done": "✅ завершён", "running": "🔄 идёт", "queued": "⏳ ожидает", "cancelled": "❌ отменён", "failed": "❌ ошибка"}.get(scan.status, scan.status)
+    lines = [
+        f"<b>📊 {html.escape(scan.title)}</b>",
+        "",
+        f"Статус: <b>{status_label}</b>",
+        f"Запуск: <b>{_berlin_text(scan.created_at)}</b>",
+        f"Глубина: <b>{scan.page_limit} стр. на категорию</b>",
+        f"Категорий: <b>{scan.completed_categories}/{scan.total_categories}</b>",
+        "",
+        f"📦 В снимке: <b>{len(rows)}</b> объявлений",
+        f"👁 С просмотрами: <b>{viewed}</b>",
+        f"🚀 Выросли после скана: <b>{growers}</b>" + (f" · суммарно +{total_growth}" if total_growth else ""),
+        f"🆕 Новых после скана, уже найденных последующими сканами: <b>{new_since}</b>",
+        f"❌ Исчезли: <b>{disappeared}</b>",
+    ]
+    if scan.last_view_refresh_at:
+        lines += ["", f"Последнее обновление просмотров: <b>{_berlin_text(scan.last_view_refresh_at)}</b>"]
+    lines += ["", "💡 Нажми «Обновить просмотры» через час-два — бот сравнит новые значения с моментом завершения этого скана."]
+    return "\n".join(lines)
+
+
+@dp.callback_query(F.data.startswith("scan:"))
+async def scan_detail(callback: CallbackQuery) -> None:
+    try:
+        scan_id = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("Скан не найден", show_alert=True); return
+    scan = await get_user_scan(callback.from_user.id, scan_id)
+    if scan is None:
+        await callback.answer("Скан не найден", show_alert=True); return
+    await callback.answer()
+    text = await render_scan_detail(scan)
+    # A scan can be opened both from a normal text message and from the result-file caption.
+    # Telegram cannot edit a document into text, so open a fresh card for document callbacks.
+    if callback.message.text:
+        await callback.message.edit_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan.id), disable_web_page_preview=True
+        )
+    else:
+        await callback.message.answer(
+            text, parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan.id), disable_web_page_preview=True
+        )
+
+
+@dp.callback_query(F.data.startswith("scantop:"))
+async def scan_top(callback: CallbackQuery) -> None:
+    scan_id = int(callback.data.split(":", 1)[1])
+    scan = await get_user_scan(callback.from_user.id, scan_id)
+    if scan is None:
+        await callback.answer("Скан не найден", show_alert=True); return
+    pairs = await get_scan_rows(scan_id)
+    pairs = [p for p in pairs if p[0].view_count is not None]
+    pairs.sort(key=lambda p: p[0].view_count or 0, reverse=True)
+    await callback.answer()
+    if not pairs:
+        text = "🔥 <b>Самые просматриваемые</b>\n\nПока нет данных просмотров."
+    else:
+        lines = [f"🔥 <b>Топ скана: {html.escape(scan.title)}</b>", ""]
+        for i, (row, snap) in enumerate(pairs[:12], 1):
+            delta = (row.view_count - snap.initial_view_count) if snap.initial_view_count is not None else None
+            growth = f" · 🚀 +{delta}" if delta is not None and delta > 0 else ""
+            lines.append(
+                f"<b>{i}. {html.escape(row.title[:55])}</b>\n"
+                f"👁 {row.view_count}{growth} · 💶 {html.escape(_price_display(row.price_text, row.price_eur))}\n"
+                f"<a href=\"{html.escape(row.url)}\">Открыть</a>"
+            )
+        text = "\n\n".join(lines)
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=scan_detail_keyboard(scan_id))
+
+
+@dp.callback_query(F.data.startswith("scangrowth:"))
+async def scan_growth(callback: CallbackQuery) -> None:
+    scan_id = int(callback.data.split(":", 1)[1])
+    scan = await get_user_scan(callback.from_user.id, scan_id)
+    if scan is None:
+        await callback.answer("Скан не найден", show_alert=True); return
+    pairs = await get_scan_rows(scan_id)
+    growth = []
+    elapsed_hours = max(1/60, ((datetime.utcnow() - (scan.finished_at or scan.created_at)).total_seconds() / 3600))
+    for row, snap in pairs:
+        if row.view_count is None or snap.initial_view_count is None:
+            continue
+        delta = row.view_count - snap.initial_view_count
+        if delta > 0:
+            growth.append((delta / elapsed_hours, delta, row))
+    growth.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    await callback.answer()
+    if not growth:
+        text = (
+            "🚀 <b>Рост просмотров</b>\n\nПока роста не зафиксировано. "
+            "Обнови просмотры через некоторое время — тогда здесь появится динамика."
+        )
+    else:
+        lines = [f"🚀 <b>Быстрее всего растут: {html.escape(scan.title)}</b>", ""]
+        for i, (per_hour, delta, row) in enumerate(growth[:12], 1):
+            lines.append(
+                f"<b>{i}. {html.escape(row.title[:55])}</b>\n"
+                f"🚀 +{delta} · ≈ {per_hour:.1f} просмотров/ч · 👁 {row.view_count}\n"
+                f"💶 {html.escape(_price_display(row.price_text, row.price_eur))} · "
+                f"<a href=\"{html.escape(row.url)}\">Открыть</a>"
+            )
+        text = "\n\n".join(lines)
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=scan_detail_keyboard(scan_id))
+
+
+@dp.callback_query(F.data.startswith("scanviews:"))
+async def scan_refresh_views(callback: CallbackQuery) -> None:
+    scan_id = int(callback.data.split(":", 1)[1])
+    scan = await get_user_scan(callback.from_user.id, scan_id)
+    if scan is None:
+        await callback.answer("Скан не найден", show_alert=True); return
+    pairs = await get_scan_rows(scan_id)
+    rows = [row for row, _ in pairs]
+    if not rows:
+        await callback.answer("В этом скане пока нет объявлений", show_alert=True); return
+    await callback.answer("Обновляю просмотры")
+    await refresh_view_counts(rows, callback.message)
+    await update_scan_view_refresh(scan_id)
+    scan = await get_user_scan(callback.from_user.id, scan_id)
+    await callback.message.answer(
+        await render_scan_detail(scan), parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan_id)
+    )
+
+
+@dp.callback_query(F.data.startswith("scanexport:"))
+async def scan_export(callback: CallbackQuery) -> None:
+    scan_id = int(callback.data.split(":", 1)[1])
+    scan = await get_user_scan(callback.from_user.id, scan_id)
+    if scan is None:
+        await callback.answer("Скан не найден", show_alert=True); return
+    pairs = await get_scan_rows(scan_id)
+    rows = [row for row, _ in pairs]
+    await callback.answer()
+    await send_smart_export(
+        callback.message, callback.from_user.id, scan.total_categories,
+        category_keys_override=set(_scan_category_keys(scan)), rows_override=rows,
+    )
+
+
+@dp.callback_query(F.data.startswith("scanrepeat:"))
+async def scan_repeat(callback: CallbackQuery) -> None:
+    scan_id = int(callback.data.split(":", 1)[1])
+    scan = await get_user_scan(callback.from_user.id, scan_id)
+    if scan is None:
+        await callback.answer("Скан не найден", show_alert=True); return
+    async with job_guard:
+        existing = active_jobs.get(callback.from_user.id)
+        if existing and existing.state in {"queued", "running"} and not existing.cancel_requested:
+            await callback.answer("У тебя уже идёт скан", show_alert=True); return
+        if len(queued_job_ids) >= MAX_QUEUE_SIZE:
+            await callback.answer("Сервис сейчас сильно загружен. Попробуй чуть позже.", show_alert=True); return
+    keys = [k for k in _scan_category_keys(scan) if k in CATEGORIES]
+    if not keys:
+        await callback.answer("Категории этого скана больше недоступны", show_alert=True); return
+    await callback.answer("Повторяю скан")
+    await enqueue_user_scan(callback.message, callback.from_user.id, keys, scan.page_limit)
+
+
 @dp.callback_query(F.data == "groups")
 async def groups(callback: CallbackQuery) -> None:
     if not allowed(callback.from_user.id): await callback.answer("Нет доступа", show_alert=True); return
@@ -2180,7 +2598,7 @@ async def start_scan(callback: CallbackQuery) -> None:
 
     await callback.answer()
     await callback.message.answer(
-        "<b>📄 Сколько страниц отпарсить?</b>\n\n"
+        "<b>🔎 Глубина нового скана</b>\n\n"
         f"Выбрано категорий: <b>{len(selected_cats)}</b>\n"
         "Лимит применяется <b>к каждой выбранной категории</b>.\n\n"
         "25 — быстрый сбор\n"
@@ -2222,34 +2640,9 @@ async def start_scan_with_pages(callback: CallbackQuery) -> None:
             return
 
     await update_setting(callback.from_user.id, "page_limit", page_limit)
-    await callback.answer("Запускаю парсинг")
-    status = await callback.message.answer(
-        "⏳ <b>Подготавливаю парсинг…</b>",
-        parse_mode=ParseMode.HTML,
-    )
-    job = ScanJob(
-        job_id=uuid.uuid4().hex[:12],
-        user_id=callback.from_user.id,
-        chat_id=callback.message.chat.id,
-        status_message_id=status.message_id,
-        category_keys=[cat.key for cat in selected_cats],
-        created_at=datetime.utcnow(),
-        warnings=[],
-        page_limit=page_limit,
-    )
-    async with job_guard:
-        existing = active_jobs.get(callback.from_user.id)
-        if existing and existing.state in {"queued", "running"} and not existing.cancel_requested:
-            await status.edit_text("⚠️ У тебя уже есть активный запуск.")
-            return
-        active_jobs[job.user_id] = job
-        queued_job_ids.append(job.job_id)
-        scan_queue.put_nowait(job)
-
-    await status.edit_text(
-        render_user_job_status(job),
-        parse_mode=ParseMode.HTML,
-        reply_markup=job_keyboard(job.job_id),
+    await callback.answer("Запускаю скан")
+    await enqueue_user_scan(
+        callback.message, callback.from_user.id, [cat.key for cat in selected_cats], page_limit
     )
 
 
