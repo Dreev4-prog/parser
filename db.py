@@ -43,10 +43,14 @@ if _IS_SQLITE:
 
 
 def _listing_columns(sync_conn) -> set[str]:
+    return _table_columns(sync_conn, "listings")
+
+
+def _table_columns(sync_conn, table_name: str) -> set[str]:
     inspector = inspect(sync_conn)
-    if "listings" not in inspector.get_table_names():
+    if table_name not in inspector.get_table_names():
         return set()
-    return {column["name"] for column in inspector.get_columns("listings")}
+    return {column["name"] for column in inspector.get_columns(table_name)}
 
 
 async def init_db() -> None:
@@ -63,3 +67,11 @@ async def init_db() -> None:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN is_active BOOLEAN DEFAULT TRUE"))
         if columns and "disappeared_at" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN disappeared_at TIMESTAMP"))
+
+        settings_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "user_settings"))
+        if settings_columns and "page_limit" not in settings_columns:
+            await conn.execute(text("ALTER TABLE user_settings ADD COLUMN page_limit INTEGER DEFAULT 100"))
+
+        scan_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "category_scan_state"))
+        if scan_columns and "day_seed_capped" not in scan_columns:
+            await conn.execute(text("ALTER TABLE category_scan_state ADD COLUMN day_seed_capped BOOLEAN DEFAULT FALSE"))

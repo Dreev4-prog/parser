@@ -16,7 +16,11 @@ USER_AGENT = os.getenv(
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
 )
-MAX_PAGES_PER_CATEGORY = max(1, int(os.getenv("MAX_PAGES_PER_CATEGORY", "500")))
+HARD_MAX_PAGES_PER_CATEGORY = 100
+MAX_PAGES_PER_CATEGORY = min(
+    HARD_MAX_PAGES_PER_CATEGORY,
+    max(1, int(os.getenv("MAX_PAGES_PER_CATEGORY", str(HARD_MAX_PAGES_PER_CATEGORY)))),
+)
 PAGE_DELAY_SECONDS = max(0.0, float(os.getenv("PAGE_DELAY_SECONDS", "0.7")))
 STOP_AFTER_EMPTY_TODAY_PAGES = max(1, int(os.getenv("STOP_AFTER_EMPTY_TODAY_PAGES", "2")))
 AVAILABILITY_TIMEOUT = max(5.0, float(os.getenv("AVAILABILITY_TIMEOUT", "20")))

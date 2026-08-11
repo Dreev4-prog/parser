@@ -57,6 +57,8 @@ class UserSettings(Base):
     sort_mode: Mapped[str] = mapped_column(String(32), default="newest")
     include_words: Mapped[str] = mapped_column(String(1000), default="")
     exclude_words: Mapped[str] = mapped_column(String(1000), default="")
+    # Maximum number of result pages the user wants refreshed per category.
+    page_limit: Mapped[int] = mapped_column(Integer, default=100)
 
 
 class CategoryScanState(Base):
@@ -70,6 +72,9 @@ class CategoryScanState(Base):
     last_scan_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     last_mode: Mapped[str] = mapped_column(String(16), default="full")
     day_seed_complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    # True when the daily seed stopped only because the user/page cap was reached.
+    # This lets a later user request a deeper scan without treating a shallow seed as complete.
+    day_seed_capped: Mapped[bool] = mapped_column(Boolean, default=False)
     day_full_pages: Mapped[int] = mapped_column(Integer, default=0)
     last_pages: Mapped[int] = mapped_column(Integer, default=0)
     last_new: Mapped[int] = mapped_column(Integer, default=0)
