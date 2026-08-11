@@ -7,6 +7,9 @@ import logging
 import os
 import shutil
 import tempfile
+import time
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -31,12 +34,11 @@ from filters import (
     sort_rows,
     unique_rows,
 )
-from models import Listing, PriceHistory, SelectedCategory, UserSettings
+from models import CategoryScanState, Listing, ParserRun, PriceHistory, SelectedCategory, UserSettings
 from parser import (
     MAX_PAGES_PER_CATEGORY,
     PAGE_DELAY_SECONDS,
     STOP_AFTER_EMPTY_TODAY_PAGES,
-    STOP_AFTER_NO_NEW_PAGES,
     KleinanzeigenParser,
     ParsedListing,
     is_today_text,
@@ -49,9 +51,24 @@ log = logging.getLogger("kleinanzeigen-bot")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 BERLIN = ZoneInfo("Europe/Berlin")
-scan_lock = asyncio.Lock()
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
 AVAILABILITY_CONCURRENCY = max(1, min(8, int(os.getenv("AVAILABILITY_CONCURRENCY", "4"))))
+
+# v2.6 Multi-User Core. User launches go into a queue. Only a limited number
+# of jobs are processed at once, while category scans are shared globally.
+MAX_CONCURRENT_JOBS = max(1, min(8, int(os.getenv("MAX_CONCURRENT_JOBS", "3"))))
+MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
+CATEGORY_CACHE_TTL_SECONDS = max(0, int(os.getenv("CATEGORY_CACHE_TTL_SECONDS", "300")))
+STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVAL_SECONDS", "1.5")))
+
+# v2.5 incremental scan tuning (kept in v2.6). A full scan is forced once per category per Berlin day.
+# Later runs stop after the parser crosses the previous head checkpoint and then
+# sees a small safety overlap of already-known pages.
+INCREMENTAL_STOP_AFTER_KNOWN_PAGES = max(1, int(os.getenv("INCREMENTAL_STOP_AFTER_KNOWN_PAGES", "2")))
+INCREMENTAL_MIN_KNOWN_RATIO = min(1.0, max(0.5, float(os.getenv("INCREMENTAL_MIN_KNOWN_RATIO", "0.80"))))
+INCREMENTAL_MIN_PAGES = max(1, int(os.getenv("INCREMENTAL_MIN_PAGES", "2")))
+INCREMENTAL_HEAD_SIZE = max(3, min(20, int(os.getenv("INCREMENTAL_HEAD_SIZE", "8"))))
+INCREMENTAL_OVERLAP_PAGES = max(0, int(os.getenv("INCREMENTAL_OVERLAP_PAGES", "1")))
 
 MODE_LABELS = {
     "newest": "🆕 Самые новые",
@@ -89,8 +106,9 @@ def main_keyboard(selected_count: int = 0) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"🗂 Категории ({selected_count})", callback_data="groups")],
         [InlineKeyboardButton(text="⚙️ Настройки парсинга", callback_data="settings")],
         [InlineKeyboardButton(text="📦 Получить результат", callback_data="export_smart")],
-        [InlineKeyboardButton(text="📋 Что выбрано", callback_data="selected"),
+        [InlineKeyboardButton(text="📥 Очередь", callback_data="queue_status"),
          InlineKeyboardButton(text="📊 База", callback_data="stats")],
+        [InlineKeyboardButton(text="📋 Что выбрано", callback_data="selected")],
     ])
 
 
@@ -606,13 +624,14 @@ def settings_text(s: UserSettings) -> str:
         f"Сортировка: <b>{SORT_LABELS.get(s.sort_mode, s.sort_mode)}</b>\n"
         f"Ключевые слова: <b>{include}</b>\n"
         f"Исключить: <b>{exclude}</b>\n\n"
-        "<i>v2.4 использует более строгую группировку по модели/варианту/памяти. "
+        "<i>v2.6 сохраняет Smart Analytics/Fast Incremental и добавляет общую очередь, кэш категорий и совместные сканы. "
         "Нажми «ℹ️ Как работают режимы», чтобы увидеть текущие критерии.</i>"
     )
 
 
 async def stats_text() -> str:
     start_utc, end_utc = berlin_today_utc_bounds()
+    day_key = berlin_date_key()
     async with SessionLocal() as session:
         total = (await session.execute(select(func.count(Listing.id)))).scalar_one()
         today = (await session.execute(select(func.count(Listing.id)).where(
@@ -622,48 +641,602 @@ async def stats_text() -> str:
             Listing.first_seen_at >= start_utc, Listing.first_seen_at < end_utc, Listing.price_text.is_not(None),
         ))).scalar_one()
         drops = (await session.execute(select(func.count(PriceHistory.id)))).scalar_one()
+        runs = (await session.execute(select(func.count(ParserRun.id)).where(
+            ParserRun.started_at >= start_utc, ParserRun.started_at < end_utc, ParserRun.success.is_(True),
+        ))).scalar_one()
+        fast_runs = (await session.execute(select(func.count(ParserRun.id)).where(
+            ParserRun.started_at >= start_utc, ParserRun.started_at < end_utc,
+            ParserRun.success.is_(True), ParserRun.mode == "fast",
+        ))).scalar_one()
+        pages = (await session.execute(select(func.coalesce(func.sum(ParserRun.pages_scanned), 0)).where(
+            ParserRun.started_at >= start_utc, ParserRun.started_at < end_utc, ParserRun.success.is_(True),
+        ))).scalar_one()
+        scan_new = (await session.execute(select(func.coalesce(func.sum(ParserRun.new_count), 0)).where(
+            ParserRun.started_at >= start_utc, ParserRun.started_at < end_utc, ParserRun.success.is_(True),
+        ))).scalar_one()
+        fast_ready = (await session.execute(select(func.count(CategoryScanState.category_key)).where(
+            CategoryScanState.scan_date == day_key, CategoryScanState.day_seed_complete.is_(True),
+        ))).scalar_one()
     storage = "PostgreSQL / DATABASE_URL" if USING_PERSISTENT_DATABASE else "SQLite"
     warning = "" if USING_PERSISTENT_DATABASE else "\n\n⚠️ На Railway SQLite может потеряться после redeploy/restart."
     coverage = round(priced / today * 100) if today else 0
+    async with job_guard:
+        running_jobs_count = sum(1 for j in active_jobs.values() if j.state == "running")
+        queued_jobs_count = sum(1 for j in active_jobs.values() if j.state == "queued" and not j.cancel_requested)
+        inflight_categories_count = len(category_inflight)
     return (
-        f"<b>📊 База парсера</b>\n\n"
+        f"<b>📊 База и парсинг</b>\n\n"
         f"Сегодня собрано: <b>{today}</b>\n"
         f"С ценой: <b>{priced}</b> ({coverage}%)\n"
         f"Всего сохранено: <b>{total}</b>\n"
-        f"Записей истории цен: <b>{drops}</b>\n"
+        f"Записей истории цен: <b>{drops}</b>\n\n"
+        f"<b>⚡ v2.6 сегодня</b>\n"
+        f"Запусков категорий: <b>{runs}</b>\n"
+        f"Быстрых запусков: <b>{fast_runs}</b>\n"
+        f"Категорий готовы к fast-mode: <b>{fast_ready}</b>\n"
+        f"Пройдено страниц: <b>{pages}</b>\n"
+        f"Найдено новых за запуски: <b>{scan_new}</b>\n\n"
+        f"<b>📥 Multi-User Core</b>\n"
+        f"Воркеров: <b>{MAX_CONCURRENT_JOBS}</b>\n"
+        f"В работе: <b>{running_jobs_count}</b> · В очереди: <b>{queued_jobs_count}</b>\n"
+        f"Категорий сейчас сканируется: <b>{inflight_categories_count}</b>\n"
+        f"TTL кэша: <b>{CATEGORY_CACHE_TTL_SECONDS} сек.</b>\n\n"
         f"База: <b>{storage}</b>{warning}"
     )
 
 
-async def scan_one_category(parser: KleinanzeigenParser, cat) -> tuple[int, int, int, bool, str]:
-    new_count = today_seen = pages_scanned = empty_today_pages = no_new_pages = 0
-    for page in range(1, MAX_PAGES_PER_CATEGORY + 1):
-        items = await parser.parse_category_page(page_url(cat.url, page))
-        pages_scanned = page
-        if not items:
-            return new_count, pages_scanned, today_seen, False, "конец выдачи"
-        today_items = [item for item in items if is_today_text(item.posted_text)]
-        today_seen += len(today_items)
-        if today_items:
-            empty_today_pages = 0
-            new_items, known_count, enriched_count = await upsert_page_items(cat.key, cat.name, today_items)
-            new_count += len(new_items)
-            # Keep going while backfilling prices missing from older rows.
-            no_new_pages = 0 if (new_items or enriched_count) else no_new_pages + 1
-            log.info(
-                "category=%s page=%s total=%s today=%s new=%s known=%s prices_backfilled=%s no_new_pages=%s",
-                cat.name, page, len(items), len(today_items), len(new_items), known_count, enriched_count, no_new_pages,
-            )
-            if no_new_pages >= STOP_AFTER_NO_NEW_PAGES:
-                return new_count, pages_scanned, today_seen, False, "дошли до уже собранных"
+@dataclass
+class ScanResult:
+    new_count: int
+    pages_scanned: int
+    today_seen: int
+    known_count: int
+    enriched_count: int
+    hit_limit: bool
+    reason: str
+    mode: str
+    avoided_pages: int = 0
+
+
+@dataclass
+class CategoryDispatchResult:
+    source: str  # scan | shared | cache
+    result: ScanResult | None = None
+    cache_age_seconds: int = 0
+
+
+@dataclass
+class ScanJob:
+    job_id: str
+    user_id: int
+    chat_id: int
+    status_message_id: int
+    category_keys: list[str]
+    created_at: datetime
+    state: str = "queued"
+    cancel_requested: bool = False
+    worker_id: int | None = None
+    current_category: str = ""
+    completed_categories: int = 0
+    total_new: int = 0
+    total_pages: int = 0
+    total_avoided: int = 0
+    cache_hits: int = 0
+    shared_hits: int = 0
+    scanned_categories: int = 0
+    fast_categories: int = 0
+    full_categories: int = 0
+    warnings: list[str] | None = None
+    last_status_update: float = 0.0
+
+
+scan_queue: asyncio.Queue[ScanJob] = asyncio.Queue()
+active_jobs: dict[int, ScanJob] = {}
+queued_job_ids: list[str] = []
+job_guard = asyncio.Lock()
+category_inflight: dict[str, asyncio.Task[ScanResult]] = {}
+category_inflight_guard = asyncio.Lock()
+db_write_lock = asyncio.Lock()
+
+
+def berlin_date_key() -> str:
+    return datetime.now(BERLIN).date().isoformat()
+
+
+async def get_category_scan_state(category_key: str) -> CategoryScanState | None:
+    async with SessionLocal() as session:
+        return await session.get(CategoryScanState, category_key)
+
+
+async def save_category_scan_state(
+    category_key: str,
+    *,
+    mode: str,
+    pages_scanned: int,
+    new_count: int,
+    today_seen: int,
+    reason: str,
+    head_ids: list[str],
+    seed_complete: bool,
+) -> CategoryScanState:
+    day_key = berlin_date_key()
+    async with SessionLocal() as session:
+        state = await session.get(CategoryScanState, category_key)
+        if state is None:
+            state = CategoryScanState(category_key=category_key, scan_date=day_key)
+            session.add(state)
+        new_day = state.scan_date != day_key
+        if new_day:
+            state.scan_date = day_key
+            state.total_runs = 0
+            state.day_seed_complete = False
+            state.day_full_pages = 0
+            state.head_ids = ""
+
+        if head_ids:
+            state.head_ids = ",".join(head_ids[:INCREMENTAL_HEAD_SIZE])
+        state.last_scan_at = datetime.utcnow()
+        state.last_mode = mode
+        state.last_pages = pages_scanned
+        state.last_new = new_count
+        state.last_today_seen = today_seen
+        state.last_stop_reason = reason[:255]
+        state.total_runs = (state.total_runs or 0) + 1
+        if mode == "full":
+            state.day_seed_complete = seed_complete
+            if seed_complete:
+                state.day_full_pages = max(state.day_full_pages or 0, pages_scanned)
+        await session.commit()
+        await session.refresh(state)
+        return state
+
+
+async def record_parser_run(
+    user_id: int,
+    cat,
+    result: ScanResult,
+    started_at: datetime,
+    *,
+    success: bool = True,
+    error_text: str | None = None,
+) -> None:
+    async with SessionLocal() as session:
+        session.add(ParserRun(
+            user_id=user_id,
+            category_key=cat.key,
+            category_name=cat.name,
+            mode=result.mode,
+            started_at=started_at,
+            finished_at=datetime.utcnow(),
+            pages_scanned=result.pages_scanned,
+            today_seen=result.today_seen,
+            new_count=result.new_count,
+            known_count=result.known_count,
+            enriched_count=result.enriched_count,
+            stop_reason=result.reason[:255],
+            success=success,
+            error_text=(error_text[:1000] if error_text else None),
+        ))
+        await session.commit()
+
+
+async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int) -> ScanResult:
+    """Scan one category.
+
+    v2.5 uses two modes:
+    - full: once per Berlin day/category, walk the current-day feed until Heute ends;
+    - fast: later scans start at page 1 and stop after reaching the previous head
+      checkpoint plus a safety overlap, or after several highly-known pages.
+
+    The fast mode never skips the first pages: this keeps it correct when many new
+    listings arrived since the previous run. It only avoids re-reading the old tail.
+    """
+    state = await get_category_scan_state(cat.key)
+    day_key = berlin_date_key()
+    can_fast = bool(state and state.scan_date == day_key and state.day_seed_complete)
+    mode = "fast" if can_fast else "full"
+    previous_heads = {
+        x for x in ((state.head_ids if state else "") or "").split(",") if x
+    }
+    baseline_pages = (state.day_full_pages or 0) if state and state.scan_date == day_key else 0
+
+    new_count = 0
+    today_seen = 0
+    pages_scanned = 0
+    known_total = 0
+    enriched_total = 0
+    empty_today_pages = 0
+    consecutive_known_pages = 0
+    first_page_head_ids: list[str] = []
+    checkpoint_seen_page: int | None = None
+    started_at = datetime.utcnow()
+    reason = ""
+    hit_limit = False
+
+    try:
+        for page in range(1, MAX_PAGES_PER_CATEGORY + 1):
+            items = await parser.parse_category_page(page_url(cat.url, page))
+            pages_scanned = page
+            if not items:
+                reason = "конец выдачи"
+                break
+
+            today_items = [item for item in items if is_today_text(item.posted_text)]
+            today_seen += len(today_items)
+
+            if page == 1 and today_items:
+                first_page_head_ids = [item.external_id for item in today_items[:INCREMENTAL_HEAD_SIZE]]
+
+            if today_items:
+                empty_today_pages = 0
+                page_ids = {item.external_id for item in today_items}
+
+                async with db_write_lock:
+                    new_items, known_count, enriched_count = await upsert_page_items(cat.key, cat.name, today_items)
+                page_new = len(new_items)
+                new_count += page_new
+                known_total += known_count
+                enriched_total += enriched_count
+
+                known_ratio = known_count / max(1, len(today_items))
+                # A promoted/repeated old ad can appear near the top. Only treat a
+                # previous head ID as the boundary when the page is already mostly
+                # known; this avoids an early checkpoint on a page full of fresh ads.
+                if (
+                    mode == "fast"
+                    and checkpoint_seen_page is None
+                    and previous_heads.intersection(page_ids)
+                    and known_ratio >= 0.50
+                ):
+                    checkpoint_seen_page = page
+
+                page_is_known_tail = (
+                    page_new == 0
+                    and enriched_count == 0
+                    and known_ratio >= INCREMENTAL_MIN_KNOWN_RATIO
+                )
+                consecutive_known_pages = consecutive_known_pages + 1 if page_is_known_tail else 0
+
+                log.info(
+                    "category=%s mode=%s page=%s total=%s today=%s new=%s known=%s known_ratio=%.2f "
+                    "prices_backfilled=%s checkpoint_page=%s known_pages=%s",
+                    cat.name, mode, page, len(items), len(today_items), page_new, known_count,
+                    known_ratio, enriched_count, checkpoint_seen_page, consecutive_known_pages,
+                )
+
+                if mode == "fast" and page >= INCREMENTAL_MIN_PAGES:
+                    # Preferred stop: we crossed an ID that was near the top of the
+                    # previous run, then scanned a safety overlap into the known tail.
+                    if (
+                        checkpoint_seen_page is not None
+                        and page >= checkpoint_seen_page + INCREMENTAL_OVERLAP_PAGES
+                        and consecutive_known_pages >= 1
+                    ):
+                        reason = "быстрый стоп: достигнут прошлый чекпоинт"
+                        break
+
+                    # Fallback if the old head ad was deleted/reordered: several pages
+                    # dominated by already-known IDs are enough evidence that the fresh
+                    # prefix has ended.
+                    if consecutive_known_pages >= INCREMENTAL_STOP_AFTER_KNOWN_PAGES:
+                        reason = "быстрый стоп: пошёл уже известный хвост"
+                        break
+            else:
+                empty_today_pages += 1
+                consecutive_known_pages = 0
+                log.info(
+                    "category=%s mode=%s page=%s total=%s today=0 empty_today_pages=%s",
+                    cat.name, mode, page, len(items), empty_today_pages,
+                )
+                if empty_today_pages >= STOP_AFTER_EMPTY_TODAY_PAGES:
+                    reason = "закончились объявления Heute"
+                    break
+
+            if PAGE_DELAY_SECONDS and page < MAX_PAGES_PER_CATEGORY:
+                await asyncio.sleep(PAGE_DELAY_SECONDS)
         else:
-            empty_today_pages += 1
-            log.info("category=%s page=%s total=%s today=0 empty_today_pages=%s", cat.name, page, len(items), empty_today_pages)
-            if empty_today_pages >= STOP_AFTER_EMPTY_TODAY_PAGES:
-                return new_count, pages_scanned, today_seen, False, "закончились объявления Heute"
-        if PAGE_DELAY_SECONDS and page < MAX_PAGES_PER_CATEGORY:
-            await asyncio.sleep(PAGE_DELAY_SECONDS)
-    return new_count, pages_scanned, today_seen, True, "аварийный лимит страниц"
+            hit_limit = True
+            reason = "аварийный лимит страниц"
+
+        if not reason:
+            reason = "завершено"
+
+        # A full scan is considered seeded only if it reached a natural end, not
+        # the emergency page cap. Fast mode keeps the previously completed seed.
+        seed_complete = (mode == "full" and not hit_limit)
+        saved = await save_category_scan_state(
+            cat.key,
+            mode=mode,
+            pages_scanned=pages_scanned,
+            new_count=new_count,
+            today_seen=today_seen,
+            reason=reason,
+            head_ids=first_page_head_ids,
+            seed_complete=seed_complete,
+        )
+        avoided_pages = max(0, (saved.day_full_pages or baseline_pages or 0) - pages_scanned) if mode == "fast" else 0
+        result = ScanResult(
+            new_count=new_count,
+            pages_scanned=pages_scanned,
+            today_seen=today_seen,
+            known_count=known_total,
+            enriched_count=enriched_total,
+            hit_limit=hit_limit,
+            reason=reason,
+            mode=mode,
+            avoided_pages=avoided_pages,
+        )
+        await record_parser_run(user_id, cat, result, started_at)
+        return result
+    except Exception as exc:
+        failed = ScanResult(
+            new_count=new_count,
+            pages_scanned=pages_scanned,
+            today_seen=today_seen,
+            known_count=known_total,
+            enriched_count=enriched_total,
+            hit_limit=False,
+            reason="ошибка",
+            mode=mode,
+            avoided_pages=0,
+        )
+        try:
+            await record_parser_run(user_id, cat, failed, started_at, success=False, error_text=str(exc))
+        except Exception:
+            log.exception("Could not record failed parser run")
+        raise
+
+
+def job_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить мой запуск", callback_data=f"cancel_scan:{job_id}")],
+        [InlineKeyboardButton(text="📥 Состояние очереди", callback_data="queue_status")],
+    ])
+
+
+async def fresh_category_cache_age(category_key: str) -> int | None:
+    """Return cache age in seconds when a category can be safely reused."""
+    if CATEGORY_CACHE_TTL_SECONDS <= 0:
+        return None
+    state = await get_category_scan_state(category_key)
+    if not state or not state.last_scan_at:
+        return None
+    if state.scan_date != berlin_date_key() or not state.day_seed_complete:
+        return None
+    age = max(0, int((datetime.utcnow() - state.last_scan_at).total_seconds()))
+    if age <= CATEGORY_CACHE_TTL_SECONDS:
+        return age
+    return None
+
+
+async def _scan_category_task(cat, user_id: int) -> ScanResult:
+    parser = KleinanzeigenParser()
+    try:
+        return await scan_one_category(parser, cat, user_id)
+    finally:
+        await parser.close()
+
+
+async def dispatch_category(cat, user_id: int) -> CategoryDispatchResult:
+    """Use a fresh cache, join an in-flight scan, or start exactly one scan.
+
+    This is the core v2.6 de-duplication layer: 15 users requesting Konsolen at
+    the same moment still cause only one network scan of Konsolen.
+    """
+    cache_age = await fresh_category_cache_age(cat.key)
+    if cache_age is not None:
+        return CategoryDispatchResult(source="cache", cache_age_seconds=cache_age)
+
+    async with category_inflight_guard:
+        task = category_inflight.get(cat.key)
+        if task is None:
+            task = asyncio.create_task(_scan_category_task(cat, user_id), name=f"category-scan:{cat.key}")
+            category_inflight[cat.key] = task
+            source = "scan"
+        else:
+            source = "shared"
+
+    try:
+        result = await asyncio.shield(task)
+        return CategoryDispatchResult(source=source, result=result)
+    finally:
+        if task.done():
+            async with category_inflight_guard:
+                if category_inflight.get(cat.key) is task:
+                    category_inflight.pop(cat.key, None)
+
+
+async def queue_status_text(user_id: int) -> str:
+    async with job_guard:
+        running = [j for j in active_jobs.values() if j.state == "running"]
+        queued = [j for j in active_jobs.values() if j.state == "queued" and not j.cancel_requested]
+        mine = active_jobs.get(user_id)
+        position = None
+        if mine and mine.state == "queued" and mine.job_id in queued_job_ids:
+            position = queued_job_ids.index(mine.job_id) + 1
+
+    lines = [
+        "<b>📥 Очередь парсинга</b>",
+        "",
+        f"Воркеров: <b>{MAX_CONCURRENT_JOBS}</b>",
+        f"Лимит очереди: <b>{MAX_QUEUE_SIZE}</b>",
+        f"Сейчас выполняется: <b>{len(running)}</b>",
+        f"Ждут в очереди: <b>{len(queued)}</b>",
+        f"Кэш категории: <b>{CATEGORY_CACHE_TTL_SECONDS // 60} мин.</b>" if CATEGORY_CACHE_TTL_SECONDS else "Кэш категории: <b>выключен</b>",
+    ]
+    if mine:
+        lines += ["", "<b>Твоя задача</b>"]
+        if mine.state == "queued":
+            lines.append(f"⏳ В очереди" + (f", позиция примерно <b>{position}</b>" if position else ""))
+        elif mine.state == "running":
+            lines.append(f"⚙️ Выполняется воркером <b>#{mine.worker_id}</b>")
+            if mine.current_category:
+                lines.append(f"Сейчас: <b>{html.escape(mine.current_category)}</b>")
+            lines.append(f"Готово категорий: <b>{mine.completed_categories}/{len(mine.category_keys)}</b>")
+        elif mine.cancel_requested:
+            lines.append("❌ Ожидает отмены")
+    else:
+        lines += ["", "У тебя сейчас нет активного запуска."]
+    return "\n".join(lines)
+
+
+async def edit_job_status(bot: Bot, job: ScanJob, text: str, *, force: bool = False) -> None:
+    now = time.monotonic()
+    if not force and now - job.last_status_update < STATUS_UPDATE_INTERVAL_SECONDS:
+        return
+    job.last_status_update = now
+    try:
+        await bot.edit_message_text(
+            chat_id=job.chat_id,
+            message_id=job.status_message_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=job_keyboard(job.job_id) if job.state in {"queued", "running"} else None,
+        )
+    except Exception as exc:
+        # Telegram may reject an identical edit; this must never stop parsing.
+        log.debug("Could not edit job status %s: %s", job.job_id, exc)
+
+
+async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None:
+    today_count = len(await today_rows())
+    if cancelled:
+        title = "❌ <b>Парсинг отменён</b>"
+    else:
+        title = "✅ <b>Парсинг завершён</b>"
+    text = (
+        f"{title}\n\n"
+        f"Категорий обработано: <b>{job.completed_categories}/{len(job.category_keys)}</b>\n"
+        f"Новых объявлений обнаружено: <b>{job.total_new}</b>\n"
+        f"Всего сегодня в общей базе: <b>{today_count}</b>\n\n"
+        f"🌐 Реально просканировано категорий: <b>{job.scanned_categories}</b>\n"
+        f"📄 Сетевых страниц: <b>{job.total_pages}</b>\n"
+        f"⚡ Fast-mode: <b>{job.fast_categories}</b> · 📚 Full-mode: <b>{job.full_categories}</b>\n"
+        f"🧠 Из свежего кэша: <b>{job.cache_hits}</b>\n"
+        f"🤝 Подключено к уже идущему скану: <b>{job.shared_hits}</b>\n"
+        f"⏩ Сэкономлено старых страниц: <b>{job.total_avoided}</b>\n\n"
+        "Нажми <b>📦 Получить результат</b> — выборка сформируется по твоим настройкам."
+    )
+    job.state = "cancelled" if cancelled else "done"
+    await edit_job_status(bot, job, text, force=True)
+    if job.warnings:
+        try:
+            await bot.send_message(
+                job.chat_id,
+                "<b>⚠️ Предупреждения</b>\n\n" + "\n".join(f"• {html.escape(x)}" for x in job.warnings[:20]),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            log.exception("Could not send warnings for job=%s", job.job_id)
+
+
+async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
+    job.state = "running"
+    job.worker_id = worker_id
+    job.warnings = job.warnings or []
+    await edit_job_status(
+        bot,
+        job,
+        f"⚙️ <b>Парсинг запущен</b>\n\nВоркер: <b>#{worker_id}</b>\nКатегорий: <b>{len(job.category_keys)}</b>",
+        force=True,
+    )
+
+    for idx, key in enumerate(job.category_keys, start=1):
+        if job.cancel_requested:
+            break
+        cat = CATEGORIES.get(key)
+        if cat is None:
+            job.warnings.append(f"Неизвестная категория: {key}")
+            continue
+        job.current_category = cat.name
+        try:
+            dispatched = await dispatch_category(cat, job.user_id)
+            result = dispatched.result
+            source_label = "🧠 кэш"
+            if dispatched.source == "cache":
+                job.cache_hits += 1
+                source_label = f"🧠 кэш ({dispatched.cache_age_seconds} сек.)"
+            elif dispatched.source == "shared":
+                job.shared_hits += 1
+                source_label = "🤝 общий скан"
+            else:
+                job.scanned_categories += 1
+                source_label = "🌐 новый скан"
+
+            if result is not None:
+                # New_count is a global DB fact from this shared scan. Pages are counted
+                # only for the job that actually started the network scan.
+                job.total_new += result.new_count
+                if dispatched.source == "scan":
+                    job.total_pages += result.pages_scanned
+                    job.total_avoided += result.avoided_pages
+                    if result.mode == "fast":
+                        job.fast_categories += 1
+                    else:
+                        job.full_categories += 1
+                if result.hit_limit:
+                    job.warnings.append(f"{cat.name}: достигнут аварийный лимит страниц")
+
+            job.completed_categories += 1
+            mode_line = ""
+            if result is not None:
+                mode_line = f"\nРежим категории: <b>{'⚡ быстрый' if result.mode == 'fast' else '📚 полный'}</b>"
+            await edit_job_status(
+                bot,
+                job,
+                "⏳ <b>Парсинг</b>\n\n"
+                f"Категория: <b>{idx}/{len(job.category_keys)}</b>\n"
+                f"Сейчас: <b>{html.escape(cat.name)}</b>\n"
+                f"Источник: <b>{source_label}</b>{mode_line}\n\n"
+                f"Новых обнаружено: <b>{job.total_new}</b>\n"
+                f"Реальных сканов: <b>{job.scanned_categories}</b>\n"
+                f"Из кэша: <b>{job.cache_hits}</b> · Общих: <b>{job.shared_hits}</b>\n"
+                f"Сетевых страниц: <b>{job.total_pages}</b>",
+            )
+        except Exception as exc:
+            log.exception("Queue scan error job=%s category=%s", job.job_id, cat.name)
+            job.warnings.append(f"{cat.name}: {str(exc)[:120]}")
+            job.completed_categories += 1
+
+    await finish_job(bot, job, cancelled=job.cancel_requested)
+
+
+async def scan_worker(bot: Bot, worker_id: int) -> None:
+    log.info("Scan worker #%s started", worker_id)
+    while True:
+        job = await scan_queue.get()
+        try:
+            async with job_guard:
+                if job.job_id in queued_job_ids:
+                    queued_job_ids.remove(job.job_id)
+                if job.cancel_requested:
+                    job.state = "cancelled"
+                else:
+                    job.state = "running"
+                    job.worker_id = worker_id
+
+            if job.cancel_requested:
+                await finish_job(bot, job, cancelled=True)
+            else:
+                await process_scan_job(bot, job, worker_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Unhandled scan worker error worker=%s job=%s", worker_id, job.job_id)
+            job.state = "failed"
+            try:
+                await edit_job_status(bot, job, "❌ <b>Ошибка задания парсинга</b>\nПопробуй запустить ещё раз.", force=True)
+            except Exception:
+                pass
+        finally:
+            async with job_guard:
+                if active_jobs.get(job.user_id) is job:
+                    active_jobs.pop(job.user_id, None)
+                if job.job_id in queued_job_ids:
+                    queued_job_ids.remove(job.job_id)
+            scan_queue.task_done()
+
+
 
 
 dp = Dispatcher()
@@ -677,8 +1250,9 @@ async def start(message: Message, state: FSMContext) -> None:
         return
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>Kleinanzeigen Parser v2.4 · Smart Analytics</b>\n\n"
-        "Сначала парсер собирает объявления в базу, затем ты можешь менять режим выдачи без повторного парсинга.\n\n"
+        "<b>Kleinanzeigen Parser v2.6 · Multi-User Core</b>\n\n"
+        "Запуски идут через общую очередь: свежие категории берутся из кэша, а одинаковые одновременные запросы объединяются в один скан.\n"
+        "После сбора можешь менять режим выдачи без повторного парсинга.\n\n"
         "🆕 новые · 💎 уникальные · 🔥 частые · ⚡ быстро исчезающие · 💰 ниже рынка · 📉 снижение цены.",
         reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML,
     )
@@ -691,7 +1265,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>Kleinanzeigen Parser v2.4</b>\n\nВыбери действие:", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("<b>Kleinanzeigen Parser v2.6</b>\n\nВыбери действие:", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == "settings")
@@ -708,7 +1282,7 @@ async def settings(callback: CallbackQuery, state: FSMContext) -> None:
 async def mode_help(callback: CallbackQuery) -> None:
     await callback.answer()
     text = (
-        "<b>ℹ️ Критерии Smart Analytics v2.4</b>\n\n"
+        "<b>ℹ️ Критерии Smart Analytics v2.6</b>\n\n"
         "💎 <b>Уникальные</b> — группа модели встречается ровно 1 раз в выбранном периоде. "
         "Цвет, состояние и продавцовский текст не дробят группу.\n\n"
         "🔥 <b>Часто публикуемые</b> — минимум 3 разных ID одной модели/варианта. "
@@ -926,52 +1500,103 @@ async def export_smart(callback: CallbackQuery) -> None:
     await send_smart_export(callback.message, callback.from_user.id, len(selected))
 
 
+@dp.callback_query(F.data == "queue_status")
+async def queue_status(callback: CallbackQuery) -> None:
+    if not allowed(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer()
+    selected = await get_selected(callback.from_user.id)
+    await callback.message.answer(
+        await queue_status_text(callback.from_user.id),
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard(len(selected)),
+    )
+
+
+@dp.callback_query(F.data.startswith("cancel_scan:"))
+async def cancel_scan(callback: CallbackQuery) -> None:
+    job_id = callback.data.split(":", 1)[1]
+    async with job_guard:
+        job = active_jobs.get(callback.from_user.id)
+        if job is None or job.job_id != job_id:
+            await callback.answer("Активная задача уже не найдена", show_alert=True)
+            return
+        job.cancel_requested = True
+        if job.job_id in queued_job_ids:
+            queued_job_ids.remove(job.job_id)
+        state = job.state
+    if state == "queued":
+        await callback.answer("Задача отменена")
+        await callback.message.edit_text(
+            "❌ <b>Задача отменена</b>\nОна не будет запускать новые категории.",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await callback.answer("Отмена принята")
+        await callback.message.edit_text(
+            "⏳ <b>Отменяю запуск</b>\n\nТекущий общий скан категории, если он уже начался, не прерывается. "
+            "После него твоя задача остановится.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
 @dp.callback_query(F.data == "start_scan")
 async def start_scan(callback: CallbackQuery) -> None:
-    if not allowed(callback.from_user.id): await callback.answer("Нет доступа", show_alert=True); return
-    if scan_lock.locked(): await callback.answer("Парсинг уже идёт", show_alert=True); return
+    if not allowed(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
     selected_keys = await get_selected(callback.from_user.id)
     selected_cats = [CATEGORIES[k] for k in CATEGORIES if k in selected_keys]
-    if not selected_cats: await callback.answer("Сначала выбери хотя бы одну категорию", show_alert=True); return
-    await callback.answer()
-    status = await callback.message.answer(f"⏳ <b>Начинаю парсинг</b>\nКатегорий: <b>{len(selected_cats)}</b>", parse_mode=ParseMode.HTML)
+    if not selected_cats:
+        await callback.answer("Сначала выбери хотя бы одну категорию", show_alert=True)
+        return
 
-    async with scan_lock:
-        parser = KleinanzeigenParser()
-        total_pages = total_new = 0
-        warnings: list[str] = []
-        try:
-            for idx, cat in enumerate(selected_cats, start=1):
-                try:
-                    new_count, pages, today_seen, hit_limit, reason = await scan_one_category(parser, cat)
-                    total_pages += pages; total_new += new_count
-                    if hit_limit: warnings.append(f"{cat.name}: достигнут аварийный лимит страниц")
-                    await status.edit_text(
-                        "⏳ <b>Парсинг</b>\n\n"
-                        f"Категория: <b>{idx}/{len(selected_cats)}</b>\n"
-                        f"Сейчас: <b>{html.escape(cat.name)}</b>\n"
-                        f"Новых в категории: <b>{new_count}</b>\n"
-                        f"Новых за запуск: <b>{total_new}</b>\n"
-                        f"Страниц: <b>{total_pages}</b>\n"
-                        f"Остановка: <b>{html.escape(reason)}</b>", parse_mode=ParseMode.HTML,
-                    )
-                except Exception as exc:
-                    log.exception("Parsing error category=%s", cat.name)
-                    warnings.append(f"{cat.name}: {str(exc)[:120]}")
-            today_count = len(await today_rows())
-            await status.edit_text(
-                "✅ <b>Парсинг завершён</b>\n\n"
-                f"Новых объявлений: <b>{total_new}</b>\n"
-                f"Всего сегодня в базе: <b>{today_count}</b>\n"
-                f"Пройдено страниц: <b>{total_pages}</b>\n\n"
-                "Теперь нажми <b>📦 Получить результат</b> — он сформируется по текущим настройкам.",
-                parse_mode=ParseMode.HTML,
-            )
-            # Do not auto-send a potentially huge raw file. User chooses the output mode.
-            if warnings:
-                await callback.message.answer("<b>⚠️ Предупреждения</b>\n\n" + "\n".join(f"• {html.escape(x)}" for x in warnings[:20]), parse_mode=ParseMode.HTML)
-        finally:
-            await parser.close()
+    async with job_guard:
+        existing = active_jobs.get(callback.from_user.id)
+        if existing and existing.state in {"queued", "running"} and not existing.cancel_requested:
+            await callback.answer("У тебя уже есть запуск в очереди или в работе", show_alert=True)
+            return
+        if len(queued_job_ids) >= MAX_QUEUE_SIZE:
+            await callback.answer("Очередь временно заполнена. Попробуй чуть позже.", show_alert=True)
+            return
+
+    await callback.answer("Добавляю в очередь")
+    status = await callback.message.answer(
+        "⏳ <b>Добавляю задачу в очередь…</b>",
+        parse_mode=ParseMode.HTML,
+    )
+    job = ScanJob(
+        job_id=uuid.uuid4().hex[:12],
+        user_id=callback.from_user.id,
+        chat_id=callback.message.chat.id,
+        status_message_id=status.message_id,
+        category_keys=[cat.key for cat in selected_cats],
+        created_at=datetime.utcnow(),
+        warnings=[],
+    )
+    async with job_guard:
+        # Re-check after sending the status message in case the user double-clicked.
+        existing = active_jobs.get(callback.from_user.id)
+        if existing and existing.state in {"queued", "running"} and not existing.cancel_requested:
+            await status.edit_text("⚠️ У тебя уже есть активный запуск.")
+            return
+        active_jobs[job.user_id] = job
+        queued_job_ids.append(job.job_id)
+        position = len(queued_job_ids)
+        scan_queue.put_nowait(job)
+
+    await status.edit_text(
+        "✅ <b>Задача добавлена в очередь</b>\n\n"
+        f"Категорий: <b>{len(job.category_keys)}</b>\n"
+        f"Позиция в очереди: примерно <b>{position}</b>\n"
+        f"Одновременно работают: до <b>{MAX_CONCURRENT_JOBS}</b> задач\n"
+        f"Свежий кэш категории: <b>{CATEGORY_CACHE_TTL_SECONDS // 60} мин.</b>\n\n"
+        "Если другая задача уже парсит ту же категорию, твоя подключится к её результату — второй запрос к Kleinanzeigen не создаётся.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=job_keyboard(job.job_id),
+    )
 
 
 async def main() -> None:
@@ -979,10 +1604,33 @@ async def main() -> None:
     await init_db()
     bot = Bot(BOT_TOKEN)
     me = await bot.get_me()
-    log.info("Starting @%s", me.username)
+    log.info(
+        "Starting @%s | workers=%s cache_ttl=%ss",
+        me.username, MAX_CONCURRENT_JOBS, CATEGORY_CACHE_TTL_SECONDS,
+    )
     if not USING_PERSISTENT_DATABASE:
-        log.warning("DATABASE_URL is not set. SQLite works, but on Railway its data may be lost after redeploy/restart.")
-    await dp.start_polling(bot)
+        log.warning(
+            "DATABASE_URL is not set. v2.6 queue/cache work on SQLite, but the queue is in-memory "
+            "and SQLite data may be lost after Railway redeploy/restart. PostgreSQL is the next step."
+        )
+
+    worker_tasks = [
+        asyncio.create_task(scan_worker(bot, i), name=f"scan-worker-{i}")
+        for i in range(1, MAX_CONCURRENT_JOBS + 1)
+    ]
+    try:
+        await dp.start_polling(bot)
+    finally:
+        for task in worker_tasks:
+            task.cancel()
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
+        async with category_inflight_guard:
+            inflight = list(category_inflight.values())
+        for task in inflight:
+            task.cancel()
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
+        await bot.session.close()
 
 
 if __name__ == "__main__":

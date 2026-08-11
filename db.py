@@ -1,6 +1,6 @@
 import os
 
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from models import Base
@@ -20,8 +20,26 @@ DATABASE_URL = normalize_database_url(
 )
 USING_PERSISTENT_DATABASE = bool(RAW_DATABASE_URL) and not DATABASE_URL.startswith("sqlite")
 
-engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+_IS_SQLITE = DATABASE_URL.startswith("sqlite")
+_connect_args = {"timeout": 30} if _IS_SQLITE else {}
+engine = create_async_engine(
+    DATABASE_URL, echo=False, pool_pre_ping=True, connect_args=_connect_args
+)
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+
+if _IS_SQLITE:
+    @event.listens_for(engine.sync_engine, "connect")
+    def _sqlite_pragmas(dbapi_connection, _connection_record):
+        # v2.6 can run several parser workers in one process. WAL + busy timeout
+        # makes temporary SQLite much more tolerant of concurrent readers/writers.
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=30000")
+        finally:
+            cursor.close()
 
 
 def _listing_columns(sync_conn) -> set[str]:

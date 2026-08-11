@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -57,3 +57,44 @@ class UserSettings(Base):
     sort_mode: Mapped[str] = mapped_column(String(32), default="newest")
     include_words: Mapped[str] = mapped_column(String(1000), default="")
     exclude_words: Mapped[str] = mapped_column(String(1000), default="")
+
+
+class CategoryScanState(Base):
+    """Small per-category checkpoint used by v2.5+/v2.6 incremental scans."""
+
+    __tablename__ = "category_scan_state"
+
+    category_key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    scan_date: Mapped[str] = mapped_column(String(10), index=True)  # Europe/Berlin YYYY-MM-DD
+    head_ids: Mapped[str] = mapped_column(Text, default="")
+    last_scan_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    last_mode: Mapped[str] = mapped_column(String(16), default="full")
+    day_seed_complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    day_full_pages: Mapped[int] = mapped_column(Integer, default=0)
+    last_pages: Mapped[int] = mapped_column(Integer, default=0)
+    last_new: Mapped[int] = mapped_column(Integer, default=0)
+    last_today_seen: Mapped[int] = mapped_column(Integer, default=0)
+    total_runs: Mapped[int] = mapped_column(Integer, default=0)
+    last_stop_reason: Mapped[str] = mapped_column(String(255), default="")
+
+
+class ParserRun(Base):
+    """History of category scans; useful for Telegram stats and future scheduler work."""
+
+    __tablename__ = "parser_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(index=True)
+    category_key: Mapped[str] = mapped_column(String(80), index=True)
+    category_name: Mapped[str] = mapped_column(String(255))
+    mode: Mapped[str] = mapped_column(String(16), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    pages_scanned: Mapped[int] = mapped_column(Integer, default=0)
+    today_seen: Mapped[int] = mapped_column(Integer, default=0)
+    new_count: Mapped[int] = mapped_column(Integer, default=0)
+    known_count: Mapped[int] = mapped_column(Integer, default=0)
+    enriched_count: Mapped[int] = mapped_column(Integer, default=0)
+    stop_reason: Mapped[str] = mapped_column(String(255), default="")
+    success: Mapped[bool] = mapped_column(Boolean, default=True)
+    error_text: Mapped[str | None] = mapped_column(String(1000), nullable=True)
