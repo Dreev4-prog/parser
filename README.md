@@ -1,45 +1,13 @@
-# Kleinanzeigen Parser Bot v2.6.6 — Views in export
+# Kleinanzeigen Parser Bot v2.6.7 — View Source Inspector
 
-Эта версия подключает публичный счётчик просмотров к обычной выгрузке, а не только к отдельной кнопке теста.
+This diagnostic release keeps the v2.6.6 parser and adds a network inspector to the existing **👁 Тест просмотров** flow.
 
-## Что изменено
+- Reads the public counter from `#viewad-cntr-num`.
+- Captures only public XHR/fetch response URLs and small text snippets.
+- Searches for likely `views/viewCount/counter/Aufruf` sources and the current counter value.
+- Never exposes cookies, request headers or authentication data.
+- If no direct source is found, the bot explicitly reports that Chromium/DOM remains the reliable method.
 
-- В обычных режимах `🆕 Самые новые`, `📚 Все`, `💎 Уникальные` и `💰 Ниже рынка` перед выгрузкой бот подгружает публичные просмотры объявлений.
-- В CSV появилась колонка `👁 Просмотры`.
-- Счётчик сначала ищется быстрым HTTP-способом в `#viewad-cntr-num`; если его нет в исходном HTML, используется Playwright/Chromium с JavaScript.
-- Один Chromium переиспользуется для пачки объявлений; одновременно открывается ограниченное количество страниц.
-- Просмотры сохраняются в БД (`listings.view_count`) и кэшируются, чтобы другие пользователи не открывали те же объявления заново.
-- История изменения просмотров сохраняется в `view_history` — позже это позволит считать прирост за 1/3/6/24 часа.
-- Во время получения просмотров бот показывает живой прогресс `120/640 (19%)`.
-- В `📊 База` добавлен показатель покрытия просмотрами.
-- Кнопка `👁 Тест просмотров` сохранена.
+Mass parsing behavior from v2.6.6 is unchanged in this diagnostic build.
 
-## Важный момент по скорости
-
-Получение просмотров требует открыть страницу каждого объявления, поэтому первая выгрузка большой выборки может занять заметно больше времени. Повторные выгрузки используют кэш.
-
-По умолчанию:
-
-```env
-VIEW_COUNT_CACHE_TTL_SECONDS=900
-VIEW_COUNT_CONCURRENCY=6
-```
-
-Для Railway Hobby рекомендуется пока оставить `VIEW_COUNT_CONCURRENCY=6` или ниже.
-
-## Railway
-
-Новый проект и новый бот не нужны. Замените файлы в текущем GitHub-репозитории.
-
-Start Command:
-
-```bash
-python bot.py
-```
-
-Основные Variables остаются прежними:
-
-```env
-BOT_TOKEN=...
-ADMIN_IDS=...
-```
+Railway start command: `python bot.py`.

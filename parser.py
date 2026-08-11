@@ -38,6 +38,19 @@ class ViewCountResult:
     error: str | None = None
 
 
+
+
+@dataclass
+class ViewNetworkProbe:
+    views: int | None
+    source: str
+    final_url: str | None
+    page_title: str | None
+    candidates: list[dict]
+    element_html: str | None = None
+    error: str | None = None
+
+
 @dataclass
 class ParsedListing:
     external_id: str
@@ -387,6 +400,158 @@ class KleinanzeigenParser:
         except Exception as exc:
             log.warning("View-count browser fetch failed for %s: %s", url, exc)
             return ViewCountResult(None, None, "browser:error", error=str(exc)[:500])
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+    async def inspect_view_network(self, url: str) -> ViewNetworkProbe:
+        """Inspect the public ad page and report likely network sources for the view counter.
+
+        This is deliberately diagnostic: it records only public response URLs and small
+        text snippets from XHR/fetch responses. Cookies, request headers and auth data
+        are never returned.
+        """
+        if not _allowed_url(url) or "/s-anzeige/" not in url:
+            return ViewNetworkProbe(None, "invalid-url", None, None, [], error="Нужна публичная ссылка Kleinanzeigen")
+
+        page = None
+        capture_tasks: list[asyncio.Task] = []
+        captured: list[dict] = []
+        try:
+            context = await self._ensure_view_browser()
+            page = await context.new_page()
+
+            async def route_handler(route):
+                # Keep scripts/XHR because the counter may depend on them; skip heavy media.
+                if route.request.resource_type in {"image", "font", "media"}:
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await page.route("**/*", route_handler)
+
+            async def capture_response(response):
+                try:
+                    rtype = response.request.resource_type
+                    if rtype not in {"xhr", "fetch"}:
+                        return
+                    ctype = (response.headers.get("content-type") or "").lower()
+                    if not any(x in ctype for x in ("json", "text", "javascript", "xml")):
+                        return
+                    if len(captured) >= 80:
+                        return
+                    text = await response.text()
+                    if len(text) > 350_000:
+                        text = text[:350_000]
+                    captured.append({
+                        "url": response.url,
+                        "status": response.status,
+                        "type": rtype,
+                        "content_type": ctype[:120],
+                        "body": text,
+                    })
+                except Exception:
+                    pass
+
+            def on_response(response):
+                try:
+                    capture_tasks.append(asyncio.create_task(capture_response(response)))
+                except Exception:
+                    pass
+
+            page.on("response", on_response)
+            await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+            final_url = page.url
+            page_title = await page.title()
+            try:
+                await page.wait_for_selector("#viewad-cntr-num", state="attached", timeout=8_000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(800)
+
+            views = None
+            element_html = None
+            locator = page.locator("#viewad-cntr-num")
+            if await locator.count():
+                raw = (await locator.first.inner_text()).strip()
+                m = re.search(r"\d[\d.\s]*", raw)
+                if m:
+                    views = int(re.sub(r"\D", "", m.group(0)))
+                try:
+                    element_html = await locator.first.evaluate("el => el.parentElement ? el.parentElement.outerHTML : el.outerHTML")
+                except Exception:
+                    element_html = None
+
+            if capture_tasks:
+                try:
+                    await asyncio.wait_for(asyncio.gather(*capture_tasks, return_exceptions=True), timeout=4.0)
+                except Exception:
+                    pass
+
+            candidates: list[dict] = []
+            keywords = ("view", "views", "viewcount", "counter", "cntr", "aufruf", "impression")
+            view_token = str(views) if views is not None else None
+            for item in captured:
+                u = item["url"]
+                body = item["body"]
+                low_u = u.lower()
+                low_b = body.lower()
+                score = 0
+                reasons = []
+                if any(k in low_u for k in keywords):
+                    score += 4
+                    reasons.append("keyword-in-url")
+                body_keyword = next((k for k in keywords if k in low_b), None)
+                if body_keyword:
+                    score += 3
+                    reasons.append(f"keyword:{body_keyword}")
+                if view_token and re.search(rf"(?<!\d){re.escape(view_token)}(?!\d)", body):
+                    score += 2
+                    reasons.append("contains-current-count")
+                if score <= 0:
+                    continue
+                # Small, safe context only; no headers/cookies are exposed.
+                snippet = ""
+                pos = -1
+                for k in keywords:
+                    pos = low_b.find(k)
+                    if pos >= 0:
+                        break
+                if pos < 0 and view_token:
+                    pos = body.find(view_token)
+                if pos >= 0:
+                    start = max(0, pos - 100)
+                    end = min(len(body), pos + 220)
+                    snippet = re.sub(r"\s+", " ", body[start:end]).strip()
+                candidates.append({
+                    "score": score,
+                    "url": u,
+                    "status": item["status"],
+                    "type": item["type"],
+                    "content_type": item["content_type"],
+                    "reasons": reasons,
+                    "snippet": snippet[:320],
+                })
+
+            candidates.sort(key=lambda x: (-x["score"], x["url"]))
+            # Deduplicate by URL and keep only a concise top set.
+            dedup = []
+            seen = set()
+            for c in candidates:
+                if c["url"] in seen:
+                    continue
+                seen.add(c["url"])
+                dedup.append(c)
+                if len(dedup) >= 8:
+                    break
+
+            return ViewNetworkProbe(views, "dom:#viewad-cntr-num" if views is not None else "browser:not-found", final_url, page_title, dedup, element_html)
+        except Exception as exc:
+            log.warning("View network probe failed for %s: %s", url, exc)
+            return ViewNetworkProbe(None, "browser:error", None, None, [], error=str(exc)[:500])
         finally:
             if page is not None:
                 try:

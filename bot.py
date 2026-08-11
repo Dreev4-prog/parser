@@ -1849,9 +1849,9 @@ async def view_test(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SettingsInput.view_test_url)
     await callback.answer()
     await callback.message.answer(
-        "<b>👁 Тест публичных просмотров</b>\n\n"
+        "<b>👁 Тест просмотров + поиск быстрого источника</b>\n\n"
         "Пришли одну ссылку на обычное объявление Kleinanzeigen. "
-        "Бот откроет её без авторизации через Chromium и попробует прочитать публичный счётчик просмотров.\n\n"
+        "Бот откроет её без авторизации через Chromium, прочитает публичный счётчик и одновременно проверит XHR/fetch-запросы страницы — ищем более быстрый источник просмотров.\n\n"
         "Например:\n<code>https://www.kleinanzeigen.de/s-anzeige/.../3482322145-245-2351</code>",
         parse_mode=ParseMode.HTML,
     )
@@ -1876,26 +1876,43 @@ async def run_view_test(message: Message, state: FSMContext) -> None:
     )
     parser = KleinanzeigenParser()
     try:
-        result = await parser.fetch_public_view_count(url)
+        result = await parser.inspect_view_network(url)
     finally:
         await parser.close()
 
     selected = await get_selected(message.from_user.id)
     if result.views is not None:
+        lines = [
+            "✅ <b>Просмотры считались!</b>",
+            "",
+            f"👁 Просмотров: <b>{result.views}</b>",
+            f"Источник DOM: <code>{html.escape(result.source)}</code>",
+        ]
+        if result.candidates:
+            lines += ["", "🔎 <b>Кандидаты на прямой источник:</b>"]
+            for idx, c in enumerate(result.candidates[:5], 1):
+                u = c.get("url", "")
+                if len(u) > 180:
+                    u = u[:177] + "…"
+                reasons = ", ".join(c.get("reasons") or [])
+                lines.append(f"{idx}. <code>{html.escape(u)}</code>")
+                if reasons:
+                    lines.append(f"   <i>{html.escape(reasons)}</i>")
+            lines += ["", "Если здесь появится стабильный XHR/fetch-адрес со счётчиком, мы сможем попробовать получать просмотры без открытия полной страницы объявления."]
+        else:
+            lines += ["", "ℹ️ XHR/fetch с явным счётчиком не найден. Значит, на этом тесте число пришло через данные страницы/JavaScript, и самый надёжный быстрый путь пока — переиспользуемый Chromium с параллельными вкладками."]
         await status.edit_text(
-            "✅ <b>Просмотры считались!</b>\n\n"
-            f"👁 Просмотров: <b>{result.views}</b>\n"
-            f"Источник: <code>{html.escape(result.source)}</code>\n\n"
-            "Если это число совпадает с сайтом, следующим шагом можно подключать массовый сбор и историю прироста просмотров.",
+            "\n".join(lines),
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard(len(selected)),
+            disable_web_page_preview=True,
         )
     else:
         details = f"\nОшибка: <code>{html.escape(result.error)}</code>" if result.error else ""
         await status.edit_text(
             "❌ <b>Счётчик пока не считался</b>\n\n"
             f"Результат: <code>{html.escape(result.source)}</code>{details}\n\n"
-            "Это тестовый режим: по этому результату можно будет точно понять, что поправить для Railway.",
+            "Диагностика XHR/fetch тоже выполнена; пришли этот результат, если ошибка повторяется.",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard(len(selected)),
         )
