@@ -7,7 +7,6 @@ from models import Base
 
 
 def normalize_database_url(url: str) -> str:
-    # Railway commonly exposes postgresql://...; async SQLAlchemy needs asyncpg.
     if url.startswith("postgres://"):
         return "postgresql+asyncpg://" + url[len("postgres://"):]
     if url.startswith("postgresql://"):
@@ -36,9 +35,13 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-        # Tiny built-in migration from v2.0 so an existing DB can be reused.
+        # Lightweight migrations so v2.0/v2.1/v2.2 databases can be reused.
         columns = await conn.run_sync(_listing_columns)
         if columns and "category_key" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN category_key VARCHAR(80)"))
         if columns and "posted_text" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN posted_text VARCHAR(100)"))
+        if columns and "is_active" not in columns:
+            await conn.execute(text("ALTER TABLE listings ADD COLUMN is_active BOOLEAN DEFAULT TRUE"))
+        if columns and "disappeared_at" not in columns:
+            await conn.execute(text("ALTER TABLE listings ADD COLUMN disappeared_at TIMESTAMP"))

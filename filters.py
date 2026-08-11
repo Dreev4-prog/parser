@@ -9,12 +9,10 @@ from datetime import datetime, timedelta
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
-from models import Listing
+from models import Listing, PriceHistory
 
 BERLIN = ZoneInfo("Europe/Berlin")
 
-# Conservative defaults: remove obvious wanted/service/repost noise, but do NOT
-# remove words such as "defekt" because broken devices can still be real goods.
 DEFAULT_NOISE_WORDS = {
     "suche", "gesucht", "ankauf", "kaufe", "kaufen", "reparatur",
     "repariere", "service", "dienstleistung", "vermietung", "verleih",
@@ -27,14 +25,6 @@ TITLE_STOPWORDS = {
     "gebraucht", "inkl", "inklusive", "mit", "ohne", "und", "oder", "der",
     "die", "das", "ein", "eine", "einer", "einen", "für", "fuer", "von",
     "zu", "zum", "zur", "aus", "ovp", "vb", "festpreis",
-}
-
-SYNONYMS = {
-    "playstation": "ps",
-    "playstation5": "ps5",
-    "playstation4": "ps4",
-    "iphone": "iphone",
-    "mac book": "macbook",
 }
 
 
@@ -53,6 +43,7 @@ class ExportRow:
 class FrequentRow:
     product_key: str
     example_title: str
+    example_price_text: str
     count: int
     min_price: int | None
     median_price: int | None
@@ -76,6 +67,29 @@ class MarketRow:
     first_seen_at: datetime
 
 
+@dataclass
+class DisappearingRow:
+    category: str
+    title: str
+    price_text: str
+    lifespan_minutes: int
+    first_seen_at: datetime
+    disappeared_at: datetime
+    url: str
+
+
+@dataclass
+class PriceDropRow:
+    category: str
+    title: str
+    previous_price: int
+    current_price: int
+    drop_eur: int
+    drop_pct: int
+    changed_at: datetime
+    url: str
+
+
 def _ascii(text: str) -> str:
     text = unicodedata.normalize("NFKD", text)
     return "".join(ch for ch in text if not unicodedata.combining(ch))
@@ -92,8 +106,6 @@ def normalize_title(title: str) -> str:
 
 
 def smart_duplicate_key(row: Listing | ExportRow) -> tuple[str, str, str]:
-    # Same normalized title + effective price + category is treated as a likely repost.
-    # If a numeric price exists, ignore harmless text differences such as "VB".
     title = normalize_title(row.title)
     price_text = getattr(row, "price_text", "") or ""
     price_eur = getattr(row, "price_eur", None)
@@ -103,17 +115,10 @@ def smart_duplicate_key(row: Listing | ExportRow) -> tuple[str, str, str]:
 
 
 def product_family_key(title: str) -> str:
-    """Heuristic product family for frequency/market analytics.
-
-    It intentionally stays conservative. We use up to the first 5 meaningful
-    normalized tokens, preserving model/storage numbers. This is a beta grouping,
-    not ML classification.
-    """
     norm = normalize_title(title)
     tokens = norm.split()
     if not tokens:
         return ""
-    # Generic terms add little grouping value.
     generic = {"konsole", "controller", "set", "bundle", "zubehor", "zubehoer", "gerat", "geraet"}
     meaningful = [t for t in tokens if t not in generic]
     use = meaningful or tokens
@@ -126,7 +131,6 @@ def posted_datetime(row: Listing | ExportRow) -> datetime:
     m = re.search(r"Heute\s*,?\s*(\d{1,2}):(\d{2})", text, flags=re.IGNORECASE)
     if m:
         return now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
-    # first_seen_at is stored UTC-naive in this project.
     first_seen = getattr(row, "first_seen_at", None)
     if first_seen:
         return first_seen.replace(tzinfo=ZoneInfo("UTC")).astimezone(BERLIN)
@@ -199,7 +203,6 @@ def base_filter(
 
 
 def dedupe_rows(rows: list[Listing]) -> list[Listing]:
-    # Sort newest first, then keep the newest probable repost.
     ordered = sorted(rows, key=posted_datetime, reverse=True)
     seen: set[tuple[str, str, str]] = set()
     result: list[Listing] = []
@@ -224,7 +227,6 @@ def unique_rows(rows: list[Listing]) -> list[Listing]:
     groups: dict[tuple[str, str], list[Listing]] = defaultdict(list)
     for row in rows:
         groups[(row.category, product_family_key(row.title))].append(row)
-    # "Unique" = family occurs only once in the selected period.
     return [items[0] for items in groups.values() if len(items) == 1]
 
 
@@ -244,6 +246,7 @@ def frequent_rows(rows: list[Listing], min_count: int = 2) -> list[FrequentRow]:
         output.append(FrequentRow(
             product_key=key,
             example_title=newest.title,
+            example_price_text=newest.price_text or (f"{newest.price_eur} €" if newest.price_eur is not None else ""),
             count=len(items),
             min_price=min(prices) if prices else None,
             median_price=int(statistics.median(prices)) if prices else None,
@@ -290,3 +293,57 @@ def below_market_rows(rows: list[Listing], discount_threshold: float = 0.20, min
                     first_seen_at=row.first_seen_at,
                 ))
     return sorted(output, key=lambda x: (-x.discount_pct, -posted_datetime(x).timestamp()))
+
+
+def disappearing_rows(rows: list[Listing]) -> list[DisappearingRow]:
+    output: list[DisappearingRow] = []
+    for row in rows:
+        if not row.disappeared_at:
+            continue
+        delta = row.disappeared_at - row.first_seen_at
+        minutes = max(0, int(delta.total_seconds() // 60))
+        output.append(DisappearingRow(
+            category=row.category,
+            title=row.title,
+            price_text=row.price_text or (f"{row.price_eur} €" if row.price_eur is not None else ""),
+            lifespan_minutes=minutes,
+            first_seen_at=row.first_seen_at,
+            disappeared_at=row.disappeared_at,
+            url=row.url,
+        ))
+    return sorted(output, key=lambda x: (x.lifespan_minutes, x.disappeared_at))
+
+
+def price_drop_rows(rows: list[Listing], histories: list[PriceHistory]) -> list[PriceDropRow]:
+    listings = {r.external_id: r for r in rows}
+    grouped: dict[str, list[PriceHistory]] = defaultdict(list)
+    for h in histories:
+        if h.external_id in listings and h.price_eur is not None and h.price_eur > 0:
+            grouped[h.external_id].append(h)
+
+    output: list[PriceDropRow] = []
+    for external_id, events in grouped.items():
+        events = sorted(events, key=lambda h: h.recorded_at)
+        compressed: list[PriceHistory] = []
+        for event in events:
+            if not compressed or compressed[-1].price_eur != event.price_eur:
+                compressed.append(event)
+        if len(compressed) < 2:
+            continue
+        previous, current = compressed[-2], compressed[-1]
+        if current.price_eur is None or previous.price_eur is None or current.price_eur >= previous.price_eur:
+            continue
+        row = listings[external_id]
+        drop = previous.price_eur - current.price_eur
+        pct = round(drop / previous.price_eur * 100) if previous.price_eur else 0
+        output.append(PriceDropRow(
+            category=row.category,
+            title=row.title,
+            previous_price=previous.price_eur,
+            current_price=current.price_eur,
+            drop_eur=drop,
+            drop_pct=pct,
+            changed_at=current.recorded_at,
+            url=row.url,
+        ))
+    return sorted(output, key=lambda x: (-x.drop_pct, -x.drop_eur, x.title.lower()))

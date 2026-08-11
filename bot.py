@@ -25,11 +25,13 @@ from filters import (
     base_filter,
     below_market_rows,
     dedupe_rows,
+    disappearing_rows,
     frequent_rows,
+    price_drop_rows,
     sort_rows,
     unique_rows,
 )
-from models import Listing, SelectedCategory, UserSettings
+from models import Listing, PriceHistory, SelectedCategory, UserSettings
 from parser import (
     MAX_PAGES_PER_CATEGORY,
     PAGE_DELAY_SECONDS,
@@ -48,13 +50,17 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 BERLIN = ZoneInfo("Europe/Berlin")
 scan_lock = asyncio.Lock()
+AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
+AVAILABILITY_CONCURRENCY = max(1, min(8, int(os.getenv("AVAILABILITY_CONCURRENCY", "4"))))
 
 MODE_LABELS = {
     "newest": "🆕 Самые новые",
     "all": "📚 Все",
     "unique": "💎 Уникальные",
     "frequent": "🔥 Часто публикуемые",
-    "below_market": "💰 Ниже рынка β",
+    "below_market": "💰 Ниже рынка",
+    "fast_disappearing": "⚡ Быстро исчезающие",
+    "price_drop": "📉 Снижение цены",
 }
 PERIOD_LABELS = {"1h": "1 час", "3h": "3 часа", "6h": "6 часов", "today": "Сегодня"}
 PRICE_LABELS = {
@@ -119,9 +125,19 @@ def category_keyboard(group_key: str, selected_keys: set[str]) -> InlineKeyboard
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _mode_button(s: UserSettings, mode: str) -> InlineKeyboardButton:
+    label = MODE_LABELS[mode]
+    if s.output_mode == mode:
+        label = "✅ " + label
+    return InlineKeyboardButton(text=label, callback_data=f"quickmode:{mode}")
+
+
 def settings_keyboard(s: UserSettings) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Режим: {MODE_LABELS.get(s.output_mode, s.output_mode)}", callback_data="set_mode")],
+        [_mode_button(s, "newest"), _mode_button(s, "all")],
+        [_mode_button(s, "unique"), _mode_button(s, "frequent")],
+        [_mode_button(s, "fast_disappearing"), _mode_button(s, "below_market")],
+        [_mode_button(s, "price_drop")],
         [InlineKeyboardButton(text=f"🚫 Умные дубли: {'ВКЛ' if s.smart_dedupe else 'ВЫКЛ'}", callback_data="toggle_dedupe")],
         [InlineKeyboardButton(text=f"🧹 Чистить услуги/поиск: {'ВКЛ' if s.clean_noise else 'ВЫКЛ'}", callback_data="toggle_noise")],
         [InlineKeyboardButton(text=f"🕐 Период: {PERIOD_LABELS.get(s.period, s.period)}", callback_data="set_period")],
@@ -229,9 +245,11 @@ async def clear_selected(user_id: int) -> None:
         await session.commit()
 
 
-async def upsert_page_items(category_key: str, category_name: str, items: list[ParsedListing]) -> tuple[list[ParsedListing], int]:
+async def upsert_page_items(
+    category_key: str, category_name: str, items: list[ParsedListing]
+) -> tuple[list[ParsedListing], int, int]:
     if not items:
-        return [], 0
+        return [], 0, 0
     unique = {item.external_id: item for item in items}
     ids = list(unique)
     async with SessionLocal() as session:
@@ -239,6 +257,7 @@ async def upsert_page_items(category_key: str, category_name: str, items: list[P
         existing = {row.external_id: row for row in result.scalars().all()}
         now = datetime.utcnow()
         new_items: list[ParsedListing] = []
+        enriched_count = 0
         for external_id, item in unique.items():
             row = existing.get(external_id)
             if row is None:
@@ -246,19 +265,43 @@ async def upsert_page_items(category_key: str, category_name: str, items: list[P
                     external_id=item.external_id, category_key=category_key, category=category_name,
                     title=item.title, price_text=item.price_text, price_eur=item.price_eur,
                     posted_text=item.posted_text, url=item.url, first_seen_at=now, last_seen_at=now,
+                    is_active=True, disappeared_at=None,
                 ))
+                if item.price_text:
+                    session.add(PriceHistory(
+                        external_id=item.external_id, price_text=item.price_text,
+                        price_eur=item.price_eur, recorded_at=now,
+                    ))
                 new_items.append(item)
             else:
+                old_price_text = row.price_text
+                old_price_eur = row.price_eur
+                # Never erase a previously parsed price because of one weak HTML response.
+                if item.price_text is not None:
+                    if old_price_text is None and item.price_text:
+                        enriched_count += 1
+                    if (old_price_text, old_price_eur) != (item.price_text, item.price_eur):
+                        if old_price_text is not None or old_price_eur is not None:
+                            session.add(PriceHistory(
+                                external_id=external_id, price_text=old_price_text,
+                                price_eur=old_price_eur, recorded_at=now - timedelta(microseconds=1),
+                            ))
+                        session.add(PriceHistory(
+                            external_id=external_id, price_text=item.price_text,
+                            price_eur=item.price_eur, recorded_at=now,
+                        ))
+                    row.price_text = item.price_text
+                    row.price_eur = item.price_eur
                 row.category_key = category_key
                 row.category = category_name
                 row.title = item.title
-                row.price_text = item.price_text
-                row.price_eur = item.price_eur
                 row.posted_text = item.posted_text
                 row.url = item.url
                 row.last_seen_at = now
+                row.is_active = True
+                row.disappeared_at = None
         await session.commit()
-        return new_items, len(unique) - len(new_items)
+        return new_items, len(unique) - len(new_items), enriched_count
 
 
 def berlin_today_utc_bounds() -> tuple[datetime, datetime]:
@@ -301,13 +344,31 @@ def _temp_csv(name: str) -> tuple[Path, csv.writer, object]:
     return path, csv.writer(f, delimiter=";"), f
 
 
+def _price_display(price_text: str | None, price_eur: int | None) -> str:
+    if price_text:
+        return price_text
+    if price_eur is not None:
+        return f"{price_eur} €"
+    return "—"
+
+
+def _berlin_text(dt: datetime | None) -> str:
+    if not dt:
+        return ""
+    return dt.replace(tzinfo=timezone.utc).astimezone(BERLIN).strftime("%d.%m.%Y %H:%M")
+
+
 def write_listing_csv(rows: list[Listing], mode: str) -> Path:
     now = datetime.now(BERLIN)
     path, writer, f = _temp_csv(f"kleinanzeigen_{mode}_{now:%Y-%m-%d_%H-%M}.csv")
     try:
-        writer.writerow(["Категория", "Название", "Цена", "Дата публикации", "Ссылка"])
+        writer.writerow(["Категория", "Название", "Цена", "Цена, €", "Дата публикации", "Ссылка"])
         for row in rows:
-            writer.writerow([row.category, row.title, row.price_text or "", row.posted_text or "Сегодня", row.url])
+            writer.writerow([
+                row.category, row.title, _price_display(row.price_text, row.price_eur),
+                row.price_eur if row.price_eur is not None else "",
+                row.posted_text or "Сегодня", row.url,
+            ])
     finally:
         f.close()
     return path
@@ -317,10 +378,14 @@ def write_frequent_csv(rows) -> Path:
     now = datetime.now(BERLIN)
     path, writer, f = _temp_csv(f"kleinanzeigen_chasto_publikuemye_{now:%Y-%m-%d_%H-%M}.csv")
     try:
-        writer.writerow(["Категория", "Группа товара", "Пример названия", "Публикаций", "Мин. цена", "Медиана", "Макс. цена", "Последнее", "Ссылка-пример"])
+        writer.writerow([
+            "Категория", "Группа товара", "Пример названия", "Цена примера",
+            "Публикаций", "Мин. цена, €", "Медиана, €", "Макс. цена, €",
+            "Последнее", "Ссылка-пример",
+        ])
         for row in rows:
             writer.writerow([
-                row.category, row.product_key, row.example_title, row.count,
+                row.category, row.product_key, row.example_title, row.example_price_text or "—", row.count,
                 row.min_price if row.min_price is not None else "",
                 row.median_price if row.median_price is not None else "",
                 row.max_price if row.max_price is not None else "",
@@ -335,25 +400,120 @@ def write_market_csv(rows) -> Path:
     now = datetime.now(BERLIN)
     path, writer, f = _temp_csv(f"kleinanzeigen_nizhe_rynka_{now:%Y-%m-%d_%H-%M}.csv")
     try:
-        writer.writerow(["Категория", "Название", "Цена", "Медиана группы", "Ниже медианы, %", "Образцов", "Дата", "Ссылка"])
+        writer.writerow([
+            "Категория", "Название", "Цена", "Цена, €", "Медиана группы, €",
+            "Ниже медианы, %", "Образцов", "Дата", "Ссылка",
+        ])
         for row in rows:
-            writer.writerow([row.category, row.title, row.price_text, row.median_price, row.discount_pct, row.samples, row.posted_text, row.url])
+            writer.writerow([
+                row.category, row.title, row.price_text or f"{row.price_eur} €", row.price_eur,
+                row.median_price, row.discount_pct, row.samples, row.posted_text, row.url,
+            ])
     finally:
         f.close()
     return path
 
 
+def write_disappearing_csv(rows) -> Path:
+    now = datetime.now(BERLIN)
+    path, writer, f = _temp_csv(f"kleinanzeigen_bystro_ischezayushchie_{now:%Y-%m-%d_%H-%M}.csv")
+    try:
+        writer.writerow([
+            "Категория", "Название", "Цена", "Время жизни, мин",
+            "Впервые замечено", "Обнаружено исчезновение", "Ссылка",
+        ])
+        for row in rows:
+            writer.writerow([
+                row.category, row.title, row.price_text or "—", row.lifespan_minutes,
+                _berlin_text(row.first_seen_at), _berlin_text(row.disappeared_at), row.url,
+            ])
+    finally:
+        f.close()
+    return path
+
+
+def write_price_drop_csv(rows) -> Path:
+    now = datetime.now(BERLIN)
+    path, writer, f = _temp_csv(f"kleinanzeigen_snizhenie_ceny_{now:%Y-%m-%d_%H-%M}.csv")
+    try:
+        writer.writerow([
+            "Категория", "Название", "Старая цена, €", "Новая цена, €",
+            "Снижение, €", "Снижение, %", "Зафиксировано", "Ссылка",
+        ])
+        for row in rows:
+            writer.writerow([
+                row.category, row.title, row.previous_price, row.current_price,
+                row.drop_eur, row.drop_pct, _berlin_text(row.changed_at), row.url,
+            ])
+    finally:
+        f.close()
+    return path
+
+
+async def histories_for(rows: list[Listing]) -> list[PriceHistory]:
+    ids = [row.external_id for row in rows]
+    if not ids:
+        return []
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(PriceHistory).where(PriceHistory.external_id.in_(ids)).order_by(PriceHistory.recorded_at.asc())
+        )
+        return list(result.scalars().all())
+
+
+async def refresh_availability(rows: list[Listing]) -> tuple[int, int, int]:
+    """Check a bounded batch of tracked public ad links for availability.
+
+    Returns checked, newly_disappeared, unknown. This is intentionally bounded
+    and low-concurrency so the analytics mode does not hammer the site.
+    """
+    candidates = [r for r in rows if r.is_active and r.url][:AVAILABILITY_CHECK_LIMIT]
+    if not candidates:
+        return 0, 0, 0
+
+    parser = KleinanzeigenParser()
+    sem = asyncio.Semaphore(AVAILABILITY_CONCURRENCY)
+
+    async def check(row: Listing):
+        async with sem:
+            result = await parser.check_listing_active(row.url)
+            return row.external_id, result
+
+    try:
+        results = await asyncio.gather(*(check(row) for row in candidates))
+    finally:
+        await parser.close()
+
+    disappeared_ids = [external_id for external_id, active in results if active is False]
+    unknown = sum(1 for _, active in results if active is None)
+    if disappeared_ids:
+        now = datetime.utcnow()
+        async with SessionLocal() as session:
+            result = await session.execute(select(Listing).where(Listing.external_id.in_(disappeared_ids)))
+            found = list(result.scalars().all())
+            for row in found:
+                if row.is_active:
+                    row.is_active = False
+                    row.disappeared_at = now
+            await session.commit()
+    return len(candidates), len(disappeared_ids), unknown
+
+
 async def send_smart_export(message: Message, user_id: int, selected_count: int) -> int:
     s = await get_settings(user_id)
+    mode = s.output_mode
     all_rows = await today_rows()
-    base = base_filter(
+    raw_base = base_filter(
         all_rows, period=s.period, price_filter=s.price_filter, clean_noise=s.clean_noise,
         include_words=s.include_words or "", exclude_words=s.exclude_words or "",
     )
-    if s.smart_dedupe:
+
+    # Frequency intentionally sees all distinct IDs; otherwise smart de-duplication
+    # would hide the very repetitions this mode is meant to measure.
+    base = raw_base
+    if s.smart_dedupe and mode != "frequent":
         base = dedupe_rows(base)
 
-    mode = s.output_mode
     if mode == "frequent":
         result = frequent_rows(base)
         if not result:
@@ -361,13 +521,55 @@ async def send_smart_export(message: Message, user_id: int, selected_count: int)
             return 0
         path = write_frequent_csv(result)
         caption = f"🔥 Часто публикуемые группы: {len(result)}"
+
     elif mode == "below_market":
         result = below_market_rows(base)
         if not result:
             await message.answer("💰 Пока недостаточно похожих объявлений или нет позиций ≥20% ниже медианы.", reply_markup=main_keyboard(selected_count))
             return 0
         path = write_market_csv(result)
-        caption = f"💰 Потенциально ниже рынка: {len(result)} · β-режим"
+        caption = f"💰 Потенциально ниже рынка: {len(result)}"
+
+    elif mode == "fast_disappearing":
+        status = await message.answer(
+            f"⚡ Проверяю доступность до <b>{AVAILABILITY_CHECK_LIMIT}</b> сегодняшних объявлений…",
+            parse_mode=ParseMode.HTML,
+        )
+        checked, newly_disappeared, unknown = await refresh_availability(base)
+        # Reload rows because availability status may have changed.
+        all_rows = await today_rows()
+        refreshed = base_filter(
+            all_rows, period=s.period, price_filter=s.price_filter, clean_noise=s.clean_noise,
+            include_words=s.include_words or "", exclude_words=s.exclude_words or "",
+        )
+        if s.smart_dedupe:
+            refreshed = dedupe_rows(refreshed)
+        result = disappearing_rows(refreshed)
+        await status.edit_text(
+            f"⚡ Проверено: <b>{checked}</b> · новых исчезнувших: <b>{newly_disappeared}</b> · неопределённых: <b>{unknown}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        if not result:
+            await message.answer(
+                "⚡ Пока нет зафиксированных исчезнувших объявлений. Этот режим становится полезнее после нескольких запусков в течение дня.",
+                reply_markup=main_keyboard(selected_count),
+            )
+            return 0
+        path = write_disappearing_csv(result)
+        caption = f"⚡ Быстро исчезающие: {len(result)}"
+
+    elif mode == "price_drop":
+        histories = await histories_for(base)
+        result = price_drop_rows(base, histories)
+        if not result:
+            await message.answer(
+                "📉 Снижений цены пока не зафиксировано. История начинает накапливаться с v2.3; нужен повторный парсинг после изменения цены объявления.",
+                reply_markup=main_keyboard(selected_count),
+            )
+            return 0
+        path = write_price_drop_csv(result)
+        caption = f"📉 Снижение цены: {len(result)}"
+
     else:
         result = unique_rows(base) if mode == "unique" else sort_rows(base, s.sort_mode)
         if mode == "unique":
@@ -399,7 +601,8 @@ def settings_text(s: UserSettings) -> str:
         f"Сортировка: <b>{SORT_LABELS.get(s.sort_mode, s.sort_mode)}</b>\n"
         f"Ключевые слова: <b>{include}</b>\n"
         f"Исключить: <b>{exclude}</b>\n\n"
-        "<i>💎 Уникальные и 💰 Ниже рынка используют эвристическое объединение похожих названий (β).</i>"
+        "<i>Кнопки 🔥 / ⚡ / 💰 / 📉 теперь находятся прямо здесь. "
+        "⚡ проверяет доступность сохранённых ссылок ограниченными пакетами; 📉 использует историю цен.</i>"
     )
 
 
@@ -410,9 +613,21 @@ async def stats_text() -> str:
         today = (await session.execute(select(func.count(Listing.id)).where(
             Listing.first_seen_at >= start_utc, Listing.first_seen_at < end_utc,
         ))).scalar_one()
+        priced = (await session.execute(select(func.count(Listing.id)).where(
+            Listing.first_seen_at >= start_utc, Listing.first_seen_at < end_utc, Listing.price_text.is_not(None),
+        ))).scalar_one()
+        drops = (await session.execute(select(func.count(PriceHistory.id)))).scalar_one()
     storage = "PostgreSQL / DATABASE_URL" if USING_PERSISTENT_DATABASE else "SQLite"
     warning = "" if USING_PERSISTENT_DATABASE else "\n\n⚠️ На Railway SQLite может потеряться после redeploy/restart."
-    return f"<b>📊 База парсера</b>\n\nСегодня собрано: <b>{today}</b>\nВсего сохранено: <b>{total}</b>\nБаза: <b>{storage}</b>{warning}"
+    coverage = round(priced / today * 100) if today else 0
+    return (
+        f"<b>📊 База парсера</b>\n\n"
+        f"Сегодня собрано: <b>{today}</b>\n"
+        f"С ценой: <b>{priced}</b> ({coverage}%)\n"
+        f"Всего сохранено: <b>{total}</b>\n"
+        f"Записей истории цен: <b>{drops}</b>\n"
+        f"База: <b>{storage}</b>{warning}"
+    )
 
 
 async def scan_one_category(parser: KleinanzeigenParser, cat) -> tuple[int, int, int, bool, str]:
@@ -426,10 +641,14 @@ async def scan_one_category(parser: KleinanzeigenParser, cat) -> tuple[int, int,
         today_seen += len(today_items)
         if today_items:
             empty_today_pages = 0
-            new_items, known_count = await upsert_page_items(cat.key, cat.name, today_items)
+            new_items, known_count, enriched_count = await upsert_page_items(cat.key, cat.name, today_items)
             new_count += len(new_items)
-            no_new_pages = 0 if new_items else no_new_pages + 1
-            log.info("category=%s page=%s total=%s today=%s new=%s known=%s no_new_pages=%s", cat.name, page, len(items), len(today_items), len(new_items), known_count, no_new_pages)
+            # v2.3 also keeps going while it is backfilling prices missing from older rows.
+            no_new_pages = 0 if (new_items or enriched_count) else no_new_pages + 1
+            log.info(
+                "category=%s page=%s total=%s today=%s new=%s known=%s prices_backfilled=%s no_new_pages=%s",
+                cat.name, page, len(items), len(today_items), len(new_items), known_count, enriched_count, no_new_pages,
+            )
             if no_new_pages >= STOP_AFTER_NO_NEW_PAGES:
                 return new_count, pages_scanned, today_seen, False, "дошли до уже собранных"
         else:
@@ -453,9 +672,9 @@ async def start(message: Message, state: FSMContext) -> None:
         return
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>Kleinanzeigen Parser v2.2 · Smart Parsing</b>\n\n"
+        "<b>Kleinanzeigen Parser v2.3 · Smart Parsing</b>\n\n"
         "Сначала парсер собирает объявления в базу, затем ты можешь менять режим выдачи без повторного парсинга.\n\n"
-        "🆕 новые · 💎 уникальные · 🔥 часто публикуемые · 💰 ниже рынка β · фильтры цены/слов/периода.",
+        "🆕 новые · 💎 уникальные · 🔥 частые · ⚡ быстро исчезающие · 💰 ниже рынка · 📉 снижение цены.",
         reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML,
     )
 
@@ -467,7 +686,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>Kleinanzeigen Parser v2.2</b>\n\nВыбери действие:", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("<b>Kleinanzeigen Parser v2.3</b>\n\nВыбери действие:", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == "settings")
@@ -477,6 +696,17 @@ async def settings(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     s = await get_settings(callback.from_user.id)
     await callback.answer()
+    await callback.message.edit_text(settings_text(s), reply_markup=settings_keyboard(s), parse_mode=ParseMode.HTML)
+
+
+@dp.callback_query(F.data.startswith("quickmode:"))
+async def quick_mode(callback: CallbackQuery) -> None:
+    value = callback.data.split(":", 1)[1]
+    if value not in MODE_LABELS:
+        await callback.answer("Режим не найден", show_alert=True)
+        return
+    s = await update_setting(callback.from_user.id, "output_mode", value)
+    await callback.answer(f"Выбрано: {MODE_LABELS[value]}")
     await callback.message.edit_text(settings_text(s), reply_markup=settings_keyboard(s), parse_mode=ParseMode.HTML)
 
 

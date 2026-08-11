@@ -1,78 +1,63 @@
-# Kleinanzeigen Parser Bot v2.2.0 — Smart Parsing
+# Kleinanzeigen Parser Bot v2.3.0 — Smart Analytics
 
-Telegram parser for public Kleinanzeigen category pages. v2.2 separates **collection** from **output**: the parser stores the full current-day dataset, while settings decide what goes into the export.
+Telegram parser for public Kleinanzeigen category pages. Collection and output are separated: the parser stores the current-day dataset, while filters/analytics decide what is exported.
 
-## New in v2.2
+## Fixed in v2.3
 
-### ⚙️ Parsing/output settings
-
-- **Output mode**
+- Prices: more robust extraction from category cards + text fallback.
+- Existing v2.2 rows with missing prices are backfilled during the next scan.
+- Every regular export now has both `Цена` and numeric `Цена, €` columns.
+- Analytics modes are visible directly inside **⚙️ Настройки парсинга**:
   - 🆕 Самые новые
   - 📚 Все
-  - 💎 Уникальные (beta title-family heuristic)
-  - 🔥 Часто публикуемые (aggregated product-family report)
-  - 💰 Ниже рынка β (>=20% below the median of a product family, minimum 3 priced samples)
-- **Smart duplicates** — likely reposts with the same normalized title + price + category are collapsed, keeping the newest.
-- **Clean services/search** — filters obvious `Suche`, `Ankauf`, `Reparatur`, service/rental/swap noise from exports. This does not delete it from the DB.
-- **Period** — 1h / 3h / 6h / today.
-- **Price presets** — any / 0–50 / 50–100 / 100–200 / 200–500 / 500+ EUR.
-- **Sort** — newest / price ascending / price descending.
-- **Include words** — comma-separated allow-list keywords.
-- **Exclude words** — comma-separated custom exclusions.
+  - 💎 Уникальные
+  - 🔥 Часто публикуемые
+  - ⚡ Быстро исчезающие
+  - 💰 Ниже рынка
+  - 📉 Снижение цены
 
-### 📦 Result export
+## Analytics
 
-The main menu now has **📦 Получить результат**. It generates a CSV using current settings without rescanning Kleinanzeigen.
+### 🔥 Часто публикуемые
+Groups similar product titles and shows publication count plus example/minimum/median/maximum prices.
 
-`🔥 Часто публикуемые` exports:
-- category
-- product-family key
-- example title
-- publication count
-- min / median / max price
-- newest timestamp
-- example link
+### ⚡ Быстро исчезающие
+On export, checks a bounded batch of saved public listing links and records listings that are no longer available. The file includes approximate lifetime from first detection to the check that detected disappearance. This gets more useful after several runs during the day.
 
-`💰 Ниже рынка β` exports potential price outliers against the median of similar title families. It is a heuristic, not a valuation guarantee.
-
-## Important behavior
-
-- Collection is still by public category/search pages only.
-- Filters affect exports, not collection. You can change settings and export again instantly.
-- ID-based database deduplication remains permanent.
-- Smart duplicate/family grouping is intentionally conservative and heuristic.
-- No CAPTCHA/authentication/access-control bypass is implemented.
-
-## Railway
-
-Required variables:
+Defaults:
 
 ```env
-BOT_TOKEN=...
-ADMIN_IDS=123456789
+AVAILABILITY_CHECK_LIMIT=150
+AVAILABILITY_CONCURRENCY=4
 ```
 
-Recommended later for persistence:
+### 💰 Ниже рынка
+Heuristic grouping by normalized product titles. A listing is shown when it is at least 20% below the median of a group with enough priced samples.
 
-```env
-DATABASE_URL=postgresql://...
-```
+### 📉 Снижение цены
+v2.3 starts storing price history. When a known ad is parsed again with a lower price, it becomes available in this report. Existing v2.2 data does not have historical prices retroactively, so this report needs at least two observations after upgrading.
 
-Optional parser variables:
+## Railway update
 
-```env
-MAX_PAGES_PER_CATEGORY=500
-PAGE_DELAY_SECONDS=0.7
-STOP_AFTER_EMPTY_TODAY_PAGES=2
-STOP_AFTER_NO_NEW_PAGES=2
-```
+No new bot or Railway project is needed.
 
-Start command:
+1. Replace repository files with v2.3.
+2. Keep Railway Start Command:
 
 ```bash
 python bot.py
 ```
 
-## Upgrade from v2.1
+3. Keep variables:
 
-Replace the repository files with v2.2 and redeploy. The new `user_settings` table is created automatically. Existing listings/categories remain compatible.
+```env
+BOT_TOKEN=...
+ADMIN_IDS=...
+```
+
+4. `DATABASE_URL` is still optional for testing, but PostgreSQL is strongly recommended before relying on multi-day price/disappearance history.
+5. After deploy, run `/start` and perform one new scan. The first v2.3 scan may traverse more pages because it also backfills missing prices from v2.2.
+
+## Notes
+
+The project reads publicly visible listing data and does not implement CAPTCHA bypass or protection evasion. Keep request rates reasonable.

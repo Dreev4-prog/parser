@@ -17,11 +17,23 @@ class Listing(Base):
     category: Mapped[str] = mapped_column(String(255), index=True)
     title: Mapped[str] = mapped_column(String(500))
     price_text: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    price_eur: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    price_eur: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     posted_text: Mapped[str | None] = mapped_column(String(100), nullable=True)
     url: Mapped[str] = mapped_column(String(1200), unique=True)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    disappeared_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+
+class PriceHistory(Base):
+    __tablename__ = "price_history"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    external_id: Mapped[str] = mapped_column(String(64), index=True)
+    price_text: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    price_eur: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 class SelectedCategory(Base):
