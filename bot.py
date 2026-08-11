@@ -65,7 +65,7 @@ STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVA
 # Public view-count enrichment. Values are cached in the DB so repeated exports
 # by many users reuse recent counters instead of reopening the same ad pages.
 VIEW_COUNT_CACHE_TTL_SECONDS = max(60, int(os.getenv("VIEW_COUNT_CACHE_TTL_SECONDS", "900")))
-VIEW_COUNT_CONCURRENCY = max(1, min(10, int(os.getenv("VIEW_COUNT_CONCURRENCY", "6"))))
+VIEW_COUNT_CONCURRENCY = max(1, min(10, int(os.getenv("VIEW_COUNT_CONCURRENCY", "8"))))
 VIEW_COUNT_EXPORT_MODES = {"newest", "all", "unique", "below_market"}
 
 # v2.5 incremental scan tuning (kept in v2.6). A full scan is forced once per category per Berlin day.
@@ -600,7 +600,7 @@ async def refresh_view_counts(rows: list[Listing], message: Message | BotChatAda
         try:
             status = await message.answer(
                 f"👁 Собираю просмотры для <b>{len(targets)}</b> объявлений…\n"
-                f"Недавние значения кэшируются на {max(1, VIEW_COUNT_CACHE_TTL_SECONDS // 60)} мин.",
+                f"⚡ Пассивный сетевой счётчик + DOM fallback · кэш {max(1, VIEW_COUNT_CACHE_TTL_SECONDS // 60)} мин.",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
@@ -612,7 +612,7 @@ async def refresh_view_counts(rows: list[Listing], message: Message | BotChatAda
                 pct = round(done / total * 100) if total else 100
                 await status.edit_text(
                     f"👁 Собираю просмотры… <b>{done}/{total}</b> ({pct}%)\n"
-                    f"Недавние значения кэшируются на {max(1, VIEW_COUNT_CACHE_TTL_SECONDS // 60)} мин.",
+                    f"⚡ Пассивный сетевой счётчик + DOM fallback · кэш {max(1, VIEW_COUNT_CACHE_TTL_SECONDS // 60)} мин.",
                     parse_mode=ParseMode.HTML,
                 )
             except Exception:
@@ -1898,7 +1898,13 @@ async def run_view_test(message: Message, state: FSMContext) -> None:
                 lines.append(f"{idx}. <code>{html.escape(u)}</code>")
                 if reasons:
                     lines.append(f"   <i>{html.escape(reasons)}</i>")
-            lines += ["", "Если здесь появится стабильный XHR/fetch-адрес со счётчиком, мы сможем попробовать получать просмотры без открытия полной страницы объявления."]
+                if c.get("passive_views") is not None:
+                    shape = c.get("passive_shape") or "payload"
+                    lines.append(
+                        f"   ✅ пассивно распознано: <b>{int(c['passive_views'])}</b> "
+                        f"(<code>{html.escape(str(shape))}</code>)"
+                    )
+            lines += ["", "Если у s-vac-inc-get появится строка «пассивно распознано», v2.6.9 уже использует это число автоматически — без отдельного вызова endpoint. DOM остаётся запасным вариантом."]
         else:
             lines += ["", "ℹ️ XHR/fetch с явным счётчиком не найден. Значит, на этом тесте число пришло через данные страницы/JavaScript, и самый надёжный быстрый путь пока — переиспользуемый Chromium с параллельными вкладками."]
         await status.edit_text(

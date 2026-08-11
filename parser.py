@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -230,6 +231,113 @@ def parse_category_html(html_text: str) -> list[ParsedListing]:
     return items
 
 
+PASSIVE_VIEW_ENDPOINT_RE = re.compile(r"/s-vac-inc-get\.json(?:\?|$)", re.IGNORECASE)
+VIEW_KEY_RE = re.compile(r"(?:^|[_-])(view(?:s|count)?|counter|cntr|aufruf(?:e)?|impression(?:s)?|visit(?:s)?)(?:$|[_-])", re.IGNORECASE)
+
+
+def _coerce_nonnegative_int(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value <= 999_999_999 else None
+    if isinstance(value, float) and value.is_integer():
+        iv = int(value)
+        return iv if 0 <= iv <= 999_999_999 else None
+    if isinstance(value, str):
+        raw = value.strip()
+        if re.fullmatch(r"\d{1,9}", raw):
+            return int(raw)
+        if re.fullmatch(r"\d{1,3}(?:[.\s]\d{3})+", raw):
+            return int(re.sub(r"\D", "", raw))
+    return None
+
+
+def _extract_passive_view_payload(text: str, *, ad_id: str | None = None) -> tuple[int | None, str | None]:
+    """Extract a likely public view count from a response Kleinanzeigen itself requested.
+
+    This function NEVER performs the request. It only parses the response body captured
+    while a normal public ad page is loading. Keyed values such as views/viewCount/
+    counter/Aufrufe are preferred. For the known s-vac-inc-get endpoint a single scalar
+    integer is accepted as a conservative fallback.
+    """
+    if not text:
+        return None, None
+    body = text.strip()
+    if not body:
+        return None, None
+
+    try:
+        data = json.loads(body)
+    except Exception:
+        data = None
+
+    keyed: list[tuple[int, str, int]] = []
+    scalars: list[tuple[str, int]] = []
+
+    def walk(value, path: str = "$"):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                key = str(k)
+                next_path = f"{path}.{key}"
+                iv = _coerce_nonnegative_int(v)
+                if iv is not None:
+                    scalars.append((next_path, iv))
+                    low = key.lower().replace("-", "_")
+                    score = 0
+                    if low in {"views", "view", "viewcount", "view_count", "aufrufe", "counter", "cntr"}:
+                        score = 10
+                    elif VIEW_KEY_RE.search(low):
+                        score = 7
+                    elif low in {"count", "num", "value"}:
+                        score = 3
+                    if score:
+                        keyed.append((score, next_path, iv))
+                walk(v, next_path)
+        elif isinstance(value, list):
+            for i, v in enumerate(value[:100]):
+                walk(v, f"{path}[{i}]")
+        else:
+            iv = _coerce_nonnegative_int(value)
+            if iv is not None:
+                scalars.append((path, iv))
+
+    if data is not None:
+        walk(data)
+        if keyed:
+            keyed.sort(key=lambda x: (-x[0], len(x[1]), x[1]))
+            score, path, value = keyed[0]
+            return value, f"json:{path}"
+
+        # Conservative endpoint-specific fallback: one numeric scalar other than the ad ID.
+        ad_num = int(ad_id) if ad_id and ad_id.isdigit() else None
+        unique = []
+        seen = set()
+        ignored_scalar_keys = {"status", "statuscode", "code", "httpstatus", "adid", "ad_id", "id"}
+        for path, value in scalars:
+            leaf = path.rsplit(".", 1)[-1].lower().replace("-", "_")
+            if value == ad_num or value in seen or leaf in ignored_scalar_keys:
+                continue
+            seen.add(value)
+            unique.append((path, value))
+        if len(unique) == 1:
+            path, value = unique[0]
+            return value, f"json-single:{path}"
+
+    # Plain-text number is also a safe shape for this specific captured endpoint.
+    iv = _coerce_nonnegative_int(body)
+    if iv is not None and (not ad_id or str(iv) != ad_id):
+        return iv, "text:integer"
+
+    # Narrow textual keyed fallback; avoid arbitrary numbers such as ad IDs/statuses.
+    m = re.search(
+        r'(?i)(?:"|\\b)(views?|view[_-]?count|counter|cntr|aufrufe?|impressions?|visits?)(?:"|\\b)\\s*[:=]\\s*"?(\\d{1,9})"?',
+        body,
+    )
+    if m:
+        return int(m.group(2)), f"text-key:{m.group(1)}"
+    return None, None
+
+
 class KleinanzeigenParser:
     def __init__(self) -> None:
         self.client = httpx.AsyncClient(
@@ -328,6 +436,43 @@ class KleinanzeigenParser:
                 extra_http_headers={"Accept-Language": "de-DE,de;q=0.9,en;q=0.7"},
             )
             return self._browser_context
+
+    async def _install_lightweight_route(self, page) -> None:
+        async def route_handler(route):
+            if route.request.resource_type in {"image", "font", "media"}:
+                await route.abort()
+            else:
+                await route.continue_()
+        await page.route("**/*", route_handler)
+
+    def _attach_passive_view_capture(self, page, ad_id: str | None):
+        """Return (future, tasks) for the view response naturally requested by the page."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        tasks: list[asyncio.Task] = []
+
+        async def capture(response):
+            try:
+                if future.done():
+                    return
+                if not PASSIVE_VIEW_ENDPOINT_RE.search(response.url):
+                    return
+                text = await response.text()
+                value, shape = _extract_passive_view_payload(text[:350_000], ad_id=ad_id)
+                if value is not None and not future.done():
+                    future.set_result((value, text[:500], response.url, shape))
+            except Exception:
+                pass
+
+        def on_response(response):
+            if PASSIVE_VIEW_ENDPOINT_RE.search(response.url):
+                try:
+                    tasks.append(asyncio.create_task(capture(response)))
+                except Exception:
+                    pass
+
+        page.on("response", on_response)
+        return future, tasks
 
     @staticmethod
     def _view_value_from_text(text: str | None) -> tuple[int | None, str | None]:
@@ -520,28 +665,39 @@ class KleinanzeigenParser:
         try:
             context = await self._ensure_view_browser()
             page = await context.new_page()
+            await self._install_lightweight_route(page)
+            ad_id = extract_external_id(url)
+            passive_future, passive_tasks = self._attach_passive_view_capture(page, ad_id)
 
-            async def route_handler(route):
-                if route.request.resource_type in {"image", "font", "media"}:
-                    await route.abort()
-                else:
-                    await route.continue_()
-
-            await page.route("**/*", route_handler)
             await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
             final_url = page.url
             page_title = await page.title()
 
+            # Fast path in v2.6.9: wait briefly for the public counter endpoint that
+            # Kleinanzeigen itself requests while rendering this page. We do NOT call
+            # that endpoint ourselves, so there is no extra counter request.
             try:
-                await page.wait_for_selector("#viewad-title", state="attached", timeout=8_000)
+                value, raw_payload, endpoint_url, shape = await asyncio.wait_for(
+                    asyncio.shield(passive_future), timeout=3.0
+                )
+                return ViewCountResult(
+                    int(value), raw_payload,
+                    f"network:passive:s-vac-inc-get:{shape or 'payload'}",
+                    final_url, page_title,
+                )
+            except (asyncio.TimeoutError, PlaywrightTimeoutError):
+                pass
+
+            try:
+                await page.wait_for_selector("#viewad-title", state="attached", timeout=4_000)
             except PlaywrightTimeoutError:
                 pass
-            # Give late hydration a little time, then try all known DOM/JSON shapes.
+            # DOM is the reliable fallback if the network response shape changes.
             try:
-                await page.wait_for_selector("#viewad-cntr-num", state="attached", timeout=6_000)
+                await page.wait_for_selector("#viewad-cntr-num", state="attached", timeout=3_000)
             except PlaywrightTimeoutError:
                 pass
-            await page.wait_for_timeout(1200)
+            await page.wait_for_timeout(350)
 
             value, raw, source = await self._extract_view_count_from_page(page)
             if value is not None:
@@ -578,15 +734,7 @@ class KleinanzeigenParser:
         try:
             context = await self._ensure_view_browser()
             page = await context.new_page()
-
-            async def route_handler(route):
-                # Keep scripts/XHR because the counter may depend on them; skip heavy media.
-                if route.request.resource_type in {"image", "font", "media"}:
-                    await route.abort()
-                else:
-                    await route.continue_()
-
-            await page.route("**/*", route_handler)
+            await self._install_lightweight_route(page)
 
             async def capture_response(response):
                 try:
@@ -601,12 +749,20 @@ class KleinanzeigenParser:
                     text = await response.text()
                     if len(text) > 350_000:
                         text = text[:350_000]
+                    parsed_views = None
+                    parsed_shape = None
+                    if PASSIVE_VIEW_ENDPOINT_RE.search(response.url):
+                        parsed_views, parsed_shape = _extract_passive_view_payload(
+                            text, ad_id=extract_external_id(url)
+                        )
                     captured.append({
                         "url": response.url,
                         "status": response.status,
                         "type": rtype,
                         "content_type": ctype[:120],
                         "body": text,
+                        "passive_views": parsed_views,
+                        "passive_shape": parsed_shape,
                     })
                 except Exception:
                     pass
@@ -660,6 +816,12 @@ class KleinanzeigenParser:
                 low_b = body.lower()
                 score = 0
                 reasons = []
+                if PASSIVE_VIEW_ENDPOINT_RE.search(u):
+                    score += 10
+                    reasons.append("passive-counter-endpoint")
+                    if item.get("passive_views") is not None:
+                        score += 8
+                        reasons.append(f"parsed-views:{item['passive_views']}")
                 if any(k in low_u for k in keywords):
                     score += 4
                     reasons.append("keyword-in-url")
@@ -693,6 +855,8 @@ class KleinanzeigenParser:
                     "content_type": item["content_type"],
                     "reasons": reasons,
                     "snippet": snippet[:320],
+                    "passive_views": item.get("passive_views"),
+                    "passive_shape": item.get("passive_shape"),
                 })
 
             candidates.sort(key=lambda x: (-x["score"], x["url"]))
