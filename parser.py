@@ -25,6 +25,15 @@ MAX_PAGES_PER_CATEGORY = min(
 PAGE_DELAY_SECONDS = max(0.0, float(os.getenv("PAGE_DELAY_SECONDS", "0.7")))
 STOP_AFTER_EMPTY_TODAY_PAGES = max(1, int(os.getenv("STOP_AFTER_EMPTY_TODAY_PAGES", "2")))
 AVAILABILITY_TIMEOUT = max(5.0, float(os.getenv("AVAILABILITY_TIMEOUT", "20")))
+VIEW_COUNT_GLOBAL_CONCURRENCY = max(1, min(16, int(os.getenv("VIEW_COUNT_GLOBAL_CONCURRENCY", "10"))))
+_GLOBAL_VIEW_SEMAPHORE = None
+
+
+def _global_view_semaphore() -> asyncio.Semaphore:
+    global _GLOBAL_VIEW_SEMAPHORE
+    if _GLOBAL_VIEW_SEMAPHORE is None:
+        _GLOBAL_VIEW_SEMAPHORE = asyncio.Semaphore(VIEW_COUNT_GLOBAL_CONCURRENCY)
+    return _GLOBAL_VIEW_SEMAPHORE
 
 log = logging.getLogger("kleinanzeigen-parser")
 
@@ -312,10 +321,8 @@ def _extract_passive_view_payload(text: str, *, ad_id: str | None = None) -> tup
         ad_num = int(ad_id) if ad_id and ad_id.isdigit() else None
         unique = []
         seen = set()
-        ignored_scalar_keys = {"status", "statuscode", "code", "httpstatus", "adid", "ad_id", "id"}
         for path, value in scalars:
-            leaf = path.rsplit(".", 1)[-1].lower().replace("-", "_")
-            if value == ad_num or value in seen or leaf in ignored_scalar_keys:
+            if value == ad_num or value in seen:
                 continue
             seen.add(value)
             unique.append((path, value))
@@ -439,7 +446,7 @@ class KleinanzeigenParser:
 
     async def _install_lightweight_route(self, page) -> None:
         async def route_handler(route):
-            if route.request.resource_type in {"image", "font", "media"}:
+            if route.request.resource_type in {"image", "font", "media", "stylesheet"}:
                 await route.abort()
             else:
                 await route.continue_()
@@ -635,7 +642,7 @@ class KleinanzeigenParser:
             pass
         return diag
 
-    async def fetch_public_view_count(self, url: str, *, browser_fallback: bool = True) -> ViewCountResult:
+    async def fetch_public_view_count(self, url: str, *, browser_fallback: bool = True, http_fast_path: bool = True) -> ViewCountResult:
         """Read the public view counter without authentication.
 
         First try the normal HTML response (cheap). If the counter is injected only
@@ -645,13 +652,14 @@ class KleinanzeigenParser:
         if not _allowed_url(url) or "/s-anzeige/" not in url:
             return ViewCountResult(None, None, "invalid-url", error="Нужна публичная ссылка на объявление Kleinanzeigen")
 
-        try:
-            html_text = await self.fetch_html(url)
-            value, raw = self._view_count_from_html(html_text)
-            if value is not None:
-                return ViewCountResult(value, raw, "http:#viewad-cntr-num", url, None)
-        except Exception as exc:
-            log.debug("View-count HTTP fast path failed for %s: %s", url, exc)
+        if http_fast_path:
+            try:
+                html_text = await self.fetch_html(url)
+                value, raw = self._view_count_from_html(html_text)
+                if value is not None:
+                    return ViewCountResult(value, raw, "http:#viewad-cntr-num", url, None)
+            except Exception as exc:
+                log.debug("View-count HTTP fast path failed for %s: %s", url, exc)
 
         if not browser_fallback:
             return ViewCountResult(None, None, "http:not-found", url, None)
@@ -897,9 +905,15 @@ class KleinanzeigenParser:
         sem = asyncio.Semaphore(max(1, min(10, concurrency)))
         results: dict[str, ViewCountResult] = {}
 
+        global_sem = _global_view_semaphore()
+
         async def one(url: str):
             async with sem:
-                results[url] = await self.fetch_public_view_count(url)
+                async with global_sem:
+                    # Category pages never expose the counter, so the batch path
+                    # skips a redundant HTTP detail-page fetch and opens the
+                    # lightweight Playwright page directly.
+                    results[url] = await self.fetch_public_view_count(url, http_fast_path=False)
 
         # Work in chunks so thousands of listings do not create thousands of live tasks.
         chunk_size = max(20, concurrency * 8)

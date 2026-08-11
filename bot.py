@@ -62,8 +62,8 @@ MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
 CATEGORY_CACHE_TTL_SECONDS = max(0, int(os.getenv("CATEGORY_CACHE_TTL_SECONDS", "300")))
 STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVAL_SECONDS", "1.5")))
 
-# Public view-count enrichment. Values are cached in the DB so repeated exports
-# by many users reuse recent counters instead of reopening the same ad pages.
+# Public view counts are collected inline while category pages are scanned.
+# Recent values are cached so shared/multi-user scans do not reopen the same ad.
 VIEW_COUNT_CACHE_TTL_SECONDS = max(60, int(os.getenv("VIEW_COUNT_CACHE_TTL_SECONDS", "900")))
 VIEW_COUNT_CONCURRENCY = max(1, min(10, int(os.getenv("VIEW_COUNT_CONCURRENCY", "8"))))
 VIEW_COUNT_EXPORT_MODES = {"newest", "all", "unique", "below_market"}
@@ -579,6 +579,77 @@ async def refresh_availability(rows: list[Listing]) -> tuple[int, int, int]:
     return len(candidates), len(disappeared_ids), unknown
 
 
+async def enrich_page_view_counts(
+    parser: KleinanzeigenParser,
+    items: list[ParsedListing],
+    live: CategoryLiveProgress | None = None,
+) -> tuple[int, int, int]:
+    """Fetch public view counters as part of the category-page pipeline.
+
+    Only missing/stale counters are opened. The same Playwright browser is reused
+    by the category parser, and the passive s-vac-inc-get response is preferred.
+    Returns (requested, updated, failed).
+    """
+    if not items:
+        return 0, 0, 0
+
+    unique = {item.external_id: item for item in items if item.url}
+    if not unique:
+        return 0, 0, 0
+
+    cutoff = datetime.utcnow() - timedelta(seconds=VIEW_COUNT_CACHE_TTL_SECONDS)
+    async with SessionLocal() as session:
+        result = await session.execute(select(Listing).where(Listing.external_id.in_(list(unique))))
+        rows = {row.external_id: row for row in result.scalars().all()}
+        targets = [
+            unique[eid] for eid, row in rows.items()
+            if row.views_checked_at is None or row.views_checked_at < cutoff
+        ]
+
+    if not targets:
+        if live is not None:
+            live.views_ready += len(unique)
+        return 0, 0, 0
+
+    results = await parser.fetch_public_view_counts(
+        [item.url for item in targets],
+        concurrency=VIEW_COUNT_CONCURRENCY,
+    )
+
+    now = datetime.utcnow()
+    updated = 0
+    failed = 0
+    url_to_id = {item.url: item.external_id for item in targets}
+    async with db_write_lock:
+        async with SessionLocal() as session:
+            db_result = await session.execute(select(Listing).where(Listing.external_id.in_([item.external_id for item in targets])))
+            db_rows = {row.external_id: row for row in db_result.scalars().all()}
+            for url, vr in results.items():
+                external_id = url_to_id.get(url)
+                row = db_rows.get(external_id) if external_id else None
+                if row is None:
+                    continue
+                if vr.views is None:
+                    failed += 1
+                    continue
+                old = row.view_count
+                row.view_count = int(vr.views)
+                row.views_checked_at = now
+                if old != row.view_count:
+                    session.add(ViewHistory(
+                        external_id=row.external_id,
+                        view_count=row.view_count,
+                        recorded_at=now,
+                    ))
+                updated += 1
+            await session.commit()
+
+    if live is not None:
+        live.views_ready += updated + max(0, len(unique) - len(targets))
+        live.views_failed += failed
+    return len(targets), updated, failed
+
+
 async def refresh_view_counts(rows: list[Listing], message: Message | BotChatAdapter | None = None) -> tuple[int, int, int]:
     """Refresh missing/stale public view counters and persist them.
 
@@ -699,10 +770,8 @@ async def send_smart_export(
     if s.smart_dedupe and mode != "frequent":
         base = dedupe_rows(base)
 
-    # v2.6.6: populate public view counters before user-facing listing exports.
-    # The DB cache prevents repeated work when many users request the same data.
-    if mode in VIEW_COUNT_EXPORT_MODES and base:
-        await refresh_view_counts(base, message)
+    # v2.7.0: view counters are collected during the category scan itself.
+    # Export is intentionally read-only so the result file is available immediately.
 
     if mode == "frequent":
         result = frequent_rows(base, min_count=3)
@@ -912,6 +981,8 @@ class CategoryLiveProgress:
     today_seen: int = 0
     new_count: int = 0
     known_count: int = 0
+    views_ready: int = 0
+    views_failed: int = 0
     estimated_pages: int = 10
     started_monotonic: float = 0.0
     page_limit: int = 100
@@ -1101,6 +1172,14 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
 
                 async with db_write_lock:
                     new_items, known_count, enriched_count = await upsert_page_items(cat.key, cat.name, today_items)
+
+                # v2.7.0: collect public view counters immediately for this page.
+                # Recent counters are served from the DB cache; stale/missing ones
+                # are opened through the same lightweight Playwright pool.
+                live = category_live_progress.get(progress_key)
+                views_requested, views_updated, views_failed = await enrich_page_view_counts(
+                    parser, today_items, live
+                )
                 page_new = len(new_items)
                 new_count += page_new
                 known_total += known_count
@@ -1131,9 +1210,11 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
 
                 log.info(
                     "category=%s mode=%s page=%s total=%s today=%s new=%s known=%s known_ratio=%.2f "
-                    "prices_backfilled=%s checkpoint_page=%s known_pages=%s",
+                    "prices_backfilled=%s views_requested=%s views_updated=%s views_failed=%s "
+                    "checkpoint_page=%s known_pages=%s",
                     cat.name, mode, page, len(items), len(today_items), page_new, known_count,
-                    known_ratio, enriched_count, checkpoint_seen_page, consecutive_known_pages,
+                    known_ratio, enriched_count, views_requested, views_updated, views_failed,
+                    checkpoint_seen_page, consecutive_known_pages,
                 )
 
                 if mode == "fast" and page >= INCREMENTAL_MIN_PAGES:
@@ -1378,12 +1459,16 @@ def render_user_job_status(job: ScanJob) -> str:
     current_page = 0
     current_today = 0
     live_new = 0
+    live_views_ready = 0
+    live_views_failed = 0
     current_eta = float(base_category_eta)
 
     if live is not None:
         current_page = live.page
         current_today = live.today_seen
         live_new = live.new_count
+        live_views_ready = live.views_ready
+        live_views_failed = live.views_failed
         target_pages = max(1, live.estimated_pages if live.mode == "fast" else job.page_limit)
         current_fraction = min(0.95, current_page / target_pages)
 
@@ -1413,7 +1498,12 @@ def render_user_job_status(job: ScanJob) -> str:
 
     category_line = html.escape(job.current_category) if job.current_category else "Подготовка…"
     page_line = f"\nСтраница: <b>{current_page} / {job.page_limit}</b>" if current_page else ""
-    today_line = f"\nОбъявлений просмотрено в категории: <b>{current_today}</b>" if current_today else ""
+    today_line = f"\nОбъявлений обработано в категории: <b>{current_today}</b>" if current_today else ""
+    views_line = ""
+    if current_today:
+        views_line = f"\n👁 Просмотры готовы: <b>{live_views_ready}/{current_today}</b>"
+        if live_views_failed:
+            views_line += f" · ошибок: <b>{live_views_failed}</b>"
     visible_new = job.total_new + live_new
 
     return (
@@ -1421,7 +1511,7 @@ def render_user_job_status(job: ScanJob) -> str:
         f"{_progress_bar(percent)} <b>{percent}%</b>\n"
         f"Категории: <b>{job.completed_categories}/{total}</b> готово\n"
         f"Глубина: <b>{job.page_limit} страниц</b>\n"
-        f"Сейчас: <b>{category_line}</b>{page_line}{today_line}\n\n"
+        f"Сейчас: <b>{category_line}</b>{page_line}{today_line}{views_line}\n\n"
         f"🆕 Найдено новых: <b>{visible_new}</b>\n"
         f"⏱ Прошло: <b>{_human_duration(elapsed)}</b>\n"
         f"⌛ Осталось примерно: <b>{_human_eta(eta)}</b>\n\n"
@@ -1640,7 +1730,7 @@ async def start(message: Message, state: FSMContext) -> None:
         return
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>Kleinanzeigen Parser v2.6.5</b>\n\n"
+        "<b>Kleinanzeigen Parser v2.7.0</b>\n\n"
         "Выбери категории и нажми «Начать парсинг». Прогресс будет обновляться автоматически, а после завершения бот сразу пришлёт готовый файл.\n"
         "После сбора можешь менять режим выдачи без повторного парсинга.\n\n"
         "🆕 новые · 💎 уникальные · 🔥 частые · ⚡ быстро исчезающие · 💰 ниже рынка · 📉 снижение цены.",
@@ -1655,7 +1745,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>Kleinanzeigen Parser v2.6.5</b>\n\nВыбери действие:", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("<b>Kleinanzeigen Parser v2.7.0</b>\n\nВыбери действие:", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == "post_settings")
@@ -1676,7 +1766,7 @@ async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
     await callback.message.answer(
-        "<b>Kleinanzeigen Parser v2.6.5</b>\n\nВыбери действие:",
+        "<b>Kleinanzeigen Parser v2.7.0</b>\n\nВыбери действие:",
         reply_markup=main_keyboard(len(selected)),
         parse_mode=ParseMode.HTML,
     )
