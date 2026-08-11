@@ -119,7 +119,7 @@ def main_keyboard(selected_count: int = 0) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"🗂 Категории ({selected_count})", callback_data="groups")],
         [InlineKeyboardButton(text="⚙️ Настройки парсинга", callback_data="settings")],
         [InlineKeyboardButton(text="📦 Получить результат", callback_data="export_smart")],
-        [InlineKeyboardButton(text="👁 Тест просмотров", callback_data="view_test")],
+        [InlineKeyboardButton(text="⚡ Тест быстрых просмотров", callback_data="view_test")],
         [InlineKeyboardButton(text="📊 База", callback_data="stats")],
         [InlineKeyboardButton(text="📋 Что выбрано", callback_data="selected")],
     ])
@@ -672,7 +672,7 @@ async def refresh_view_counts(rows: list[Listing], message: Message | BotChatAda
         try:
             status = await message.answer(
                 f"👁 Собираю просмотры для <b>{len(targets)}</b> объявлений…\n"
-                f"⚡ Пассивный сетевой счётчик + DOM fallback · кэш {max(1, VIEW_COUNT_CACHE_TTL_SECONDS // 60)} мин.",
+                f"⚡ Прямой счётчик + browser fallback · кэш {max(1, VIEW_COUNT_CACHE_TTL_SECONDS // 60)} мин.",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
@@ -684,7 +684,7 @@ async def refresh_view_counts(rows: list[Listing], message: Message | BotChatAda
                 pct = round(done / total * 100) if total else 100
                 await status.edit_text(
                     f"👁 Собираю просмотры… <b>{done}/{total}</b> ({pct}%)\n"
-                    f"⚡ Пассивный сетевой счётчик + DOM fallback · кэш {max(1, VIEW_COUNT_CACHE_TTL_SECONDS // 60)} мин.",
+                    f"⚡ Прямой счётчик + browser fallback · кэш {max(1, VIEW_COUNT_CACHE_TTL_SECONDS // 60)} мин.",
                     parse_mode=ParseMode.HTML,
                 )
             except Exception:
@@ -1952,10 +1952,11 @@ async def view_test(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SettingsInput.view_test_url)
     await callback.answer()
     await callback.message.answer(
-        "<b>👁 Тест просмотров + поиск быстрого источника</b>\n\n"
-        "Пришли одну ссылку на обычное объявление Kleinanzeigen. "
-        "Бот откроет её без авторизации через Chromium, прочитает публичный счётчик и одновременно проверит XHR/fetch-запросы страницы — ищем более быстрый источник просмотров.\n\n"
-        "Например:\n<code>https://www.kleinanzeigen.de/s-anzeige/.../3482322145-245-2351</code>",
+        "<b>⚡ Тест быстрого получения просмотров</b>\n\n"
+        "Пришли одну публичную ссылку Kleinanzeigen. Бот сравнит два способа:\n"
+        "1) прямой запрос счётчика без открытия карточки;\n"
+        "2) обычное открытие страницы через Chromium как контроль.\n\n"
+        "Так мы сразу увидим, сколько времени экономит быстрый режим.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1973,77 +1974,72 @@ async def run_view_test(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     status = await message.answer(
-        "⏳ <b>Открываю объявление в Chromium…</b>\n\n"
-        "Жду появления публичного счётчика 👁. Обычно тест занимает несколько секунд.",
+        "⏳ <b>Сравниваю быстрый запрос и Chromium…</b>\n\n"
+        "Тест может добавить единичные просмотры к объявлению.",
         parse_mode=ParseMode.HTML,
     )
     parser = KleinanzeigenParser()
     try:
-        result = await parser.inspect_view_network(url)
+        t0 = time.perf_counter()
+        mode, direct = await parser.probe_direct_view_mode(url, force=True)
+        direct_time = time.perf_counter() - t0
+
+        t1 = time.perf_counter()
+        browser = await parser.fetch_public_view_count(url, http_fast_path=False)
+        browser_time = time.perf_counter() - t1
     finally:
         await parser.close()
 
     selected = await get_selected(message.from_user.id)
-    if result.views is not None:
-        lines = [
-            "✅ <b>Просмотры считались!</b>",
-            "",
-            f"👁 Просмотров: <b>{result.views}</b>",
-            f"Источник DOM: <code>{html.escape(result.source)}</code>",
+    lines = ["⚡ <b>Тест быстрого счётчика</b>", ""]
+
+    if direct.views is not None:
+        lines += [
+            f"🚀 Прямой способ: <b>{direct.views}</b> просмотров",
+            f"Источник: <code>{html.escape(direct.source)}</code>",
+            f"Время: <b>{direct_time:.2f} сек</b>",
         ]
-        if result.candidates:
-            lines += ["", "🔎 <b>Кандидаты на прямой источник:</b>"]
-            for idx, c in enumerate(result.candidates[:5], 1):
-                u = c.get("url", "")
-                if len(u) > 180:
-                    u = u[:177] + "…"
-                reasons = ", ".join(c.get("reasons") or [])
-                lines.append(f"{idx}. <code>{html.escape(u)}</code>")
-                if reasons:
-                    lines.append(f"   <i>{html.escape(reasons)}</i>")
-                if c.get("passive_views") is not None:
-                    shape = c.get("passive_shape") or "payload"
-                    lines.append(
-                        f"   ✅ пассивно распознано: <b>{int(c['passive_views'])}</b> "
-                        f"(<code>{html.escape(str(shape))}</code>)"
-                    )
-            lines += ["", "Если у s-vac-inc-get появится строка «пассивно распознано», v2.6.9 уже использует это число автоматически — без отдельного вызова endpoint. DOM остаётся запасным вариантом."]
-        else:
-            lines += ["", "ℹ️ XHR/fetch с явным счётчиком не найден. Значит, на этом тесте число пришло через данные страницы/JavaScript, и самый надёжный быстрый путь пока — переиспользуемый Chromium с параллельными вкладками."]
-        await status.edit_text(
-            "\n".join(lines),
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard(len(selected)),
-            disable_web_page_preview=True,
-        )
     else:
-        diag = result.diagnostic or {}
-        diag_lines = []
-        if result.page_title:
-            diag_lines.append(f"Заголовок страницы: <code>{html.escape(result.page_title[:160])}</code>")
-        if result.final_url and result.final_url != url:
-            diag_lines.append(f"Финальный URL: <code>{html.escape(result.final_url[:220])}</code>")
-        if diag.get("classification"):
-            labels = {
-                "normal": "обычная страница объявления",
-                "challenge": "страница проверки/защиты",
-                "consent-only": "страница согласия cookies",
-                "redirected": "редирект с объявления",
-            }
-            diag_lines.append(f"Страница: <b>{html.escape(labels.get(diag['classification'], str(diag['classification'])))}</b>")
-        if diag.get("extra_info"):
-            diag_lines.append(f"Блок даты/просмотров: <code>{html.escape(str(diag['extra_info'])[:220])}</code>")
-        details = f"\nОшибка: <code>{html.escape(result.error)}</code>" if result.error else ""
-        diag_text = ("\n" + "\n".join(diag_lines)) if diag_lines else ""
-        await status.edit_text(
-            "❌ <b>Счётчик пока не считался</b>\n\n"
-            f"Результат: <code>{html.escape(result.source)}</code>{details}{diag_text}\n\n"
-            "Теперь тест проверяет старый selector, блок даты/👁, альтернативные DOM-атрибуты и встроенный JSON. "
-            "Если снова не найдёт число, этот ответ покажет, получает ли Railway обычную страницу или страницу защиты.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard(len(selected)),
-            disable_web_page_preview=True,
-        )
+        lines += [
+            "🚀 Прямой способ: <b>не сработал</b>",
+            f"Режим: <code>{html.escape(mode)}</code>",
+            f"Время попытки: <b>{direct_time:.2f} сек</b>",
+        ]
+        if direct.error:
+            lines.append(f"Ошибка: <code>{html.escape(direct.error[:180])}</code>")
+
+    lines.append("")
+    if browser.views is not None:
+        lines += [
+            f"🌐 Chromium: <b>{browser.views}</b> просмотров",
+            f"Источник: <code>{html.escape(browser.source)}</code>",
+            f"Время: <b>{browser_time:.2f} сек</b>",
+        ]
+    else:
+        lines += [
+            "🌐 Chromium: <b>не удалось получить</b>",
+            f"Время: <b>{browser_time:.2f} сек</b>",
+        ]
+
+    if direct.views is not None and browser_time > 0:
+        speedup = browser_time / max(direct_time, 0.01)
+        lines += [
+            "",
+            f"📈 Ускорение на тесте: <b>примерно ×{speedup:.1f}</b>",
+            "✅ Обычный массовый парсинг v2.7.2 уже сначала использует быстрый способ. Chromium включается только для объявлений, где прямой счётчик не сработал.",
+        ]
+    else:
+        lines += [
+            "",
+            "ℹ️ Для массового парсинга останется автоматический browser fallback, поэтому объявления не потеряются.",
+        ]
+
+    await status.edit_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard(len(selected)),
+        disable_web_page_preview=True,
+    )
 
 
 @dp.callback_query(F.data == "groups")

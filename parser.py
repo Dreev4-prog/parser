@@ -30,6 +30,7 @@ CATEGORY_RETRY_JITTER_SECONDS = max(0.0, float(os.getenv("CATEGORY_RETRY_JITTER_
 STOP_AFTER_EMPTY_TODAY_PAGES = max(1, int(os.getenv("STOP_AFTER_EMPTY_TODAY_PAGES", "2")))
 AVAILABILITY_TIMEOUT = max(5.0, float(os.getenv("AVAILABILITY_TIMEOUT", "20")))
 VIEW_COUNT_GLOBAL_CONCURRENCY = max(1, min(16, int(os.getenv("VIEW_COUNT_GLOBAL_CONCURRENCY", "6"))))
+DIRECT_VIEW_CONCURRENCY = max(1, min(16, int(os.getenv("DIRECT_VIEW_CONCURRENCY", "8"))))
 _GLOBAL_VIEW_SEMAPHORE = None
 
 
@@ -373,6 +374,9 @@ class KleinanzeigenParser:
         self._browser = None
         self._browser_context = None
         self._browser_lock = asyncio.Lock()
+        self._direct_mode_lock = asyncio.Lock()
+        self._direct_view_mode: str = "unknown"  # unknown|http|context|browser
+        self._context_session_seeded = False
 
     async def close(self) -> None:
         try:
@@ -679,6 +683,137 @@ class KleinanzeigenParser:
             pass
         return diag
 
+    @staticmethod
+    def _direct_view_url(ad_id: str) -> str:
+        return f"{BASE_URL}/s-vac-inc-get.json?adId={ad_id}"
+
+    @staticmethod
+    def _direct_view_headers(referer: str) -> dict[str, str]:
+        return {
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": referer,
+            "X-Requested-With": "XMLHttpRequest",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+
+    async def _direct_view_http(self, url: str) -> ViewCountResult:
+        ad_id = extract_external_id(url)
+        endpoint = self._direct_view_url(ad_id)
+        try:
+            response = await self.client.get(
+                endpoint,
+                headers=self._direct_view_headers(url),
+                timeout=12.0,
+            )
+            if response.status_code != 200:
+                return ViewCountResult(
+                    None, None, f"direct-http:status-{response.status_code}",
+                    str(response.url), None,
+                    error=f"HTTP {response.status_code}",
+                )
+            text = response.text
+            value, shape = _extract_passive_view_payload(text[:350_000], ad_id=ad_id)
+            if value is None:
+                return ViewCountResult(None, text[:500], "direct-http:unparsed", str(response.url), None)
+            return ViewCountResult(
+                int(value), text[:500], f"direct-http:s-vac-inc-get:{shape or 'payload'}",
+                str(response.url), None,
+            )
+        except Exception as exc:
+            return ViewCountResult(None, None, "direct-http:error", error=str(exc)[:300])
+
+    async def _seed_context_request_session(self, context) -> None:
+        if self._context_session_seeded:
+            return
+        try:
+            response = await context.request.get(
+                BASE_URL + "/",
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "de-DE,de;q=0.9,en;q=0.7",
+                },
+                timeout=15_000,
+                fail_on_status_code=False,
+            )
+            if 200 <= response.status < 500:
+                self._context_session_seeded = True
+        except Exception:
+            pass
+
+    async def _direct_view_context_request(self, url: str) -> ViewCountResult:
+        ad_id = extract_external_id(url)
+        endpoint = self._direct_view_url(ad_id)
+        try:
+            context = await self._ensure_view_browser()
+            response = await context.request.get(
+                endpoint,
+                headers=self._direct_view_headers(url),
+                timeout=12_000,
+                fail_on_status_code=False,
+            )
+            if response.status in {403, 429} and not self._context_session_seeded:
+                await self._seed_context_request_session(context)
+                response = await context.request.get(
+                    endpoint,
+                    headers=self._direct_view_headers(url),
+                    timeout=12_000,
+                    fail_on_status_code=False,
+                )
+            if response.status != 200:
+                return ViewCountResult(
+                    None, None, f"direct-context:status-{response.status}",
+                    endpoint, None, error=f"HTTP {response.status}",
+                )
+            text = await response.text()
+            value, shape = _extract_passive_view_payload(text[:350_000], ad_id=ad_id)
+            if value is None:
+                return ViewCountResult(None, text[:500], "direct-context:unparsed", endpoint, None)
+            return ViewCountResult(
+                int(value), text[:500], f"direct-context:s-vac-inc-get:{shape or 'payload'}",
+                endpoint, None,
+            )
+        except Exception as exc:
+            return ViewCountResult(None, None, "direct-context:error", error=str(exc)[:300])
+
+    async def probe_direct_view_mode(self, url: str, *, force: bool = False) -> tuple[str, ViewCountResult]:
+        """Find the cheapest working public counter path once per parser instance.
+
+        Order: plain HTTP -> Playwright APIRequestContext -> normal browser page.
+        The direct endpoint may increment the public counter, just like opening the ad page.
+        """
+        if not force and self._direct_view_mode != "unknown":
+            return self._direct_view_mode, ViewCountResult(None, None, f"mode:{self._direct_view_mode}")
+        async with self._direct_mode_lock:
+            if not force and self._direct_view_mode != "unknown":
+                return self._direct_view_mode, ViewCountResult(None, None, f"mode:{self._direct_view_mode}")
+            direct = await self._direct_view_http(url)
+            if direct.views is not None:
+                self._direct_view_mode = "http"
+                return "http", direct
+            context_direct = await self._direct_view_context_request(url)
+            if context_direct.views is not None:
+                self._direct_view_mode = "context"
+                return "context", context_direct
+            self._direct_view_mode = "browser"
+            return "browser", context_direct
+
+    async def fetch_public_view_count_direct(self, url: str, *, mode: str | None = None) -> ViewCountResult:
+        """Fast counter fetch that does not render an ad page when a direct path works."""
+        if not _allowed_url(url) or "/s-anzeige/" not in url:
+            return ViewCountResult(None, None, "invalid-url", error="Нужна публичная ссылка на объявление Kleinanzeigen")
+        chosen = mode or self._direct_view_mode
+        if chosen == "unknown":
+            chosen, probe = await self.probe_direct_view_mode(url)
+            if probe.views is not None:
+                return probe
+        if chosen == "http":
+            return await self._direct_view_http(url)
+        if chosen == "context":
+            return await self._direct_view_context_request(url)
+        return ViewCountResult(None, None, "direct:browser-required")
+
     async def fetch_public_view_count(self, url: str, *, browser_fallback: bool = True, http_fast_path: bool = True) -> ViewCountResult:
         """Read the public view counter without authentication.
 
@@ -938,33 +1073,86 @@ class KleinanzeigenParser:
                     pass
 
     async def fetch_public_view_counts(self, urls: list[str], *, concurrency: int = 6, progress_cb=None) -> dict[str, ViewCountResult]:
-        """Batch view-count fetch with one reusable browser and bounded concurrency."""
-        sem = asyncio.Semaphore(max(1, min(10, concurrency)))
-        results: dict[str, ViewCountResult] = {}
+        """Batch public view counters with a direct-first fast path.
 
+        v2.7.2 probes the public s-vac-inc-get endpoint once. If plain HTTP or a
+        Playwright APIRequestContext works, counters are fetched without rendering ad
+        pages. Only failed counters fall back to the lightweight browser-page method.
+        """
+        if not urls:
+            return {}
+
+        # Preserve order while dropping duplicates.
+        urls = list(dict.fromkeys(urls))
+        results: dict[str, ViewCountResult] = {}
+        total = len(urls)
+
+        mode, probe = await self.probe_direct_view_mode(urls[0])
+        if probe.views is not None:
+            results[urls[0]] = probe
+
+        direct_sem = asyncio.Semaphore(DIRECT_VIEW_CONCURRENCY)
+        done_count = len(results)
+        done_lock = asyncio.Lock()
+
+        async def report_progress():
+            if progress_cb is None:
+                return
+            try:
+                maybe = progress_cb(done_count, total)
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+            except Exception:
+                pass
+
+        async def direct_one(url: str):
+            nonlocal done_count
+            if url in results:
+                return
+            async with direct_sem:
+                vr = await self.fetch_public_view_count_direct(url, mode=mode)
+                results[url] = vr
+            async with done_lock:
+                done_count += 1
+            await report_progress()
+
+        if mode in {"http", "context"}:
+            await asyncio.gather(*(direct_one(url) for url in urls if url not in results))
+        else:
+            # Browser mode: leave all URLs for the fallback pass below.
+            results = {}
+            done_count = 0
+
+        failed_urls = [url for url in urls if results.get(url) is None or results[url].views is None]
+        if not failed_urls:
+            await report_progress()
+            return results
+
+        # Browser fallback is intentionally gentler than direct requests. This is
+        # only used for the minority of URLs that the fast endpoint cannot read.
+        page_sem = asyncio.Semaphore(max(1, min(6, concurrency)))
         global_sem = _global_view_semaphore()
 
-        async def one(url: str):
-            async with sem:
+        async def browser_one(url: str):
+            nonlocal done_count
+            async with page_sem:
                 async with global_sem:
-                    # Category pages never expose the counter, so the batch path
-                    # skips a redundant HTTP detail-page fetch and opens the
-                    # lightweight Playwright page directly.
-                    results[url] = await self.fetch_public_view_count(url, http_fast_path=False)
+                    vr = await self.fetch_public_view_count(url, http_fast_path=False)
+                    results[url] = vr
+            # Direct attempts already incremented progress; in pure browser mode they did not.
+            if mode == "browser":
+                async with done_lock:
+                    done_count += 1
+                await report_progress()
 
-        # Work in chunks so thousands of listings do not create thousands of live tasks.
-        chunk_size = max(20, concurrency * 8)
-        total = len(urls)
-        for i in range(0, total, chunk_size):
-            chunk = urls[i:i + chunk_size]
-            await asyncio.gather(*(one(url) for url in chunk))
-            if progress_cb is not None:
-                try:
-                    maybe = progress_cb(min(total, i + len(chunk)), total)
-                    if asyncio.iscoroutine(maybe):
-                        await maybe
-                except Exception:
-                    pass
+        chunk_size = max(12, concurrency * 5)
+        for i in range(0, len(failed_urls), chunk_size):
+            chunk = failed_urls[i:i + chunk_size]
+            await asyncio.gather(*(browser_one(url) for url in chunk))
+        if mode != "browser":
+            # Progress was already counted during direct attempts; final fallback only
+            # changes quality, not the number of processed URLs.
+            await report_progress()
         return results
 
     async def check_listing_active(self, url: str) -> bool | None:

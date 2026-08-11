@@ -1,23 +1,36 @@
-# Kleinanzeigen Parser Bot v2.7.1 — Stable Inline Views
+# Kleinanzeigen Parser Bot v2.7.2 — Direct Views Turbo
 
-This patch keeps inline public view counters from v2.7.0 and makes category scanning gentler when Kleinanzeigen temporarily refuses requests.
+This version tests and enables a faster public view-counter path.
 
-## Changes
+## What changed
 
-- Inline views stay enabled during the normal category scan.
-- Default view concurrency reduced from 8 to 5; global detail-page cap reduced from 10 to 6.
-- View cache increased to 30 minutes, reducing repeat ad-page opens and extra view increments.
-- Category page delay defaults to 1.0s.
-- HTTP 403/429 gets a bounded cooldown + retry (no CAPTCHA/challenge/protection bypass).
-- If the site still refuses a category, already collected rows are preserved and exported instead of failing the whole job.
-- Interrupted categories are not marked as fully seeded, so a later run can try again.
+- The parser first tries the public counter endpoint used by the Kleinanzeigen ad page (`s-vac-inc-get.json?adId=...`) directly.
+- If plain HTTP is accepted, no ad page is rendered for that counter.
+- If plain HTTP is not accepted, the parser tries Playwright's shared `APIRequestContext` (same browser session/cookies, but still without rendering a page).
+- Only counters that cannot be read directly fall back to the lightweight Chromium page method from v2.7.1.
+- The working direct mode is probed once per parser instance and then reused for the rest of the scan.
+- Direct counter requests run concurrently; browser fallback remains more conservative.
+- Existing 30-minute view cache remains active, so recently checked listings are not requested again.
+- The Telegram button is now `⚡ Тест быстрых просмотров`: it compares direct-counter time against Chromium time on one ad.
+
+## Important
+
+Opening an ad or calling the counter endpoint may increment the public counter. The existing cache limits repeated checks. No CAPTCHA/access-control bypass is implemented.
 
 ## Optional Railway variables
 
 ```env
+# Fast direct counter requests
+DIRECT_VIEW_CONCURRENCY=8
+
+# Browser fallback limits
 VIEW_COUNT_CONCURRENCY=5
 VIEW_COUNT_GLOBAL_CONCURRENCY=6
+
+# Reuse a recent counter instead of checking again
 VIEW_COUNT_CACHE_TTL_SECONDS=1800
+
+# Category scan stability
 PAGE_DELAY_SECONDS=1.0
 CATEGORY_HTTP_RETRIES=3
 CATEGORY_403_BACKOFF_SECONDS=10
