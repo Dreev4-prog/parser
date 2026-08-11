@@ -1,46 +1,46 @@
-# Kleinanzeigen Parser v1
+# Kleinanzeigen Parser v1.1
 
-Minimal foundation for collecting listings from a public Kleinanzeigen category page.
+Category parser foundation for public Kleinanzeigen pages.
 
-Stores:
+Collects:
 - category
 - title
 - price
 - listing URL
 - external listing ID
-- view count snapshots
+- view-count snapshots when the public page exposes them
 - first/last seen timestamps
 
-## Setup
+## What changed in v1.1
+
+v1.0 looked only for visible `Aufrufe/Besucher` text in the static HTML.
+
+v1.1 tries, in order:
+1. public static HTML and embedded state/JSON;
+2. a real headless Chromium page with JavaScript enabled;
+3. JSON responses requested by that public page.
+
+It does **not** bypass login, CAPTCHA, bot protection, or other access controls. If Kleinanzeigen does not expose a view count publicly, the result remains `views=None` and the log says `source=...not-exposed`.
+
+## Railway
+
+This version includes a Dockerfile based on the official Playwright Python image so Chromium and its Linux dependencies are available on Railway.
+
+Keep your current Railway Custom Start Command, for example:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
+python main.py --category "Konsolen" --url "https://www.kleinanzeigen.de/s-konsolen/c279" --max-items 20
 ```
 
-## Run
+After uploading v1.1 to GitHub, Railway should automatically rebuild using the Dockerfile.
 
-Copy a public Kleinanzeigen category URL from your browser, then:
+## Environment variables
 
-```bash
-python main.py \
-  --category "Elektronik" \
-  --url "PASTE_PUBLIC_CATEGORY_URL_HERE" \
-  --max-items 20
-```
+- `VIEW_MODE=auto` — first HTTP, then Chromium fallback (recommended)
+- `VIEW_MODE=http` — HTTP only
+- `VIEW_MODE=browser` — Chromium only
+- `REQUEST_DELAY_SECONDS=2.0` — delay before opening each listing
+- `BROWSER_WAIT_MS=2500` — wait after DOM load for JS/network data
+- `BROWSER_TIMEOUT_MS=20000` — page navigation timeout
 
-The first version uses SQLite so it is easy to test locally. The model is already compatible with migrating to PostgreSQL later by changing DATABASE_URL and installing asyncpg.
-
-## Database structure
-
-`listings` keeps the current ad data.
-
-`view_snapshots` stores every measured view count. This lets later versions calculate +views in 24h / 3 days without changing the schema.
-
-## Notes
-
-The HTML selectors are intentionally isolated in `parser.py`. If Kleinanzeigen changes markup, only this file should need adjustment.
-
-Use a conservative request interval and respect the site's rules and access controls. This project does not include CAPTCHA bypassing, login automation, proxy rotation, or anti-bot evasion.
+Use conservative request intervals and respect the site's rules and access controls.

@@ -51,19 +51,34 @@ async def run(category: str, url: str, max_items: int) -> None:
     try:
         items = await parser.parse_category_page(url)
         print(f"Found {len(items)} listings on category page")
+        print(f"Opening up to {min(len(items), max_items)} listings for view count...")
 
+        with_views = 0
         for item in items[:max_items]:
             listing, created = await upsert_listing(category, item)
-            views = await parser.parse_views(item.url)
-            await save_views(listing.id, views)
+            view_result = await parser.parse_views(item.url)
+            await save_views(listing.id, view_result.views)
+            if view_result.views is not None:
+                with_views += 1
             marker = "NEW" if created else "UPD"
-            print(f"[{marker}] {item.title} | {item.price_text or '-'} | views={views} | {item.url}")
+            print(
+                f"[{marker}] {item.title} | {item.price_text or '-'} | "
+                f"views={view_result.views} | source={view_result.source} | {item.url}"
+            )
+
+        print(f"Done. View count found for {with_views}/{min(len(items), max_items)} opened listings.")
+        if max_items and with_views == 0:
+            print(
+                "NOTE: Kleinanzeigen may not expose public view counts for these listings. "
+                "v1.1 checks static HTML, embedded JSON, rendered JavaScript DOM and JSON network responses; "
+                "it does not bypass login, CAPTCHA or access controls."
+            )
     finally:
         await parser.close()
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Kleinanzeigen category parser v1")
+    ap = argparse.ArgumentParser(description="Kleinanzeigen category parser v1.1")
     ap.add_argument("--category", required=True, help="Friendly category name")
     ap.add_argument("--url", required=True, help="Public Kleinanzeigen category/search URL")
     ap.add_argument("--max-items", type=int, default=20, help="Max listings to open for view count")
