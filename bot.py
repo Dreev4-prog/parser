@@ -41,6 +41,7 @@ from parser import (
     STOP_AFTER_EMPTY_TODAY_PAGES,
     KleinanzeigenParser,
     ParsedListing,
+    ViewCountResult,
     is_today_text,
     page_url,
 )
@@ -98,6 +99,7 @@ PAGE_LIMIT_BASE_ETA_SECONDS = {25: 60, 50: 120, 100: 180}
 class SettingsInput(StatesGroup):
     include_words = State()
     exclude_words = State()
+    view_test_url = State()
 
 
 def allowed(user_id: int) -> bool:
@@ -110,6 +112,7 @@ def main_keyboard(selected_count: int = 0) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"🗂 Категории ({selected_count})", callback_data="groups")],
         [InlineKeyboardButton(text="⚙️ Настройки парсинга", callback_data="settings")],
         [InlineKeyboardButton(text="📦 Получить результат", callback_data="export_smart")],
+        [InlineKeyboardButton(text="👁 Тест просмотров", callback_data="view_test")],
         [InlineKeyboardButton(text="📊 База", callback_data="stats")],
         [InlineKeyboardButton(text="📋 Что выбрано", callback_data="selected")],
     ])
@@ -1523,7 +1526,7 @@ async def start(message: Message, state: FSMContext) -> None:
         return
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>Kleinanzeigen Parser v2.6.2</b>\n\n"
+        "<b>Kleinanzeigen Parser v2.6.5</b>\n\n"
         "Выбери категории и нажми «Начать парсинг». Прогресс будет обновляться автоматически, а после завершения бот сразу пришлёт готовый файл.\n"
         "После сбора можешь менять режим выдачи без повторного парсинга.\n\n"
         "🆕 новые · 💎 уникальные · 🔥 частые · ⚡ быстро исчезающие · 💰 ниже рынка · 📉 снижение цены.",
@@ -1538,7 +1541,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>Kleinanzeigen Parser v2.6.2</b>\n\nВыбери действие:", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("<b>Kleinanzeigen Parser v2.6.5</b>\n\nВыбери действие:", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == "post_settings")
@@ -1559,7 +1562,7 @@ async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
     await callback.message.answer(
-        "<b>Kleinanzeigen Parser v2.6.2</b>\n\nВыбери действие:",
+        "<b>Kleinanzeigen Parser v2.6.5</b>\n\nВыбери действие:",
         reply_markup=main_keyboard(len(selected)),
         parse_mode=ParseMode.HTML,
     )
@@ -1722,6 +1725,66 @@ async def reset_settings(callback: CallbackQuery) -> None:
     s = await reset_user_settings(callback.from_user.id)
     await callback.answer("Настройки сброшены")
     await callback.message.edit_text(settings_text(s), reply_markup=settings_keyboard(s), parse_mode=ParseMode.HTML)
+
+
+@dp.callback_query(F.data == "view_test")
+async def view_test(callback: CallbackQuery, state: FSMContext) -> None:
+    if not allowed(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(SettingsInput.view_test_url)
+    await callback.answer()
+    await callback.message.answer(
+        "<b>👁 Тест публичных просмотров</b>\n\n"
+        "Пришли одну ссылку на обычное объявление Kleinanzeigen. "
+        "Бот откроет её без авторизации через Chromium и попробует прочитать публичный счётчик просмотров.\n\n"
+        "Например:\n<code>https://www.kleinanzeigen.de/s-anzeige/.../3482322145-245-2351</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.message(SettingsInput.view_test_url)
+async def run_view_test(message: Message, state: FSMContext) -> None:
+    if not allowed(message.from_user.id):
+        await state.clear()
+        await message.answer("Нет доступа.")
+        return
+    url = (message.text or "").strip()
+    if not (url.startswith("https://") and "kleinanzeigen.de/s-anzeige/" in url):
+        await message.answer("⚠️ Пришли именно публичную ссылку на объявление Kleinanzeigen или нажми /start для выхода.")
+        return
+
+    await state.clear()
+    status = await message.answer(
+        "⏳ <b>Открываю объявление в Chromium…</b>\n\n"
+        "Жду появления публичного счётчика 👁. Обычно тест занимает несколько секунд.",
+        parse_mode=ParseMode.HTML,
+    )
+    parser = KleinanzeigenParser()
+    try:
+        result = await parser.fetch_public_view_count(url)
+    finally:
+        await parser.close()
+
+    selected = await get_selected(message.from_user.id)
+    if result.views is not None:
+        await status.edit_text(
+            "✅ <b>Просмотры считались!</b>\n\n"
+            f"👁 Просмотров: <b>{result.views}</b>\n"
+            f"Источник: <code>{html.escape(result.source)}</code>\n\n"
+            "Если это число совпадает с сайтом, следующим шагом можно подключать массовый сбор и историю прироста просмотров.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard(len(selected)),
+        )
+    else:
+        details = f"\nОшибка: <code>{html.escape(result.error)}</code>" if result.error else ""
+        await status.edit_text(
+            "❌ <b>Счётчик пока не считался</b>\n\n"
+            f"Результат: <code>{html.escape(result.source)}</code>{details}\n\n"
+            "Это тестовый режим: по этому результату можно будет точно понять, что поправить для Railway.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard(len(selected)),
+        )
 
 
 @dp.callback_query(F.data == "groups")
