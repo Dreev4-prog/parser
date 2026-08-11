@@ -74,6 +74,24 @@ async def init_db() -> None:
         if columns and "views_checked_at" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN views_checked_at TIMESTAMP"))
 
+        # v3.0 product-recognition columns. Kept as simple additive migrations so
+        # existing Railway SQLite/PostgreSQL data can be reused in-place.
+        identity_columns = {
+            "identity_key": "VARCHAR(500)",
+            "identity_label": "VARCHAR(500)",
+            "identity_brand": "VARCHAR(80)",
+            "identity_model": "VARCHAR(180)",
+            "identity_variant": "VARCHAR(180)",
+            "identity_product_type": "VARCHAR(80)",
+            "identity_storage_gb": "INTEGER",
+            "identity_ram_gb": "INTEGER",
+            "identity_specs": "VARCHAR(300)",
+            "identity_confidence": "INTEGER",
+        }
+        for column_name, sql_type in identity_columns.items():
+            if columns and column_name not in columns:
+                await conn.execute(text(f"ALTER TABLE listings ADD COLUMN {column_name} {sql_type}"))
+
         settings_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "user_settings"))
         if settings_columns and "page_limit" not in settings_columns:
             await conn.execute(text("ALTER TABLE user_settings ADD COLUMN page_limit INTEGER DEFAULT 100"))

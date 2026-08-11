@@ -28,6 +28,19 @@ class Listing(Base):
     view_count: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     views_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
 
+    # v3.0 deterministic product identity. These columns are intentionally
+    # denormalized on the listing so analytics do not have to re-parse titles.
+    identity_key: Mapped[str | None] = mapped_column(String(500), nullable=True, index=True)
+    identity_label: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    identity_brand: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    identity_model: Mapped[str | None] = mapped_column(String(180), nullable=True, index=True)
+    identity_variant: Mapped[str | None] = mapped_column(String(180), nullable=True)
+    identity_product_type: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    identity_storage_gb: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    identity_ram_gb: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    identity_specs: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    identity_confidence: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
 
 class PriceHistory(Base):
     __tablename__ = "price_history"
@@ -152,3 +165,15 @@ class ScanListing(Base):
     external_id: Mapped[str] = mapped_column(String(64), index=True)
     initial_view_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     captured_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ScanViewHistory(Base):
+    """Per-user-scan view snapshots used for 1/3/6/24h velocity analytics."""
+
+    __tablename__ = "scan_view_history"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scan_id: Mapped[int] = mapped_column(index=True)
+    external_id: Mapped[str] = mapped_column(String(64), index=True)
+    view_count: Mapped[int] = mapped_column(Integer)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)

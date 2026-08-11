@@ -10,6 +10,7 @@ from typing import Iterable
 from zoneinfo import ZoneInfo
 
 from models import Listing, PriceHistory
+from product_identity import recognize_product
 
 BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -241,6 +242,14 @@ def _is_modelish(token: str) -> bool:
 
 
 def product_family(title: str) -> ProductFamily:
+    # v3.0: use the structured recognizer first. This preserves price-relevant
+    # differences such as PS5 Slim Disc vs Digital or iPhone storage sizes.
+    identity = recognize_product(title)
+    if identity.key and identity.confidence >= 70:
+        return ProductFamily(identity.key, identity.confidence)
+
+    # Conservative fallback for categories/models not covered by the explicit
+    # recognizer yet. Unknown titles are not forced into a fake strong identity.
     tokens = _identity_tokens(title)
     if not tokens:
         return ProductFamily("", 0)
@@ -432,8 +441,10 @@ def frequent_rows(rows: list[Listing], min_count: int = 3) -> list[FrequentRow]:
         family = product_family(items[0].title)
         prices = [x.price_eur for x in items if x.price_eur is not None and x.price_eur > 0]
         newest = max(items, key=posted_datetime)
+        identity = recognize_product(newest.title, newest.category)
+        readable_key = identity.label if identity.key and identity.confidence >= 70 else key
         output.append(FrequentRow(
-            product_key=key,
+            product_key=readable_key,
             example_title=newest.title,
             example_price_text=newest.price_text or (f"{newest.price_eur} €" if newest.price_eur is not None else ""),
             count=len(items),

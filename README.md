@@ -1,76 +1,94 @@
-# Kleinanzeigen Parser Bot v2.8.3
+# Kleinanzeigen Parser Bot v3.0.0
 
+v3.0 adds deterministic **product recognition** on top of the fast direct public view-counter, saved scans, Moscow-date search and view-velocity history.
 
-This version tests and enables a faster public view-counter path.
+## v3.0 — Product Identity
 
-## What changed
+Every parsed listing is now classified locally (no external AI/API call) into structured fields when the title is clear enough:
 
-- The parser first tries the public counter endpoint used by the Kleinanzeigen ad page (`s-vac-inc-get.json?adId=...`) directly.
-- If plain HTTP is accepted, no ad page is rendered for that counter.
-- If plain HTTP is not accepted, the parser tries Playwright's shared `APIRequestContext` (same browser session/cookies, but still without rendering a page).
-- Only counters that cannot be read directly fall back to the lightweight Chromium page method from v2.8.0.
-- The working direct mode is probed once per parser instance and then reused for the rest of the scan.
-- Direct counter requests run concurrently; browser fallback remains more conservative.
-- Existing 30-minute view cache remains active, so recently checked listings are not requested again.
-- The Telegram button is now `⚡ Тест быстрых просмотров`: it compares direct-counter time against Chromium time on one ad.
+- brand
+- product type
+- model
+- important variant
+- storage
+- RAM where relevant
+- model-defining specs such as MacBook display/chip or Apple TV generation
+- confidence score
+- stable `identity_key` used by Smart Analytics
 
-## Important
+High-confidence rules currently cover the most useful resale/electronics families, including:
 
-Opening an ad or calling the counter endpoint may increment the public counter. The existing cache limits repeated checks. No CAPTCHA/access-control bypass is implemented.
+- Apple: iPhone, iPad, MacBook Air/Pro, Mac mini, iMac, Apple TV, AirPods
+- Sony: PS5/PS4 variants, PlayStation Portal, DualSense / DualSense Edge
+- Nintendo Switch / Switch 2
+- Xbox Series / One
+- Steam Deck, Meta Quest
+- Samsung Galaxy, Google Pixel
+- NVIDIA RTX/GTX and AMD RX GPUs
+- AMD Ryzen and Intel Core CPUs
+- conservative generic brand/model fallback for other products
 
-## Optional Railway variables
+Examples that stay separate:
 
-```env
-# Fast direct counter requests
-DIRECT_VIEW_CONCURRENCY=8
+- `PS5 Slim Disc 1TB` vs `PS5 Slim Digital 1TB`
+- `iPhone 15 Pro Max 256GB` vs `iPhone 15 Pro 128GB`
+- `MacBook Pro 14 M3 Pro 18GB/512GB` vs another RAM/storage configuration
+- `Apple TV 4K Gen 3 128GB Ethernet` vs 64GB/older generation
 
-# Browser fallback limits
-VIEW_COUNT_CONCURRENCY=5
-VIEW_COUNT_GLOBAL_CONCURRENCY=6
+Unknown or weak titles are **not forced** into a strong group. Smart market/frequency analytics use the structured identity only when confidence is high enough, then fall back conservatively.
 
-# Reuse a recent counter instead of checking again
-VIEW_COUNT_CACHE_TTL_SECONDS=1800
+## Telegram UI
 
-# Category scan stability
-PAGE_DELAY_SECONDS=1.0
-CATEGORY_HTTP_RETRIES=3
-CATEGORY_403_BACKOFF_SECONDS=10
-CATEGORY_RETRY_JITTER_SECONDS=2
-```
+Saved scan cards now include `🧠 Модели` / `🧠 Распознанные модели`:
 
-Start command remains:
+- recognition coverage for the scan
+- number of distinct recognized product configurations
+- grouped model/configuration
+- listing count
+- median price
+- maximum public views
+- recognition confidence
+
+Top-by-views and View Velocity screens also show the normalized identity when available.
+
+## CSV
+
+Normal listing CSVs now include:
+
+- `🧠 Распознанный товар`
+- `Бренд`
+- `Модель`
+- `Версия`
+- `Память, GB`
+- `RAM, GB`
+- `Точность распознавания, %`
+
+Existing title/price/views/date/link fields are preserved.
+
+## Existing databases
+
+`init_db()` adds the v3.0 identity columns automatically. On startup, listings collected by older versions are backfilled locally from their existing titles, so saved v2.8/v2.9 scans can immediately benefit from the new model view.
+
+## Existing features preserved
+
+- fast direct public view counter with browser fallback
+- promoted/Top/Highlight listing filter
+- exact target-date scan in Moscow time
+- 25 / 50 / 100 page depth
+- multi-user queue and shared category cache
+- saved `Мои сканы`
+- manual view refresh
+- view history and 1/3/6/24h velocity
+- CSV export and Smart Analytics modes
+
+## Railway
+
+No new required variables. Existing variables remain valid.
+
+Start command:
 
 ```bash
 python bot.py
 ```
 
-
-## v2.8.0 — User Scan Hub
-
-- Новый простой главный экран: Популярное / Новый скан / Мои сканы / Категории / Настройки.
-- Каждый запуск сохраняется как карточка в `Мои сканы`.
-- Снимок объявлений и исходных просмотров фиксируется в момент завершения.
-- Из карточки можно обновить просмотры, увидеть лидеров и рост, скачать файл именно этого скана или повторить его.
-- Рост считается относительно просмотров на момент завершения скана.
-- Текущий быстрый direct-view механизм v2.7.2 сохранён без изменений.
-
-> Важно: при SQLite история живёт в локальном файле контейнера. Для гарантированного хранения между redeploy/restart перед публичным запуском рекомендуется PostgreSQL.
-
-## v2.8.2 — фильтр рекламных/продвигаемых объявлений
-
-По умолчанию карточки с явными признаками платного продвижения Kleinanzeigen исключаются до сбора просмотров и записи в БД. В v2.8.2 фильтр стал консервативным: он проверяет точные классы wrapper-а `badge-topad`, `is-topad`, `is-highlight` и явные рекламные badge-метки, не сканируя обычные классы/родителей по словам `highlight` или `sponsor`.
-
-Важно: фильтр не использует правило «много просмотров за короткое время», поэтому настоящее свежее вирусное объявление не отбрасывается только из-за высокого счётчика.
-
-Переменная Railway (обычно менять не нужно):
-`FILTER_PROMOTED_LISTINGS=1` — фильтр включён (по умолчанию). Поставить `0`, чтобы временно вернуть продвигаемые карточки.
-
-
-## v2.8.3 — поиск по точной дате (МСК)
-- «Новый скан» сначала спрашивает конкретную дату.
-- Можно отправить день текущего месяца (`12`) или полную дату (`10.08.2026`).
-- Все пользовательские даты/время показываются по Europe/Moscow (UTC+3).
-- `Heute/Gestern + HH:MM` Kleinanzeigen переводятся из немецкого времени в московскую календарную дату.
-- Скан идёт по выдаче до выбранного дня и останавливается после того, как прошёл его.
-- Карточка «Мои сканы» хранит выбранную дату; повтор скана использует ту же дату.
-- CSV содержит отдельную колонку `Дата (МСК)` и исходное отображение даты Kleinanzeigen.
+The existing Playwright Docker image/setup remains unchanged for browser fallback.

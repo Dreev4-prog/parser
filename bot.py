@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import shutil
+import statistics
 import tempfile
 import time
 import uuid
@@ -35,7 +36,8 @@ from filters import (
     sort_rows,
     unique_rows,
 )
-from models import CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing, SelectedCategory, UserScan, UserSettings, ViewHistory
+from models import CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing, ScanViewHistory, SelectedCategory, UserScan, UserSettings, ViewHistory
+from product_identity import TYPE_DISPLAY, ProductIdentity, recognize_product
 from parser import (
     MAX_PAGES_PER_CATEGORY,
     PAGE_DELAY_SECONDS,
@@ -143,8 +145,9 @@ def post_scan_keyboard(scan_id: int | None = None) -> InlineKeyboardMarkup:
         ])
         rows.append([
             InlineKeyboardButton(text="🔥 Топ", callback_data=f"scantop:{scan_id}"),
-            InlineKeyboardButton(text="🚀 Рост", callback_data=f"scangrowth:{scan_id}"),
+            InlineKeyboardButton(text="🚀 Динамика", callback_data=f"scangrowth:{scan_id}:1"),
         ])
+        rows.append([InlineKeyboardButton(text="🧠 Распознанные модели", callback_data=f"scanproducts:{scan_id}")])
     else:
         rows.append([InlineKeyboardButton(text="🔄 Запустить снова", callback_data="start_scan")])
     rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="post_home")])
@@ -155,11 +158,27 @@ def scan_detail_keyboard(scan_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👁 Обновить просмотры", callback_data=f"scanviews:{scan_id}"),
          InlineKeyboardButton(text="🔄 Пересканировать", callback_data=f"scanrepeat:{scan_id}")],
-        [InlineKeyboardButton(text="🔥 Самые просматриваемые", callback_data=f"scantop:{scan_id}")],
-        [InlineKeyboardButton(text="🚀 Сильнее всего растут", callback_data=f"scangrowth:{scan_id}")],
+        [InlineKeyboardButton(text="🔥 Самые просматриваемые", callback_data=f"scantop:{scan_id}"),
+         InlineKeyboardButton(text="🧠 Модели", callback_data=f"scanproducts:{scan_id}")],
+        [InlineKeyboardButton(text="🚀 Динамика", callback_data=f"scangrowth:{scan_id}:1"),
+         InlineKeyboardButton(text="🕘 История", callback_data=f"scanhistory:{scan_id}")],
         [InlineKeyboardButton(text="📄 Файл этого скана", callback_data=f"scanexport:{scan_id}")],
         [InlineKeyboardButton(text="⬅️ Мои сканы", callback_data="my_scans"),
          InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
+    ])
+
+
+def growth_period_keyboard(scan_id: int, active_hours: int = 1) -> InlineKeyboardMarkup:
+    def b(hours: int) -> InlineKeyboardButton:
+        label = f"{hours}ч"
+        if hours == active_hours:
+            label = "✅ " + label
+        return InlineKeyboardButton(text=label, callback_data=f"scangrowth:{scan_id}:{hours}")
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [b(1), b(3), b(6), b(24)],
+        [InlineKeyboardButton(text="👁 Обновить сейчас", callback_data=f"scanviews:{scan_id}")],
+        [InlineKeyboardButton(text="⬅️ К скану", callback_data=f"scan:{scan_id}")],
     ])
 
 
@@ -392,22 +411,146 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
                     initial_view_count=row.view_count,
                     captured_at=now,
                 ))
+                if row.view_count is not None:
+                    session.add(ScanViewHistory(
+                        scan_id=scan.id,
+                        external_id=row.external_id,
+                        view_count=int(row.view_count),
+                        recorded_at=now,
+                    ))
             await session.commit()
 
 
-async def update_scan_view_refresh(scan_id: int) -> None:
+async def update_scan_view_refresh(scan_id: int) -> int:
+    """Store one complete view observation round for a saved scan."""
+    now = datetime.utcnow()
+    async with db_write_lock:
+        async with SessionLocal() as session:
+            scan = await session.get(UserScan, scan_id)
+            if scan is None:
+                return 0
+            result = await session.execute(
+                select(Listing.external_id, Listing.view_count)
+                .join(ScanListing, Listing.external_id == ScanListing.external_id)
+                .where(ScanListing.scan_id == scan_id)
+            )
+            values = list(result.all())
+            recorded = 0
+            for external_id, view_count in values:
+                if view_count is None:
+                    continue
+                session.add(ScanViewHistory(
+                    scan_id=scan_id,
+                    external_id=external_id,
+                    view_count=int(view_count),
+                    recorded_at=now,
+                ))
+                recorded += 1
+            scan.viewed_count = recorded
+            scan.last_view_refresh_at = now
+            await session.commit()
+            return recorded
+
+
+async def get_scan_history_rounds(scan_id: int, limit: int = 12) -> list[tuple[datetime, int, int]]:
+    """Return observation rounds, including v2.8 scan snapshots as a baseline."""
     async with SessionLocal() as session:
-        scan = await session.get(UserScan, scan_id)
-        if scan is None:
-            return
-        pairs = await session.execute(
-            select(Listing.view_count).join(ScanListing, Listing.external_id == ScanListing.external_id)
-            .where(ScanListing.scan_id == scan_id)
+        live_result = await session.execute(
+            select(
+                ScanViewHistory.recorded_at,
+                func.count(ScanViewHistory.id),
+                func.sum(ScanViewHistory.view_count),
+            )
+            .where(ScanViewHistory.scan_id == scan_id)
+            .group_by(ScanViewHistory.recorded_at)
         )
-        values = [v for v in pairs.scalars().all()]
-        scan.viewed_count = sum(1 for v in values if v is not None)
-        scan.last_view_refresh_at = datetime.utcnow()
-        await session.commit()
+        baseline_result = await session.execute(
+            select(
+                ScanListing.captured_at,
+                func.count(ScanListing.id),
+                func.sum(ScanListing.initial_view_count),
+            )
+            .where(
+                ScanListing.scan_id == scan_id,
+                ScanListing.initial_view_count.is_not(None),
+            )
+            .group_by(ScanListing.captured_at)
+        )
+
+    merged: dict[datetime, tuple[int, int]] = {}
+    for dt, count, total in baseline_result.all():
+        merged[dt] = (int(count or 0), int(total or 0))
+    # Real v2.9 rounds win on identical timestamps.
+    for dt, count, total in live_result.all():
+        merged[dt] = (int(count or 0), int(total or 0))
+    ordered = sorted(merged.items(), key=lambda item: item[0], reverse=True)[:limit]
+    return [(dt, count, total) for dt, (count, total) in ordered]
+
+
+async def get_scan_growth_rows(scan_id: int, period_hours: int) -> tuple[list[tuple[float, int, float, int, Listing]], int]:
+    """Calculate view velocity from the observation points of one saved scan."""
+    period_hours = period_hours if period_hours in {1, 3, 6, 24} else 1
+    pairs = await get_scan_rows(scan_id)
+    listings = {listing.external_id: listing for listing, _ in pairs}
+    if not listings:
+        return [], 0
+
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(
+                ScanViewHistory.external_id,
+                ScanViewHistory.view_count,
+                ScanViewHistory.recorded_at,
+            )
+            .where(
+                ScanViewHistory.scan_id == scan_id,
+                ScanViewHistory.external_id.in_(list(listings)),
+            )
+            .order_by(ScanViewHistory.external_id, ScanViewHistory.recorded_at)
+        )
+        points = list(result.all())
+
+    # The v2.8 ScanListing snapshot is a valid baseline, so scans created before
+    # v2.9 become useful after just one refresh instead of needing two.
+    by_id: dict[str, list[tuple[datetime, int]]] = {}
+    rounds: set[datetime] = set()
+    for listing, snap in pairs:
+        if snap.initial_view_count is not None:
+            by_id.setdefault(listing.external_id, []).append((snap.captured_at, int(snap.initial_view_count)))
+            rounds.add(snap.captured_at)
+    for external_id, view_count, recorded_at in points:
+        series = by_id.setdefault(external_id, [])
+        point = (recorded_at, int(view_count))
+        if point not in series:
+            series.append(point)
+        rounds.add(recorded_at)
+    for series in by_id.values():
+        series.sort(key=lambda point: point[0])
+
+    growth: list[tuple[float, int, float, int, Listing]] = []
+    for external_id, series in by_id.items():
+        if len(series) < 2:
+            continue
+        current_at, current_views = series[-1]
+        target_at = current_at - timedelta(hours=period_hours)
+        before = [point for point in series[:-1] if point[0] <= target_at]
+        if before:
+            base_at, base_views = before[-1]
+        else:
+            base_at, base_views = series[0]
+        elapsed_hours = (current_at - base_at).total_seconds() / 3600
+        if elapsed_hours < (2 / 60):
+            continue
+        delta = current_views - base_views
+        if delta <= 0:
+            continue
+        listing = listings.get(external_id)
+        if listing is None:
+            continue
+        growth.append((delta / elapsed_hours, delta, elapsed_hours, current_views, listing))
+
+    growth.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return growth, len(rounds)
 
 
 def my_scans_keyboard(scans: list[UserScan]) -> InlineKeyboardMarkup:
@@ -473,6 +616,49 @@ async def clear_selected(user_id: int) -> None:
         await session.commit()
 
 
+def _identity_kwargs(title: str, category: str) -> tuple[ProductIdentity, dict]:
+    identity = recognize_product(title, category)
+    values = {
+        "identity_key": identity.key or None,
+        "identity_label": identity.label or None,
+        "identity_brand": identity.brand or None,
+        "identity_model": identity.model or None,
+        "identity_variant": identity.variant or None,
+        "identity_product_type": identity.product_type or None,
+        "identity_storage_gb": identity.storage_gb,
+        "identity_ram_gb": identity.ram_gb,
+        "identity_specs": identity.specs or None,
+        "identity_confidence": identity.confidence,
+    }
+    return identity, values
+
+
+def _apply_identity(row: Listing, title: str, category: str) -> ProductIdentity:
+    identity, values = _identity_kwargs(title, category)
+    for field, value in values.items():
+        setattr(row, field, value)
+    return identity
+
+
+def _identity_display(row: Listing) -> str:
+    if (row.identity_confidence or 0) >= 70 and row.identity_label:
+        return row.identity_label
+    return row.title
+
+
+async def backfill_product_identities() -> int:
+    """Fill v3.0 identity fields for listings collected by older versions."""
+    async with db_write_lock:
+        async with SessionLocal() as session:
+            result = await session.execute(select(Listing).where(Listing.identity_confidence.is_(None)))
+            rows = list(result.scalars().all())
+            for row in rows:
+                _apply_identity(row, row.title, row.category)
+            if rows:
+                await session.commit()
+            return len(rows)
+
+
 async def upsert_page_items(
     category_key: str, category_name: str, items: list[ParsedListing]
 ) -> tuple[list[ParsedListing], int, int]:
@@ -489,12 +675,14 @@ async def upsert_page_items(
         for external_id, item in unique.items():
             row = existing.get(external_id)
             if row is None:
+                _identity, identity_values = _identity_kwargs(item.title, category_name)
                 session.add(Listing(
                     external_id=item.external_id, category_key=category_key, category=category_name,
                     title=item.title, price_text=item.price_text, price_eur=item.price_eur,
                     posted_text=item.posted_text, posted_date_msk=(posted_date_moscow(item.posted_text).isoformat() if posted_date_moscow(item.posted_text) else None),
                     url=item.url, first_seen_at=now, last_seen_at=now,
                     is_active=True, disappeared_at=None,
+                    **identity_values,
                 ))
                 if item.price_text:
                     session.add(PriceHistory(
@@ -524,6 +712,7 @@ async def upsert_page_items(
                 row.category_key = category_key
                 row.category = category_name
                 row.title = item.title
+                _apply_identity(row, item.title, category_name)
                 row.posted_text = item.posted_text
                 parsed_day = posted_date_moscow(item.posted_text)
                 row.posted_date_msk = parsed_day.isoformat() if parsed_day else row.posted_date_msk
@@ -632,10 +821,19 @@ def write_listing_csv(rows: list[Listing], mode: str) -> Path:
     now = datetime.now(MOSCOW)
     path, writer, f = _temp_csv(f"kleinanzeigen_{mode}_{now:%Y-%m-%d_%H-%M}.csv")
     try:
-        writer.writerow(["Категория", "Название", "Цена", "Цена, €", "👁 Просмотры", "Дата (МСК)", "Как показано на Kleinanzeigen", "Ссылка"])
+        writer.writerow([
+            "Категория", "Название", "🧠 Распознанный товар", "Бренд", "Модель", "Версия",
+            "Память, GB", "RAM, GB", "Точность распознавания, %",
+            "Цена", "Цена, €", "👁 Просмотры", "Дата (МСК)", "Как показано на Kleinanzeigen", "Ссылка"
+        ])
         for row in rows:
             writer.writerow([
-                row.category, row.title, _price_display(row.price_text, row.price_eur),
+                row.category, row.title, row.identity_label or "", row.identity_brand or "",
+                row.identity_model or "", row.identity_variant or "",
+                row.identity_storage_gb if row.identity_storage_gb is not None else "",
+                row.identity_ram_gb if row.identity_ram_gb is not None else "",
+                row.identity_confidence if row.identity_confidence is not None else "",
+                _price_display(row.price_text, row.price_eur),
                 row.price_eur if row.price_eur is not None else "",
                 row.view_count if row.view_count is not None else "",
                 _date_label(row.posted_date_msk), row.posted_text or "", row.url,
@@ -843,7 +1041,7 @@ async def enrich_page_view_counts(
     return len(targets), updated, failed
 
 
-async def refresh_view_counts(rows: list[Listing], message: Message | BotChatAdapter | None = None) -> tuple[int, int, int]:
+async def refresh_view_counts(rows: list[Listing], message: Message | BotChatAdapter | None = None, *, force: bool = False) -> tuple[int, int, int]:
     """Refresh missing/stale public view counters and persist them.
 
     Returns (requested, updated, failed). Recent counters are reused from the DB.
@@ -854,17 +1052,18 @@ async def refresh_view_counts(rows: list[Listing], message: Message | BotChatAda
     cutoff = datetime.utcnow() - timedelta(seconds=VIEW_COUNT_CACHE_TTL_SECONDS)
     targets = [
         row for row in rows
-        if row.url and (row.views_checked_at is None or row.views_checked_at < cutoff)
+        if row.url and (force or row.views_checked_at is None or row.views_checked_at < cutoff)
     ]
     if not targets:
         return 0, 0, 0
 
     status = None
+    status_note = "свежий запрос" if force else f"кэш {max(1, VIEW_COUNT_CACHE_TTL_SECONDS // 60)} мин."
     if message is not None:
         try:
             status = await message.answer(
                 f"👁 Собираю просмотры для <b>{len(targets)}</b> объявлений…\n"
-                f"⚡ Прямой счётчик + browser fallback · кэш {max(1, VIEW_COUNT_CACHE_TTL_SECONDS // 60)} мин.",
+                f"⚡ Прямой счётчик + browser fallback · {status_note}",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
@@ -876,7 +1075,7 @@ async def refresh_view_counts(rows: list[Listing], message: Message | BotChatAda
                 pct = round(done / total * 100) if total else 100
                 await status.edit_text(
                     f"👁 Собираю просмотры… <b>{done}/{total}</b> ({pct}%)\n"
-                    f"⚡ Прямой счётчик + browser fallback · кэш {max(1, VIEW_COUNT_CACHE_TTL_SECONDS // 60)} мин.",
+                    f"⚡ Прямой счётчик + browser fallback · {status_note}",
                     parse_mode=ParseMode.HTML,
                 )
             except Exception:
@@ -2006,11 +2205,12 @@ async def start(message: Message, state: FSMContext) -> None:
         return
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>🔍 Kleinanzeigen Parser v2.8.3</b>\n\n"
+        "<b>🔍 Kleinanzeigen Parser v3.0.0</b>\n\n"
         "Здесь всё строится вокруг сохранённых сканов:\n"
         "🔥 <b>Популярное сейчас</b> — лидеры по просмотрам\n"
         "🔎 <b>Новый скан</b> — собрать свежие объявления\n"
-        "📊 <b>Мои сканы</b> — вернуться к любому запуску, обновить просмотры и увидеть рост\n\n"
+        "📊 <b>Мои сканы</b> — вернуться к любому запуску, обновить просмотры и увидеть рост\n"
+        "🧠 <b>Распознавание</b> — бот объединяет разные написания одной модели и сохраняет важные версии/память\n\n"
         "После скана результат не теряется: его карточка остаётся в «Мои сканы».",
         reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML,
     )
@@ -2023,7 +2223,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v2.8.3</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v3.0.0</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == "post_settings")
@@ -2044,7 +2244,7 @@ async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
     await callback.message.answer(
-        "<b>🔍 Kleinanzeigen Parser v2.8.3</b>\n\nЧто хочешь посмотреть?",
+        "<b>🔍 Kleinanzeigen Parser v3.0.0</b>\n\nЧто хочешь посмотреть?",
         reply_markup=main_keyboard(len(selected)),
         parse_mode=ParseMode.HTML,
     )
@@ -2291,7 +2491,7 @@ async def run_view_test(message: Message, state: FSMContext) -> None:
         lines += [
             "",
             f"📈 Ускорение на тесте: <b>примерно ×{speedup:.1f}</b>",
-            "✅ Обычный массовый парсинг v2.7.2 уже сначала использует быстрый способ. Chromium включается только для объявлений, где прямой счётчик не сработал.",
+            "✅ Обычный массовый парсинг v3.0.0 уже сначала использует быстрый способ. Chromium включается только для объявлений, где прямой счётчик не сработал.",
         ]
     else:
         lines += [
@@ -2325,8 +2525,10 @@ async def popular_now(callback: CallbackQuery) -> None:
         lines = ["🔥 <b>Популярное сейчас</b>", "", "Лидеры по просмотрам среди свежих собранных объявлений:", ""]
         for i, row in enumerate(top, 1):
             title = html.escape(row.title[:55])
+            identity = html.escape(row.identity_label[:70]) if (row.identity_label and (row.identity_confidence or 0) >= 70) else ""
             price = html.escape(_price_display(row.price_text, row.price_eur))
-            lines.append(f"<b>{i}. {title}</b>\n👁 {row.view_count} · 💶 {price}\n<a href=\"{html.escape(row.url)}\">Открыть объявление</a>")
+            identity_line = f"\n🧠 {identity}" if identity else ""
+            lines.append(f"<b>{i}. {title}</b>{identity_line}\n👁 {row.view_count} · 💶 {price}\n<a href=\"{html.escape(row.url)}\">Открыть объявление</a>")
         lines.append("\n🚀 Скорость роста появится в карточках «Мои сканы» после повторного обновления просмотров.")
         text = "\n\n".join(lines)
     await callback.message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=main_keyboard(len(selected)))
@@ -2357,6 +2559,9 @@ async def render_scan_detail(scan: UserScan) -> str:
     rows = [listing for listing, _ in pairs]
     viewed = sum(1 for row in rows if row.view_count is not None)
     disappeared = sum(1 for row in rows if not row.is_active)
+    recognized = [row for row in rows if (row.identity_confidence or 0) >= 70 and row.identity_key]
+    recognized_models = len({row.identity_key for row in recognized})
+    recognition_pct = round(len(recognized) / len(rows) * 100) if rows else 0
     growers = 0
     total_growth = 0
     for listing, snap in pairs:
@@ -2373,6 +2578,7 @@ async def render_scan_detail(scan: UserScan) -> str:
                 new_since = (await session.execute(select(func.count(Listing.id)).where(
                     Listing.category_key.in_(keys), Listing.first_seen_at > scan.finished_at
                 ))).scalar_one()
+    history_rounds = await get_scan_history_rounds(scan.id, limit=50)
     status_label = {"done": "✅ завершён", "running": "🔄 идёт", "queued": "⏳ ожидает", "cancelled": "❌ отменён", "failed": "❌ ошибка"}.get(scan.status, scan.status)
     lines = [
         f"<b>📊 {html.escape(scan.title)}</b>",
@@ -2385,13 +2591,15 @@ async def render_scan_detail(scan: UserScan) -> str:
         "",
         f"📦 В снимке: <b>{len(rows)}</b> объявлений",
         f"👁 С просмотрами: <b>{viewed}</b>",
+        f"🧠 Распознано уверенно: <b>{len(recognized)}</b> ({recognition_pct}%) · моделей: <b>{recognized_models}</b>",
         f"🚀 Выросли после скана: <b>{growers}</b>" + (f" · суммарно +{total_growth}" if total_growth else ""),
         f"🆕 Новых после скана, уже найденных последующими сканами: <b>{new_since}</b>",
         f"❌ Исчезли: <b>{disappeared}</b>",
+        f"📈 Точек наблюдения: <b>{len(history_rounds)}</b>",
     ]
     if scan.last_view_refresh_at:
         lines += ["", f"Последнее обновление просмотров: <b>{_moscow_text(scan.last_view_refresh_at)} МСК</b>"]
-    lines += ["", "💡 Нажми «Обновить просмотры» через час-два — бот сравнит новые значения с моментом завершения этого скана."]
+    lines += ["", "💡 Обновляй просмотры позже и открывай «Динамика»: доступны интервалы 1 / 3 / 6 / 24 часа."]
     return "\n".join(lines)
 
 
@@ -2418,6 +2626,76 @@ async def scan_detail(callback: CallbackQuery) -> None:
         )
 
 
+@dp.callback_query(F.data.startswith("scanproducts:"))
+async def scan_products(callback: CallbackQuery) -> None:
+    try:
+        scan_id = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("Скан не найден", show_alert=True); return
+    scan = await get_user_scan(callback.from_user.id, scan_id)
+    if scan is None:
+        await callback.answer("Скан не найден", show_alert=True); return
+
+    pairs = await get_scan_rows(scan_id)
+    all_rows = [row for row, _ in pairs]
+    recognized = [
+        row for row in all_rows
+        if row.identity_key and row.identity_label and (row.identity_confidence or 0) >= 70
+    ]
+    groups: dict[str, list[Listing]] = {}
+    for row in recognized:
+        groups.setdefault(row.identity_key, []).append(row)
+
+    ranked = sorted(
+        groups.values(),
+        key=lambda items: (
+            len(items),
+            max((row.view_count or 0) for row in items),
+            max((row.first_seen_at for row in items), default=datetime.min),
+        ),
+        reverse=True,
+    )
+    await callback.answer()
+    if not all_rows:
+        text = "🧠 <b>Распознанные модели</b>\n\nВ этом скане пока нет объявлений."
+    elif not ranked:
+        text = (
+            "🧠 <b>Распознанные модели</b>\n\n"
+            "Пока нет моделей с уверенностью распознавания от 70%. "
+            "Такие объявления остаются в результате, но не смешиваются в ценовые группы."
+        )
+    else:
+        coverage = round(len(recognized) / len(all_rows) * 100)
+        lines = [
+            f"🧠 <b>Модели скана: {html.escape(scan.title)}</b>",
+            f"Распознано уверенно: <b>{len(recognized)}/{len(all_rows)} ({coverage}%)</b> · групп: <b>{len(ranked)}</b>",
+            "",
+        ]
+        for i, items in enumerate(ranked[:15], 1):
+            example = max(items, key=lambda row: ((row.view_count or 0), row.first_seen_at))
+            prices = [row.price_eur for row in items if row.price_eur is not None and row.price_eur > 0]
+            median_price = int(statistics.median(prices)) if prices else None
+            max_views = max((row.view_count or 0) for row in items)
+            type_label = TYPE_DISPLAY.get(example.identity_product_type or "", example.identity_product_type or "товар")
+            price_part = f" · 💶 медиана {median_price} €" if median_price is not None else ""
+            views_part = f" · 👁 макс. {max_views}" if max_views else ""
+            lines.append(
+                f"<b>{i}. {html.escape(example.identity_label or example.title)}</b>\n"
+                f"{html.escape(type_label)} · 📦 {len(items)} объявл.{price_part}{views_part}\n"
+                f"Точность: {example.identity_confidence or 0}% · "
+                f'<a href="{html.escape(example.url)}">пример</a>'
+            )
+        lines += [
+            "",
+            "💡 Разные написания одной модели объединяются, а важные версии, память и RAM сохраняются отдельно.",
+        ]
+        text = "\n\n".join(lines)
+    await callback.message.answer(
+        text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        reply_markup=scan_detail_keyboard(scan_id),
+    )
+
+
 @dp.callback_query(F.data.startswith("scantop:"))
 async def scan_top(callback: CallbackQuery) -> None:
     scan_id = int(callback.data.split(":", 1)[1])
@@ -2435,8 +2713,12 @@ async def scan_top(callback: CallbackQuery) -> None:
         for i, (row, snap) in enumerate(pairs[:12], 1):
             delta = (row.view_count - snap.initial_view_count) if snap.initial_view_count is not None else None
             growth = f" · 🚀 +{delta}" if delta is not None and delta > 0 else ""
+            identity_line = ""
+            if row.identity_label and (row.identity_confidence or 0) >= 70:
+                identity_line = f"🧠 {html.escape(row.identity_label[:75])}\n"
             lines.append(
                 f"<b>{i}. {html.escape(row.title[:55])}</b>\n"
+                f"{identity_line}"
                 f"👁 {row.view_count}{growth} · 💶 {html.escape(_price_display(row.price_text, row.price_eur))}\n"
                 f"<a href=\"{html.escape(row.url)}\">Открыть</a>"
             )
@@ -2446,37 +2728,86 @@ async def scan_top(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("scangrowth:"))
 async def scan_growth(callback: CallbackQuery) -> None:
-    scan_id = int(callback.data.split(":", 1)[1])
+    parts = callback.data.split(":")
+    try:
+        scan_id = int(parts[1])
+        period_hours = int(parts[2]) if len(parts) > 2 else 1
+    except Exception:
+        await callback.answer("Скан не найден", show_alert=True); return
+    if period_hours not in {1, 3, 6, 24}:
+        period_hours = 1
     scan = await get_user_scan(callback.from_user.id, scan_id)
     if scan is None:
         await callback.answer("Скан не найден", show_alert=True); return
-    pairs = await get_scan_rows(scan_id)
-    growth = []
-    elapsed_hours = max(1/60, ((datetime.utcnow() - (scan.finished_at or scan.created_at)).total_seconds() / 3600))
-    for row, snap in pairs:
-        if row.view_count is None or snap.initial_view_count is None:
-            continue
-        delta = row.view_count - snap.initial_view_count
-        if delta > 0:
-            growth.append((delta / elapsed_hours, delta, row))
-    growth.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    growth, rounds = await get_scan_growth_rows(scan_id, period_hours)
     await callback.answer()
-    if not growth:
+    period_label = {1: "1 час", 3: "3 часа", 6: "6 часов", 24: "24 часа"}[period_hours]
+    if rounds < 2:
         text = (
-            "🚀 <b>Рост просмотров</b>\n\nПока роста не зафиксировано. "
-            "Обнови просмотры через некоторое время — тогда здесь появится динамика."
+            f"🚀 <b>Динамика за {period_label}</b>\n\n"
+            "Есть только первая точка наблюдения. Нажми «Обновить просмотры» позже — "
+            "после второй точки бот сможет посчитать реальную скорость роста."
+        )
+    elif not growth:
+        text = (
+            f"🚀 <b>Динамика за {period_label}</b>\n\n"
+            "Рост между доступными точками пока не зафиксирован. "
+            "Можно переключить период или обновить просмотры ещё раз позже."
         )
     else:
-        lines = [f"🚀 <b>Быстрее всего растут: {html.escape(scan.title)}</b>", ""]
-        for i, (per_hour, delta, row) in enumerate(growth[:12], 1):
+        lines = [
+            f"🚀 <b>Быстрее всего растут · {period_label}</b>",
+            f"<b>{html.escape(scan.title)}</b>",
+            "",
+        ]
+        for i, (per_hour, delta, elapsed_hours, current_views, row) in enumerate(growth[:12], 1):
+            if elapsed_hours < 1:
+                elapsed_text = f"{max(1, round(elapsed_hours * 60))} мин"
+            else:
+                elapsed_text = f"{elapsed_hours:.1f} ч"
+            identity_line = ""
+            if row.identity_label and (row.identity_confidence or 0) >= 70:
+                identity_line = f"🧠 {html.escape(row.identity_label[:75])}\n"
             lines.append(
                 f"<b>{i}. {html.escape(row.title[:55])}</b>\n"
-                f"🚀 +{delta} · ≈ {per_hour:.1f} просмотров/ч · 👁 {row.view_count}\n"
+                f"{identity_line}"
+                f"🚀 +{delta} за {elapsed_text} · <b>{per_hour:.1f}/ч</b> · 👁 {current_views}\n"
                 f"💶 {html.escape(_price_display(row.price_text, row.price_eur))} · "
-                f"<a href=\"{html.escape(row.url)}\">Открыть</a>"
+                f'<a href="{html.escape(row.url)}">Открыть</a>'
             )
+        lines += ["", f"📈 Точек наблюдения в этом скане: <b>{rounds}</b>"]
         text = "\n\n".join(lines)
-    await callback.message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=scan_detail_keyboard(scan_id))
+    await callback.message.answer(
+        text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        reply_markup=growth_period_keyboard(scan_id, period_hours),
+    )
+
+
+@dp.callback_query(F.data.startswith("scanhistory:"))
+async def scan_history(callback: CallbackQuery) -> None:
+    try:
+        scan_id = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("Скан не найден", show_alert=True); return
+    scan = await get_user_scan(callback.from_user.id, scan_id)
+    if scan is None:
+        await callback.answer("Скан не найден", show_alert=True); return
+    rounds = await get_scan_history_rounds(scan_id, limit=10)
+    await callback.answer()
+    if not rounds:
+        text = "🕘 <b>История просмотров</b>\n\nПока нет сохранённых точек наблюдения."
+    else:
+        lines = [f"🕘 <b>История: {html.escape(scan.title)}</b>", "", "Последние точки по московскому времени:"]
+        for idx, (recorded_at, count, total_views) in enumerate(rounds, 1):
+            marker = "🟢" if idx == 1 else "▫️"
+            lines.append(
+                f"{marker} <b>{_moscow_text(recorded_at)} МСК</b> · "
+                f"{count} объявл. · суммарно 👁 {total_views}"
+            )
+        lines += ["", "Каждое ручное «Обновить просмотры» добавляет новую точку для сравнения."]
+        text = "\n".join(lines)
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan_id))
 
 
 @dp.callback_query(F.data.startswith("scanviews:"))
@@ -2490,7 +2821,7 @@ async def scan_refresh_views(callback: CallbackQuery) -> None:
     if not rows:
         await callback.answer("В этом скане пока нет объявлений", show_alert=True); return
     await callback.answer("Обновляю просмотры")
-    await refresh_view_counts(rows, callback.message)
+    await refresh_view_counts(rows, callback.message, force=True)
     await update_scan_view_refresh(scan_id)
     scan = await get_user_scan(callback.from_user.id, scan_id)
     await callback.message.answer(
@@ -2750,6 +3081,9 @@ async def start_scan_with_pages(callback: CallbackQuery, state: FSMContext) -> N
 async def main() -> None:
     if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN is not set")
     await init_db()
+    backfilled = await backfill_product_identities()
+    if backfilled:
+        log.info("v3.0 product identity backfill: %s listings", backfilled)
     bot = Bot(BOT_TOKEN)
     me = await bot.get_me()
     log.info(
