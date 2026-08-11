@@ -152,6 +152,11 @@ class UserScan(Base):
     new_count: Mapped[int] = mapped_column(Integer, default=0)
     result_count: Mapped[int] = mapped_column(Integer, default=0)
     viewed_count: Mapped[int] = mapped_column(Integer, default=0)
+    # v3.0.1 exact-date scanner metadata. A scan can finish partially when
+    # Kleinanzeigen temporarily refuses requests or the safety cap is reached
+    # before the requested calendar day is fully crossed.
+    target_complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    scan_note: Mapped[str] = mapped_column(String(500), default="")
 
 
 class ScanListing(Base):

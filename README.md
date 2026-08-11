@@ -1,94 +1,49 @@
-# Kleinanzeigen Parser Bot v3.0.0
+# Kleinanzeigen Parser Bot v3.0.1
 
-v3.0 adds deterministic **product recognition** on top of the fast direct public view-counter, saved scans, Moscow-date search and view-velocity history.
+v3.0.1 fixes exact-date scanning and keeps all v3.0 product-recognition/view-history features.
 
-## v3.0 — Product Identity
+## Exact date = automatic depth
 
-Every parsed listing is now classified locally (no external AI/API call) into structured fields when the title is clear enough:
+The old 25 / 50 / 100-page choice no longer limits a scan for a concrete Moscow date.
 
-- brand
-- product type
-- model
-- important variant
-- storage
-- RAM where relevant
-- model-defining specs such as MacBook display/chip or Apple TV generation
-- confidence score
-- stable `identity_key` used by Smart Analytics
+After the user enters a date (for example `10.08.2026`), the bot automatically:
 
-High-confidence rules currently cover the most useful resale/electronics families, including:
+1. starts from the newest category page;
+2. skips newer calendar days;
+3. begins collecting when the requested Moscow date is reached;
+4. keeps paging until the feed is entirely older than that date;
+5. stops only after the selected day is fully crossed.
 
-- Apple: iPhone, iPad, MacBook Air/Pro, Mac mini, iMac, Apple TV, AirPods
-- Sony: PS5/PS4 variants, PlayStation Portal, DualSense / DualSense Edge
-- Nintendo Switch / Switch 2
-- Xbox Series / One
-- Steam Deck, Meta Quest
-- Samsung Galaxy, Google Pixel
-- NVIDIA RTX/GTX and AMD RX GPUs
-- AMD Ryzen and Intel Core CPUs
-- conservative generic brand/model fallback for other products
+The Telegram progress card shows the current page and the oldest calendar date reached instead of a misleading fixed ETA.
 
-Examples that stay separate:
+## No more false zero because of shallow depth
 
-- `PS5 Slim Disc 1TB` vs `PS5 Slim Digital 1TB`
-- `iPhone 15 Pro Max 256GB` vs `iPhone 15 Pro 128GB`
-- `MacBook Pro 14 M3 Pro 18GB/512GB` vs another RAM/storage configuration
-- `Apple TV 4K Gen 3 128GB Ethernet` vs 64GB/older generation
+If Kleinanzeigen temporarily refuses requests or the high safety cap is reached before the requested date is fully collected, the scan is marked **partial** instead of pretending that `0 listings` is a complete answer. The saved scan card keeps the reason.
 
-Unknown or weak titles are **not forced** into a strong group. Smart market/frequency analytics use the structured identity only when confidence is high enough, then fall back conservatively.
+A true zero is only treated as complete when the parser actually crosses the requested calendar day (or reaches the physical end of the feed) without finding matching listings.
 
-## Telegram UI
+## Safety cap
 
-Saved scan cards now include `🧠 Модели` / `🧠 Распознанные модели`:
+`DATE_SCAN_MAX_PAGES=1000` is only a guard against endless scanning if Kleinanzeigen changes its ordering. It is **not** the normal user-visible depth. Increase it in Railway only if a very large category genuinely needs more than 1000 pages to reach the target date.
 
-- recognition coverage for the scan
-- number of distinct recognized product configurations
-- grouped model/configuration
-- listing count
-- median price
-- maximum public views
-- recognition confidence
-
-Top-by-views and View Velocity screens also show the normalized identity when available.
-
-## CSV
-
-Normal listing CSVs now include:
-
-- `🧠 Распознанный товар`
-- `Бренд`
-- `Модель`
-- `Версия`
-- `Память, GB`
-- `RAM, GB`
-- `Точность распознавания, %`
-
-Existing title/price/views/date/link fields are preserved.
-
-## Existing databases
-
-`init_db()` adds the v3.0 identity columns automatically. On startup, listings collected by older versions are backfilled locally from their existing titles, so saved v2.8/v2.9 scans can immediately benefit from the new model view.
-
-## Existing features preserved
+## Preserved from v3.0
 
 - fast direct public view counter with browser fallback
 - promoted/Top/Highlight listing filter
-- exact target-date scan in Moscow time
-- 25 / 50 / 100 page depth
-- multi-user queue and shared category cache
+- Moscow-time publication-date normalization
+- multi-user queue/shared category cache
 - saved `Мои сканы`
-- manual view refresh
-- view history and 1/3/6/24h velocity
-- CSV export and Smart Analytics modes
+- manual view refresh and 1/3/6/24h view velocity
+- product identity recognition
+- model grouping and CSV identity columns
+- Smart Analytics modes
 
 ## Railway
 
-No new required variables. Existing variables remain valid.
+No required setting changes. Existing deployments work with the default safety cap.
 
 Start command:
 
 ```bash
 python bot.py
 ```
-
-The existing Playwright Docker image/setup remains unchanged for browser fallback.

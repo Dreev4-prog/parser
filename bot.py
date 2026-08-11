@@ -107,6 +107,11 @@ PAGE_LIMIT_CHOICES = (25, 50, 100)
 # around 3 minutes, then the estimate is recalculated from the real page rate.
 PAGE_LIMIT_BASE_ETA_SECONDS = {25: 60, 50: 120, 100: 180}
 
+# v3.0.1 exact-date mode. The old 25/50/100 depth is deliberately NOT used
+# when the user asks for a concrete Moscow date. We keep a high safety cap only
+# to prevent an accidental endless walk if Kleinanzeigen changes its ordering.
+DATE_SCAN_MAX_PAGES = max(100, min(3000, int(os.getenv("DATE_SCAN_MAX_PAGES", "1000"))))
+
 
 class SettingsInput(StatesGroup):
     include_words = State()
@@ -385,11 +390,13 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
             scan = await session.get(UserScan, job.scan_id)
             if scan is None:
                 return
-            scan.status = "cancelled" if cancelled else "done"
+            scan.status = "cancelled" if cancelled else ("partial" if job.incomplete_categories else "done")
             scan.finished_at = now
             scan.completed_categories = job.completed_categories
             scan.total_categories = len(job.category_keys)
             scan.new_count = job.total_new
+            scan.target_complete = bool(not cancelled and job.incomplete_categories == 0)
+            scan.scan_note = " | ".join((job.scan_notes or [])[:4])[:500]
             if cancelled:
                 await session.commit()
                 return
@@ -556,7 +563,12 @@ async def get_scan_growth_rows(scan_id: int, period_hours: int) -> tuple[list[tu
 def my_scans_keyboard(scans: list[UserScan]) -> InlineKeyboardMarkup:
     rows = []
     for scan in scans[:8]:
-        icon = "✅" if scan.status == "done" else ("⏳" if scan.status in {"queued", "running"} else "⚪️")
+        icon = (
+            "✅" if scan.status == "done"
+            else "⚠️" if scan.status == "partial"
+            else "⏳" if scan.status in {"queued", "running"}
+            else "⚪️"
+        )
         target_label = _date_label(scan.target_date) if scan.target_date else _moscow_text(scan.finished_at or scan.created_at)[:10]
         label = f"{icon} {scan.title[:22]} · {target_label[:5]}"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"scan:{scan.id}")])
@@ -1251,10 +1263,10 @@ def settings_text(s: UserSettings) -> str:
         f"Период: <b>{PERIOD_LABELS.get(s.period, s.period)}</b>\n"
         f"Цена: <b>{PRICE_LABELS.get(s.price_filter, s.price_filter)}</b>\n"
         f"Сортировка: <b>{SORT_LABELS.get(s.sort_mode, s.sort_mode)}</b>\n"
-        f"Последняя глубина запуска: <b>{getattr(s, 'page_limit', 100)} страниц</b>\n"
+        "Скан по дате: <b>автоматическая глубина</b>\n"
         f"Ключевые слова: <b>{include}</b>\n"
         f"Исключить: <b>{exclude}</b>\n\n"
-        "<i>v2.6.6 сохраняет Smart Analytics/Fast Incremental и добавляет пользовательский живой прогресс; внутренняя очередь, кэш и совместные сканы скрыты от пользователей. "
+        "<i>Точный поиск по дате сам листает выдачу до выбранного дня; внутренняя очередь, кэш и совместные сканы скрыты от пользователей. "
         "Нажми «ℹ️ Как работают режимы», чтобы увидеть текущие критерии.</i>"
     )
 
@@ -1326,6 +1338,8 @@ class ScanResult:
     reason: str
     mode: str
     avoided_pages: int = 0
+    date_complete: bool = False
+    oldest_date_seen: str = ""
 
 
 @dataclass
@@ -1365,6 +1379,8 @@ class ScanJob:
     current_progress_key: str = ""
     scan_id: int | None = None
     target_date: str = ""
+    incomplete_categories: int = 0
+    scan_notes: list[str] | None = None
 
 
 @dataclass
@@ -1381,9 +1397,24 @@ class CategoryLiveProgress:
     estimated_pages: int = 10
     started_monotonic: float = 0.0
     page_limit: int = 100
+    oldest_date_seen: str = ""
+    phase: str = "seeking"
 
 
 category_live_progress: dict[str, CategoryLiveProgress] = {}
+
+
+def _date_scan_limit(target_date: str) -> int:
+    """Network safety cap for exact-date scans.
+
+    The requested 25/50/100 UI depth is intentionally ignored here. Exact-date
+    scans walk until the requested day is fully crossed or this safety cap is hit.
+    """
+    return DATE_SCAN_MAX_PAGES if target_date else MAX_PAGES_PER_CATEGORY
+
+
+def _progress_key(category_key: str, target_date: str) -> str:
+    return f"{category_key}:date:{target_date}"
 
 
 scan_queue: asyncio.Queue[ScanJob] = asyncio.Queue()
@@ -1443,7 +1474,7 @@ async def save_category_scan_state(
         state.last_today_seen = today_seen
         state.last_stop_reason = reason[:255]
         state.total_runs = (state.total_runs or 0) + 1
-        if mode == "full":
+        if mode in {"full", "date"}:
             # Keep the deepest seeded window for the day. A 25-page seed enables
             # later 25-page fast scans, while a later 100-page request can deepen it.
             state.day_full_pages = max(state.day_full_pages or 0, pages_scanned)
@@ -1497,18 +1528,18 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     The fast mode never skips the first pages: this keeps it correct when many new
     listings arrived since the previous run. It only avoids re-reading the old tail.
     """
-    scan_limit = max(1, min(MAX_PAGES_PER_CATEGORY, int(page_limit)))
+    # Exact-date mode is auto-depth: the historical 25/50/100 user choice must
+    # never cut the scan off before the requested day. `page_limit` is retained
+    # only for backward compatibility with saved scans/settings.
+    scan_limit = _date_scan_limit(target_date)
     target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
-    progress_key = f"{cat.key}:{scan_limit}:{target_date}"
+    progress_key = _progress_key(cat.key, target_date)
     state = await get_category_scan_state(cat.key)
     day_key = berlin_date_key()
-    can_fast = bool(
-        state
-        and state.scan_date == day_key
-        and (state.target_date or "") == target_date
-        and (state.day_seed_complete or (state.day_full_pages or 0) >= scan_limit)
-    )
-    mode = "fast" if can_fast else "full"
+    # Incremental fast-stop is unsafe for an exact historical date: a known
+    # prefix can appear long before we reach the requested calendar day.
+    can_fast = False
+    mode = "date"
     previous_heads = {
         x for x in ((state.head_ids if state else "") or "").split(",") if x
     }
@@ -1519,9 +1550,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         historic_pages = int(state.day_full_pages or state.last_pages or 10)
     else:
         historic_pages = 10
-    estimated_pages = scan_limit
-    if mode == "fast":
-        estimated_pages = max(INCREMENTAL_MIN_PAGES, min(scan_limit, 8, int(state.last_pages or 3) if state else 3))
+    # ETA is deliberately only a soft estimate. The UI primarily shows the
+    # oldest date reached so users can see real progress toward the target.
+    estimated_pages = min(scan_limit, max(25, historic_pages if historic_pages else 25))
     category_live_progress[progress_key] = CategoryLiveProgress(
         category_key=cat.key,
         category_name=cat.name,
@@ -1529,6 +1560,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         estimated_pages=estimated_pages,
         started_monotonic=time.monotonic(),
         page_limit=scan_limit,
+        phase="seeking",
     )
 
     new_count = 0
@@ -1538,6 +1570,8 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     enriched_total = 0
     empty_today_pages = 0
     target_seen_any = False
+    date_complete = False
+    oldest_date_seen = ""
     consecutive_known_pages = 0
     first_page_head_ids: list[str] = []
     checkpoint_seen_page: int | None = None
@@ -1563,6 +1597,10 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             page_dates = [(item, posted_date_moscow(item.posted_text)) for item in items]
             today_items = [item for item, item_day in page_dates if item_day == target_day]
             dated_days = [item_day for _, item_day in page_dates if item_day is not None]
+            if dated_days:
+                page_oldest = min(dated_days)
+                if not oldest_date_seen or page_oldest.isoformat() < oldest_date_seen:
+                    oldest_date_seen = page_oldest.isoformat()
             today_seen += len(today_items)
             if today_items:
                 target_seen_any = True
@@ -1570,10 +1608,12 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             if live is not None:
                 live.page = page
                 live.today_seen = today_seen
+                live.oldest_date_seen = oldest_date_seen
+                live.phase = "collecting" if target_seen_any else "seeking"
                 # If a first/full scan is larger than our historical estimate, expand
                 # the estimate instead of showing a fake 100% too early.
                 if page >= live.estimated_pages:
-                    live.estimated_pages = min(scan_limit, page + (2 if mode == "fast" else 5))
+                    live.estimated_pages = min(scan_limit, max(page + 10, int(page * 1.25)))
 
             if not first_page_head_ids and today_items:
                 first_page_head_ids = [item.external_id for item in today_items[:INCREMENTAL_HEAD_SIZE]]
@@ -1657,14 +1697,23 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 # date we keep paging. Once all dated cards are older than it, the
                 # requested calendar day is behind us and the scan can stop.
                 if dated_days and max(dated_days) < target_day:
-                    reason = "прошли выбранную дату" if target_seen_any else "выбранная дата не найдена в просмотренной выдаче"
+                    date_complete = True
+                    reason = "выбранная дата собрана полностью" if target_seen_any else "выбранная дата пройдена; объявлений за неё не найдено"
                     break
+
+            # If target listings were present on a previous page, keep going until
+            # we see a page that is entirely older. This guarantees that the whole
+            # selected date is collected instead of stopping on the first match.
+            if target_seen_any and dated_days and max(dated_days) < target_day:
+                date_complete = True
+                reason = "выбранная дата собрана полностью"
+                break
 
             if PAGE_DELAY_SECONDS and page < scan_limit:
                 await asyncio.sleep(PAGE_DELAY_SECONDS)
         else:
             hit_limit = True
-            reason = f"лимит {scan_limit} страниц достигнут"
+            reason = f"защитный лимит {scan_limit} страниц достигнут до полного завершения даты"
 
         if not reason:
             reason = "завершено"
@@ -1673,9 +1722,14 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         # Very large categories intentionally keep only the newest window; after
         # that first capped scan, later runs may use fast incremental mode instead
         # of re-reading all 100 pages every time.
+        # Reaching the physical end of the feed also proves the target-date result
+        # is complete, even when there were zero matching active listings.
+        if reason == "конец выдачи":
+            date_complete = True
+
         interrupted = reason.startswith("временный лимит Kleinanzeigen")
-        seed_complete = (mode == "full" and not hit_limit and not interrupted)
-        seed_capped = (mode == "full" and hit_limit and not interrupted)
+        seed_complete = bool(date_complete and not interrupted)
+        seed_capped = bool(hit_limit and not interrupted)
         saved = await save_category_scan_state(
             cat.key,
             target_date=target_date,
@@ -1699,6 +1753,8 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             reason=reason,
             mode=mode,
             avoided_pages=avoided_pages,
+            date_complete=date_complete,
+            oldest_date_seen=oldest_date_seen,
         )
         await record_parser_run(user_id, cat, result, started_at)
         return result
@@ -1713,6 +1769,8 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             reason="ошибка",
             mode=mode,
             avoided_pages=0,
+            date_complete=False,
+            oldest_date_seen=oldest_date_seen,
         )
         try:
             await record_parser_run(user_id, cat, failed, started_at, success=False, error_text=str(exc))
@@ -1736,7 +1794,7 @@ async def fresh_category_cache_age(category_key: str, page_limit: int, target_da
         return None
     if state.scan_date != berlin_date_key() or (state.target_date or "") != target_date:
         return None
-    requested = max(1, min(MAX_PAGES_PER_CATEGORY, int(page_limit)))
+    requested = _date_scan_limit(target_date)
     if not (state.day_seed_complete or (state.day_full_pages or 0) >= requested):
         return None
     age = max(0, int((datetime.utcnow() - state.last_scan_at).total_seconds()))
@@ -1763,7 +1821,7 @@ async def dispatch_category(cat, user_id: int, page_limit: int, target_date: str
     if cache_age is not None:
         return CategoryDispatchResult(source="cache", cache_age_seconds=cache_age)
 
-    inflight_key = f"{cat.key}:{max(1, min(MAX_PAGES_PER_CATEGORY, int(page_limit)))}:{target_date}"
+    inflight_key = _progress_key(cat.key, target_date)
     async with category_inflight_guard:
         task = category_inflight.get(inflight_key)
         if task is None:
@@ -1857,51 +1915,28 @@ def _progress_bar(percent: int) -> str:
 
 def render_user_job_status(job: ScanJob) -> str:
     total = max(1, len(job.category_keys))
-    base_category_eta = _base_category_eta_seconds(job.page_limit)
 
     if job.state == "queued":
         waited = max(0, int((datetime.utcnow() - job.created_at).total_seconds()))
-        total_estimate = base_category_eta * total
         return (
             "⏳ <b>Подготавливаю парсинг…</b>\n\n"
             f"Выбрано категорий: <b>{total}</b>\n"
             f"Дата объявлений: <b>{_date_label(job.target_date)} (МСК)</b>\n"
-            f"Глубина: <b>{job.page_limit} страниц на категорию</b>\n"
-            f"Ориентировочное время: <b>{_human_eta(total_estimate)}</b>\n"
+            "Глубина: <b>автоматическая — до выбранной даты</b>\n"
             f"Подготовка: <b>{waited} сек</b>\n\n"
-            "Статус обновляется автоматически."
+            "Бот сам листает выдачу, пока не соберёт выбранный день полностью."
         )
 
     live = category_live_progress.get(job.current_progress_key) if job.current_progress_key else None
-    current_fraction = 0.0
-    current_page = 0
-    current_today = 0
-    live_new = 0
-    live_views_ready = 0
-    live_views_failed = 0
-    current_eta = float(base_category_eta)
+    current_page = live.page if live is not None else 0
+    current_today = live.today_seen if live is not None else 0
+    live_new = live.new_count if live is not None else 0
+    live_views_ready = live.views_ready if live is not None else 0
+    live_views_failed = live.views_failed if live is not None else 0
 
-    if live is not None:
-        current_page = live.page
-        current_today = live.today_seen
-        live_new = live.new_count
-        live_views_ready = live.views_ready
-        live_views_failed = live.views_failed
-        target_pages = max(1, live.estimated_pages if live.mode == "fast" else job.page_limit)
-        current_fraction = min(0.95, current_page / target_pages)
-
-        # Start conservatively, then blend in the actual observed page rate.
-        base_remaining = base_category_eta * max(0.0, 1.0 - current_fraction)
-        current_eta = base_remaining
-        if current_page >= 3 and live.started_monotonic:
-            cat_elapsed = max(1.0, time.monotonic() - live.started_monotonic)
-            seconds_per_page = cat_elapsed / max(1, current_page)
-            observed_remaining = seconds_per_page * max(0, target_pages - current_page)
-            current_eta = 0.55 * base_remaining + 0.45 * observed_remaining
-
-    completed_units = min(total, job.completed_categories + current_fraction)
-    fraction = max(0.0, min(1.0, completed_units / total))
-    percent = int(fraction * 100)
+    # Exact-date depth is unknown in advance, so do not manufacture a fake page
+    # percentage/ETA. Category completion plus the oldest reached date is truthful.
+    percent = int(max(0.0, min(1.0, job.completed_categories / total)) * 100)
     if job.completed_categories >= total:
         percent = 100
 
@@ -1909,14 +1944,18 @@ def render_user_job_status(job: ScanJob) -> str:
     if job.started_running_monotonic:
         elapsed = max(0, int(time.monotonic() - job.started_running_monotonic))
 
-    remaining_after_current = max(0, total - job.completed_categories - (1 if job.current_category else 0))
-    eta = current_eta + remaining_after_current * base_category_eta
-    if job.completed_categories >= total:
-        eta = 0
-
     category_line = html.escape(job.current_category) if job.current_category else "Подготовка…"
-    page_line = f"\nСтраница: <b>{current_page} / {job.page_limit}</b>" if current_page else ""
-    today_line = f"\nОбъявлений обработано в категории: <b>{current_today}</b>" if current_today else ""
+    page_line = f"\nСтраница: <b>{current_page}</b>" if current_page else ""
+    reached_line = ""
+    phase_line = ""
+    if live is not None and live.oldest_date_seen:
+        reached_line = f"\nСамая старая достигнутая дата: <b>{_date_label(live.oldest_date_seen)}</b>"
+        phase_line = (
+            "\nЭтап: <b>собираю выбранную дату</b>"
+            if live.phase == "collecting"
+            else "\nЭтап: <b>иду к выбранной дате</b>"
+        )
+    today_line = f"\nНайдено за выбранную дату: <b>{current_today}</b>" if current_today else ""
     views_line = ""
     if current_today:
         views_line = f"\n👁 Просмотры готовы: <b>{live_views_ready}/{current_today}</b>"
@@ -1926,14 +1965,14 @@ def render_user_job_status(job: ScanJob) -> str:
 
     return (
         "🔄 <b>Парсинг идёт</b>\n\n"
-        f"{_progress_bar(percent)} <b>{percent}%</b>\n"
+        f"{_progress_bar(percent)} <b>{percent}% категорий завершено</b>\n"
         f"Категории: <b>{job.completed_categories}/{total}</b> готово\n"
         f"Дата: <b>{_date_label(job.target_date)} (МСК)</b>\n"
-        f"Глубина: <b>{job.page_limit} страниц</b>\n"
-        f"Сейчас: <b>{category_line}</b>{page_line}{today_line}{views_line}\n\n"
+        "Глубина: <b>автоматическая</b>\n"
+        f"Сейчас: <b>{category_line}</b>{page_line}{reached_line}{phase_line}{today_line}{views_line}\n\n"
         f"🆕 Найдено новых: <b>{visible_new}</b>\n"
         f"⏱ Прошло: <b>{_human_duration(elapsed)}</b>\n"
-        f"⌛ Осталось примерно: <b>{_human_eta(eta)}</b>\n\n"
+        "⌛ Осталось: <b>зависит от того, сколько страниц до выбранной даты</b>\n\n"
         "Прогресс обновляется автоматически."
     )
 
@@ -1977,7 +2016,7 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
     mins, secs = divmod(elapsed_seconds, 60)
     elapsed_text = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
 
-    job.state = "cancelled" if cancelled else "done"
+    job.state = "cancelled" if cancelled else ("partial" if job.incomplete_categories else "done")
     if cancelled:
         text = (
             "❌ <b>Парсинг отменён</b>\n\n"
@@ -1986,10 +2025,16 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
             f"⏱ Время: <b>{elapsed_text}</b>"
         )
     else:
+        headline = "⚠️ <b>Парсинг завершён частично</b>" if job.incomplete_categories else "✅ <b>Парсинг завершён</b>"
+        completeness_line = (
+            f"⚠️ Не удалось полностью дойти до даты в категориях: <b>{job.incomplete_categories}</b>\n"
+            if job.incomplete_categories else ""
+        )
         text = (
-            "✅ <b>Парсинг завершён</b>\n\n"
+            f"{headline}\n\n"
             f"🗂 Категорий обработано: <b>{job.completed_categories}/{len(job.category_keys)}</b>\n"
             f"📅 Дата объявлений: <b>{_date_label(job.target_date)} (МСК)</b>\n"
+            f"{completeness_line}"
             f"🆕 Новых объявлений: <b>{job.total_new}</b>\n"
             f"⏱ Время: <b>{elapsed_text}</b>\n\n"
             "📄 Формирую файл с результатом…"
@@ -2000,10 +2045,11 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
         try:
             settings = await get_settings(job.user_id)
             result_prefix = (
-                "✅ <b>Готовый результат</b>\n"
+                ("⚠️ <b>Частичный результат</b>\n" if job.incomplete_categories else "✅ <b>Готовый результат</b>\n")
+                +
                 f"🗂 Категорий: <b>{job.completed_categories}/{len(job.category_keys)}</b>\n"
                 f"📅 Дата: <b>{_date_label(job.target_date)} (МСК)</b>\n"
-                f"📄 Глубина: <b>{job.page_limit} страниц на категорию</b>\n"
+                f"📄 Глубина: <b>автоматически до выбранной даты</b>\n"
                 f"🆕 Новых найдено: <b>{job.total_new}</b>\n"
                 f"⏱ Время: <b>{elapsed_text}</b>\n"
                 f"Режим: <b>{MODE_LABELS.get(settings.output_mode, settings.output_mode)}</b>\n"
@@ -2060,6 +2106,7 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
     job.worker_id = worker_id
     job.started_running_monotonic = time.monotonic()
     job.warnings = job.warnings or []
+    job.scan_notes = job.scan_notes or []
     await edit_job_status(bot, job, render_user_job_status(job), force=True)
 
     for idx, key in enumerate(job.category_keys, start=1):
@@ -2071,7 +2118,7 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
             continue
         job.current_category = cat.name
         job.current_category_key = cat.key
-        job.current_progress_key = f"{cat.key}:{job.page_limit}:{job.target_date}"
+        job.current_progress_key = _progress_key(cat.key, job.target_date)
         job.current_category_index = idx
         try:
             await edit_job_status(bot, job, render_user_job_status(job), force=True)
@@ -2099,8 +2146,16 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
                         job.fast_categories += 1
                     else:
                         job.full_categories += 1
-                if result.hit_limit:
-                    job.warnings.append(f"{cat.name}: достигнут выбранный лимит {job.page_limit} страниц")
+                if not result.date_complete:
+                    job.incomplete_categories += 1
+                    reached = _date_label(result.oldest_date_seen) if result.oldest_date_seen else "не определена"
+                    note = (
+                        f"{cat.name}: до {_date_label(job.target_date)} полностью не дошли; "
+                        f"самая старая достигнутая дата — {reached}, просмотрено {result.pages_scanned} стр."
+                    )
+                    job.warnings.append(note)
+                    job.scan_notes = job.scan_notes or []
+                    job.scan_notes.append(note)
                 elif result.reason.startswith("временный лимит Kleinanzeigen"):
                     job.warnings.append(
                         f"{cat.name}: Kleinanzeigen временно ограничил запросы; сохранено {result.pages_scanned} стр., можно повторить позже"
@@ -2579,14 +2634,21 @@ async def render_scan_detail(scan: UserScan) -> str:
                     Listing.category_key.in_(keys), Listing.first_seen_at > scan.finished_at
                 ))).scalar_one()
     history_rounds = await get_scan_history_rounds(scan.id, limit=50)
-    status_label = {"done": "✅ завершён", "running": "🔄 идёт", "queued": "⏳ ожидает", "cancelled": "❌ отменён", "failed": "❌ ошибка"}.get(scan.status, scan.status)
+    status_label = {
+        "done": "✅ завершён",
+        "partial": "⚠️ частичный",
+        "running": "🔄 идёт",
+        "queued": "⏳ ожидает",
+        "cancelled": "❌ отменён",
+        "failed": "❌ ошибка",
+    }.get(scan.status, scan.status)
     lines = [
         f"<b>📊 {html.escape(scan.title)}</b>",
         "",
         f"Статус: <b>{status_label}</b>",
         f"Запуск: <b>{_moscow_text(scan.created_at)} МСК</b>",
         f"Дата объявлений: <b>{_date_label(scan.target_date)} (МСК)</b>",
-        f"Глубина: <b>{scan.page_limit} стр. на категорию</b>",
+        "Глубина: <b>автоматически до выбранной даты</b>",
         f"Категорий: <b>{scan.completed_categories}/{scan.total_categories}</b>",
         "",
         f"📦 В снимке: <b>{len(rows)}</b> объявлений",
@@ -2599,6 +2661,8 @@ async def render_scan_detail(scan: UserScan) -> str:
     ]
     if scan.last_view_refresh_at:
         lines += ["", f"Последнее обновление просмотров: <b>{_moscow_text(scan.last_view_refresh_at)} МСК</b>"]
+    if scan.status == "partial" and getattr(scan, "scan_note", ""):
+        lines += ["", f"⚠️ <b>Почему результат частичный:</b> {html.escape(scan.scan_note)}"]
     lines += ["", "💡 Обновляй просмотры позже и открывай «Динамика»: доступны интервалы 1 / 3 / 6 / 24 часа."]
     return "\n".join(lines)
 
@@ -3008,7 +3072,8 @@ async def start_scan(callback: CallbackQuery, state: FSMContext) -> None:
         f"Сегодня по МСК: <b>{today_label}</b>.\n\n"
         "Можно отправить просто число текущего месяца, например <code>12</code>, "
         "или полную дату <code>10.08.2026</code>.\n\n"
-        "После даты выберешь глубину 25 / 50 / 100 страниц.",
+        "После даты скан запустится автоматически. Бот сам определит нужную глубину "
+        "и остановится только после того, как выбранный день будет собран полностью.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -3029,12 +3094,36 @@ async def receive_scan_date(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(target_date=target_date)
     selected = await get_selected(message.from_user.id)
+    selected_cats = [CATEGORIES[k] for k in CATEGORIES if k in selected]
+    if not selected_cats:
+        await state.clear()
+        await message.answer("Сначала выбери хотя бы одну категорию.")
+        return
+
+    async with job_guard:
+        existing = active_jobs.get(message.from_user.id)
+        if existing and existing.state in {"queued", "running"} and not existing.cancel_requested:
+            await state.clear()
+            await message.answer("У тебя уже идёт парсинг.")
+            return
+        if len(queued_job_ids) >= MAX_QUEUE_SIZE:
+            await state.clear()
+            await message.answer("Сервис сейчас сильно загружен. Попробуй чуть позже.")
+            return
+
+    await state.clear()
     await message.answer(
-        f"<b>🔎 Скан за {_date_label(target_date)} (МСК)</b>\n\n"
-        f"Выбрано категорий: <b>{len(selected)}</b>.\n"
-        "Теперь выбери глубину для каждой категории:",
+        f"<b>🔎 Запускаю скан за {_date_label(target_date)} (МСК)</b>\n"
+        f"Категорий: <b>{len(selected_cats)}</b>\n"
+        "Глубина: <b>автоматическая</b>",
         parse_mode=ParseMode.HTML,
-        reply_markup=page_limit_keyboard(),
+    )
+    await enqueue_user_scan(
+        message,
+        message.from_user.id,
+        [cat.key for cat in selected_cats],
+        0,  # v3.0.1 sentinel: exact-date auto-depth
+        target_date,
     )
 
 
