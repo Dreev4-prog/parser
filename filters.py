@@ -130,6 +130,7 @@ class MarketRow:
     title: str
     price_text: str
     price_eur: int
+    view_count: int | None
     median_price: int
     discount_pct: int
     samples: int
@@ -478,6 +479,7 @@ def below_market_rows(rows: list[Listing], discount_threshold: float = 0.20, min
                     title=row.title,
                     price_text=row.price_text or f"{row.price_eur} €",
                     price_eur=row.price_eur,
+                    view_count=getattr(row, "view_count", None),
                     median_price=median,
                     discount_pct=round(discount * 100),
                     samples=len(priced),

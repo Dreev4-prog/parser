@@ -24,6 +24,8 @@ class Listing(Base):
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     disappeared_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    view_count: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    views_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
 
 
 class PriceHistory(Base):
@@ -33,6 +35,15 @@ class PriceHistory(Base):
     external_id: Mapped[str] = mapped_column(String(64), index=True)
     price_text: Mapped[str | None] = mapped_column(String(100), nullable=True)
     price_eur: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ViewHistory(Base):
+    __tablename__ = "view_history"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    external_id: Mapped[str] = mapped_column(String(64), index=True)
+    view_count: Mapped[int] = mapped_column(Integer)
     recorded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 

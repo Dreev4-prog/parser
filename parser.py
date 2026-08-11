@@ -227,8 +227,30 @@ class KleinanzeigenParser:
             timeout=30.0,
             follow_redirects=True,
         )
+        self._playwright = None
+        self._browser = None
+        self._browser_context = None
+        self._browser_lock = asyncio.Lock()
 
     async def close(self) -> None:
+        try:
+            if self._browser_context is not None:
+                await self._browser_context.close()
+        except Exception:
+            pass
+        try:
+            if self._browser is not None:
+                await self._browser.close()
+        except Exception:
+            pass
+        try:
+            if self._playwright is not None:
+                await self._playwright.stop()
+        except Exception:
+            pass
+        self._browser_context = None
+        self._browser = None
+        self._playwright = None
         await self.client.aclose()
 
     async def fetch_html(self, url: str) -> str:
@@ -253,97 +275,148 @@ class KleinanzeigenParser:
         return parse_category_html(await self.fetch_html(url))
 
 
-    async def fetch_public_view_count(self, url: str) -> ViewCountResult:
-        """Read the public view counter rendered by the Kleinanzeigen detail page.
+    @staticmethod
+    def _view_count_from_html(html_text: str) -> tuple[int | None, str | None]:
+        """Fast path: some Kleinanzeigen responses already contain the counter in HTML."""
+        soup = BeautifulSoup(html_text, "html.parser")
+        node = soup.select_one("#viewad-cntr-num")
+        if node is not None:
+            raw = node.get_text(" ", strip=True)
+            match = re.search(r"\d[\d.\s]*", raw)
+            if match:
+                return int(re.sub(r"\D", "", match.group(0))), raw
+        # Narrow source fallback; do not scan arbitrary page numbers.
+        m = re.search(
+            r'id=["\']viewad-cntr-num["\'][^>]*>\s*([0-9][0-9.\s]*)\s*<',
+            html_text, flags=re.IGNORECASE,
+        )
+        if m:
+            raw = m.group(1).strip()
+            return int(re.sub(r"\D", "", raw)), raw
+        return None, None
 
-        Kleinanzeigen currently renders the counter in ``#viewad-cntr-num`` after
-        JavaScript runs. This method intentionally uses a real headless browser and
-        does not log in, inject cookies, or bypass access controls.
+    async def _ensure_view_browser(self):
+        if self._browser_context is not None:
+            return self._browser_context
+        async with self._browser_lock:
+            if self._browser_context is not None:
+                return self._browser_context
+            from playwright.async_api import async_playwright
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            self._browser_context = await self._browser.new_context(
+                user_agent=USER_AGENT,
+                locale="de-DE",
+                viewport={"width": 1365, "height": 900},
+                extra_http_headers={"Accept-Language": "de-DE,de;q=0.9,en;q=0.7"},
+            )
+            return self._browser_context
+
+    async def fetch_public_view_count(self, url: str, *, browser_fallback: bool = True) -> ViewCountResult:
+        """Read the public view counter without authentication.
+
+        First try the normal HTML response (cheap). If the counter is injected only
+        after JavaScript, reuse one Playwright browser/context for all calls made by
+        this parser instance instead of starting a Chromium process per listing.
         """
         if not _allowed_url(url) or "/s-anzeige/" not in url:
             return ViewCountResult(None, None, "invalid-url", error="Нужна публичная ссылка на объявление Kleinanzeigen")
 
         try:
+            html_text = await self.fetch_html(url)
+            value, raw = self._view_count_from_html(html_text)
+            if value is not None:
+                return ViewCountResult(value, raw, "http:#viewad-cntr-num", url, None)
+        except Exception as exc:
+            log.debug("View-count HTTP fast path failed for %s: %s", url, exc)
+
+        if not browser_fallback:
+            return ViewCountResult(None, None, "http:not-found", url, None)
+
+        try:
             from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-            from playwright.async_api import async_playwright
         except Exception as exc:
             return ViewCountResult(None, None, "playwright-unavailable", error=str(exc))
 
-        browser = None
-        context = None
+        page = None
         try:
-            async with async_playwright() as pw:
-                browser = await pw.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-dev-shm-usage"],
+            context = await self._ensure_view_browser()
+            page = await context.new_page()
+
+            async def route_handler(route):
+                if route.request.resource_type in {"image", "font", "media"}:
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await page.route("**/*", route_handler)
+            await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+            final_url = page.url
+            page_title = await page.title()
+
+            selector = "#viewad-cntr-num"
+            try:
+                await page.wait_for_selector(selector, state="attached", timeout=8_000)
+            except PlaywrightTimeoutError:
+                pass
+
+            locator = page.locator(selector)
+            if await locator.count():
+                raw = (await locator.first.inner_text()).strip()
+                match = re.search(r"\d[\d.\s]*", raw)
+                if match:
+                    value = int(re.sub(r"\D", "", match.group(0)))
+                    return ViewCountResult(value, raw, "dom:#viewad-cntr-num", final_url, page_title)
+
+            extra = page.locator("#viewad-extra-info")
+            if await extra.count():
+                raw_html = await extra.first.inner_html()
+                m = re.search(
+                    r"(?:viewad-cntr-num|cntr-num)[^>]*>\s*([0-9][0-9.\s]*)\s*<",
+                    raw_html, flags=re.IGNORECASE,
                 )
-                context = await browser.new_context(
-                    user_agent=USER_AGENT,
-                    locale="de-DE",
-                    viewport={"width": 1365, "height": 900},
-                    extra_http_headers={"Accept-Language": "de-DE,de;q=0.9,en;q=0.7"},
-                )
-                page = await context.new_page()
+                if m:
+                    raw = m.group(1).strip()
+                    value = int(re.sub(r"\D", "", raw))
+                    return ViewCountResult(value, raw, "dom:extra-info", final_url, page_title)
 
-                # Images/fonts/media are not needed for the counter and make Railway
-                # detail-page tests slower. Scripts/XHR remain enabled.
-                async def route_handler(route):
-                    if route.request.resource_type in {"image", "font", "media"}:
-                        await route.abort()
-                    else:
-                        await route.continue_()
-
-                await page.route("**/*", route_handler)
-                await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-                final_url = page.url
-                page_title = await page.title()
-
-                selector = "#viewad-cntr-num"
-                try:
-                    await page.wait_for_selector(selector, state="attached", timeout=12_000)
-                except PlaywrightTimeoutError:
-                    pass
-
-                locator = page.locator(selector)
-                if await locator.count():
-                    raw = (await locator.first.inner_text()).strip()
-                    match = re.search(r"\d[\d.\s]*", raw)
-                    if match:
-                        value = int(re.sub(r"\D", "", match.group(0)))
-                        return ViewCountResult(value, raw, "dom:#viewad-cntr-num", final_url, page_title)
-
-                # Fallback: the counter sits inside the extra-info block. Keep this
-                # deliberately narrow so dates/prices cannot be mistaken for views.
-                extra = page.locator("#viewad-extra-info")
-                if await extra.count():
-                    extra_text = (await extra.first.inner_text()).strip()
-                    # Prefer the number from an element whose id/class mentions the counter.
-                    raw_html = await extra.first.inner_html()
-                    m = re.search(
-                        r"(?:viewad-cntr-num|cntr-num)[^>]*>\s*([0-9][0-9.\s]*)\s*<",
-                        raw_html,
-                        flags=re.IGNORECASE,
-                    )
-                    if m:
-                        raw = m.group(1).strip()
-                        value = int(re.sub(r"\D", "", raw))
-                        return ViewCountResult(value, raw, "dom:extra-info", final_url, page_title)
-
-                return ViewCountResult(None, None, "browser:not-found", final_url, page_title)
+            return ViewCountResult(None, None, "browser:not-found", final_url, page_title)
         except Exception as exc:
-            log.exception("View-count browser test failed for %s", url)
+            log.warning("View-count browser fetch failed for %s: %s", url, exc)
             return ViewCountResult(None, None, "browser:error", error=str(exc)[:500])
         finally:
-            try:
-                if context is not None:
-                    await context.close()
-            except Exception:
-                pass
-            try:
-                if browser is not None:
-                    await browser.close()
-            except Exception:
-                pass
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+    async def fetch_public_view_counts(self, urls: list[str], *, concurrency: int = 6, progress_cb=None) -> dict[str, ViewCountResult]:
+        """Batch view-count fetch with one reusable browser and bounded concurrency."""
+        sem = asyncio.Semaphore(max(1, min(10, concurrency)))
+        results: dict[str, ViewCountResult] = {}
+
+        async def one(url: str):
+            async with sem:
+                results[url] = await self.fetch_public_view_count(url)
+
+        # Work in chunks so thousands of listings do not create thousands of live tasks.
+        chunk_size = max(20, concurrency * 8)
+        total = len(urls)
+        for i in range(0, total, chunk_size):
+            chunk = urls[i:i + chunk_size]
+            await asyncio.gather(*(one(url) for url in chunk))
+            if progress_cb is not None:
+                try:
+                    maybe = progress_cb(min(total, i + len(chunk)), total)
+                    if asyncio.iscoroutine(maybe):
+                        await maybe
+                except Exception:
+                    pass
+        return results
 
     async def check_listing_active(self, url: str) -> bool | None:
         """Return True=live, False=unavailable, None=could not determine safely."""

@@ -67,6 +67,10 @@ async def init_db() -> None:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN is_active BOOLEAN DEFAULT TRUE"))
         if columns and "disappeared_at" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN disappeared_at TIMESTAMP"))
+        if columns and "view_count" not in columns:
+            await conn.execute(text("ALTER TABLE listings ADD COLUMN view_count INTEGER"))
+        if columns and "views_checked_at" not in columns:
+            await conn.execute(text("ALTER TABLE listings ADD COLUMN views_checked_at TIMESTAMP"))
 
         settings_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "user_settings"))
         if settings_columns and "page_limit" not in settings_columns:

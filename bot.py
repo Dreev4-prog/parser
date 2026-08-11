@@ -34,7 +34,7 @@ from filters import (
     sort_rows,
     unique_rows,
 )
-from models import CategoryScanState, Listing, ParserRun, PriceHistory, SelectedCategory, UserSettings
+from models import CategoryScanState, Listing, ParserRun, PriceHistory, SelectedCategory, UserSettings, ViewHistory
 from parser import (
     MAX_PAGES_PER_CATEGORY,
     PAGE_DELAY_SECONDS,
@@ -61,6 +61,12 @@ MAX_CONCURRENT_JOBS = max(1, min(8, int(os.getenv("MAX_CONCURRENT_JOBS", "3"))))
 MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
 CATEGORY_CACHE_TTL_SECONDS = max(0, int(os.getenv("CATEGORY_CACHE_TTL_SECONDS", "300")))
 STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVAL_SECONDS", "1.5")))
+
+# Public view-count enrichment. Values are cached in the DB so repeated exports
+# by many users reuse recent counters instead of reopening the same ad pages.
+VIEW_COUNT_CACHE_TTL_SECONDS = max(60, int(os.getenv("VIEW_COUNT_CACHE_TTL_SECONDS", "900")))
+VIEW_COUNT_CONCURRENCY = max(1, min(10, int(os.getenv("VIEW_COUNT_CONCURRENCY", "6"))))
+VIEW_COUNT_EXPORT_MODES = {"newest", "all", "unique", "below_market"}
 
 # v2.5 incremental scan tuning (kept in v2.6). A full scan is forced once per category per Berlin day.
 # Later runs stop after the parser crosses the previous head checkpoint and then
@@ -433,11 +439,12 @@ def write_listing_csv(rows: list[Listing], mode: str) -> Path:
     now = datetime.now(BERLIN)
     path, writer, f = _temp_csv(f"kleinanzeigen_{mode}_{now:%Y-%m-%d_%H-%M}.csv")
     try:
-        writer.writerow(["Категория", "Название", "Цена", "Цена, €", "Дата публикации", "Ссылка"])
+        writer.writerow(["Категория", "Название", "Цена", "Цена, €", "👁 Просмотры", "Дата публикации", "Ссылка"])
         for row in rows:
             writer.writerow([
                 row.category, row.title, _price_display(row.price_text, row.price_eur),
                 row.price_eur if row.price_eur is not None else "",
+                row.view_count if row.view_count is not None else "",
                 row.posted_text or "Сегодня", row.url,
             ])
     finally:
@@ -472,12 +479,13 @@ def write_market_csv(rows) -> Path:
     path, writer, f = _temp_csv(f"kleinanzeigen_nizhe_rynka_{now:%Y-%m-%d_%H-%M}.csv")
     try:
         writer.writerow([
-            "Категория", "Название", "Цена", "Цена, €", "Медиана группы, €",
+            "Категория", "Название", "Цена", "Цена, €", "👁 Просмотры", "Медиана группы, €",
             "Ниже медианы, %", "Образцов", "Точность группы, %", "Дата", "Ссылка",
         ])
         for row in rows:
             writer.writerow([
                 row.category, row.title, row.price_text or f"{row.price_eur} €", row.price_eur,
+                getattr(row, "view_count", None) if getattr(row, "view_count", None) is not None else "",
                 row.median_price, row.discount_pct, row.samples, row.confidence, row.posted_text, row.url,
             ])
     finally:
@@ -571,6 +579,102 @@ async def refresh_availability(rows: list[Listing]) -> tuple[int, int, int]:
     return len(candidates), len(disappeared_ids), unknown
 
 
+async def refresh_view_counts(rows: list[Listing], message: Message | BotChatAdapter | None = None) -> tuple[int, int, int]:
+    """Refresh missing/stale public view counters and persist them.
+
+    Returns (requested, updated, failed). Recent counters are reused from the DB.
+    """
+    if not rows:
+        return 0, 0, 0
+
+    cutoff = datetime.utcnow() - timedelta(seconds=VIEW_COUNT_CACHE_TTL_SECONDS)
+    targets = [
+        row for row in rows
+        if row.url and (row.views_checked_at is None or row.views_checked_at < cutoff)
+    ]
+    if not targets:
+        return 0, 0, 0
+
+    status = None
+    if message is not None:
+        try:
+            status = await message.answer(
+                f"👁 Собираю просмотры для <b>{len(targets)}</b> объявлений…\n"
+                f"Недавние значения кэшируются на {max(1, VIEW_COUNT_CACHE_TTL_SECONDS // 60)} мин.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            status = None
+
+    async def progress_cb(done: int, total: int):
+        if status is not None and hasattr(status, "edit_text"):
+            try:
+                pct = round(done / total * 100) if total else 100
+                await status.edit_text(
+                    f"👁 Собираю просмотры… <b>{done}/{total}</b> ({pct}%)\n"
+                    f"Недавние значения кэшируются на {max(1, VIEW_COUNT_CACHE_TTL_SECONDS // 60)} мин.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+    parser = KleinanzeigenParser()
+    try:
+        results = await parser.fetch_public_view_counts(
+            [row.url for row in targets],
+            concurrency=VIEW_COUNT_CONCURRENCY,
+            progress_cb=progress_cb,
+        )
+    finally:
+        await parser.close()
+
+    now = datetime.utcnow()
+    updated = 0
+    failed = 0
+    by_id = {row.external_id: row for row in targets}
+    url_to_id = {row.url: row.external_id for row in targets}
+    async with db_write_lock:
+        async with SessionLocal() as session:
+            result = await session.execute(select(Listing).where(Listing.external_id.in_(list(by_id))))
+            db_rows = {row.external_id: row for row in result.scalars().all()}
+            for url, vr in results.items():
+                external_id = url_to_id.get(url)
+                row = db_rows.get(external_id) if external_id else None
+                if row is None:
+                    continue
+                if vr.views is None:
+                    failed += 1
+                    continue
+                old = row.view_count
+                row.view_count = int(vr.views)
+                row.views_checked_at = now
+                if old != row.view_count:
+                    session.add(ViewHistory(
+                        external_id=row.external_id,
+                        view_count=row.view_count,
+                        recorded_at=now,
+                    ))
+                updated += 1
+            await session.commit()
+
+    # Update the already-loaded ORM objects so the CSV can be written without a reload.
+    for row in targets:
+        vr = results.get(row.url)
+        if vr and vr.views is not None:
+            row.view_count = int(vr.views)
+            row.views_checked_at = now
+
+    if status is not None and hasattr(status, "edit_text"):
+        try:
+            await status.edit_text(
+                f"👁 Просмотры готовы: <b>{updated}</b> · не удалось: <b>{failed}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+    return len(targets), updated, failed
+
+
 async def send_smart_export(
     message: Message | BotChatAdapter,
     user_id: int,
@@ -594,6 +698,11 @@ async def send_smart_export(
     base = raw_base
     if s.smart_dedupe and mode != "frequent":
         base = dedupe_rows(base)
+
+    # v2.6.6: populate public view counters before user-facing listing exports.
+    # The DB cache prevents repeated work when many users request the same data.
+    if mode in VIEW_COUNT_EXPORT_MODES and base:
+        await refresh_view_counts(base, message)
 
     if mode == "frequent":
         result = frequent_rows(base, min_count=3)
@@ -683,7 +792,7 @@ def settings_text(s: UserSettings) -> str:
         f"Последняя глубина запуска: <b>{getattr(s, 'page_limit', 100)} страниц</b>\n"
         f"Ключевые слова: <b>{include}</b>\n"
         f"Исключить: <b>{exclude}</b>\n\n"
-        "<i>v2.6.4 сохраняет Smart Analytics/Fast Incremental и добавляет пользовательский живой прогресс; внутренняя очередь, кэш и совместные сканы скрыты от пользователей. "
+        "<i>v2.6.6 сохраняет Smart Analytics/Fast Incremental и добавляет пользовательский живой прогресс; внутренняя очередь, кэш и совместные сканы скрыты от пользователей. "
         "Нажми «ℹ️ Как работают режимы», чтобы увидеть текущие критерии.</i>"
     )
 
@@ -698,6 +807,9 @@ async def stats_text() -> str:
         ))).scalar_one()
         priced = (await session.execute(select(func.count(Listing.id)).where(
             Listing.first_seen_at >= start_utc, Listing.first_seen_at < end_utc, Listing.price_text.is_not(None),
+        ))).scalar_one()
+        viewed = (await session.execute(select(func.count(Listing.id)).where(
+            Listing.first_seen_at >= start_utc, Listing.first_seen_at < end_utc, Listing.view_count.is_not(None),
         ))).scalar_one()
         drops = (await session.execute(select(func.count(PriceHistory.id)))).scalar_one()
         runs = (await session.execute(select(func.count(ParserRun.id)).where(
@@ -719,6 +831,7 @@ async def stats_text() -> str:
     storage = "PostgreSQL / DATABASE_URL" if USING_PERSISTENT_DATABASE else "SQLite"
     warning = "" if USING_PERSISTENT_DATABASE else "\n\n⚠️ На Railway SQLite может потеряться после redeploy/restart."
     coverage = round(priced / today * 100) if today else 0
+    view_coverage = round(viewed / today * 100) if today else 0
     async with job_guard:
         running_jobs_count = sum(1 for j in active_jobs.values() if j.state == "running")
         queued_jobs_count = sum(1 for j in active_jobs.values() if j.state == "queued" and not j.cancel_requested)
@@ -727,6 +840,7 @@ async def stats_text() -> str:
         f"<b>📊 База и парсинг</b>\n\n"
         f"Сегодня собрано: <b>{today}</b>\n"
         f"С ценой: <b>{priced}</b> ({coverage}%)\n"
+        f"С просмотрами: <b>{viewed}</b> ({view_coverage}%)\n"
         f"Всего сохранено: <b>{total}</b>\n"
         f"Записей истории цен: <b>{drops}</b>\n\n"
         f"<b>⚡ v2.6 сегодня</b>\n"
