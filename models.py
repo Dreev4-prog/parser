@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Integer, String, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -31,3 +31,17 @@ class SelectedCategory(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(index=True)
     category_key: Mapped[str] = mapped_column(String(80), index=True)
+
+
+class UserSettings(Base):
+    __tablename__ = "user_settings"
+
+    user_id: Mapped[int] = mapped_column(primary_key=True)
+    output_mode: Mapped[str] = mapped_column(String(32), default="newest")
+    smart_dedupe: Mapped[bool] = mapped_column(Boolean, default=True)
+    clean_noise: Mapped[bool] = mapped_column(Boolean, default=True)
+    period: Mapped[str] = mapped_column(String(16), default="today")
+    price_filter: Mapped[str] = mapped_column(String(32), default="any")
+    sort_mode: Mapped[str] = mapped_column(String(32), default="newest")
+    include_words: Mapped[str] = mapped_column(String(1000), default="")
+    exclude_words: Mapped[str] = mapped_column(String(1000), default="")

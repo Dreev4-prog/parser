@@ -1,36 +1,64 @@
-# Kleinanzeigen Parser Bot v2.1.0
+# Kleinanzeigen Parser Bot v2.2.0 — Smart Parsing
 
-Incremental Telegram parser for public Kleinanzeigen category pages.
+Telegram parser for public Kleinanzeigen category pages. v2.2 separates **collection** from **output**: the parser stores the full current-day dataset, while settings decide what goes into the export.
 
-## What changed from v2.0
+## New in v2.2
 
-- Cumulative database: every listing is stored by Kleinanzeigen ad ID.
-- First scan of the day can walk all pages containing `Heute`.
-- Later scans stop after two consecutive pages with today's listings but no new IDs, so they normally do not rescan hundreds of old pages.
-- New button: **📄 Выгрузить за сегодня**.
-- CSV is cumulative for the current Berlin day and can be downloaded at any time.
-- Scan status shows new listings and pages scanned.
-- Built-in DB migration from v2.0 adds `category_key` and `posted_text`.
-- Parent and child categories are not selected together, reducing duplicates.
+### ⚙️ Parsing/output settings
 
-## Railway variables
+- **Output mode**
+  - 🆕 Самые новые
+  - 📚 Все
+  - 💎 Уникальные (beta title-family heuristic)
+  - 🔥 Часто публикуемые (aggregated product-family report)
+  - 💰 Ниже рынка β (>=20% below the median of a product family, minimum 3 priced samples)
+- **Smart duplicates** — likely reposts with the same normalized title + price + category are collapsed, keeping the newest.
+- **Clean services/search** — filters obvious `Suche`, `Ankauf`, `Reparatur`, service/rental/swap noise from exports. This does not delete it from the DB.
+- **Period** — 1h / 3h / 6h / today.
+- **Price presets** — any / 0–50 / 50–100 / 100–200 / 200–500 / 500+ EUR.
+- **Sort** — newest / price ascending / price descending.
+- **Include words** — comma-separated allow-list keywords.
+- **Exclude words** — comma-separated custom exclusions.
 
-Required:
+### 📦 Result export
+
+The main menu now has **📦 Получить результат**. It generates a CSV using current settings without rescanning Kleinanzeigen.
+
+`🔥 Часто публикуемые` exports:
+- category
+- product-family key
+- example title
+- publication count
+- min / median / max price
+- newest timestamp
+- example link
+
+`💰 Ниже рынка β` exports potential price outliers against the median of similar title families. It is a heuristic, not a valuation guarantee.
+
+## Important behavior
+
+- Collection is still by public category/search pages only.
+- Filters affect exports, not collection. You can change settings and export again instantly.
+- ID-based database deduplication remains permanent.
+- Smart duplicate/family grouping is intentionally conservative and heuristic.
+- No CAPTCHA/authentication/access-control bypass is implemented.
+
+## Railway
+
+Required variables:
 
 ```env
 BOT_TOKEN=...
 ADMIN_IDS=123456789
 ```
 
-Recommended for Railway:
+Recommended later for persistence:
 
 ```env
 DATABASE_URL=postgresql://...
 ```
 
-Without `DATABASE_URL` the bot falls back to SQLite. SQLite is enough for a quick test, but Railway's container filesystem is not a safe place for long-term cumulative data across redeploys/restarts. Use PostgreSQL (or a persistent volume) for reliable history.
-
-Optional:
+Optional parser variables:
 
 ```env
 MAX_PAGES_PER_CATEGORY=500
@@ -39,29 +67,12 @@ STOP_AFTER_EMPTY_TODAY_PAGES=2
 STOP_AFTER_NO_NEW_PAGES=2
 ```
 
-## Start command
+Start command:
 
 ```bash
 python bot.py
 ```
 
-## Workflow
+## Upgrade from v2.1
 
-1. `/start`
-2. **🗂 Выбрать категории**
-3. **▶️ Начать парсинг**
-4. On the first run, the bot collects today's listings until `Heute` ends.
-5. On later runs, it normally stops when it reaches already-stored listings.
-6. **📄 Выгрузить за сегодня** generates the accumulated CSV at any time.
-
-CSV columns:
-
-- Категория
-- Название
-- Цена
-- Дата публикации
-- Ссылка
-
-## Notes
-
-The parser only reads publicly available Kleinanzeigen category/search pages. It does not bypass CAPTCHA, authentication, or access controls.
+Replace the repository files with v2.2 and redeploy. The new `user_settings` table is created automatically. Existing listings/categories remain compatible.
