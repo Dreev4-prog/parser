@@ -5,8 +5,9 @@ import csv
 import html
 import logging
 import os
+import shutil
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -17,9 +18,18 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Inli
 from sqlalchemy import delete, func, select
 
 from categories import CATEGORIES, GROUPS, categories_for_group, group_root_key
-from db import SessionLocal, init_db
+from db import SessionLocal, USING_PERSISTENT_DATABASE, init_db
 from models import Listing, SelectedCategory
-from parser import KleinanzeigenParser, ParsedListing
+from parser import (
+    MAX_PAGES_PER_CATEGORY,
+    PAGE_DELAY_SECONDS,
+    STOP_AFTER_EMPTY_TODAY_PAGES,
+    STOP_AFTER_NO_NEW_PAGES,
+    KleinanzeigenParser,
+    ParsedListing,
+    is_today_text,
+    page_url,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("kleinanzeigen-bot")
@@ -42,6 +52,7 @@ def main_keyboard(selected_count: int = 0) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="▶️ Начать парсинг", callback_data="start_scan")],
         [InlineKeyboardButton(text=f"🗂 Выбрать категории ({selected_count})", callback_data="groups")],
+        [InlineKeyboardButton(text="📄 Выгрузить за сегодня", callback_data="export_today")],
         [InlineKeyboardButton(text="📋 Что выбрано", callback_data="selected"),
          InlineKeyboardButton(text="📊 База", callback_data="stats")],
     ])
@@ -65,7 +76,6 @@ def groups_keyboard(selected_keys: set[str]) -> InlineKeyboardMarkup:
 
 
 def category_keyboard(group_key: str, selected_keys: set[str]) -> InlineKeyboardMarkup:
-    group = GROUPS[group_key]
     cats = categories_for_group(group_key)
     rows = []
     for cat in cats:
@@ -149,54 +159,110 @@ async def clear_selected(user_id: int) -> None:
         await session.commit()
 
 
-async def upsert_items(category: str, items: list[ParsedListing]) -> tuple[int, int]:
+async def upsert_page_items(
+    category_key: str,
+    category_name: str,
+    items: list[ParsedListing],
+) -> tuple[list[ParsedListing], int]:
+    """Save one page and return (brand-new listings, already-known count)."""
     if not items:
-        return 0, 0
-    ids = [x.external_id for x in items]
+        return [], 0
+
+    unique: dict[str, ParsedListing] = {item.external_id: item for item in items}
+    ids = list(unique)
     async with SessionLocal() as session:
         existing_result = await session.execute(select(Listing).where(Listing.external_id.in_(ids)))
-        existing = {x.external_id: x for x in existing_result.scalars().all()}
+        existing = {row.external_id: row for row in existing_result.scalars().all()}
         now = datetime.utcnow()
-        new_count = 0
-        for item in items:
-            listing = existing.get(item.external_id)
+        new_items: list[ParsedListing] = []
+
+        for external_id, item in unique.items():
+            listing = existing.get(external_id)
             if listing is None:
                 session.add(Listing(
                     external_id=item.external_id,
-                    category=category,
+                    category_key=category_key,
+                    category=category_name,
                     title=item.title,
                     price_text=item.price_text,
                     price_eur=item.price_eur,
+                    posted_text=item.posted_text,
                     url=item.url,
+                    first_seen_at=now,
+                    last_seen_at=now,
                 ))
-                new_count += 1
+                new_items.append(item)
             else:
-                listing.category = category
+                listing.category_key = category_key
+                listing.category = category_name
                 listing.title = item.title
                 listing.price_text = item.price_text
                 listing.price_eur = item.price_eur
+                listing.posted_text = item.posted_text
                 listing.url = item.url
                 listing.last_seen_at = now
+
         await session.commit()
-    return new_count, len(items) - new_count
+        return new_items, len(unique) - len(new_items)
 
 
-def write_csv(rows: list[tuple[str, ParsedListing]]) -> Path:
+def berlin_today_utc_bounds() -> tuple[datetime, datetime]:
+    now = datetime.now(BERLIN)
+    start_local = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1)
+    start_utc = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+    end_utc = end_local.astimezone(timezone.utc).replace(tzinfo=None)
+    return start_utc, end_utc
+
+
+async def today_rows() -> list[Listing]:
+    start_utc, end_utc = berlin_today_utc_bounds()
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Listing)
+            .where(Listing.first_seen_at >= start_utc, Listing.first_seen_at < end_utc)
+            .order_by(Listing.category.asc(), Listing.first_seen_at.desc())
+        )
+        return list(result.scalars().all())
+
+
+def write_today_csv(rows: list[Listing]) -> Path:
     now = datetime.now(BERLIN)
     temp_dir = Path(tempfile.mkdtemp(prefix="kleinanzeigen_"))
-    path = temp_dir / f"kleinanzeigen_{now:%Y-%m-%d_%H-%M}.csv"
+    path = temp_dir / f"kleinanzeigen_heute_{now:%Y-%m-%d_%H-%M}.csv"
     with path.open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f, delimiter=";")
         writer.writerow(["Категория", "Название", "Цена", "Дата публикации", "Ссылка"])
-        for category_name, item in rows:
+        for row in rows:
             writer.writerow([
-                category_name,
-                item.title,
-                item.price_text or "",
-                item.posted_text or "Сегодня",
-                item.url,
+                row.category,
+                row.title,
+                row.price_text or "",
+                row.posted_text or "Сегодня",
+                row.url,
             ])
     return path
+
+
+async def send_today_file(message: Message, selected_count: int) -> int:
+    rows = await today_rows()
+    if not rows:
+        await message.answer(
+            "📄 За сегодня в базе пока нет объявлений.",
+            reply_markup=main_keyboard(selected_count),
+        )
+        return 0
+
+    path = write_today_csv(rows)
+    try:
+        await message.answer_document(
+            FSInputFile(path),
+            caption=f"📄 Объявления за сегодня: {len(rows)}",
+            reply_markup=main_keyboard(selected_count),
+        )
+    finally:
+        shutil.rmtree(path.parent, ignore_errors=True)
+    return len(rows)
 
 
 def selected_text(keys: set[str]) -> str:
@@ -225,9 +291,90 @@ def selected_text(keys: set[str]) -> str:
 
 
 async def stats_text() -> str:
+    start_utc, end_utc = berlin_today_utc_bounds()
     async with SessionLocal() as session:
         total = (await session.execute(select(func.count(Listing.id)))).scalar_one()
-    return f"<b>📊 База парсера</b>\n\nВсего сохранено объявлений: <b>{total}</b>"
+        today = (await session.execute(
+            select(func.count(Listing.id)).where(
+                Listing.first_seen_at >= start_utc,
+                Listing.first_seen_at < end_utc,
+            )
+        )).scalar_one()
+    storage = "PostgreSQL / DATABASE_URL" if USING_PERSISTENT_DATABASE else "SQLite"
+    warning = "" if USING_PERSISTENT_DATABASE else "\n\n⚠️ На Railway SQLite может потеряться после redeploy/restart."
+    return (
+        "<b>📊 База парсера</b>\n\n"
+        f"Сегодня собрано: <b>{today}</b>\n"
+        f"Всего сохранено: <b>{total}</b>\n"
+        f"База: <b>{storage}</b>"
+        f"{warning}"
+    )
+
+
+async def scan_one_category(parser: KleinanzeigenParser, cat) -> tuple[int, int, int, bool, str]:
+    """Incremental scan.
+
+    The first scan walks all pages containing Heute. Later scans normally stop once
+    two consecutive pages contain today's listings but no brand-new IDs. This avoids
+    rescanning the whole day while being tolerant of promoted/reordered cards.
+
+    Returns: (new_count, pages_scanned, today_seen, hit_limit, stop_reason)
+    """
+    new_count = 0
+    today_seen = 0
+    pages_scanned = 0
+    empty_today_pages = 0
+    no_new_pages = 0
+
+    for page in range(1, MAX_PAGES_PER_CATEGORY + 1):
+        items = await parser.parse_category_page(page_url(cat.url, page))
+        pages_scanned = page
+
+        if not items:
+            log.info("category=%s page=%s no listings, stop", cat.name, page)
+            return new_count, pages_scanned, today_seen, False, "конец выдачи"
+
+        today_items = [item for item in items if is_today_text(item.posted_text)]
+        today_seen += len(today_items)
+
+        if today_items:
+            empty_today_pages = 0
+            new_items, known_count = await upsert_page_items(cat.key, cat.name, today_items)
+            new_count += len(new_items)
+
+            if new_items:
+                no_new_pages = 0
+            elif known_count:
+                no_new_pages += 1
+            else:
+                no_new_pages += 1
+
+            log.info(
+                "category=%s page=%s total=%s today=%s new=%s known=%s no_new_pages=%s",
+                cat.name,
+                page,
+                len(items),
+                len(today_items),
+                len(new_items),
+                known_count,
+                no_new_pages,
+            )
+
+            if no_new_pages >= STOP_AFTER_NO_NEW_PAGES:
+                return new_count, pages_scanned, today_seen, False, "дошли до уже собранных"
+        else:
+            empty_today_pages += 1
+            log.info(
+                "category=%s page=%s total=%s today=0 empty_today_pages=%s",
+                cat.name, page, len(items), empty_today_pages,
+            )
+            if empty_today_pages >= STOP_AFTER_EMPTY_TODAY_PAGES:
+                return new_count, pages_scanned, today_seen, False, "закончились объявления Heute"
+
+        if PAGE_DELAY_SECONDS and page < MAX_PAGES_PER_CATEGORY:
+            await asyncio.sleep(PAGE_DELAY_SECONDS)
+
+    return new_count, pages_scanned, today_seen, True, "аварийный лимит страниц"
 
 
 dp = Dispatcher()
@@ -240,10 +387,12 @@ async def start(message: Message) -> None:
         return
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>Kleinanzeigen Parser v2.0</b>\n\n"
-        "1) Выбери нужные категории.\n"
+        "<b>Kleinanzeigen Parser v2.1</b>\n\n"
+        "1) Выбери категории.\n"
         "2) Нажми <b>Начать парсинг</b>.\n"
-        "3) Я пройду страницы с сортировкой по свежести, соберу объявления с пометкой <b>Heute</b> и пришлю один CSV-файл.\n\n"
+        "3) Первый запуск соберёт весь сегодняшний день. Следующие запуски остановятся, "
+        "когда бот дойдёт до уже сохранённых объявлений.\n"
+        "4) <b>Выгрузить за сегодня</b> в любой момент пришлёт общий CSV-файл.\n\n"
         "В файле: <b>категория, название, цена, дата и ссылка</b>.",
         reply_markup=main_keyboard(len(selected)),
         parse_mode=ParseMode.HTML,
@@ -258,7 +407,7 @@ async def home(callback: CallbackQuery) -> None:
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
     await callback.message.edit_text(
-        "<b>Kleinanzeigen Parser v2.0</b>\n\nВыбери действие:",
+        "<b>Kleinanzeigen Parser v2.1</b>\n\nВыбери действие:",
         reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML,
     )
 
@@ -359,6 +508,16 @@ async def stats(callback: CallbackQuery) -> None:
     )
 
 
+@dp.callback_query(F.data == "export_today")
+async def export_today(callback: CallbackQuery) -> None:
+    if not allowed(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer()
+    selected = await get_selected(callback.from_user.id)
+    await send_today_file(callback.message, len(selected))
+
+
 @dp.callback_query(F.data == "start_scan")
 async def start_scan(callback: CallbackQuery) -> None:
     if not allowed(callback.from_user.id):
@@ -376,73 +535,60 @@ async def start_scan(callback: CallbackQuery) -> None:
 
     await callback.answer()
     status = await callback.message.answer(
-        f"⏳ <b>Начинаю парсинг за сегодня</b>\nКатегорий: <b>{len(selected_cats)}</b>",
+        f"⏳ <b>Начинаю парсинг</b>\nКатегорий: <b>{len(selected_cats)}</b>",
         parse_mode=ParseMode.HTML,
     )
 
     async with scan_lock:
         parser = KleinanzeigenParser()
-        all_rows: list[tuple[str, ParsedListing]] = []
-        seen_ids: set[str] = set()
         total_pages = 0
+        total_new = 0
         warnings: list[str] = []
         try:
             for idx, cat in enumerate(selected_cats, start=1):
                 try:
-                    items, pages, hit_limit = await parser.parse_today(cat.url)
+                    new_count, pages, today_seen, hit_limit, reason = await scan_one_category(parser, cat)
                     total_pages += pages
+                    total_new += new_count
                     if hit_limit:
                         warnings.append(f"{cat.name}: достигнут аварийный лимит страниц")
-                    new_count, old_count = await upsert_items(cat.name, items)
-                    added = 0
-                    for item in items:
-                        if item.external_id in seen_ids:
-                            continue
-                        seen_ids.add(item.external_id)
-                        all_rows.append((cat.name, item))
-                        added += 1
+
                     log.info(
-                        "category=%s pages=%s today=%s added_to_file=%s new_db=%s old_db=%s",
-                        cat.name, pages, len(items), added, new_count, old_count,
+                        "category=%s pages=%s today_seen=%s new=%s stop=%s",
+                        cat.name, pages, today_seen, new_count, reason,
                     )
                     await status.edit_text(
-                        "⏳ <b>Парсинг за сегодня</b>\n\n"
+                        "⏳ <b>Парсинг</b>\n\n"
                         f"Категория: <b>{idx}/{len(selected_cats)}</b>\n"
                         f"Сейчас: <b>{html.escape(cat.name)}</b>\n"
-                        f"Страниц просмотрено всего: <b>{total_pages}</b>\n"
-                        f"Объявлений в файл: <b>{len(all_rows)}</b>",
+                        f"В этой категории новых: <b>{new_count}</b>\n"
+                        f"Новых за запуск: <b>{total_new}</b>\n"
+                        f"Страниц просмотрено: <b>{total_pages}</b>\n"
+                        f"Остановка: <b>{html.escape(reason)}</b>",
                         parse_mode=ParseMode.HTML,
                     )
                 except Exception as exc:
                     log.exception("Parsing error category=%s", cat.name)
                     warnings.append(f"{cat.name}: {str(exc)[:120]}")
 
-            path = write_csv(all_rows)
-            caption = (
-                f"✅ Готово. За сегодня собрано: {len(all_rows)} объявлений\n"
-                f"Категорий: {len(selected_cats)} · страниц: {total_pages}\n"
-                "Формат CSV открывается в Excel."
+            today_count = len(await today_rows())
+            await status.edit_text(
+                "✅ <b>Парсинг завершён</b>\n\n"
+                f"Новых объявлений за запуск: <b>{total_new}</b>\n"
+                f"Всего в сегодняшнем файле: <b>{today_count}</b>\n"
+                f"Пройдено страниц: <b>{total_pages}</b>",
+                parse_mode=ParseMode.HTML,
             )
-            if warnings:
-                caption += f"\n⚠️ Категорий с предупреждениями: {len(warnings)}"
 
-            await callback.message.answer_document(
-                FSInputFile(path),
-                caption=caption,
-                reply_markup=main_keyboard(len(selected_keys)),
-            )
+            # As in v2.0, send the result automatically; the main menu also lets
+            # the user download the same accumulated file again at any time.
+            await send_today_file(callback.message, len(selected_keys))
+
             if warnings:
                 text = "<b>⚠️ Предупреждения</b>\n\n" + "\n".join(
                     f"• {html.escape(x)}" for x in warnings[:20]
                 )
                 await callback.message.answer(text, parse_mode=ParseMode.HTML)
-
-            await status.edit_text(
-                f"✅ <b>Парсинг завершён</b>\n\n"
-                f"Собрано объявлений за сегодня: <b>{len(all_rows)}</b>\n"
-                f"Пройдено страниц: <b>{total_pages}</b>",
-                parse_mode=ParseMode.HTML,
-            )
         finally:
             await parser.close()
 
@@ -454,6 +600,10 @@ async def main() -> None:
     bot = Bot(BOT_TOKEN)
     me = await bot.get_me()
     log.info("Starting @%s", me.username)
+    if not USING_PERSISTENT_DATABASE:
+        log.warning(
+            "DATABASE_URL is not set. SQLite works, but on Railway its data may be lost after redeploy/restart."
+        )
     await dp.start_polling(bot)
 
 

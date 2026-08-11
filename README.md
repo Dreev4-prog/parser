@@ -1,44 +1,67 @@
-# Kleinanzeigen Parser Bot v2.0.0
+# Kleinanzeigen Parser Bot v2.1.0
 
-Telegram-бот для сбора публичных объявлений Kleinanzeigen по выбранным категориям.
+Incremental Telegram parser for public Kleinanzeigen category pages.
 
-## Что изменилось
+## What changed from v2.0
 
-- Отдельная кнопка **«Выбрать категории»**.
-- Отдельная кнопка **«Начать парсинг»**.
-- Добавлены все основные разделы Kleinanzeigen и подкатегории, показанные на главной странице сайта на 11.08.2026.
-- Можно выбрать весь раздел или отдельные подкатегории.
-- Выбор категорий сохраняется в базе.
-- Парсер идёт по страницам категории, пока в выдаче есть объявления с пометкой **Heute**.
-- Результат каждого запуска приходит одним CSV-файлом (UTF-8 BOM, `;`), который нормально открывается в Excel.
-- Колонки файла: Категория, Название, Цена, Дата публикации, Ссылка.
-- Дубли по ID в итоговом файле удаляются.
-- Просмотры не собираются.
+- Cumulative database: every listing is stored by Kleinanzeigen ad ID.
+- First scan of the day can walk all pages containing `Heute`.
+- Later scans stop after two consecutive pages with today's listings but no new IDs, so they normally do not rescan hundreds of old pages.
+- New button: **📄 Выгрузить за сегодня**.
+- CSV is cumulative for the current Berlin day and can be downloaded at any time.
+- Scan status shows new listings and pages scanned.
+- Built-in DB migration from v2.0 adds `category_key` and `posted_text`.
+- Parent and child categories are not selected together, reducing duplicates.
 
-## Railway
+## Railway variables
 
-Оставь тот же проект и тот же GitHub-репозиторий.
+Required:
 
-Variables:
+```env
+BOT_TOKEN=...
+ADMIN_IDS=123456789
+```
 
-- `BOT_TOKEN` — обязательно.
-- `ADMIN_IDS` — твой Telegram ID (можно несколько через запятую).
-- `DATABASE_URL` — необязательно; если есть Railway PostgreSQL, выбор категорий и база сохраняются надёжнее между деплоями.
-- `MAX_PAGES_PER_CATEGORY` — аварийный предел страниц одной категории, по умолчанию `500`. Это НЕ лимит количества объявлений.
-- `PAGE_DELAY_SECONDS` — пауза между страницами, по умолчанию `0.7` секунды.
+Recommended for Railway:
 
-Start Command:
+```env
+DATABASE_URL=postgresql://...
+```
+
+Without `DATABASE_URL` the bot falls back to SQLite. SQLite is enough for a quick test, but Railway's container filesystem is not a safe place for long-term cumulative data across redeploys/restarts. Use PostgreSQL (or a persistent volume) for reliable history.
+
+Optional:
+
+```env
+MAX_PAGES_PER_CATEGORY=500
+PAGE_DELAY_SECONDS=0.7
+STOP_AFTER_EMPTY_TODAY_PAGES=2
+STOP_AFTER_NO_NEW_PAGES=2
+```
+
+## Start command
 
 ```bash
 python bot.py
 ```
 
-## Как бот определяет «за сегодня»
+## Workflow
 
-Kleinanzeigen в стандартной выдаче без выбранного города показывает новые объявления сверху. Бот проходит страницы и берёт карточки, где сайт показывает `Heute`. После двух страниц подряд без `Heute` парсинг этой категории заканчивается.
+1. `/start`
+2. **🗂 Выбрать категории**
+3. **▶️ Начать парсинг**
+4. On the first run, the bot collects today's listings until `Heute` ends.
+5. On later runs, it normally stops when it reaches already-stored listings.
+6. **📄 Выгрузить за сегодня** generates the accumulated CSV at any time.
 
-Верхние рекламные объявления могут быть вставлены отдельно самой площадкой; бот берёт только карточки, где есть метка `Heute`.
+CSV columns:
 
-## Важно
+- Категория
+- Название
+- Цена
+- Дата публикации
+- Ссылка
 
-Парсер работает только с публичными страницами `kleinanzeigen.de`, не логинится в аккаунт и не обходит CAPTCHA/ограничения доступа.
+## Notes
+
+The parser only reads publicly available Kleinanzeigen category/search pages. It does not bypass CAPTCHA, authentication, or access controls.

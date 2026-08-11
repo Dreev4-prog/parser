@@ -18,7 +18,8 @@ USER_AGENT = os.getenv(
 )
 MAX_PAGES_PER_CATEGORY = max(1, int(os.getenv("MAX_PAGES_PER_CATEGORY", "500")))
 PAGE_DELAY_SECONDS = max(0.0, float(os.getenv("PAGE_DELAY_SECONDS", "0.7")))
-STOP_AFTER_EMPTY_TODAY_PAGES = 2
+STOP_AFTER_EMPTY_TODAY_PAGES = max(1, int(os.getenv("STOP_AFTER_EMPTY_TODAY_PAGES", "2")))
+STOP_AFTER_NO_NEW_PAGES = max(1, int(os.getenv("STOP_AFTER_NO_NEW_PAGES", "2")))
 
 log = logging.getLogger("kleinanzeigen-parser")
 
@@ -42,8 +43,12 @@ def parse_price(text: str | None) -> int | None:
 
 
 def extract_external_id(url: str) -> str:
+    # Kleinanzeigen ad URLs normally end with /<ad-id>-<category-id>-<location-id>.
+    match = re.search(r"/(\d{6,})-\d+-\d+(?:[/?#]|$)", url)
+    if match:
+        return match.group(1)
     nums = re.findall(r"\d{6,}", url)
-    return nums[-1] if nums else url
+    return nums[0] if nums else url
 
 
 def _allowed_url(url: str) -> bool:
@@ -68,9 +73,6 @@ def page_url(base_url: str, page: int) -> str:
 
 
 def _extract_posted_text(node) -> str | None:
-    # The visible card text currently contains values like "Heute, 16:42",
-    # "Gestern, 22:10" or a German calendar date. Matching the whole card
-    # keeps this resilient if Kleinanzeigen changes the exact CSS class.
     text = node.get_text(" ", strip=True)
     patterns = [
         r"\bHeute(?:,?\s*\d{1,2}:\d{2})?\b",
@@ -78,9 +80,9 @@ def _extract_posted_text(node) -> str | None:
         r"\b\d{1,2}\.\d{1,2}\.\d{4}\b",
     ]
     for pattern in patterns:
-        m = re.search(pattern, text, flags=re.IGNORECASE)
-        if m:
-            return m.group(0)
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(0)
     return None
 
 
@@ -164,45 +166,3 @@ class KleinanzeigenParser:
 
     async def parse_category_page(self, url: str) -> list[ParsedListing]:
         return parse_category_html(await self.fetch_html(url))
-
-    async def parse_today(self, base_url: str) -> tuple[list[ParsedListing], int, bool]:
-        """Parse all visible listings marked 'Heute' in newest-first category pages.
-
-        Returns (items, pages_scanned, hit_safety_limit).
-        We stop after two consecutive pages without today's listings because Kleinanzeigen
-        documents the default no-location order as newest first. A high safety limit exists
-        only to prevent accidental endless scans if the site changes pagination.
-        """
-        found: list[ParsedListing] = []
-        seen_ids: set[str] = set()
-        empty_today_pages = 0
-        pages_scanned = 0
-
-        for page in range(1, MAX_PAGES_PER_CATEGORY + 1):
-            url = page_url(base_url, page)
-            items = await self.parse_category_page(url)
-            pages_scanned = page
-
-            if not items:
-                log.info("page=%s no listings, stop", page)
-                return found, pages_scanned, False
-
-            today = [x for x in items if is_today_text(x.posted_text)]
-            for item in today:
-                if item.external_id not in seen_ids:
-                    seen_ids.add(item.external_id)
-                    found.append(item)
-
-            log.info("page=%s total=%s today=%s", page, len(items), len(today))
-
-            if today:
-                empty_today_pages = 0
-            else:
-                empty_today_pages += 1
-                if empty_today_pages >= STOP_AFTER_EMPTY_TODAY_PAGES:
-                    return found, pages_scanned, False
-
-            if PAGE_DELAY_SECONDS and page < MAX_PAGES_PER_CATEGORY:
-                await asyncio.sleep(PAGE_DELAY_SECONDS)
-
-        return found, pages_scanned, True
