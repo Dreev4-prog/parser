@@ -1,4 +1,5 @@
-# Kleinanzeigen Parser Bot v3.0.1
+# Kleinanzeigen Parser Bot v3.0.2
+
 
 v3.0.1 fixes exact-date scanning and keeps all v3.0 product-recognition/view-history features.
 
@@ -47,3 +48,8 @@ Start command:
 ```bash
 python bot.py
 ```
+
+
+## v3.0.2 — Date Jump Search
+
+Exact-date scans no longer walk every page from page 1. The bot probes pages exponentially, binary-searches the date boundary, then sequentially collects only the selected calendar day. View counters are fetched only for matching listings. Promoted Top/Highlight listings remain excluded before date logic.

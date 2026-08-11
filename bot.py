@@ -107,10 +107,11 @@ PAGE_LIMIT_CHOICES = (25, 50, 100)
 # around 3 minutes, then the estimate is recalculated from the real page rate.
 PAGE_LIMIT_BASE_ETA_SECONDS = {25: 60, 50: 120, 100: 180}
 
-# v3.0.1 exact-date mode. The old 25/50/100 depth is deliberately NOT used
-# when the user asks for a concrete Moscow date. We keep a high safety cap only
-# to prevent an accidental endless walk if Kleinanzeigen changes its ordering.
+# v3.0.2 exact-date mode. The old 25/50/100 depth is deliberately NOT used.
+# Date Jump Search probes sparse pages to find the target-day boundary, then
+# sequentially reads only the small matching range. This is only a page-index cap.
 DATE_SCAN_MAX_PAGES = max(100, min(3000, int(os.getenv("DATE_SCAN_MAX_PAGES", "1000"))))
+DATE_JUMP_PROBE_DELAY_SECONDS = max(0.0, min(1.0, float(os.getenv("DATE_JUMP_PROBE_DELAY_SECONDS", "0.18"))))
 
 
 class SettingsInput(StatesGroup):
@@ -1266,7 +1267,7 @@ def settings_text(s: UserSettings) -> str:
         "Скан по дате: <b>автоматическая глубина</b>\n"
         f"Ключевые слова: <b>{include}</b>\n"
         f"Исключить: <b>{exclude}</b>\n\n"
-        "<i>Точный поиск по дате сам листает выдачу до выбранного дня; внутренняя очередь, кэш и совместные сканы скрыты от пользователей. "
+        "<i>Точный поиск по дате использует быстрый переход к нужному диапазону; внутренняя очередь, кэш и совместные сканы скрыты от пользователей. "
         "Нажми «ℹ️ Как работают режимы», чтобы увидеть текущие критерии.</i>"
     )
 
@@ -1340,6 +1341,7 @@ class ScanResult:
     avoided_pages: int = 0
     date_complete: bool = False
     oldest_date_seen: str = ""
+    max_page_reached: int = 0
 
 
 @dataclass
@@ -1398,6 +1400,7 @@ class CategoryLiveProgress:
     started_monotonic: float = 0.0
     page_limit: int = 100
     oldest_date_seen: str = ""
+    current_page_date: str = ""
     phase: str = "seeking"
 
 
@@ -1408,7 +1411,7 @@ def _date_scan_limit(target_date: str) -> int:
     """Network safety cap for exact-date scans.
 
     The requested 25/50/100 UI depth is intentionally ignored here. Exact-date
-    scans walk until the requested day is fully crossed or this safety cap is hit.
+    scans jump to the requested date range; this remains the maximum page index allowed.
     """
     return DATE_SCAN_MAX_PAGES if target_date else MAX_PAGES_PER_CATEGORY
 
@@ -1518,218 +1521,281 @@ async def record_parser_run(
 
 
 async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page_limit: int, target_date: str) -> ScanResult:
-    """Scan one category.
+    """Scan one category for one exact Moscow calendar date.
 
-    v2.5 uses two modes:
-    - full: once per Berlin day/category, walk the current-day feed until Heute ends;
-    - fast: later scans start at page 1 and stop after reaching the previous head
-      checkpoint plus a safety overlap, or after several highly-known pages.
+    v3.0.2 uses Date Jump Search instead of walking every page from 1 to the
+    requested day. The algorithm first probes pages exponentially (1, 2, 4, 8,
+    ...), then performs a binary search for the boundary where the feed reaches
+    the requested date. Only a tiny safety overlap around that boundary is read
+    sequentially, and view counters are requested only for listings that really
+    belong to the selected date.
 
-    The fast mode never skips the first pages: this keeps it correct when many new
-    listings arrived since the previous run. It only avoids re-reading the old tail.
+    This keeps exact-date scans practical in very large categories: a day around
+    page 350 normally needs roughly a dozen locating requests instead of ~350
+    throw-away requests before collection even begins.
     """
-    # Exact-date mode is auto-depth: the historical 25/50/100 user choice must
-    # never cut the scan off before the requested day. `page_limit` is retained
-    # only for backward compatibility with saved scans/settings.
     scan_limit = _date_scan_limit(target_date)
     target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
     progress_key = _progress_key(cat.key, target_date)
     state = await get_category_scan_state(cat.key)
     day_key = berlin_date_key()
-    # Incremental fast-stop is unsafe for an exact historical date: a known
-    # prefix can appear long before we reach the requested calendar day.
-    can_fast = False
     mode = "date"
-    previous_heads = {
-        x for x in ((state.head_ids if state else "") or "").split(",") if x
-    }
-    baseline_pages = (state.day_full_pages or 0) if state and state.scan_date == day_key and (state.target_date or "") == target_date else 0
-    # A rough page estimate is used only for the user-facing progress/ETA. It is
-    # deliberately conservative and is recalibrated while the scan runs.
-    if state and (state.day_full_pages or state.last_pages):
-        historic_pages = int(state.day_full_pages or state.last_pages or 10)
-    else:
-        historic_pages = 10
-    # ETA is deliberately only a soft estimate. The UI primarily shows the
-    # oldest date reached so users can see real progress toward the target.
-    estimated_pages = min(scan_limit, max(25, historic_pages if historic_pages else 25))
+    baseline_pages = (
+        (state.day_full_pages or 0)
+        if state and state.scan_date == day_key and (state.target_date or "") == target_date
+        else 0
+    )
+
     category_live_progress[progress_key] = CategoryLiveProgress(
         category_key=cat.key,
         category_name=cat.name,
         mode=mode,
-        estimated_pages=estimated_pages,
+        estimated_pages=scan_limit,
         started_monotonic=time.monotonic(),
         page_limit=scan_limit,
-        phase="seeking",
+        phase="jumping",
     )
 
     new_count = 0
     today_seen = 0
-    pages_scanned = 0
     known_total = 0
     enriched_total = 0
-    empty_today_pages = 0
     target_seen_any = False
     date_complete = False
     oldest_date_seen = ""
-    consecutive_known_pages = 0
     first_page_head_ids: list[str] = []
-    checkpoint_seen_page: int | None = None
     started_at = datetime.utcnow()
     reason = ""
     hit_limit = False
 
+    # Cache pages fetched while locating the date. Reusing these pages prevents
+    # duplicate HTTP calls when the collection pass lands on the same page.
+    page_cache: dict[int, list] = {}
+    requested_pages: set[int] = set()
+
+    def classify(items) -> tuple[str, list, list]:
+        """Return relation of a page to target date plus parsed date tuples.
+
+        newer  -> every dated normal listing is newer than target
+        target -> at least one listing belongs to target
+        older  -> every dated normal listing is older than target
+        mixed  -> page spans both sides without an exact target date
+        unknown-> no usable publication dates on the page
+        empty  -> physical end of feed
+        """
+        if not items:
+            return "empty", [], []
+        pairs = [(item, posted_date_moscow(item.posted_text)) for item in items]
+        days = [d for _, d in pairs if d is not None]
+        if not days:
+            return "unknown", pairs, days
+        if any(d == target_day for d in days):
+            return "target", pairs, days
+        if min(days) > target_day:
+            return "newer", pairs, days
+        if max(days) < target_day:
+            return "older", pairs, days
+        return "mixed", pairs, days
+
+    async def fetch_page(page: int, phase: str):
+        nonlocal oldest_date_seen
+        page = max(1, min(scan_limit, int(page)))
+        if page in page_cache:
+            items = page_cache[page]
+        else:
+            items = await parser.parse_category_page(page_url(cat.url, page))
+            page_cache[page] = items
+            requested_pages.add(page)
+            if phase == "jumping" and DATE_JUMP_PROBE_DELAY_SECONDS:
+                await asyncio.sleep(DATE_JUMP_PROBE_DELAY_SECONDS)
+        relation, pairs, days = classify(items)
+        page_date_hint = ""
+        if days:
+            page_oldest = min(days)
+            page_newest = max(days)
+            page_date_hint = page_oldest.isoformat() if page_oldest == page_newest else f"{page_newest.isoformat()}..{page_oldest.isoformat()}"
+            if not oldest_date_seen or page_oldest.isoformat() < oldest_date_seen:
+                oldest_date_seen = page_oldest.isoformat()
+        live = category_live_progress.get(progress_key)
+        if live is not None:
+            live.page = page
+            live.oldest_date_seen = oldest_date_seen
+            live.current_page_date = page_date_hint
+            live.phase = phase
+        log.info(
+            "category=%s mode=date-jump phase=%s page=%s relation=%s dated=%s requests=%s",
+            cat.name, phase, page, relation, len(days), len(requested_pages),
+        )
+        return items, relation, pairs, days
+
+    async def process_target_items(items, pairs) -> None:
+        nonlocal new_count, today_seen, known_total, enriched_total, target_seen_any, first_page_head_ids
+        target_items = [item for item, item_day in pairs if item_day == target_day]
+        if not target_items:
+            return
+        target_seen_any = True
+        today_seen += len(target_items)
+        if not first_page_head_ids:
+            first_page_head_ids = [item.external_id for item in target_items[:INCREMENTAL_HEAD_SIZE]]
+
+        async with db_write_lock:
+            new_items, known_count, enriched_count = await upsert_page_items(
+                cat.key, cat.name, target_items
+            )
+
+        live = category_live_progress.get(progress_key)
+        await enrich_page_view_counts(parser, target_items, live)
+        new_count += len(new_items)
+        known_total += known_count
+        enriched_total += enriched_count
+        live = category_live_progress.get(progress_key)
+        if live is not None:
+            live.today_seen = today_seen
+            live.new_count = new_count
+            live.known_count = known_total
+
     try:
-        for page in range(1, scan_limit + 1):
+        # ----- 1) Exponential search: find a bracket around the target date. -----
+        low_newer = 0
+        high_boundary: int | None = None
+        candidate_page: int | None = None
+        probe = 1
+
+        while probe <= scan_limit:
             try:
-                items = await parser.parse_category_page(page_url(cat.url, page))
+                items, relation, pairs, days = await fetch_page(probe, "jumping")
             except TemporaryAccessError as exc:
-                # Keep everything already collected. Do not mark the daily seed as
-                # complete, so a later run can continue/deepen the category.
-                reason = f"временный лимит Kleinanzeigen (HTTP {exc.status_code}); сохранён частичный результат"
-                log.warning("category=%s page=%s stopped after temporary refusal: %s", cat.name, page, exc)
-                break
-            pages_scanned = page
-            if not items:
-                reason = "конец выдачи"
+                reason = f"временный лимит Kleinanzeigen (HTTP {exc.status_code}); поиск даты прерван"
+                log.warning("category=%s jump page=%s refused: %s", cat.name, probe, exc)
                 break
 
-            page_dates = [(item, posted_date_moscow(item.posted_text)) for item in items]
-            today_items = [item for item, item_day in page_dates if item_day == target_day]
-            dated_days = [item_day for _, item_day in page_dates if item_day is not None]
-            if dated_days:
-                page_oldest = min(dated_days)
-                if not oldest_date_seen or page_oldest.isoformat() < oldest_date_seen:
-                    oldest_date_seen = page_oldest.isoformat()
-            today_seen += len(today_items)
-            if today_items:
-                target_seen_any = True
+            if relation == "target":
+                # We found the day, but it may have started dozens of pages earlier.
+                # Keep this as the upper boundary and binary-search backwards.
+                high_boundary = probe
+                break
+            if relation in {"older", "mixed", "empty"}:
+                high_boundary = probe
+                break
+            if relation == "unknown":
+                # An undated/changed markup page is not a trustworthy boundary.
+                # Skip farther ahead while keeping the last proven-newer page as lo.
+                if probe == scan_limit:
+                    hit_limit = True
+                    reason = f"защитный лимит {scan_limit} страниц: даты на странице не распознаны"
+                    break
+                next_probe = min(scan_limit, 2 if probe == 1 else probe * 2)
+                if next_probe == probe:
+                    hit_limit = True
+                    reason = f"защитный лимит {scan_limit} страниц: диапазон даты не найден"
+                    break
+                probe = next_probe
+                continue
+
+            # relation == newer: target is deeper in the feed.
+            low_newer = probe
+            if probe == scan_limit:
+                hit_limit = True
+                reason = f"защитный лимит {scan_limit} страниц: выбранная дата глубже"
+                break
+            probe = min(scan_limit, 2 if probe == 1 else probe * 2)
+            if probe == low_newer:
+                hit_limit = True
+                reason = f"защитный лимит {scan_limit} страниц: выбранная дата глубже"
+                break
+
+        if not reason and high_boundary is None:
+            hit_limit = True
+            reason = f"защитный лимит {scan_limit} страниц: диапазон даты не найден"
+
+        # ----- 2) Binary search for the first page that is not entirely newer. -----
+        if not reason and high_boundary is not None:
+            lo = max(0, low_newer)
+            hi = high_boundary
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                try:
+                    items, relation, pairs, days = await fetch_page(mid, "jumping")
+                except TemporaryAccessError as exc:
+                    reason = f"временный лимит Kleinanzeigen (HTTP {exc.status_code}); поиск даты прерван"
+                    log.warning("category=%s binary page=%s refused: %s", cat.name, mid, exc)
+                    break
+                if relation == "newer":
+                    lo = mid
+                else:
+                    hi = mid
+                    if relation == "target":
+                        candidate_page = mid
+            if not reason:
+                candidate_page = hi
+
+        # ----- 3) Sequentially collect only the small target-date range. -----
+        if not reason and candidate_page is not None:
+            # Two-page overlap protects against small ordering irregularities while
+            # still avoiding hundreds of irrelevant pages.
+            start_page = max(1, candidate_page - 2)
             live = category_live_progress.get(progress_key)
             if live is not None:
-                live.page = page
-                live.today_seen = today_seen
-                live.oldest_date_seen = oldest_date_seen
-                live.phase = "collecting" if target_seen_any else "seeking"
-                # If a first/full scan is larger than our historical estimate, expand
-                # the estimate instead of showing a fake 100% too early.
-                if page >= live.estimated_pages:
-                    live.estimated_pages = min(scan_limit, max(page + 10, int(page * 1.25)))
+                live.phase = "collecting"
 
-            if not first_page_head_ids and today_items:
-                first_page_head_ids = [item.external_id for item in today_items[:INCREMENTAL_HEAD_SIZE]]
-
-            if today_items:
-                empty_today_pages = 0
-                page_ids = {item.external_id for item in today_items}
-
-                async with db_write_lock:
-                    new_items, known_count, enriched_count = await upsert_page_items(cat.key, cat.name, today_items)
-
-                # v2.7.0: collect public view counters immediately for this page.
-                # Recent counters are served from the DB cache; stale/missing ones
-                # are opened through the same lightweight Playwright pool.
-                live = category_live_progress.get(progress_key)
-                views_requested, views_updated, views_failed = await enrich_page_view_counts(
-                    parser, today_items, live
-                )
-                page_new = len(new_items)
-                new_count += page_new
-                known_total += known_count
-                enriched_total += enriched_count
-                live = category_live_progress.get(progress_key)
-                if live is not None:
-                    live.new_count = new_count
-                    live.known_count = known_total
-
-                known_ratio = known_count / max(1, len(today_items))
-                # A promoted/repeated old ad can appear near the top. Only treat a
-                # previous head ID as the boundary when the page is already mostly
-                # known; this avoids an early checkpoint on a page full of fresh ads.
-                if (
-                    mode == "fast"
-                    and checkpoint_seen_page is None
-                    and previous_heads.intersection(page_ids)
-                    and known_ratio >= 0.50
-                ):
-                    checkpoint_seen_page = page
-
-                page_is_known_tail = (
-                    page_new == 0
-                    and enriched_count == 0
-                    and known_ratio >= INCREMENTAL_MIN_KNOWN_RATIO
-                )
-                consecutive_known_pages = consecutive_known_pages + 1 if page_is_known_tail else 0
-
-                log.info(
-                    "category=%s mode=%s page=%s total=%s today=%s new=%s known=%s known_ratio=%.2f "
-                    "prices_backfilled=%s views_requested=%s views_updated=%s views_failed=%s "
-                    "checkpoint_page=%s known_pages=%s",
-                    cat.name, mode, page, len(items), len(today_items), page_new, known_count,
-                    known_ratio, enriched_count, views_requested, views_updated, views_failed,
-                    checkpoint_seen_page, consecutive_known_pages,
-                )
-
-                if mode == "fast" and page >= INCREMENTAL_MIN_PAGES:
-                    # Preferred stop: we crossed an ID that was near the top of the
-                    # previous run, then scanned a safety overlap into the known tail.
-                    if (
-                        checkpoint_seen_page is not None
-                        and page >= checkpoint_seen_page + INCREMENTAL_OVERLAP_PAGES
-                        and consecutive_known_pages >= 1
-                    ):
-                        reason = "быстрый стоп: достигнут прошлый чекпоинт"
-                        break
-
-                    # Fallback if the old head ad was deleted/reordered: several pages
-                    # dominated by already-known IDs are enough evidence that the fresh
-                    # prefix has ended.
-                    if consecutive_known_pages >= INCREMENTAL_STOP_AFTER_KNOWN_PAGES:
-                        reason = "быстрый стоп: пошёл уже известный хвост"
-                        break
-            else:
-                empty_today_pages += 1
-                consecutive_known_pages = 0
-                log.info(
-                    "category=%s mode=%s page=%s total=%s target=%s matched=0",
-                    cat.name, mode, page, len(items), target_date,
-                )
-                # Search pages are ordered newest-first. Before we reach the requested
-                # date we keep paging. Once all dated cards are older than it, the
-                # requested calendar day is behind us and the scan can stop.
-                if dated_days and max(dated_days) < target_day:
-                    date_complete = True
-                    reason = "выбранная дата собрана полностью" if target_seen_any else "выбранная дата пройдена; объявлений за неё не найдено"
+            saw_newer_during_collection = False
+            for page in range(start_page, scan_limit + 1):
+                try:
+                    items, relation, pairs, days = await fetch_page(page, "collecting")
+                except TemporaryAccessError as exc:
+                    reason = f"временный лимит Kleinanzeigen (HTTP {exc.status_code}); сохранён частичный результат"
+                    log.warning("category=%s collect page=%s refused: %s", cat.name, page, exc)
                     break
 
-            # If target listings were present on a previous page, keep going until
-            # we see a page that is entirely older. This guarantees that the whole
-            # selected date is collected instead of stopping on the first match.
-            if target_seen_any and dated_days and max(dated_days) < target_day:
-                date_complete = True
-                reason = "выбранная дата собрана полностью"
-                break
+                if relation == "empty":
+                    date_complete = True
+                    reason = (
+                        "выбранная дата собрана полностью"
+                        if target_seen_any
+                        else "конец выдачи; объявлений за выбранную дату не найдено"
+                    )
+                    break
 
-            if PAGE_DELAY_SECONDS and page < scan_limit:
-                await asyncio.sleep(PAGE_DELAY_SECONDS)
-        else:
-            hit_limit = True
-            reason = f"защитный лимит {scan_limit} страниц достигнут до полного завершения даты"
+                if relation == "newer":
+                    saw_newer_during_collection = True
+
+                await process_target_items(items, pairs)
+
+                # Once a normal page is entirely older than the target, the selected
+                # date has been crossed. Promoted cards were removed in parser.py, so
+                # they cannot pull an old date into the top of the feed here.
+                if relation == "older":
+                    date_complete = True
+                    reason = (
+                        "выбранная дата собрана полностью"
+                        if target_seen_any
+                        else "выбранная дата пройдена; объявлений за неё не найдено"
+                    )
+                    break
+
+                # A page that spans both sides but has no exact target means there are
+                # no normal listings for that date at this boundary.
+                if relation == "mixed" and not target_seen_any:
+                    date_complete = True
+                    reason = "выбранная дата пройдена; объявлений за неё не найдено"
+                    break
+
+                if PAGE_DELAY_SECONDS and page < scan_limit:
+                    # Keep the gentle delay only during the short collection pass.
+                    # Jump probes themselves are sparse and do not need a per-page wait.
+                    await asyncio.sleep(min(PAGE_DELAY_SECONDS, 0.35))
+            else:
+                hit_limit = True
+                reason = f"защитный лимит {scan_limit} страниц достигнут во время сбора даты"
 
         if not reason:
             reason = "завершено"
 
-        # v2.6.3 treats the configured 100-page window as a complete seed.
-        # Very large categories intentionally keep only the newest window; after
-        # that first capped scan, later runs may use fast incremental mode instead
-        # of re-reading all 100 pages every time.
-        # Reaching the physical end of the feed also proves the target-date result
-        # is complete, even when there were zero matching active listings.
-        if reason == "конец выдачи":
-            date_complete = True
-
         interrupted = reason.startswith("временный лимит Kleinanzeigen")
         seed_complete = bool(date_complete and not interrupted)
         seed_capped = bool(hit_limit and not interrupted)
+        pages_scanned = len(requested_pages)
+
         saved = await save_category_scan_state(
             cat.key,
             target_date=target_date,
@@ -1742,7 +1808,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             seed_complete=seed_complete,
             seed_capped=seed_capped,
         )
-        avoided_pages = max(0, (saved.day_full_pages or baseline_pages or 0) - pages_scanned) if mode == "fast" else 0
+        avoided_pages = 0
         result = ScanResult(
             new_count=new_count,
             pages_scanned=pages_scanned,
@@ -1755,10 +1821,17 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             avoided_pages=avoided_pages,
             date_complete=date_complete,
             oldest_date_seen=oldest_date_seen,
+            max_page_reached=max(requested_pages) if requested_pages else 0,
         )
         await record_parser_run(user_id, cat, result, started_at)
+        log.info(
+            "category=%s date-jump complete target=%s requests=%s max_page=%s matched=%s reason=%s",
+            cat.name, target_date, pages_scanned, max(requested_pages) if requested_pages else 0,
+            today_seen, reason,
+        )
         return result
     except Exception as exc:
+        pages_scanned = len(requested_pages)
         failed = ScanResult(
             new_count=new_count,
             pages_scanned=pages_scanned,
@@ -1771,13 +1844,13 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             avoided_pages=0,
             date_complete=False,
             oldest_date_seen=oldest_date_seen,
+            max_page_reached=max(requested_pages) if requested_pages else 0,
         )
         try:
             await record_parser_run(user_id, cat, failed, started_at, success=False, error_text=str(exc))
         except Exception:
             log.exception("Could not record failed parser run")
         raise
-
 
 def job_keyboard(job_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1922,9 +1995,9 @@ def render_user_job_status(job: ScanJob) -> str:
             "⏳ <b>Подготавливаю парсинг…</b>\n\n"
             f"Выбрано категорий: <b>{total}</b>\n"
             f"Дата объявлений: <b>{_date_label(job.target_date)} (МСК)</b>\n"
-            "Глубина: <b>автоматическая — до выбранной даты</b>\n"
+            "Поиск даты: <b>⚡ быстрый переход</b>\n"
             f"Подготовка: <b>{waited} сек</b>\n\n"
-            "Бот сам листает выдачу, пока не соберёт выбранный день полностью."
+            "Бот быстро находит нужный диапазон страниц и собирает только выбранный день."
         )
 
     live = category_live_progress.get(job.current_progress_key) if job.current_progress_key else None
@@ -1948,13 +2021,19 @@ def render_user_job_status(job: ScanJob) -> str:
     page_line = f"\nСтраница: <b>{current_page}</b>" if current_page else ""
     reached_line = ""
     phase_line = ""
-    if live is not None and live.oldest_date_seen:
-        reached_line = f"\nСамая старая достигнутая дата: <b>{_date_label(live.oldest_date_seen)}</b>"
-        phase_line = (
-            "\nЭтап: <b>собираю выбранную дату</b>"
-            if live.phase == "collecting"
-            else "\nЭтап: <b>иду к выбранной дате</b>"
-        )
+    if live is not None:
+        if live.phase == "collecting":
+            reached_line = "\n🎯 Диапазон выбранной даты найден"
+            phase_line = "\nЭтап: <b>собираю выбранную дату</b>"
+        else:
+            if live.current_page_date:
+                hint = live.current_page_date
+                if ".." in hint:
+                    newer, older = hint.split("..", 1)
+                    reached_line = f"\nДата на проверяемой странице: <b>{_date_label(newer)} — {_date_label(older)}</b>"
+                else:
+                    reached_line = f"\nДата на проверяемой странице: <b>{_date_label(hint)}</b>"
+            phase_line = "\nЭтап: <b>⚡ ищу диапазон даты</b>"
     today_line = f"\nНайдено за выбранную дату: <b>{current_today}</b>" if current_today else ""
     views_line = ""
     if current_today:
@@ -1968,11 +2047,11 @@ def render_user_job_status(job: ScanJob) -> str:
         f"{_progress_bar(percent)} <b>{percent}% категорий завершено</b>\n"
         f"Категории: <b>{job.completed_categories}/{total}</b> готово\n"
         f"Дата: <b>{_date_label(job.target_date)} (МСК)</b>\n"
-        "Глубина: <b>автоматическая</b>\n"
+        "Поиск даты: <b>⚡ быстрый переход</b>\n"
         f"Сейчас: <b>{category_line}</b>{page_line}{reached_line}{phase_line}{today_line}{views_line}\n\n"
         f"🆕 Найдено новых: <b>{visible_new}</b>\n"
         f"⏱ Прошло: <b>{_human_duration(elapsed)}</b>\n"
-        "⌛ Осталось: <b>зависит от того, сколько страниц до выбранной даты</b>\n\n"
+        "⌛ Осталось: <b>сначала быстрый поиск диапазона, затем сбор выбранного дня</b>\n\n"
         "Прогресс обновляется автоматически."
     )
 
@@ -2049,7 +2128,7 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
                 +
                 f"🗂 Категорий: <b>{job.completed_categories}/{len(job.category_keys)}</b>\n"
                 f"📅 Дата: <b>{_date_label(job.target_date)} (МСК)</b>\n"
-                f"📄 Глубина: <b>автоматически до выбранной даты</b>\n"
+                f"⚡ Поиск даты: <b>быстрый переход к диапазону</b>\n"
                 f"🆕 Новых найдено: <b>{job.total_new}</b>\n"
                 f"⏱ Время: <b>{elapsed_text}</b>\n"
                 f"Режим: <b>{MODE_LABELS.get(settings.output_mode, settings.output_mode)}</b>\n"
@@ -2151,14 +2230,16 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
                     reached = _date_label(result.oldest_date_seen) if result.oldest_date_seen else "не определена"
                     note = (
                         f"{cat.name}: до {_date_label(job.target_date)} полностью не дошли; "
-                        f"самая старая достигнутая дата — {reached}, просмотрено {result.pages_scanned} стр."
+                        f"самая старая достигнутая дата — {reached}; "
+                        f"сетевых страниц запрошено {result.pages_scanned}, достигнута стр. {result.max_page_reached or '?'}"
                     )
                     job.warnings.append(note)
                     job.scan_notes = job.scan_notes or []
                     job.scan_notes.append(note)
                 elif result.reason.startswith("временный лимит Kleinanzeigen"):
                     job.warnings.append(
-                        f"{cat.name}: Kleinanzeigen временно ограничил запросы; сохранено {result.pages_scanned} стр., можно повторить позже"
+                        f"{cat.name}: Kleinanzeigen временно ограничил запросы; "
+                        f"успели сделать {result.pages_scanned} запросов (до стр. {result.max_page_reached or '?'}), можно повторить позже"
                     )
 
             job.completed_categories += 1
@@ -2648,7 +2729,7 @@ async def render_scan_detail(scan: UserScan) -> str:
         f"Статус: <b>{status_label}</b>",
         f"Запуск: <b>{_moscow_text(scan.created_at)} МСК</b>",
         f"Дата объявлений: <b>{_date_label(scan.target_date)} (МСК)</b>",
-        "Глубина: <b>автоматически до выбранной даты</b>",
+        "Поиск даты: <b>⚡ быстрый переход к диапазону</b>",
         f"Категорий: <b>{scan.completed_categories}/{scan.total_categories}</b>",
         "",
         f"📦 В снимке: <b>{len(rows)}</b> объявлений",
@@ -3072,7 +3153,7 @@ async def start_scan(callback: CallbackQuery, state: FSMContext) -> None:
         f"Сегодня по МСК: <b>{today_label}</b>.\n\n"
         "Можно отправить просто число текущего месяца, например <code>12</code>, "
         "или полную дату <code>10.08.2026</code>.\n\n"
-        "После даты скан запустится автоматически. Бот сам определит нужную глубину "
+        "После даты скан запустится автоматически. Бот быстро найдёт диапазон нужной даты "
         "и остановится только после того, как выбранный день будет собран полностью.",
         parse_mode=ParseMode.HTML,
     )
@@ -3115,7 +3196,7 @@ async def receive_scan_date(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"<b>🔎 Запускаю скан за {_date_label(target_date)} (МСК)</b>\n"
         f"Категорий: <b>{len(selected_cats)}</b>\n"
-        "Глубина: <b>автоматическая</b>",
+        "Поиск даты: <b>⚡ быстрый переход к диапазону</b>",
         parse_mode=ParseMode.HTML,
     )
     await enqueue_user_scan(
