@@ -106,10 +106,46 @@ def main_keyboard(selected_count: int = 0) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"🗂 Категории ({selected_count})", callback_data="groups")],
         [InlineKeyboardButton(text="⚙️ Настройки парсинга", callback_data="settings")],
         [InlineKeyboardButton(text="📦 Получить результат", callback_data="export_smart")],
-        [InlineKeyboardButton(text="📥 Очередь", callback_data="queue_status"),
-         InlineKeyboardButton(text="📊 База", callback_data="stats")],
+        [InlineKeyboardButton(text="📊 База", callback_data="stats")],
         [InlineKeyboardButton(text="📋 Что выбрано", callback_data="selected")],
     ])
+
+
+def post_scan_keyboard() -> InlineKeyboardMarkup:
+    """Compact actions shown directly under the automatic result file."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Запустить снова", callback_data="start_scan")],
+        [InlineKeyboardButton(text="📊 Другой режим", callback_data="post_settings"),
+         InlineKeyboardButton(text="📦 Другой результат", callback_data="export_smart")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="post_home")],
+    ])
+
+
+class BotChatAdapter:
+    """Small duck-typed adapter so export code can send to a chat after a queue job."""
+
+    def __init__(self, bot: Bot, chat_id: int, *, prefix: str = "", reply_markup: InlineKeyboardMarkup | None = None):
+        self.bot = bot
+        self.chat_id = chat_id
+        self.prefix = prefix.strip()
+        self.reply_markup = reply_markup
+
+    async def answer(self, text: str, **kwargs):
+        if self.prefix:
+            text = f"{self.prefix}\n\n{text}"
+        if self.reply_markup is not None:
+            kwargs["reply_markup"] = self.reply_markup
+        kwargs.setdefault("parse_mode", ParseMode.HTML)
+        return await self.bot.send_message(self.chat_id, text, **kwargs)
+
+    async def answer_document(self, document, *, caption: str | None = None, **kwargs):
+        full_caption = caption or ""
+        if self.prefix:
+            full_caption = f"{self.prefix}\n\n{full_caption}" if full_caption else self.prefix
+        if self.reply_markup is not None:
+            kwargs["reply_markup"] = self.reply_markup
+        kwargs.setdefault("parse_mode", ParseMode.HTML)
+        return await self.bot.send_document(self.chat_id, document, caption=full_caption, **kwargs)
 
 
 def groups_keyboard(selected_keys: set[str]) -> InlineKeyboardMarkup:
@@ -519,11 +555,17 @@ async def refresh_availability(rows: list[Listing]) -> tuple[int, int, int]:
     return len(candidates), len(disappeared_ids), unknown
 
 
-async def send_smart_export(message: Message, user_id: int, selected_count: int) -> int:
+async def send_smart_export(
+    message: Message | BotChatAdapter,
+    user_id: int,
+    selected_count: int,
+    *,
+    category_keys_override: set[str] | None = None,
+) -> int:
     s = await get_settings(user_id)
     mode = s.output_mode
     all_rows = await today_rows()
-    selected_keys = await get_selected(user_id)
+    selected_keys = category_keys_override if category_keys_override is not None else await get_selected(user_id)
     if selected_keys:
         all_rows = [row for row in all_rows if row.category_key in selected_keys]
     raw_base = base_filter(
@@ -624,7 +666,7 @@ def settings_text(s: UserSettings) -> str:
         f"Сортировка: <b>{SORT_LABELS.get(s.sort_mode, s.sort_mode)}</b>\n"
         f"Ключевые слова: <b>{include}</b>\n"
         f"Исключить: <b>{exclude}</b>\n\n"
-        "<i>v2.6 сохраняет Smart Analytics/Fast Incremental и добавляет общую очередь, кэш категорий и совместные сканы. "
+        "<i>v2.6.2 сохраняет Smart Analytics/Fast Incremental и добавляет пользовательский живой прогресс; внутренняя очередь, кэш и совместные сканы скрыты от пользователей. "
         "Нажми «ℹ️ Как работают режимы», чтобы увидеть текущие критерии.</i>"
     )
 
@@ -676,11 +718,6 @@ async def stats_text() -> str:
         f"Категорий готовы к fast-mode: <b>{fast_ready}</b>\n"
         f"Пройдено страниц: <b>{pages}</b>\n"
         f"Найдено новых за запуски: <b>{scan_new}</b>\n\n"
-        f"<b>📥 Multi-User Core</b>\n"
-        f"Воркеров: <b>{MAX_CONCURRENT_JOBS}</b>\n"
-        f"В работе: <b>{running_jobs_count}</b> · В очереди: <b>{queued_jobs_count}</b>\n"
-        f"Категорий сейчас сканируется: <b>{inflight_categories_count}</b>\n"
-        f"TTL кэша: <b>{CATEGORY_CACHE_TTL_SECONDS} сек.</b>\n\n"
         f"База: <b>{storage}</b>{warning}"
     )
 
@@ -728,6 +765,25 @@ class ScanJob:
     full_categories: int = 0
     warnings: list[str] | None = None
     last_status_update: float = 0.0
+    current_category_key: str = ""
+    current_category_index: int = 0
+    started_running_monotonic: float = 0.0
+
+
+@dataclass
+class CategoryLiveProgress:
+    category_key: str
+    category_name: str
+    mode: str
+    page: int = 0
+    today_seen: int = 0
+    new_count: int = 0
+    known_count: int = 0
+    estimated_pages: int = 10
+    started_monotonic: float = 0.0
+
+
+category_live_progress: dict[str, CategoryLiveProgress] = {}
 
 
 scan_queue: asyncio.Queue[ScanJob] = asyncio.Queue()
@@ -839,6 +895,22 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int) -> S
         x for x in ((state.head_ids if state else "") or "").split(",") if x
     }
     baseline_pages = (state.day_full_pages or 0) if state and state.scan_date == day_key else 0
+    # A rough page estimate is used only for the user-facing progress/ETA. It is
+    # deliberately conservative and is recalibrated while the scan runs.
+    if state and (state.day_full_pages or state.last_pages):
+        historic_pages = int(state.day_full_pages or state.last_pages or 10)
+    else:
+        historic_pages = 10
+    estimated_pages = max(2, min(MAX_PAGES_PER_CATEGORY, historic_pages))
+    if mode == "fast":
+        estimated_pages = max(INCREMENTAL_MIN_PAGES, min(8, int(state.last_pages or 3) if state else 3))
+    category_live_progress[cat.key] = CategoryLiveProgress(
+        category_key=cat.key,
+        category_name=cat.name,
+        mode=mode,
+        estimated_pages=estimated_pages,
+        started_monotonic=time.monotonic(),
+    )
 
     new_count = 0
     today_seen = 0
@@ -863,6 +935,14 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int) -> S
 
             today_items = [item for item in items if is_today_text(item.posted_text)]
             today_seen += len(today_items)
+            live = category_live_progress.get(cat.key)
+            if live is not None:
+                live.page = page
+                live.today_seen = today_seen
+                # If a first/full scan is larger than our historical estimate, expand
+                # the estimate instead of showing a fake 100% too early.
+                if page >= live.estimated_pages:
+                    live.estimated_pages = min(MAX_PAGES_PER_CATEGORY, page + (2 if mode == "fast" else 5))
 
             if page == 1 and today_items:
                 first_page_head_ids = [item.external_id for item in today_items[:INCREMENTAL_HEAD_SIZE]]
@@ -877,6 +957,10 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int) -> S
                 new_count += page_new
                 known_total += known_count
                 enriched_total += enriched_count
+                live = category_live_progress.get(cat.key)
+                if live is not None:
+                    live.new_count = new_count
+                    live.known_count = known_total
 
                 known_ratio = known_count / max(1, len(today_items))
                 # A promoted/repeated old ad can appear near the top. Only treat a
@@ -989,8 +1073,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int) -> S
 
 def job_keyboard(job_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отменить мой запуск", callback_data=f"cancel_scan:{job_id}")],
-        [InlineKeyboardButton(text="📥 Состояние очереди", callback_data="queue_status")],
+        [InlineKeyboardButton(text="❌ Отменить парсинг", callback_data=f"cancel_scan:{job_id}")],
     ])
 
 
@@ -1044,6 +1127,7 @@ async def dispatch_category(cat, user_id: int) -> CategoryDispatchResult:
             async with category_inflight_guard:
                 if category_inflight.get(cat.key) is task:
                     category_inflight.pop(cat.key, None)
+            category_live_progress.pop(cat.key, None)
 
 
 async def queue_status_text(user_id: int) -> str:
@@ -1080,6 +1164,107 @@ async def queue_status_text(user_id: int) -> str:
     return "\n".join(lines)
 
 
+def _human_duration(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "считаю…"
+    seconds = max(0, int(seconds))
+    if seconds < 15:
+        return "меньше 15 сек"
+    if seconds < 60:
+        rounded = max(10, int(round(seconds / 10) * 10))
+        return f"≈ {rounded} сек"
+    minutes = max(1, int(round(seconds / 60)))
+    return f"≈ {minutes} мин"
+
+
+def _progress_bar(percent: int) -> str:
+    percent = max(0, min(100, percent))
+    filled = min(10, percent // 10)
+    return "█" * filled + "░" * (10 - filled)
+
+
+def _queued_start_eta(job: ScanJob) -> int:
+    # Internal queue stays hidden; expose only a rough wait estimate.
+    try:
+        pos = queued_job_ids.index(job.job_id)
+    except ValueError:
+        pos = 0
+    waves_ahead = pos // max(1, MAX_CONCURRENT_JOBS)
+    return 8 + waves_ahead * 25
+
+
+def render_user_job_status(job: ScanJob) -> str:
+    total = max(1, len(job.category_keys))
+    if job.state == "queued":
+        waited = max(0, int((datetime.utcnow() - job.created_at).total_seconds()))
+        return (
+            "⏳ <b>Подготавливаю парсинг…</b>\n\n"
+            f"Выбрано категорий: <b>{total}</b>\n"
+            f"Ожидание: <b>{waited} сек</b>\n"
+            f"Ориентировочно до старта: <b>{_human_duration(_queued_start_eta(job))}</b>\n\n"
+            "Статус обновляется автоматически."
+        )
+
+    live = category_live_progress.get(job.current_category_key) if job.current_category_key else None
+    current_fraction = 0.0
+    current_page = 0
+    current_today = 0
+    live_new = 0
+    if live is not None:
+        current_page = live.page
+        current_today = live.today_seen
+        live_new = live.new_count
+        est_pages = max(1, live.estimated_pages)
+        current_fraction = min(0.95, current_page / est_pages)
+
+    completed_units = min(total, job.completed_categories + current_fraction)
+    fraction = max(0.0, min(1.0, completed_units / total))
+    percent = int(fraction * 100)
+    if job.completed_categories >= total:
+        percent = 100
+
+    elapsed = 0
+    if job.started_running_monotonic:
+        elapsed = max(0, int(time.monotonic() - job.started_running_monotonic))
+
+    eta = None
+    if 0.03 < fraction < 0.995 and elapsed >= 3:
+        eta = min(7200, elapsed * (1 - fraction) / fraction)
+    elif fraction < 0.995:
+        eta = max(10, (total - job.completed_categories) * 25)
+
+    category_line = html.escape(job.current_category) if job.current_category else "Подготовка…"
+    page_line = f"\nСтраница: <b>{current_page}</b>" if current_page else ""
+    today_line = f"\nОбъявлений просмотрено в категории: <b>{current_today}</b>" if current_today else ""
+    visible_new = job.total_new + live_new
+
+    return (
+        "🔄 <b>Парсинг идёт</b>\n\n"
+        f"{_progress_bar(percent)} <b>{percent}%</b>\n"
+        f"Категории: <b>{job.completed_categories}/{total}</b> готово\n"
+        f"Сейчас: <b>{category_line}</b>{page_line}{today_line}\n\n"
+        f"🆕 Найдено новых: <b>{visible_new}</b>\n"
+        f"⏱ Прошло: <b>{_human_duration(elapsed).replace('≈ ', '')}</b>\n"
+        f"⌛ Осталось примерно: <b>{_human_duration(eta)}</b>\n\n"
+        "Прогресс обновляется автоматически."
+    )
+
+
+async def progress_ticker(bot: Bot) -> None:
+    """Continuously refresh user-facing progress without exposing internal scheduling."""
+    while True:
+        await asyncio.sleep(max(2.0, STATUS_UPDATE_INTERVAL_SECONDS))
+        async with job_guard:
+            jobs = list(active_jobs.values())
+        for job in jobs:
+            if job.state not in {"queued", "running"} or job.cancel_requested:
+                continue
+            try:
+                await edit_job_status(bot, job, render_user_job_status(job))
+            except Exception:
+                log.debug("Could not refresh live progress for job=%s", job.job_id, exc_info=True)
+
+
 async def edit_job_status(bot: Bot, job: ScanJob, text: str, *, force: bool = False) -> None:
     now = time.monotonic()
     if not force and now - job.last_status_update < STATUS_UPDATE_INTERVAL_SECONDS:
@@ -1099,26 +1284,64 @@ async def edit_job_status(bot: Bot, job: ScanJob, text: str, *, force: bool = Fa
 
 
 async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None:
-    today_count = len(await today_rows())
-    if cancelled:
-        title = "❌ <b>Парсинг отменён</b>"
-    else:
-        title = "✅ <b>Парсинг завершён</b>"
-    text = (
-        f"{title}\n\n"
-        f"Категорий обработано: <b>{job.completed_categories}/{len(job.category_keys)}</b>\n"
-        f"Новых объявлений обнаружено: <b>{job.total_new}</b>\n"
-        f"Всего сегодня в общей базе: <b>{today_count}</b>\n\n"
-        f"🌐 Реально просканировано категорий: <b>{job.scanned_categories}</b>\n"
-        f"📄 Сетевых страниц: <b>{job.total_pages}</b>\n"
-        f"⚡ Fast-mode: <b>{job.fast_categories}</b> · 📚 Full-mode: <b>{job.full_categories}</b>\n"
-        f"🧠 Из свежего кэша: <b>{job.cache_hits}</b>\n"
-        f"🤝 Подключено к уже идущему скану: <b>{job.shared_hits}</b>\n"
-        f"⏩ Сэкономлено старых страниц: <b>{job.total_avoided}</b>\n\n"
-        "Нажми <b>📦 Получить результат</b> — выборка сформируется по твоим настройкам."
-    )
+    elapsed_seconds = max(0, int((datetime.utcnow() - job.created_at).total_seconds()))
+    mins, secs = divmod(elapsed_seconds, 60)
+    elapsed_text = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
+
     job.state = "cancelled" if cancelled else "done"
+    if cancelled:
+        text = (
+            "❌ <b>Парсинг отменён</b>\n\n"
+            f"Категорий обработано: <b>{job.completed_categories}/{len(job.category_keys)}</b>\n"
+            f"Новых найдено: <b>{job.total_new}</b>\n"
+            f"⏱ Время: <b>{elapsed_text}</b>"
+        )
+    else:
+        text = (
+            "✅ <b>Парсинг завершён</b>\n\n"
+            f"🗂 Категорий обработано: <b>{job.completed_categories}/{len(job.category_keys)}</b>\n"
+            f"🆕 Новых объявлений: <b>{job.total_new}</b>\n"
+            f"⏱ Время: <b>{elapsed_text}</b>\n\n"
+            "📄 Формирую файл с результатом…"
+        )
     await edit_job_status(bot, job, text, force=True)
+
+    if not cancelled:
+        try:
+            settings = await get_settings(job.user_id)
+            result_prefix = (
+                "✅ <b>Готовый результат</b>\n"
+                f"🗂 Категорий: <b>{job.completed_categories}/{len(job.category_keys)}</b>\n"
+                f"🆕 Новых найдено: <b>{job.total_new}</b>\n"
+                f"⏱ Время: <b>{elapsed_text}</b>\n"
+                f"Режим: <b>{MODE_LABELS.get(settings.output_mode, settings.output_mode)}</b>\n"
+                f"Период: <b>{PERIOD_LABELS.get(settings.period, settings.period)}</b>\n"
+                f"Цена: <b>{PRICE_LABELS.get(settings.price_filter, settings.price_filter)}</b>"
+            )
+            adapter = BotChatAdapter(
+                bot,
+                job.chat_id,
+                prefix=result_prefix,
+                reply_markup=post_scan_keyboard(),
+            )
+            await send_smart_export(
+                adapter,
+                job.user_id,
+                len(job.category_keys),
+                category_keys_override=set(job.category_keys),
+            )
+        except Exception as exc:
+            log.exception("Could not auto-export result for job=%s", job.job_id)
+            try:
+                await bot.send_message(
+                    job.chat_id,
+                    "⚠️ Парсинг завершён, но автоматическую выгрузку сформировать не удалось. "
+                    "Нажми «📦 Получить результат» — данные уже сохранены.",
+                    reply_markup=post_scan_keyboard(),
+                )
+            except Exception:
+                pass
+
     if job.warnings:
         try:
             await bot.send_message(
@@ -1133,13 +1356,9 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
 async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
     job.state = "running"
     job.worker_id = worker_id
+    job.started_running_monotonic = time.monotonic()
     job.warnings = job.warnings or []
-    await edit_job_status(
-        bot,
-        job,
-        f"⚙️ <b>Парсинг запущен</b>\n\nВоркер: <b>#{worker_id}</b>\nКатегорий: <b>{len(job.category_keys)}</b>",
-        force=True,
-    )
+    await edit_job_status(bot, job, render_user_job_status(job), force=True)
 
     for idx, key in enumerate(job.category_keys, start=1):
         if job.cancel_requested:
@@ -1149,7 +1368,10 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
             job.warnings.append(f"Неизвестная категория: {key}")
             continue
         job.current_category = cat.name
+        job.current_category_key = cat.key
+        job.current_category_index = idx
         try:
+            await edit_job_status(bot, job, render_user_job_status(job), force=True)
             dispatched = await dispatch_category(cat, job.user_id)
             result = dispatched.result
             source_label = "🧠 кэш"
@@ -1178,21 +1400,8 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
                     job.warnings.append(f"{cat.name}: достигнут аварийный лимит страниц")
 
             job.completed_categories += 1
-            mode_line = ""
-            if result is not None:
-                mode_line = f"\nРежим категории: <b>{'⚡ быстрый' if result.mode == 'fast' else '📚 полный'}</b>"
-            await edit_job_status(
-                bot,
-                job,
-                "⏳ <b>Парсинг</b>\n\n"
-                f"Категория: <b>{idx}/{len(job.category_keys)}</b>\n"
-                f"Сейчас: <b>{html.escape(cat.name)}</b>\n"
-                f"Источник: <b>{source_label}</b>{mode_line}\n\n"
-                f"Новых обнаружено: <b>{job.total_new}</b>\n"
-                f"Реальных сканов: <b>{job.scanned_categories}</b>\n"
-                f"Из кэша: <b>{job.cache_hits}</b> · Общих: <b>{job.shared_hits}</b>\n"
-                f"Сетевых страниц: <b>{job.total_pages}</b>",
-            )
+            # User sees only useful progress; cache/shared/worker details stay internal.
+            await edit_job_status(bot, job, render_user_job_status(job), force=True)
         except Exception as exc:
             log.exception("Queue scan error job=%s category=%s", job.job_id, cat.name)
             job.warnings.append(f"{cat.name}: {str(exc)[:120]}")
@@ -1250,8 +1459,8 @@ async def start(message: Message, state: FSMContext) -> None:
         return
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>Kleinanzeigen Parser v2.6 · Multi-User Core</b>\n\n"
-        "Запуски идут через общую очередь: свежие категории берутся из кэша, а одинаковые одновременные запросы объединяются в один скан.\n"
+        "<b>Kleinanzeigen Parser v2.6.2</b>\n\n"
+        "Выбери категории и нажми «Начать парсинг». Прогресс будет обновляться автоматически, а после завершения бот сразу пришлёт готовый файл.\n"
         "После сбора можешь менять режим выдачи без повторного парсинга.\n\n"
         "🆕 новые · 💎 уникальные · 🔥 частые · ⚡ быстро исчезающие · 💰 ниже рынка · 📉 снижение цены.",
         reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML,
@@ -1265,7 +1474,31 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>Kleinanzeigen Parser v2.6</b>\n\nВыбери действие:", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("<b>Kleinanzeigen Parser v2.6.2</b>\n\nВыбери действие:", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+
+
+@dp.callback_query(F.data == "post_settings")
+async def post_settings(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not allowed(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True); return
+    s = await get_settings(callback.from_user.id)
+    await callback.answer()
+    await callback.message.answer(settings_text(s), reply_markup=settings_keyboard(s), parse_mode=ParseMode.HTML)
+
+
+@dp.callback_query(F.data == "post_home")
+async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not allowed(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True); return
+    selected = await get_selected(callback.from_user.id)
+    await callback.answer()
+    await callback.message.answer(
+        "<b>Kleinanzeigen Parser v2.6.2</b>\n\nВыбери действие:",
+        reply_markup=main_keyboard(len(selected)),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @dp.callback_query(F.data == "settings")
@@ -1282,7 +1515,7 @@ async def settings(callback: CallbackQuery, state: FSMContext) -> None:
 async def mode_help(callback: CallbackQuery) -> None:
     await callback.answer()
     text = (
-        "<b>ℹ️ Критерии Smart Analytics v2.6</b>\n\n"
+        "<b>ℹ️ Критерии Smart Analytics v2.6.1</b>\n\n"
         "💎 <b>Уникальные</b> — группа модели встречается ровно 1 раз в выбранном периоде. "
         "Цвет, состояние и продавцовский текст не дробят группу.\n\n"
         "🔥 <b>Часто публикуемые</b> — минимум 3 разных ID одной модели/варианта. "
@@ -1502,16 +1735,21 @@ async def export_smart(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "queue_status")
 async def queue_status(callback: CallbackQuery) -> None:
+    # Backward compatibility for old bot messages: never expose global queue/workers.
     if not allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer()
-    selected = await get_selected(callback.from_user.id)
-    await callback.message.answer(
-        await queue_status_text(callback.from_user.id),
-        parse_mode=ParseMode.HTML,
-        reply_markup=main_keyboard(len(selected)),
-    )
+    async with job_guard:
+        job = active_jobs.get(callback.from_user.id)
+    if job and job.state in {"queued", "running"}:
+        text = render_user_job_status(job)
+        markup = job_keyboard(job.job_id)
+    else:
+        text = "✅ Сейчас у тебя нет активного парсинга."
+        selected = await get_selected(callback.from_user.id)
+        markup = main_keyboard(len(selected))
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
 @dp.callback_query(F.data.startswith("cancel_scan:"))
@@ -1529,14 +1767,13 @@ async def cancel_scan(callback: CallbackQuery) -> None:
     if state == "queued":
         await callback.answer("Задача отменена")
         await callback.message.edit_text(
-            "❌ <b>Задача отменена</b>\nОна не будет запускать новые категории.",
+            "❌ <b>Парсинг отменён</b>",
             parse_mode=ParseMode.HTML,
         )
     else:
         await callback.answer("Отмена принята")
         await callback.message.edit_text(
-            "⏳ <b>Отменяю запуск</b>\n\nТекущий общий скан категории, если он уже начался, не прерывается. "
-            "После него твоя задача остановится.",
+            "⏳ <b>Останавливаю парсинг…</b>\n\nТекущая категория завершится, после чего запуск остановится.",
             parse_mode=ParseMode.HTML,
         )
 
@@ -1556,15 +1793,15 @@ async def start_scan(callback: CallbackQuery) -> None:
     async with job_guard:
         existing = active_jobs.get(callback.from_user.id)
         if existing and existing.state in {"queued", "running"} and not existing.cancel_requested:
-            await callback.answer("У тебя уже есть запуск в очереди или в работе", show_alert=True)
+            await callback.answer("У тебя уже идёт парсинг", show_alert=True)
             return
         if len(queued_job_ids) >= MAX_QUEUE_SIZE:
-            await callback.answer("Очередь временно заполнена. Попробуй чуть позже.", show_alert=True)
+            await callback.answer("Сервис сейчас сильно загружен. Попробуй чуть позже.", show_alert=True)
             return
 
-    await callback.answer("Добавляю в очередь")
+    await callback.answer("Запускаю парсинг")
     status = await callback.message.answer(
-        "⏳ <b>Добавляю задачу в очередь…</b>",
+        "⏳ <b>Подготавливаю парсинг…</b>",
         parse_mode=ParseMode.HTML,
     )
     job = ScanJob(
@@ -1584,16 +1821,10 @@ async def start_scan(callback: CallbackQuery) -> None:
             return
         active_jobs[job.user_id] = job
         queued_job_ids.append(job.job_id)
-        position = len(queued_job_ids)
         scan_queue.put_nowait(job)
 
     await status.edit_text(
-        "✅ <b>Задача добавлена в очередь</b>\n\n"
-        f"Категорий: <b>{len(job.category_keys)}</b>\n"
-        f"Позиция в очереди: примерно <b>{position}</b>\n"
-        f"Одновременно работают: до <b>{MAX_CONCURRENT_JOBS}</b> задач\n"
-        f"Свежий кэш категории: <b>{CATEGORY_CACHE_TTL_SECONDS // 60} мин.</b>\n\n"
-        "Если другая задача уже парсит ту же категорию, твоя подключится к её результату — второй запрос к Kleinanzeigen не создаётся.",
+        render_user_job_status(job),
         parse_mode=ParseMode.HTML,
         reply_markup=job_keyboard(job.job_id),
     )
@@ -1618,12 +1849,14 @@ async def main() -> None:
         asyncio.create_task(scan_worker(bot, i), name=f"scan-worker-{i}")
         for i in range(1, MAX_CONCURRENT_JOBS + 1)
     ]
+    ticker_task = asyncio.create_task(progress_ticker(bot), name="user-progress-ticker")
     try:
         await dp.start_polling(bot)
     finally:
+        ticker_task.cancel()
         for task in worker_tasks:
             task.cancel()
-        await asyncio.gather(*worker_tasks, return_exceptions=True)
+        await asyncio.gather(ticker_task, *worker_tasks, return_exceptions=True)
         async with category_inflight_guard:
             inflight = list(category_inflight.values())
         for task in inflight:
