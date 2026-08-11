@@ -216,6 +216,82 @@ def _extract_price_text(node) -> str | None:
     return None
 
 
+PROMOTED_CLASS_TOKENS = (
+    "topad",
+    "top-ad",
+    "badge-topad",
+    "is-topad",
+    "highlight",
+    "is-highlight",
+    "sponsored",
+    "sponsor",
+    "promoted",
+    "promotion",
+    "werbeanzeige",
+    "werbung",
+)
+PROMOTED_LABEL_RE = re.compile(
+    r"\b(?:Top[- ]?Anzeige|Werbeanzeige|Gesponsert|Sponsored|Promoted)\b",
+    re.IGNORECASE,
+)
+FILTER_PROMOTED_LISTINGS = os.getenv("FILTER_PROMOTED_LISTINGS", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+
+
+def _is_promoted_listing_node(node) -> bool:
+    """Detect paid/promoted cards in Kleinanzeigen search results.
+
+    Detection deliberately relies on explicit promotion markers from the search card
+    (classes, data/aria labels and visible labels), not on view-count heuristics. This
+    avoids throwing away genuinely viral fresh listings.
+    """
+    if not FILTER_PROMOTED_LISTINGS:
+        return False
+
+    def attrs_blob(element) -> str:
+        parts: list[str] = []
+        for key in ("class", "id", "data-testid", "data-test", "data-adtype",
+                    "data-type", "aria-label", "title"):
+            value = element.get(key) if hasattr(element, "get") else None
+            if isinstance(value, (list, tuple)):
+                parts.extend(str(x) for x in value)
+            elif value:
+                parts.append(str(value))
+        return " ".join(parts).lower()
+
+    # The marker can live on the list item itself, on a parent wrapper, or on a
+    # badge inside the card. Include a few ancestors because our broad candidate
+    # selector can yield both the outer <li> and the inner <article>.
+    elements = [node]
+    try:
+        parent = node.parent
+        for _ in range(4):
+            if parent is None or getattr(parent, "name", None) in {"body", "html"}:
+                break
+            elements.append(parent)
+            parent = parent.parent
+        elements.extend(node.find_all(True))
+    except Exception:
+        pass
+
+    for element in elements:
+        blob = attrs_blob(element)
+        if blob and any(token in blob for token in PROMOTED_CLASS_TOKENS):
+            return True
+
+        # Promotion badges are often short labels. Inspect only short text nodes so
+        # normal descriptions mentioning words like "Highlight" are not excluded.
+        try:
+            text = " ".join(element.get_text(" ", strip=True).split())
+        except Exception:
+            text = ""
+        if text and len(text) <= 40 and PROMOTED_LABEL_RE.search(text):
+            return True
+
+    return False
+
+
 def parse_category_html(html_text: str) -> list[ParsedListing]:
     soup = BeautifulSoup(html_text, "html.parser")
     items: list[ParsedListing] = []
@@ -223,6 +299,9 @@ def parse_category_html(html_text: str) -> list[ParsedListing]:
 
     candidates = soup.select("article, li.ad-listitem, .ad-listitem")
     for node in candidates:
+        if _is_promoted_listing_node(node):
+            continue
+
         link = node.select_one("a[href*='/s-anzeige/']")
         if not link or not link.get("href"):
             continue
