@@ -5,6 +5,7 @@ import csv
 import html
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -44,6 +45,7 @@ from parser import (
     ViewCountResult,
     TemporaryAccessError,
     is_today_text,
+    posted_date_moscow,
     page_url,
 )
 
@@ -53,6 +55,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 BERLIN = ZoneInfo("Europe/Berlin")
+MOSCOW = ZoneInfo("Europe/Moscow")
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
 AVAILABILITY_CONCURRENCY = max(1, min(8, int(os.getenv("AVAILABILITY_CONCURRENCY", "4"))))
 
@@ -107,6 +110,10 @@ class SettingsInput(StatesGroup):
     include_words = State()
     exclude_words = State()
     view_test_url = State()
+
+
+class ScanInput(StatesGroup):
+    target_date = State()
 
 
 def allowed(user_id: int) -> bool:
@@ -308,13 +315,14 @@ def _scan_title(keys: list[str]) -> str:
     return f"{names[0]} + ещё {len(names) - 1}"
 
 
-async def create_user_scan(user_id: int, job_uid: str, category_keys: list[str], page_limit: int) -> UserScan:
+async def create_user_scan(user_id: int, job_uid: str, category_keys: list[str], page_limit: int, target_date: str) -> UserScan:
     scan = UserScan(
         job_uid=job_uid,
         user_id=user_id,
         title=_scan_title(category_keys),
         category_keys=",".join(category_keys),
         page_limit=page_limit,
+        target_date=target_date,
         status="queued",
         total_categories=len(category_keys),
     )
@@ -367,11 +375,9 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
                 await session.commit()
                 return
 
-            start_utc, end_utc = berlin_today_utc_bounds()
             result = await session.execute(select(Listing).where(
                 Listing.category_key.in_(job.category_keys),
-                Listing.first_seen_at >= start_utc,
-                Listing.first_seen_at < end_utc,
+                Listing.posted_date_msk == job.target_date,
             ))
             rows = list(result.scalars().all())
             scan.result_count = len(rows)
@@ -408,9 +414,8 @@ def my_scans_keyboard(scans: list[UserScan]) -> InlineKeyboardMarkup:
     rows = []
     for scan in scans[:8]:
         icon = "✅" if scan.status == "done" else ("⏳" if scan.status in {"queued", "running"} else "⚪️")
-        stamp = _berlin_text(scan.finished_at or scan.created_at)
-        short_time = f"{stamp[:5]} {stamp[-5:]}" if len(stamp) >= 16 else stamp
-        label = f"{icon} {scan.title[:24]} · {short_time}"
+        target_label = _date_label(scan.target_date) if scan.target_date else _moscow_text(scan.finished_at or scan.created_at)[:10]
+        label = f"{icon} {scan.title[:22]} · {target_label[:5]}"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"scan:{scan.id}")])
     rows.append([InlineKeyboardButton(text="🔎 Новый скан", callback_data="start_scan")])
     rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
@@ -487,7 +492,8 @@ async def upsert_page_items(
                 session.add(Listing(
                     external_id=item.external_id, category_key=category_key, category=category_name,
                     title=item.title, price_text=item.price_text, price_eur=item.price_eur,
-                    posted_text=item.posted_text, url=item.url, first_seen_at=now, last_seen_at=now,
+                    posted_text=item.posted_text, posted_date_msk=(posted_date_moscow(item.posted_text).isoformat() if posted_date_moscow(item.posted_text) else None),
+                    url=item.url, first_seen_at=now, last_seen_at=now,
                     is_active=True, disappeared_at=None,
                 ))
                 if item.price_text:
@@ -519,6 +525,8 @@ async def upsert_page_items(
                 row.category = category_name
                 row.title = item.title
                 row.posted_text = item.posted_text
+                parsed_day = posted_date_moscow(item.posted_text)
+                row.posted_date_msk = parsed_day.isoformat() if parsed_day else row.posted_date_msk
                 row.url = item.url
                 row.last_seen_at = now
                 row.is_active = True
@@ -528,7 +536,7 @@ async def upsert_page_items(
 
 
 def berlin_today_utc_bounds() -> tuple[datetime, datetime]:
-    now = datetime.now(BERLIN)
+    now = datetime.now(MOSCOW)
     start_local = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end_local = start_local + timedelta(days=1)
     return (
@@ -575,23 +583,62 @@ def _price_display(price_text: str | None, price_eur: int | None) -> str:
     return "—"
 
 
-def _berlin_text(dt: datetime | None) -> str:
+def _moscow_text(dt: datetime | None) -> str:
     if not dt:
         return ""
-    return dt.replace(tzinfo=timezone.utc).astimezone(BERLIN).strftime("%d.%m.%Y %H:%M")
+    return dt.replace(tzinfo=timezone.utc).astimezone(MOSCOW).strftime("%d.%m.%Y %H:%M")
+
+
+def _berlin_text(dt: datetime | None) -> str:
+    # Backward-compatible helper name; all user-facing timestamps are Moscow time.
+    return _moscow_text(dt)
+
+
+def _moscow_today_iso() -> str:
+    return datetime.now(MOSCOW).date().isoformat()
+
+
+def _date_label(value: str | None) -> str:
+    if not value:
+        return "—"
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%d.%m.%Y")
+    except ValueError:
+        return value
+
+
+def _parse_scan_date_input(text: str | None) -> str | None:
+    raw = (text or "").strip().replace("/", ".").replace("-", ".")
+    today = datetime.now(MOSCOW).date()
+    try:
+        if re.fullmatch(r"\d{1,2}", raw):
+            day = int(raw)
+            value = today.replace(day=day)
+        elif re.fullmatch(r"\d{1,2}\.\d{1,2}", raw):
+            day, month = map(int, raw.split("."))
+            value = datetime(today.year, month, day).date()
+        elif re.fullmatch(r"\d{1,2}\.\d{1,2}\.\d{4}", raw):
+            value = datetime.strptime(raw, "%d.%m.%Y").date()
+        else:
+            return None
+    except ValueError:
+        return None
+    if value > today:
+        return None
+    return value.isoformat()
 
 
 def write_listing_csv(rows: list[Listing], mode: str) -> Path:
-    now = datetime.now(BERLIN)
+    now = datetime.now(MOSCOW)
     path, writer, f = _temp_csv(f"kleinanzeigen_{mode}_{now:%Y-%m-%d_%H-%M}.csv")
     try:
-        writer.writerow(["Категория", "Название", "Цена", "Цена, €", "👁 Просмотры", "Дата публикации", "Ссылка"])
+        writer.writerow(["Категория", "Название", "Цена", "Цена, €", "👁 Просмотры", "Дата (МСК)", "Как показано на Kleinanzeigen", "Ссылка"])
         for row in rows:
             writer.writerow([
                 row.category, row.title, _price_display(row.price_text, row.price_eur),
                 row.price_eur if row.price_eur is not None else "",
                 row.view_count if row.view_count is not None else "",
-                row.posted_text or "Сегодня", row.url,
+                _date_label(row.posted_date_msk), row.posted_text or "", row.url,
             ])
     finally:
         f.close()
@@ -599,7 +646,7 @@ def write_listing_csv(rows: list[Listing], mode: str) -> Path:
 
 
 def write_frequent_csv(rows) -> Path:
-    now = datetime.now(BERLIN)
+    now = datetime.now(MOSCOW)
     path, writer, f = _temp_csv(f"kleinanzeigen_chasto_publikuemye_{now:%Y-%m-%d_%H-%M}.csv")
     try:
         writer.writerow([
@@ -621,7 +668,7 @@ def write_frequent_csv(rows) -> Path:
 
 
 def write_market_csv(rows) -> Path:
-    now = datetime.now(BERLIN)
+    now = datetime.now(MOSCOW)
     path, writer, f = _temp_csv(f"kleinanzeigen_nizhe_rynka_{now:%Y-%m-%d_%H-%M}.csv")
     try:
         writer.writerow([
@@ -640,7 +687,7 @@ def write_market_csv(rows) -> Path:
 
 
 def write_disappearing_csv(rows) -> Path:
-    now = datetime.now(BERLIN)
+    now = datetime.now(MOSCOW)
     path, writer, f = _temp_csv(f"kleinanzeigen_bystro_ischezayushchie_{now:%Y-%m-%d_%H-%M}.csv")
     try:
         writer.writerow([
@@ -659,7 +706,7 @@ def write_disappearing_csv(rows) -> Path:
 
 
 def write_price_drop_csv(rows) -> Path:
-    now = datetime.now(BERLIN)
+    now = datetime.now(MOSCOW)
     path, writer, f = _temp_csv(f"kleinanzeigen_snizhenie_ceny_{now:%Y-%m-%d_%H-%M}.csv")
     try:
         writer.writerow([
@@ -907,7 +954,7 @@ async def send_smart_export(
     if selected_keys:
         all_rows = [row for row in all_rows if row.category_key in selected_keys]
     raw_base = base_filter(
-        all_rows, period=s.period, price_filter=s.price_filter, clean_noise=s.clean_noise,
+        all_rows, period=("today" if rows_override is not None else s.period), price_filter=s.price_filter, clean_noise=s.clean_noise,
         include_words=s.include_words or "", exclude_words=s.exclude_words or "",
     )
 
@@ -1118,6 +1165,7 @@ class ScanJob:
     page_limit: int = 100
     current_progress_key: str = ""
     scan_id: int | None = None
+    target_date: str = ""
 
 
 @dataclass
@@ -1160,6 +1208,7 @@ async def get_category_scan_state(category_key: str) -> CategoryScanState | None
 async def save_category_scan_state(
     category_key: str,
     *,
+    target_date: str,
     mode: str,
     pages_scanned: int,
     new_count: int,
@@ -1175,9 +1224,10 @@ async def save_category_scan_state(
         if state is None:
             state = CategoryScanState(category_key=category_key, scan_date=day_key)
             session.add(state)
-        new_day = state.scan_date != day_key
+        new_day = state.scan_date != day_key or (state.target_date or "") != target_date
         if new_day:
             state.scan_date = day_key
+            state.target_date = target_date
             state.total_runs = 0
             state.day_seed_complete = False
             state.day_seed_capped = False
@@ -1186,6 +1236,7 @@ async def save_category_scan_state(
 
         if head_ids:
             state.head_ids = ",".join(head_ids[:INCREMENTAL_HEAD_SIZE])
+        state.target_date = target_date
         state.last_scan_at = datetime.utcnow()
         state.last_mode = mode
         state.last_pages = pages_scanned
@@ -1236,7 +1287,7 @@ async def record_parser_run(
         await session.commit()
 
 
-async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page_limit: int) -> ScanResult:
+async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page_limit: int, target_date: str) -> ScanResult:
     """Scan one category.
 
     v2.5 uses two modes:
@@ -1248,19 +1299,21 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     listings arrived since the previous run. It only avoids re-reading the old tail.
     """
     scan_limit = max(1, min(MAX_PAGES_PER_CATEGORY, int(page_limit)))
-    progress_key = f"{cat.key}:{scan_limit}"
+    target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
+    progress_key = f"{cat.key}:{scan_limit}:{target_date}"
     state = await get_category_scan_state(cat.key)
     day_key = berlin_date_key()
     can_fast = bool(
         state
         and state.scan_date == day_key
+        and (state.target_date or "") == target_date
         and (state.day_seed_complete or (state.day_full_pages or 0) >= scan_limit)
     )
     mode = "fast" if can_fast else "full"
     previous_heads = {
         x for x in ((state.head_ids if state else "") or "").split(",") if x
     }
-    baseline_pages = (state.day_full_pages or 0) if state and state.scan_date == day_key else 0
+    baseline_pages = (state.day_full_pages or 0) if state and state.scan_date == day_key and (state.target_date or "") == target_date else 0
     # A rough page estimate is used only for the user-facing progress/ETA. It is
     # deliberately conservative and is recalibrated while the scan runs.
     if state and (state.day_full_pages or state.last_pages):
@@ -1285,6 +1338,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     known_total = 0
     enriched_total = 0
     empty_today_pages = 0
+    target_seen_any = False
     consecutive_known_pages = 0
     first_page_head_ids: list[str] = []
     checkpoint_seen_page: int | None = None
@@ -1307,8 +1361,12 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 reason = "конец выдачи"
                 break
 
-            today_items = [item for item in items if is_today_text(item.posted_text)]
+            page_dates = [(item, posted_date_moscow(item.posted_text)) for item in items]
+            today_items = [item for item, item_day in page_dates if item_day == target_day]
+            dated_days = [item_day for _, item_day in page_dates if item_day is not None]
             today_seen += len(today_items)
+            if today_items:
+                target_seen_any = True
             live = category_live_progress.get(progress_key)
             if live is not None:
                 live.page = page
@@ -1318,7 +1376,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 if page >= live.estimated_pages:
                     live.estimated_pages = min(scan_limit, page + (2 if mode == "fast" else 5))
 
-            if page == 1 and today_items:
+            if not first_page_head_ids and today_items:
                 first_page_head_ids = [item.external_id for item in today_items[:INCREMENTAL_HEAD_SIZE]]
 
             if today_items:
@@ -1393,11 +1451,14 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 empty_today_pages += 1
                 consecutive_known_pages = 0
                 log.info(
-                    "category=%s mode=%s page=%s total=%s today=0 empty_today_pages=%s",
-                    cat.name, mode, page, len(items), empty_today_pages,
+                    "category=%s mode=%s page=%s total=%s target=%s matched=0",
+                    cat.name, mode, page, len(items), target_date,
                 )
-                if empty_today_pages >= STOP_AFTER_EMPTY_TODAY_PAGES:
-                    reason = "закончились объявления Heute"
+                # Search pages are ordered newest-first. Before we reach the requested
+                # date we keep paging. Once all dated cards are older than it, the
+                # requested calendar day is behind us and the scan can stop.
+                if dated_days and max(dated_days) < target_day:
+                    reason = "прошли выбранную дату" if target_seen_any else "выбранная дата не найдена в просмотренной выдаче"
                     break
 
             if PAGE_DELAY_SECONDS and page < scan_limit:
@@ -1418,6 +1479,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         seed_capped = (mode == "full" and hit_limit and not interrupted)
         saved = await save_category_scan_state(
             cat.key,
+            target_date=target_date,
             mode=mode,
             pages_scanned=pages_scanned,
             new_count=new_count,
@@ -1466,14 +1528,14 @@ def job_keyboard(job_id: str) -> InlineKeyboardMarkup:
     ])
 
 
-async def fresh_category_cache_age(category_key: str, page_limit: int) -> int | None:
+async def fresh_category_cache_age(category_key: str, page_limit: int, target_date: str) -> int | None:
     """Return cache age in seconds when a category can be safely reused."""
     if CATEGORY_CACHE_TTL_SECONDS <= 0:
         return None
     state = await get_category_scan_state(category_key)
     if not state or not state.last_scan_at:
         return None
-    if state.scan_date != berlin_date_key():
+    if state.scan_date != berlin_date_key() or (state.target_date or "") != target_date:
         return None
     requested = max(1, min(MAX_PAGES_PER_CATEGORY, int(page_limit)))
     if not (state.day_seed_complete or (state.day_full_pages or 0) >= requested):
@@ -1484,30 +1546,30 @@ async def fresh_category_cache_age(category_key: str, page_limit: int) -> int | 
     return None
 
 
-async def _scan_category_task(cat, user_id: int, page_limit: int) -> ScanResult:
+async def _scan_category_task(cat, user_id: int, page_limit: int, target_date: str) -> ScanResult:
     parser = KleinanzeigenParser()
     try:
-        return await scan_one_category(parser, cat, user_id, page_limit)
+        return await scan_one_category(parser, cat, user_id, page_limit, target_date)
     finally:
         await parser.close()
 
 
-async def dispatch_category(cat, user_id: int, page_limit: int) -> CategoryDispatchResult:
+async def dispatch_category(cat, user_id: int, page_limit: int, target_date: str) -> CategoryDispatchResult:
     """Use a fresh cache, join an in-flight scan, or start exactly one scan.
 
     This is the core v2.6 de-duplication layer: 15 users requesting Konsolen at
     the same moment still cause only one network scan of Konsolen.
     """
-    cache_age = await fresh_category_cache_age(cat.key, page_limit)
+    cache_age = await fresh_category_cache_age(cat.key, page_limit, target_date)
     if cache_age is not None:
         return CategoryDispatchResult(source="cache", cache_age_seconds=cache_age)
 
-    inflight_key = f"{cat.key}:{max(1, min(MAX_PAGES_PER_CATEGORY, int(page_limit)))}"
+    inflight_key = f"{cat.key}:{max(1, min(MAX_PAGES_PER_CATEGORY, int(page_limit)))}:{target_date}"
     async with category_inflight_guard:
         task = category_inflight.get(inflight_key)
         if task is None:
             task = asyncio.create_task(
-                _scan_category_task(cat, user_id, page_limit),
+                _scan_category_task(cat, user_id, page_limit, target_date),
                 name=f"category-scan:{inflight_key}",
             )
             category_inflight[inflight_key] = task
@@ -1604,6 +1666,7 @@ def render_user_job_status(job: ScanJob) -> str:
         return (
             "⏳ <b>Подготавливаю парсинг…</b>\n\n"
             f"Выбрано категорий: <b>{total}</b>\n"
+            f"Дата объявлений: <b>{_date_label(job.target_date)} (МСК)</b>\n"
             f"Глубина: <b>{job.page_limit} страниц на категорию</b>\n"
             f"Ориентировочное время: <b>{_human_eta(total_estimate)}</b>\n"
             f"Подготовка: <b>{waited} сек</b>\n\n"
@@ -1666,6 +1729,7 @@ def render_user_job_status(job: ScanJob) -> str:
         "🔄 <b>Парсинг идёт</b>\n\n"
         f"{_progress_bar(percent)} <b>{percent}%</b>\n"
         f"Категории: <b>{job.completed_categories}/{total}</b> готово\n"
+        f"Дата: <b>{_date_label(job.target_date)} (МСК)</b>\n"
         f"Глубина: <b>{job.page_limit} страниц</b>\n"
         f"Сейчас: <b>{category_line}</b>{page_line}{today_line}{views_line}\n\n"
         f"🆕 Найдено новых: <b>{visible_new}</b>\n"
@@ -1726,6 +1790,7 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
         text = (
             "✅ <b>Парсинг завершён</b>\n\n"
             f"🗂 Категорий обработано: <b>{job.completed_categories}/{len(job.category_keys)}</b>\n"
+            f"📅 Дата объявлений: <b>{_date_label(job.target_date)} (МСК)</b>\n"
             f"🆕 Новых объявлений: <b>{job.total_new}</b>\n"
             f"⏱ Время: <b>{elapsed_text}</b>\n\n"
             "📄 Формирую файл с результатом…"
@@ -1738,11 +1803,12 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
             result_prefix = (
                 "✅ <b>Готовый результат</b>\n"
                 f"🗂 Категорий: <b>{job.completed_categories}/{len(job.category_keys)}</b>\n"
+                f"📅 Дата: <b>{_date_label(job.target_date)} (МСК)</b>\n"
                 f"📄 Глубина: <b>{job.page_limit} страниц на категорию</b>\n"
                 f"🆕 Новых найдено: <b>{job.total_new}</b>\n"
                 f"⏱ Время: <b>{elapsed_text}</b>\n"
                 f"Режим: <b>{MODE_LABELS.get(settings.output_mode, settings.output_mode)}</b>\n"
-                f"Период: <b>{PERIOD_LABELS.get(settings.period, settings.period)}</b>\n"
+                f"Дата поиска: <b>{_date_label(job.target_date)} (МСК)</b>\n"
                 f"Цена: <b>{PRICE_LABELS.get(settings.price_filter, settings.price_filter)}</b>"
             )
             adapter = BotChatAdapter(
@@ -1751,11 +1817,15 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
                 prefix=result_prefix,
                 reply_markup=post_scan_keyboard(job.scan_id),
             )
+            snapshot_rows = []
+            if job.scan_id is not None:
+                snapshot_rows = [row for row, _ in await get_scan_rows(job.scan_id)]
             await send_smart_export(
                 adapter,
                 job.user_id,
                 len(job.category_keys),
                 category_keys_override=set(job.category_keys),
+                rows_override=snapshot_rows,
             )
         except Exception as exc:
             log.exception("Could not auto-export result for job=%s", job.job_id)
@@ -1802,11 +1872,11 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
             continue
         job.current_category = cat.name
         job.current_category_key = cat.key
-        job.current_progress_key = f"{cat.key}:{job.page_limit}"
+        job.current_progress_key = f"{cat.key}:{job.page_limit}:{job.target_date}"
         job.current_category_index = idx
         try:
             await edit_job_status(bot, job, render_user_job_status(job), force=True)
-            dispatched = await dispatch_category(cat, job.user_id, job.page_limit)
+            dispatched = await dispatch_category(cat, job.user_id, job.page_limit, job.target_date)
             result = dispatched.result
             source_label = "🧠 кэш"
             if dispatched.source == "cache":
@@ -1895,10 +1965,10 @@ async def scan_worker(bot: Bot, worker_id: int) -> None:
 
 
 
-async def enqueue_user_scan(message: Message, user_id: int, category_keys: list[str], page_limit: int) -> ScanJob:
+async def enqueue_user_scan(message: Message, user_id: int, category_keys: list[str], page_limit: int, target_date: str) -> ScanJob:
     """Create a persistent scan card and queue the network job."""
     job_uid = uuid.uuid4().hex[:12]
-    scan = await create_user_scan(user_id, job_uid, category_keys, page_limit)
+    scan = await create_user_scan(user_id, job_uid, category_keys, page_limit, target_date)
     status = await message.answer("⏳ <b>Подготавливаю скан…</b>", parse_mode=ParseMode.HTML)
     job = ScanJob(
         job_id=job_uid,
@@ -1910,6 +1980,7 @@ async def enqueue_user_scan(message: Message, user_id: int, category_keys: list[
         warnings=[],
         page_limit=page_limit,
         scan_id=scan.id,
+        target_date=target_date,
     )
     async with job_guard:
         active_jobs[job.user_id] = job
@@ -1935,7 +2006,7 @@ async def start(message: Message, state: FSMContext) -> None:
         return
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>🔍 Kleinanzeigen Parser v2.8.0</b>\n\n"
+        "<b>🔍 Kleinanzeigen Parser v2.8.3</b>\n\n"
         "Здесь всё строится вокруг сохранённых сканов:\n"
         "🔥 <b>Популярное сейчас</b> — лидеры по просмотрам\n"
         "🔎 <b>Новый скан</b> — собрать свежие объявления\n"
@@ -1952,7 +2023,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v2.8.0</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v2.8.3</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == "post_settings")
@@ -1973,7 +2044,7 @@ async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
     await callback.message.answer(
-        "<b>🔍 Kleinanzeigen Parser v2.8.0</b>\n\nЧто хочешь посмотреть?",
+        "<b>🔍 Kleinanzeigen Parser v2.8.3</b>\n\nЧто хочешь посмотреть?",
         reply_markup=main_keyboard(len(selected)),
         parse_mode=ParseMode.HTML,
     )
@@ -2307,7 +2378,8 @@ async def render_scan_detail(scan: UserScan) -> str:
         f"<b>📊 {html.escape(scan.title)}</b>",
         "",
         f"Статус: <b>{status_label}</b>",
-        f"Запуск: <b>{_berlin_text(scan.created_at)}</b>",
+        f"Запуск: <b>{_moscow_text(scan.created_at)} МСК</b>",
+        f"Дата объявлений: <b>{_date_label(scan.target_date)} (МСК)</b>",
         f"Глубина: <b>{scan.page_limit} стр. на категорию</b>",
         f"Категорий: <b>{scan.completed_categories}/{scan.total_categories}</b>",
         "",
@@ -2318,7 +2390,7 @@ async def render_scan_detail(scan: UserScan) -> str:
         f"❌ Исчезли: <b>{disappeared}</b>",
     ]
     if scan.last_view_refresh_at:
-        lines += ["", f"Последнее обновление просмотров: <b>{_berlin_text(scan.last_view_refresh_at)}</b>"]
+        lines += ["", f"Последнее обновление просмотров: <b>{_moscow_text(scan.last_view_refresh_at)} МСК</b>"]
     lines += ["", "💡 Нажми «Обновить просмотры» через час-два — бот сравнит новые значения с моментом завершения этого скана."]
     return "\n".join(lines)
 
@@ -2457,7 +2529,7 @@ async def scan_repeat(callback: CallbackQuery) -> None:
     if not keys:
         await callback.answer("Категории этого скана больше недоступны", show_alert=True); return
     await callback.answer("Повторяю скан")
-    await enqueue_user_scan(callback.message, callback.from_user.id, keys, scan.page_limit)
+    await enqueue_user_scan(callback.message, callback.from_user.id, keys, scan.page_limit, scan.target_date or _moscow_today_iso())
 
 
 @dp.callback_query(F.data == "groups")
@@ -2579,7 +2651,7 @@ async def cancel_scan(callback: CallbackQuery) -> None:
 
 
 @dp.callback_query(F.data == "start_scan")
-async def start_scan(callback: CallbackQuery) -> None:
+async def start_scan(callback: CallbackQuery, state: FSMContext) -> None:
     if not allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
@@ -2596,21 +2668,47 @@ async def start_scan(callback: CallbackQuery) -> None:
             await callback.answer("У тебя уже идёт парсинг", show_alert=True)
             return
 
+    await state.set_state(ScanInput.target_date)
     await callback.answer()
+    today_label = datetime.now(MOSCOW).strftime("%d.%m.%Y")
     await callback.message.answer(
-        "<b>🔎 Глубина нового скана</b>\n\n"
-        f"Выбрано категорий: <b>{len(selected_cats)}</b>\n"
-        "Лимит применяется <b>к каждой выбранной категории</b>.\n\n"
-        "25 — быстрый сбор\n"
-        "50 — средняя глубина\n"
-        "100 — максимальная глубина",
+        "<b>📅 За какое число искать объявления?</b>\n\n"
+        "Всё считаем по <b>московскому времени (МСК)</b>.\n"
+        f"Сегодня по МСК: <b>{today_label}</b>.\n\n"
+        "Можно отправить просто число текущего месяца, например <code>12</code>, "
+        "или полную дату <code>10.08.2026</code>.\n\n"
+        "После даты выберешь глубину 25 / 50 / 100 страниц.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.message(ScanInput.target_date)
+async def receive_scan_date(message: Message, state: FSMContext) -> None:
+    if not allowed(message.from_user.id):
+        await state.clear()
+        await message.answer("Нет доступа.")
+        return
+    target_date = _parse_scan_date_input(message.text)
+    if target_date is None:
+        await message.answer(
+            "⚠️ Не понял дату. Отправь, например, <code>12</code> или <code>10.08.2026</code>. "
+            "Будущую дату выбрать нельзя.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await state.update_data(target_date=target_date)
+    selected = await get_selected(message.from_user.id)
+    await message.answer(
+        f"<b>🔎 Скан за {_date_label(target_date)} (МСК)</b>\n\n"
+        f"Выбрано категорий: <b>{len(selected)}</b>.\n"
+        "Теперь выбери глубину для каждой категории:",
         parse_mode=ParseMode.HTML,
         reply_markup=page_limit_keyboard(),
     )
 
 
 @dp.callback_query(F.data.startswith("scanpages:"))
-async def start_scan_with_pages(callback: CallbackQuery) -> None:
+async def start_scan_with_pages(callback: CallbackQuery, state: FSMContext) -> None:
     if not allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
@@ -2624,6 +2722,8 @@ async def start_scan_with_pages(callback: CallbackQuery) -> None:
         await callback.answer("Выбери 25, 50 или 100 страниц", show_alert=True)
         return
 
+    data = await state.get_data()
+    target_date = data.get("target_date") or _moscow_today_iso()
     selected_keys = await get_selected(callback.from_user.id)
     selected_cats = [CATEGORIES[k] for k in CATEGORIES if k in selected_keys]
     if not selected_cats:
@@ -2640,9 +2740,10 @@ async def start_scan_with_pages(callback: CallbackQuery) -> None:
             return
 
     await update_setting(callback.from_user.id, "page_limit", page_limit)
+    await state.clear()
     await callback.answer("Запускаю скан")
     await enqueue_user_scan(
-        callback.message, callback.from_user.id, [cat.key for cat in selected_cats], page_limit
+        callback.message, callback.from_user.id, [cat.key for cat in selected_cats], page_limit, target_date
     )
 
 

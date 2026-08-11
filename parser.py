@@ -7,12 +7,16 @@ import os
 import random
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 
 import httpx
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.kleinanzeigen.de"
+BERLIN_TZ = ZoneInfo("Europe/Berlin")
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 USER_AGENT = os.getenv(
     "USER_AGENT",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -148,6 +152,48 @@ def _extract_posted_text(node) -> str | None:
 
 def is_today_text(text: str | None) -> bool:
     return bool(text and re.search(r"\bHeute\b", text, flags=re.IGNORECASE))
+
+
+def posted_date_moscow(text: str | None, now_berlin: datetime | None = None):
+    """Return the listing calendar date in Europe/Moscow.
+
+    Kleinanzeigen uses Heute/Gestern relative to Germany. When a clock time is
+    present we convert the German timestamp to Moscow, so e.g. 23:30 in Berlin
+    can correctly become the next Moscow calendar day. Explicit DD.MM.YYYY
+    dates have no time on category pages, so their calendar date is preserved.
+    """
+    if not text:
+        return None
+    raw = " ".join(str(text).split())
+    explicit = re.search(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b", raw)
+    if explicit:
+        try:
+            return datetime(int(explicit.group(3)), int(explicit.group(2)), int(explicit.group(1))).date()
+        except ValueError:
+            return None
+
+    now = now_berlin or datetime.now(BERLIN_TZ)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=BERLIN_TZ)
+    else:
+        now = now.astimezone(BERLIN_TZ)
+
+    lower = raw.lower()
+    if "heute" not in lower and "gestern" not in lower:
+        return None
+    base = now.date() - (timedelta(days=1) if "gestern" in lower else timedelta(0))
+    tm = re.search(r"\b(\d{1,2}):(\d{2})\b", raw)
+    if not tm:
+        return base
+    try:
+        local_dt = datetime(base.year, base.month, base.day, int(tm.group(1)), int(tm.group(2)), tzinfo=BERLIN_TZ)
+    except ValueError:
+        return base
+    return local_dt.astimezone(MOSCOW_TZ).date()
+
+
+def posted_matches_moscow_date(text: str | None, target_date) -> bool:
+    return posted_date_moscow(text) == target_date
 
 
 def _clean_price_candidate(text: str) -> str | None:

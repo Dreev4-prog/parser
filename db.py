@@ -63,6 +63,8 @@ async def init_db() -> None:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN category_key VARCHAR(80)"))
         if columns and "posted_text" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN posted_text VARCHAR(100)"))
+        if columns and "posted_date_msk" not in columns:
+            await conn.execute(text("ALTER TABLE listings ADD COLUMN posted_date_msk VARCHAR(10)"))
         if columns and "is_active" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN is_active BOOLEAN DEFAULT TRUE"))
         if columns and "disappeared_at" not in columns:
@@ -79,3 +81,9 @@ async def init_db() -> None:
         scan_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "category_scan_state"))
         if scan_columns and "day_seed_capped" not in scan_columns:
             await conn.execute(text("ALTER TABLE category_scan_state ADD COLUMN day_seed_capped BOOLEAN DEFAULT FALSE"))
+        if scan_columns and "target_date" not in scan_columns:
+            await conn.execute(text("ALTER TABLE category_scan_state ADD COLUMN target_date VARCHAR(10) DEFAULT ''"))
+
+        user_scan_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "user_scans"))
+        if user_scan_columns and "target_date" not in user_scan_columns:
+            await conn.execute(text("ALTER TABLE user_scans ADD COLUMN target_date VARCHAR(10) DEFAULT ''"))

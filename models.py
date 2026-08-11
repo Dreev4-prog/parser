@@ -19,6 +19,7 @@ class Listing(Base):
     price_text: Mapped[str | None] = mapped_column(String(100), nullable=True)
     price_eur: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     posted_text: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    posted_date_msk: Mapped[str | None] = mapped_column(String(10), nullable=True, index=True)
     url: Mapped[str] = mapped_column(String(1200), unique=True)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
@@ -78,7 +79,8 @@ class CategoryScanState(Base):
     __tablename__ = "category_scan_state"
 
     category_key: Mapped[str] = mapped_column(String(80), primary_key=True)
-    scan_date: Mapped[str] = mapped_column(String(10), index=True)  # Europe/Berlin YYYY-MM-DD
+    scan_date: Mapped[str] = mapped_column(String(10), index=True)  # worker-day key
+    target_date: Mapped[str] = mapped_column(String(10), default="", index=True)  # Europe/Moscow YYYY-MM-DD
     head_ids: Mapped[str] = mapped_column(Text, default="")
     last_scan_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     last_mode: Mapped[str] = mapped_column(String(16), default="full")
@@ -127,6 +129,7 @@ class UserScan(Base):
     title: Mapped[str] = mapped_column(String(255))
     category_keys: Mapped[str] = mapped_column(Text, default="")
     page_limit: Mapped[int] = mapped_column(Integer, default=25)
+    target_date: Mapped[str] = mapped_column(String(10), default="", index=True)
     status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
