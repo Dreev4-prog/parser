@@ -145,6 +145,7 @@ def settings_keyboard(s: UserSettings) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"↕️ Сортировка: {SORT_LABELS.get(s.sort_mode, s.sort_mode)}", callback_data="set_sort")],
         [InlineKeyboardButton(text="✅ Ключевые слова", callback_data="set_include"),
          InlineKeyboardButton(text="🚫 Исключить слова", callback_data="set_exclude")],
+        [InlineKeyboardButton(text="ℹ️ Как работают режимы", callback_data="mode_help")],
         [InlineKeyboardButton(text="♻️ Сбросить настройки", callback_data="reset_settings")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="home")],
     ])
@@ -381,7 +382,7 @@ def write_frequent_csv(rows) -> Path:
         writer.writerow([
             "Категория", "Группа товара", "Пример названия", "Цена примера",
             "Публикаций", "Мин. цена, €", "Медиана, €", "Макс. цена, €",
-            "Последнее", "Ссылка-пример",
+            "Точность группы, %", "Последнее", "Ссылка-пример",
         ])
         for row in rows:
             writer.writerow([
@@ -389,7 +390,7 @@ def write_frequent_csv(rows) -> Path:
                 row.min_price if row.min_price is not None else "",
                 row.median_price if row.median_price is not None else "",
                 row.max_price if row.max_price is not None else "",
-                row.newest_posted, row.example_url,
+                row.confidence, row.newest_posted, row.example_url,
             ])
     finally:
         f.close()
@@ -402,12 +403,12 @@ def write_market_csv(rows) -> Path:
     try:
         writer.writerow([
             "Категория", "Название", "Цена", "Цена, €", "Медиана группы, €",
-            "Ниже медианы, %", "Образцов", "Дата", "Ссылка",
+            "Ниже медианы, %", "Образцов", "Точность группы, %", "Дата", "Ссылка",
         ])
         for row in rows:
             writer.writerow([
                 row.category, row.title, row.price_text or f"{row.price_eur} €", row.price_eur,
-                row.median_price, row.discount_pct, row.samples, row.posted_text, row.url,
+                row.median_price, row.discount_pct, row.samples, row.confidence, row.posted_text, row.url,
             ])
     finally:
         f.close()
@@ -420,11 +421,12 @@ def write_disappearing_csv(rows) -> Path:
     try:
         writer.writerow([
             "Категория", "Название", "Цена", "Время жизни, мин",
-            "Впервые замечено", "Обнаружено исчезновение", "Ссылка",
+            "Окно проверки, мин", "Точность", "Впервые замечено", "Обнаружено исчезновение", "Ссылка",
         ])
         for row in rows:
             writer.writerow([
                 row.category, row.title, row.price_text or "—", row.lifespan_minutes,
+                row.detection_gap_minutes, row.confidence,
                 _berlin_text(row.first_seen_at), _berlin_text(row.disappeared_at), row.url,
             ])
     finally:
@@ -503,6 +505,9 @@ async def send_smart_export(message: Message, user_id: int, selected_count: int)
     s = await get_settings(user_id)
     mode = s.output_mode
     all_rows = await today_rows()
+    selected_keys = await get_selected(user_id)
+    if selected_keys:
+        all_rows = [row for row in all_rows if row.category_key in selected_keys]
     raw_base = base_filter(
         all_rows, period=s.period, price_filter=s.price_filter, clean_noise=s.clean_noise,
         include_words=s.include_words or "", exclude_words=s.exclude_words or "",
@@ -515,9 +520,9 @@ async def send_smart_export(message: Message, user_id: int, selected_count: int)
         base = dedupe_rows(base)
 
     if mode == "frequent":
-        result = frequent_rows(base)
+        result = frequent_rows(base, min_count=3)
         if not result:
-            await message.answer("🔥 По текущим настройкам повторяющихся групп пока не найдено.", reply_markup=main_keyboard(selected_count))
+            await message.answer("🔥 Пока нет групп минимум с 3 публикациями по текущим фильтрам.", reply_markup=main_keyboard(selected_count))
             return 0
         path = write_frequent_csv(result)
         caption = f"🔥 Часто публикуемые группы: {len(result)}"
@@ -525,7 +530,7 @@ async def send_smart_export(message: Message, user_id: int, selected_count: int)
     elif mode == "below_market":
         result = below_market_rows(base)
         if not result:
-            await message.answer("💰 Пока недостаточно похожих объявлений или нет позиций ≥20% ниже медианы.", reply_markup=main_keyboard(selected_count))
+            await message.answer("💰 Нужны минимум 5 цен в одной уверенной группе; сейчас нет позиций ≥20% ниже медианы похожих объявлений.", reply_markup=main_keyboard(selected_count))
             return 0
         path = write_market_csv(result)
         caption = f"💰 Потенциально ниже рынка: {len(result)}"
@@ -544,14 +549,14 @@ async def send_smart_export(message: Message, user_id: int, selected_count: int)
         )
         if s.smart_dedupe:
             refreshed = dedupe_rows(refreshed)
-        result = disappearing_rows(refreshed)
+        result = disappearing_rows(refreshed, max_lifespan_hours=12)
         await status.edit_text(
             f"⚡ Проверено: <b>{checked}</b> · новых исчезнувших: <b>{newly_disappeared}</b> · неопределённых: <b>{unknown}</b>",
             parse_mode=ParseMode.HTML,
         )
         if not result:
             await message.answer(
-                "⚡ Пока нет зафиксированных исчезнувших объявлений. Этот режим становится полезнее после нескольких запусков в течение дня.",
+                "⚡ Пока нет объявлений, исчезнувших примерно за ≤12 часов. Точность растёт при регулярных проверках в течение дня.",
                 reply_markup=main_keyboard(selected_count),
             )
             return 0
@@ -560,10 +565,10 @@ async def send_smart_export(message: Message, user_id: int, selected_count: int)
 
     elif mode == "price_drop":
         histories = await histories_for(base)
-        result = price_drop_rows(base, histories)
+        result = price_drop_rows(base, histories, min_drop_pct=5, min_drop_eur=5)
         if not result:
             await message.answer(
-                "📉 Снижений цены пока не зафиксировано. История начинает накапливаться с v2.3; нужен повторный парсинг после изменения цены объявления.",
+                "📉 Пока нет подтверждённых снижений минимум на 5 € и 5%. Нужен повторный парсинг после изменения цены объявления.",
                 reply_markup=main_keyboard(selected_count),
             )
             return 0
@@ -601,8 +606,8 @@ def settings_text(s: UserSettings) -> str:
         f"Сортировка: <b>{SORT_LABELS.get(s.sort_mode, s.sort_mode)}</b>\n"
         f"Ключевые слова: <b>{include}</b>\n"
         f"Исключить: <b>{exclude}</b>\n\n"
-        "<i>Кнопки 🔥 / ⚡ / 💰 / 📉 теперь находятся прямо здесь. "
-        "⚡ проверяет доступность сохранённых ссылок ограниченными пакетами; 📉 использует историю цен.</i>"
+        "<i>v2.4 использует более строгую группировку по модели/варианту/памяти. "
+        "Нажми «ℹ️ Как работают режимы», чтобы увидеть текущие критерии.</i>"
     )
 
 
@@ -643,7 +648,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat) -> tuple[int, int,
             empty_today_pages = 0
             new_items, known_count, enriched_count = await upsert_page_items(cat.key, cat.name, today_items)
             new_count += len(new_items)
-            # v2.3 also keeps going while it is backfilling prices missing from older rows.
+            # Keep going while backfilling prices missing from older rows.
             no_new_pages = 0 if (new_items or enriched_count) else no_new_pages + 1
             log.info(
                 "category=%s page=%s total=%s today=%s new=%s known=%s prices_backfilled=%s no_new_pages=%s",
@@ -672,7 +677,7 @@ async def start(message: Message, state: FSMContext) -> None:
         return
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>Kleinanzeigen Parser v2.3 · Smart Parsing</b>\n\n"
+        "<b>Kleinanzeigen Parser v2.4 · Smart Analytics</b>\n\n"
         "Сначала парсер собирает объявления в базу, затем ты можешь менять режим выдачи без повторного парсинга.\n\n"
         "🆕 новые · 💎 уникальные · 🔥 частые · ⚡ быстро исчезающие · 💰 ниже рынка · 📉 снижение цены.",
         reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML,
@@ -686,7 +691,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>Kleinanzeigen Parser v2.3</b>\n\nВыбери действие:", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("<b>Kleinanzeigen Parser v2.4</b>\n\nВыбери действие:", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == "settings")
@@ -697,6 +702,28 @@ async def settings(callback: CallbackQuery, state: FSMContext) -> None:
     s = await get_settings(callback.from_user.id)
     await callback.answer()
     await callback.message.edit_text(settings_text(s), reply_markup=settings_keyboard(s), parse_mode=ParseMode.HTML)
+
+
+@dp.callback_query(F.data == "mode_help")
+async def mode_help(callback: CallbackQuery) -> None:
+    await callback.answer()
+    text = (
+        "<b>ℹ️ Критерии Smart Analytics v2.4</b>\n\n"
+        "💎 <b>Уникальные</b> — группа модели встречается ровно 1 раз в выбранном периоде. "
+        "Цвет, состояние и продавцовский текст не дробят группу.\n\n"
+        "🔥 <b>Часто публикуемые</b> — минимум 3 разных ID одной модели/варианта. "
+        "В отчёте есть количество, минимум, медиана и максимум цены.\n\n"
+        "💰 <b>Ниже рынка</b> — минимум 5 объявлений с ценой в одной группе; "
+        "цена кандидата минимум на 20% ниже медианы остальных объявлений. 1 €-заглушки отсекаются.\n\n"
+        "⚡ <b>Быстро исчезающие</b> — исчезли примерно за ≤12 часов. "
+        "Точность зависит от интервала между последней успешной проверкой и обнаружением исчезновения.\n\n"
+        "📉 <b>Снижение цены</b> — тот же ID стал дешевле минимум на 5 € и 5%.\n\n"
+        "🚫 <b>Умные дубли</b> — схлопываются только очень похожие объявления с одинаковой ценой; "
+        "аналитические группы при этом строятся отдельно."
+    )
+    await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ К настройкам", callback_data="settings")]]
+    ))
 
 
 @dp.callback_query(F.data.startswith("quickmode:"))
