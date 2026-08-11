@@ -49,6 +49,7 @@ class ViewNetworkProbe:
     candidates: list[dict]
     element_html: str | None = None
     error: str | None = None
+    diagnostic: dict | None = None
 
 
 @dataclass
@@ -328,6 +329,167 @@ class KleinanzeigenParser:
             )
             return self._browser_context
 
+    @staticmethod
+    def _view_value_from_text(text: str | None) -> tuple[int | None, str | None]:
+        if not text:
+            return None, None
+        raw = " ".join(text.split()).strip()
+        if not raw:
+            return None, None
+        m = re.search(r"(?<!\d)(\d{1,3}(?:[.\s]\d{3})+|\d{1,9})(?!\d)", raw)
+        if not m:
+            return None, raw
+        digits = re.sub(r"\D", "", m.group(1))
+        if not digits:
+            return None, raw
+        value = int(digits)
+        if value < 0 or value > 999_999_999:
+            return None, raw
+        return value, raw
+
+    @classmethod
+    def _view_value_from_extra_text(cls, text: str | None) -> tuple[int | None, str | None]:
+        """Fallback for A/B markup where the eye counter lost its old id.
+
+        The extra-info block normally contains only the publication date/time and
+        the public view count. Remove date/time tokens first, then use the last
+        remaining standalone integer as the counter.
+        """
+        if not text:
+            return None, None
+        raw = " ".join(text.split()).strip()
+        cleaned = raw
+        cleaned = re.sub(r"\b\d{1,2}\.\d{1,2}\.\d{4}\b", " ", cleaned)
+        cleaned = re.sub(r"\b(?:Heute|Gestern)\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b\d{1,2}:\d{2}\b", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        nums = re.findall(r"(?<!\d)(\d{1,9})(?!\d)", cleaned)
+        if not nums:
+            return None, raw
+        value = int(nums[-1])
+        if value > 999_999_999:
+            return None, raw
+        return value, raw
+
+    async def _extract_view_count_from_page(self, page) -> tuple[int | None, str | None, str]:
+        """Extract the public counter from several current/legacy DOM shapes.
+
+        Kleinanzeigen has A/B-tested the ad header markup. The historical
+        #viewad-cntr-num selector is still preferred, but we also inspect the
+        surrounding extra-info block, view-related data/test ids, and embedded
+        application JSON. This does not use authentication or bypass challenges.
+        """
+        selectors = [
+            "#viewad-cntr-num",
+            "[data-testid='view-count']",
+            "[data-testid*='view'][data-testid*='count']",
+            "[id*='view'][id*='cntr']",
+            "[id*='view'][id*='count']",
+            "[class*='view'][class*='count']",
+        ]
+        for selector in selectors:
+            try:
+                loc = page.locator(selector)
+                count = await loc.count()
+                for i in range(min(count, 4)):
+                    raw = (await loc.nth(i).inner_text()).strip()
+                    value, raw_norm = self._view_value_from_text(raw)
+                    if value is not None:
+                        return value, raw_norm, f"dom:{selector}"
+            except Exception:
+                pass
+
+        # Very useful fallback: the public date + eye counter live in this block.
+        for selector in ("#viewad-extra-info", "[id*='viewad-extra-info']", "[data-testid*='extra-info']"):
+            try:
+                loc = page.locator(selector)
+                if await loc.count():
+                    raw = (await loc.first.inner_text()).strip()
+                    value, raw_norm = self._view_value_from_extra_text(raw)
+                    if value is not None:
+                        return value, raw_norm, f"dom:{selector}:text"
+            except Exception:
+                pass
+
+        # Search small DOM nodes whose own metadata explicitly refers to views.
+        try:
+            candidates = await page.evaluate(
+                """
+                () => {
+                  const out = [];
+                  const nodes = document.querySelectorAll('span,div,p,small,strong');
+                  for (const el of nodes) {
+                    const attrs = [el.id, el.className, el.getAttribute('data-testid'),
+                      el.getAttribute('aria-label'), el.getAttribute('title')]
+                      .filter(Boolean).join(' ').toLowerCase();
+                    if (!/(view|cntr|aufruf|impression|eye)/.test(attrs)) continue;
+                    const text = (el.innerText || el.textContent || '').trim();
+                    if (!text || text.length > 100) continue;
+                    out.push({attrs, text});
+                    if (out.length >= 40) break;
+                  }
+                  return out;
+                }
+                """
+            )
+            for item in candidates or []:
+                value, raw_norm = self._view_value_from_text(item.get("text"))
+                if value is not None:
+                    return value, raw_norm, "dom:view-metadata"
+        except Exception:
+            pass
+
+        # Some builds hydrate the value from JSON before rendering it.
+        try:
+            scripts = await page.locator("script").all_text_contents()
+            patterns = [
+                r'"views"\s*:\s*"?(\d{1,9})"?',
+                r'"viewCount"\s*:\s*"?(\d{1,9})"?',
+                r'"view_count"\s*:\s*"?(\d{1,9})"?',
+                r'"impressions"\s*:\s*"?(\d{1,9})"?',
+            ]
+            for text in scripts:
+                if not text or len(text) < 10:
+                    continue
+                for pattern in patterns:
+                    m = re.search(pattern, text, flags=re.IGNORECASE)
+                    if m:
+                        return int(m.group(1)), m.group(0), "script:hydration-json"
+        except Exception:
+            pass
+
+        return None, None, "browser:not-found"
+
+    async def _page_diagnostic(self, page) -> dict:
+        """Small non-sensitive diagnostics for explaining a missing public counter."""
+        diag = {"final_url": None, "title": None, "extra_info": None, "classification": "normal"}
+        try:
+            diag["final_url"] = page.url
+            diag["title"] = await page.title()
+        except Exception:
+            pass
+        try:
+            extra = page.locator("#viewad-extra-info")
+            if await extra.count():
+                diag["extra_info"] = " ".join((await extra.first.inner_text()).split())[:240]
+        except Exception:
+            pass
+        try:
+            body = (await page.locator("body").inner_text()).lower()[:12000]
+            challenge_words = (
+                "captcha", "access denied", "sicherheitsüberprüfung", "sicherheitsueberpruefung",
+                "ungewöhnliche aktivität", "ungewoehnliche aktivitaet", "robot", "bot protection",
+            )
+            if any(w in body for w in challenge_words):
+                diag["classification"] = "challenge"
+            elif "cookie" in body and "zustimmen" in body and len(body) < 3500:
+                diag["classification"] = "consent-only"
+            elif "/s-anzeige/" not in (page.url or ""):
+                diag["classification"] = "redirected"
+        except Exception:
+            pass
+        return diag
+
     async def fetch_public_view_count(self, url: str, *, browser_fallback: bool = True) -> ViewCountResult:
         """Read the public view counter without authentication.
 
@@ -370,33 +532,26 @@ class KleinanzeigenParser:
             final_url = page.url
             page_title = await page.title()
 
-            selector = "#viewad-cntr-num"
             try:
-                await page.wait_for_selector(selector, state="attached", timeout=8_000)
+                await page.wait_for_selector("#viewad-title", state="attached", timeout=8_000)
             except PlaywrightTimeoutError:
                 pass
+            # Give late hydration a little time, then try all known DOM/JSON shapes.
+            try:
+                await page.wait_for_selector("#viewad-cntr-num", state="attached", timeout=6_000)
+            except PlaywrightTimeoutError:
+                pass
+            await page.wait_for_timeout(1200)
 
-            locator = page.locator(selector)
-            if await locator.count():
-                raw = (await locator.first.inner_text()).strip()
-                match = re.search(r"\d[\d.\s]*", raw)
-                if match:
-                    value = int(re.sub(r"\D", "", match.group(0)))
-                    return ViewCountResult(value, raw, "dom:#viewad-cntr-num", final_url, page_title)
+            value, raw, source = await self._extract_view_count_from_page(page)
+            if value is not None:
+                return ViewCountResult(value, raw, source, final_url, page_title)
 
-            extra = page.locator("#viewad-extra-info")
-            if await extra.count():
-                raw_html = await extra.first.inner_html()
-                m = re.search(
-                    r"(?:viewad-cntr-num|cntr-num)[^>]*>\s*([0-9][0-9.\s]*)\s*<",
-                    raw_html, flags=re.IGNORECASE,
-                )
-                if m:
-                    raw = m.group(1).strip()
-                    value = int(re.sub(r"\D", "", raw))
-                    return ViewCountResult(value, raw, "dom:extra-info", final_url, page_title)
-
-            return ViewCountResult(None, None, "browser:not-found", final_url, page_title)
+            diag = await self._page_diagnostic(page)
+            error = f"page={diag.get('classification')}"
+            if diag.get("extra_info"):
+                error += f"; extra={diag['extra_info'][:160]}"
+            return ViewCountResult(None, None, source, final_url, page_title, error)
         except Exception as exc:
             log.warning("View-count browser fetch failed for %s: %s", url, exc)
             return ViewCountResult(None, None, "browser:error", error=str(exc)[:500])
@@ -467,23 +622,27 @@ class KleinanzeigenParser:
             final_url = page.url
             page_title = await page.title()
             try:
-                await page.wait_for_selector("#viewad-cntr-num", state="attached", timeout=8_000)
+                await page.wait_for_selector("#viewad-title", state="attached", timeout=8_000)
             except Exception:
                 pass
-            await page.wait_for_timeout(800)
+            try:
+                await page.wait_for_selector("#viewad-cntr-num", state="attached", timeout=6_000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(1200)
 
-            views = None
+            views, raw_view_text, view_source = await self._extract_view_count_from_page(page)
             element_html = None
-            locator = page.locator("#viewad-cntr-num")
-            if await locator.count():
-                raw = (await locator.first.inner_text()).strip()
-                m = re.search(r"\d[\d.\s]*", raw)
-                if m:
-                    views = int(re.sub(r"\D", "", m.group(0)))
+            for candidate_selector in ("#viewad-cntr-num", "#viewad-extra-info"):
                 try:
-                    element_html = await locator.first.evaluate("el => el.parentElement ? el.parentElement.outerHTML : el.outerHTML")
+                    locator = page.locator(candidate_selector)
+                    if await locator.count():
+                        element_html = await locator.first.evaluate(
+                            "el => el.parentElement ? el.parentElement.outerHTML : el.outerHTML"
+                        )
+                        break
                 except Exception:
-                    element_html = None
+                    pass
 
             if capture_tasks:
                 try:
@@ -548,7 +707,17 @@ class KleinanzeigenParser:
                 if len(dedup) >= 8:
                     break
 
-            return ViewNetworkProbe(views, "dom:#viewad-cntr-num" if views is not None else "browser:not-found", final_url, page_title, dedup, element_html)
+            diag = await self._page_diagnostic(page)
+            return ViewNetworkProbe(
+                views,
+                view_source if views is not None else "browser:not-found",
+                final_url,
+                page_title,
+                dedup,
+                element_html,
+                None if views is not None else f"page={diag.get('classification')}",
+                diag,
+            )
         except Exception as exc:
             log.warning("View network probe failed for %s: %s", url, exc)
             return ViewNetworkProbe(None, "browser:error", None, None, [], error=str(exc)[:500])

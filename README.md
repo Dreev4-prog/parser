@@ -1,13 +1,29 @@
-# Kleinanzeigen Parser Bot v2.6.7 — View Source Inspector
+# Kleinanzeigen Parser Bot v2.6.8 — Robust public view counter diagnostic
 
-This diagnostic release keeps the v2.6.6 parser and adds a network inspector to the existing **👁 Тест просмотров** flow.
+This release keeps v2.6.7 functionality and makes public-view extraction more tolerant of Kleinanzeigen markup variants.
 
-- Reads the public counter from `#viewad-cntr-num`.
-- Captures only public XHR/fetch response URLs and small text snippets.
-- Searches for likely `views/viewCount/counter/Aufruf` sources and the current counter value.
-- Never exposes cookies, request headers or authentication data.
-- If no direct source is found, the bot explicitly reports that Chromium/DOM remains the reliable method.
+## What changed
 
-Mass parsing behavior from v2.6.6 is unchanged in this diagnostic build.
+- Keeps the legacy `#viewad-cntr-num` selector as the preferred source.
+- Adds fallback extraction from the public `#viewad-extra-info` block (date/time + eye counter).
+- Checks alternate `data-testid`, id/class names related to view/counter/Aufrufe.
+- Checks embedded page hydration JSON for `views`, `viewCount`, `view_count`, or `impressions`.
+- The **👁 Тест просмотров** diagnostic now reports the final URL, page title, extra-info text, and whether Railway appears to receive a normal ad page, a redirect, cookie-only page, or a challenge/protection page.
+- No authentication, CAPTCHA bypass, or protection bypass is implemented.
 
-Railway start command: `python bot.py`.
+## Deploy
+
+Replace the files in the same GitHub repository and redeploy Railway.
+
+Start command remains:
+
+```bash
+python bot.py
+```
+
+Required environment variables remain unchanged:
+
+```env
+BOT_TOKEN=...
+ADMIN_IDS=123456789
+```

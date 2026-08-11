@@ -1908,13 +1908,32 @@ async def run_view_test(message: Message, state: FSMContext) -> None:
             disable_web_page_preview=True,
         )
     else:
+        diag = result.diagnostic or {}
+        diag_lines = []
+        if result.page_title:
+            diag_lines.append(f"Заголовок страницы: <code>{html.escape(result.page_title[:160])}</code>")
+        if result.final_url and result.final_url != url:
+            diag_lines.append(f"Финальный URL: <code>{html.escape(result.final_url[:220])}</code>")
+        if diag.get("classification"):
+            labels = {
+                "normal": "обычная страница объявления",
+                "challenge": "страница проверки/защиты",
+                "consent-only": "страница согласия cookies",
+                "redirected": "редирект с объявления",
+            }
+            diag_lines.append(f"Страница: <b>{html.escape(labels.get(diag['classification'], str(diag['classification'])))}</b>")
+        if diag.get("extra_info"):
+            diag_lines.append(f"Блок даты/просмотров: <code>{html.escape(str(diag['extra_info'])[:220])}</code>")
         details = f"\nОшибка: <code>{html.escape(result.error)}</code>" if result.error else ""
+        diag_text = ("\n" + "\n".join(diag_lines)) if diag_lines else ""
         await status.edit_text(
             "❌ <b>Счётчик пока не считался</b>\n\n"
-            f"Результат: <code>{html.escape(result.source)}</code>{details}\n\n"
-            "Диагностика XHR/fetch тоже выполнена; пришли этот результат, если ошибка повторяется.",
+            f"Результат: <code>{html.escape(result.source)}</code>{details}{diag_text}\n\n"
+            "Теперь тест проверяет старый selector, блок даты/👁, альтернативные DOM-атрибуты и встроенный JSON. "
+            "Если снова не найдёт число, этот ответ покажет, получает ли Railway обычную страницу или страницу защиты.",
             parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard(len(selected)),
+            disable_web_page_preview=True,
         )
 
 
