@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
@@ -22,10 +23,13 @@ MAX_PAGES_PER_CATEGORY = min(
     HARD_MAX_PAGES_PER_CATEGORY,
     max(1, int(os.getenv("MAX_PAGES_PER_CATEGORY", str(HARD_MAX_PAGES_PER_CATEGORY)))),
 )
-PAGE_DELAY_SECONDS = max(0.0, float(os.getenv("PAGE_DELAY_SECONDS", "0.7")))
+PAGE_DELAY_SECONDS = max(0.0, float(os.getenv("PAGE_DELAY_SECONDS", "1.0")))
+CATEGORY_HTTP_RETRIES = max(1, min(4, int(os.getenv("CATEGORY_HTTP_RETRIES", "3"))))
+CATEGORY_403_BACKOFF_SECONDS = max(3.0, float(os.getenv("CATEGORY_403_BACKOFF_SECONDS", "10")))
+CATEGORY_RETRY_JITTER_SECONDS = max(0.0, float(os.getenv("CATEGORY_RETRY_JITTER_SECONDS", "2.0")))
 STOP_AFTER_EMPTY_TODAY_PAGES = max(1, int(os.getenv("STOP_AFTER_EMPTY_TODAY_PAGES", "2")))
 AVAILABILITY_TIMEOUT = max(5.0, float(os.getenv("AVAILABILITY_TIMEOUT", "20")))
-VIEW_COUNT_GLOBAL_CONCURRENCY = max(1, min(16, int(os.getenv("VIEW_COUNT_GLOBAL_CONCURRENCY", "10"))))
+VIEW_COUNT_GLOBAL_CONCURRENCY = max(1, min(16, int(os.getenv("VIEW_COUNT_GLOBAL_CONCURRENCY", "6"))))
 _GLOBAL_VIEW_SEMAPHORE = None
 
 
@@ -36,6 +40,15 @@ def _global_view_semaphore() -> asyncio.Semaphore:
     return _GLOBAL_VIEW_SEMAPHORE
 
 log = logging.getLogger("kleinanzeigen-parser")
+
+
+class TemporaryAccessError(RuntimeError):
+    """The public site temporarily refused category requests after gentle retries."""
+
+    def __init__(self, status_code: int, url: str):
+        self.status_code = int(status_code)
+        self.url = url
+        super().__init__(f"Kleinanzeigen временно ограничил запросы (HTTP {status_code})")
 
 
 @dataclass
@@ -387,17 +400,41 @@ class KleinanzeigenParser:
             raise ValueError("Only public kleinanzeigen.de HTTPS URLs are allowed")
 
         last_error: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(CATEGORY_HTTP_RETRIES):
             try:
                 response = await self.client.get(url)
+                status = response.status_code
+
+                # Do not try to defeat site protection. A temporary 403/429 gets a
+                # small respectful cooldown and a bounded retry; persistent refusal
+                # is surfaced to the caller so the scan can stop cleanly.
+                if status in {403, 429}:
+                    if attempt >= CATEGORY_HTTP_RETRIES - 1:
+                        raise TemporaryAccessError(status, url)
+                    delay = min(45.0, CATEGORY_403_BACKOFF_SECONDS * (attempt + 1))
+                    delay += random.uniform(0.0, CATEGORY_RETRY_JITTER_SECONDS)
+                    log.warning(
+                        "Category request temporarily refused status=%s attempt=%s/%s; cooling down %.1fs: %s",
+                        status, attempt + 1, CATEGORY_HTTP_RETRIES, delay, url,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
                 response.raise_for_status()
                 return response.text
-            except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+            except TemporaryAccessError:
+                raise
+            except httpx.TimeoutException as exc:
                 last_error = exc
-                status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
-                if attempt >= 2 or (status is not None and status not in {429, 500, 502, 503, 504}):
+                if attempt >= CATEGORY_HTTP_RETRIES - 1:
                     raise
-                await asyncio.sleep(1.5 * (attempt + 1))
+                await asyncio.sleep(1.5 * (attempt + 1) + random.uniform(0.0, 0.8))
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                status = exc.response.status_code
+                if attempt >= CATEGORY_HTTP_RETRIES - 1 or status not in {500, 502, 503, 504}:
+                    raise
+                await asyncio.sleep(1.5 * (attempt + 1) + random.uniform(0.0, 0.8))
         raise RuntimeError(str(last_error))
 
     async def parse_category_page(self, url: str) -> list[ParsedListing]:

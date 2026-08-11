@@ -42,6 +42,7 @@ from parser import (
     KleinanzeigenParser,
     ParsedListing,
     ViewCountResult,
+    TemporaryAccessError,
     is_today_text,
     page_url,
 )
@@ -64,8 +65,8 @@ STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVA
 
 # Public view counts are collected inline while category pages are scanned.
 # Recent values are cached so shared/multi-user scans do not reopen the same ad.
-VIEW_COUNT_CACHE_TTL_SECONDS = max(60, int(os.getenv("VIEW_COUNT_CACHE_TTL_SECONDS", "900")))
-VIEW_COUNT_CONCURRENCY = max(1, min(10, int(os.getenv("VIEW_COUNT_CONCURRENCY", "8"))))
+VIEW_COUNT_CACHE_TTL_SECONDS = max(60, int(os.getenv("VIEW_COUNT_CACHE_TTL_SECONDS", "1800")))
+VIEW_COUNT_CONCURRENCY = max(1, min(10, int(os.getenv("VIEW_COUNT_CONCURRENCY", "5"))))
 VIEW_COUNT_EXPORT_MODES = {"newest", "all", "unique", "below_market"}
 
 # v2.5 incremental scan tuning (kept in v2.6). A full scan is forced once per category per Berlin day.
@@ -1146,7 +1147,14 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
 
     try:
         for page in range(1, scan_limit + 1):
-            items = await parser.parse_category_page(page_url(cat.url, page))
+            try:
+                items = await parser.parse_category_page(page_url(cat.url, page))
+            except TemporaryAccessError as exc:
+                # Keep everything already collected. Do not mark the daily seed as
+                # complete, so a later run can continue/deepen the category.
+                reason = f"временный лимит Kleinanzeigen (HTTP {exc.status_code}); сохранён частичный результат"
+                log.warning("category=%s page=%s stopped after temporary refusal: %s", cat.name, page, exc)
+                break
             pages_scanned = page
             if not items:
                 reason = "конец выдачи"
@@ -1258,8 +1266,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         # Very large categories intentionally keep only the newest window; after
         # that first capped scan, later runs may use fast incremental mode instead
         # of re-reading all 100 pages every time.
-        seed_complete = (mode == "full" and not hit_limit)
-        seed_capped = (mode == "full" and hit_limit)
+        interrupted = reason.startswith("временный лимит Kleinanzeigen")
+        seed_complete = (mode == "full" and not hit_limit and not interrupted)
+        seed_capped = (mode == "full" and hit_limit and not interrupted)
         saved = await save_category_scan_state(
             cat.key,
             mode=mode,
@@ -1669,6 +1678,10 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
                         job.full_categories += 1
                 if result.hit_limit:
                     job.warnings.append(f"{cat.name}: достигнут выбранный лимит {job.page_limit} страниц")
+                elif result.reason.startswith("временный лимит Kleinanzeigen"):
+                    job.warnings.append(
+                        f"{cat.name}: Kleinanzeigen временно ограничил запросы; сохранено {result.pages_scanned} стр., можно повторить позже"
+                    )
 
             job.completed_categories += 1
             # User sees only useful progress; cache/shared/worker details stay internal.
