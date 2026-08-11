@@ -1,46 +1,30 @@
-# Kleinanzeigen Parser v1.1
+# Kleinanzeigen Parser Bot v1.2.0
 
-Category parser foundation for public Kleinanzeigen pages.
+Telegram-интерфейс для парсера публичных страниц категорий Kleinanzeigen.
 
-Collects:
-- category
-- title
-- price
-- listing URL
-- external listing ID
-- view-count snapshots when the public page exposes them
-- first/last seen timestamps
+## Что умеет v1.2
 
-## What changed in v1.1
-
-v1.0 looked only for visible `Aufrufe/Besucher` text in the static HTML.
-
-v1.1 tries, in order:
-1. public static HTML and embedded state/JSON;
-2. a real headless Chromium page with JavaScript enabled;
-3. JSON responses requested by that public page.
-
-It does **not** bypass login, CAPTCHA, bot protection, or other access controls. If Kleinanzeigen does not expose a view count publicly, the result remains `views=None` and the log says `source=...not-exposed`.
+- `/start` — меню категорий.
+- Категории: Konsolen, Notebooks, PCs, Handy & Telefon, TV & Video, Audio & HiFi.
+- По нажатию на категорию читает первую страницу свежих объявлений.
+- Сохраняет: категория, название, цена, ссылка, ID, дата первого/последнего обнаружения.
+- Не сохраняет просмотры.
+- Не дублирует объявления по ID.
+- Кнопки `Последние` и `База`.
+- SQLite для простого теста; `DATABASE_URL` от Railway PostgreSQL также поддерживается.
 
 ## Railway
 
-This version includes a Dockerfile based on the official Playwright Python image so Chromium and its Linux dependencies are available on Railway.
+1. Создай Telegram-бота через @BotFather и скопируй токен.
+2. Замени файлы в текущем GitHub-репозитории файлами из этой версии.
+3. Railway -> Variables -> добавь `BOT_TOKEN`.
+4. Start Command: `python bot.py`.
+5. После deploy открой Telegram-бота и отправь `/start`.
 
-Keep your current Railway Custom Start Command, for example:
+### PostgreSQL (рекомендуется позже)
 
-```bash
-python main.py --category "Konsolen" --url "https://www.kleinanzeigen.de/s-konsolen/c279" --max-items 20
-```
+Добавь PostgreSQL в Railway и передай приложению `DATABASE_URL`. Код автоматически преобразует стандартный Railway `postgresql://` URL в async SQLAlchemy URL.
 
-After uploading v1.1 to GitHub, Railway should automatically rebuild using the Dockerfile.
+## Ограничения
 
-## Environment variables
-
-- `VIEW_MODE=auto` — first HTTP, then Chromium fallback (recommended)
-- `VIEW_MODE=http` — HTTP only
-- `VIEW_MODE=browser` — Chromium only
-- `REQUEST_DELAY_SECONDS=2.0` — delay before opening each listing
-- `BROWSER_WAIT_MS=2500` — wait after DOM load for JS/network data
-- `BROWSER_TIMEOUT_MS=20000` — page navigation timeout
-
-Use conservative request intervals and respect the site's rules and access controls.
+Парсер работает только с публичными HTTPS-страницами `kleinanzeigen.de`. Он не обходит CAPTCHA, логин или другие ограничения доступа.
