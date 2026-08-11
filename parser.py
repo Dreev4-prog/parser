@@ -216,22 +216,18 @@ def _extract_price_text(node) -> str | None:
     return None
 
 
-PROMOTED_CLASS_TOKENS = (
-    "topad",
-    "top-ad",
+PROMOTED_WRAPPER_CLASSES = {
     "badge-topad",
     "is-topad",
-    "highlight",
     "is-highlight",
-    "sponsored",
-    "sponsor",
-    "promoted",
-    "promotion",
-    "werbeanzeige",
-    "werbung",
-)
+}
+PROMOTED_BADGE_CLASSES = {
+    "badge-advertisement",
+    "badge-sponsored",
+    "badge-promoted",
+}
 PROMOTED_LABEL_RE = re.compile(
-    r"\b(?:Top[- ]?Anzeige|Werbeanzeige|Gesponsert|Sponsored|Promoted)\b",
+    r"^(?:Top[- ]?Anzeige|Werbeanzeige|Gesponsert|Sponsored|Promoted)$",
     re.IGNORECASE,
 )
 FILTER_PROMOTED_LISTINGS = os.getenv("FILTER_PROMOTED_LISTINGS", "1").strip().lower() not in {
@@ -239,55 +235,70 @@ FILTER_PROMOTED_LISTINGS = os.getenv("FILTER_PROMOTED_LISTINGS", "1").strip().lo
 }
 
 
-def _is_promoted_listing_node(node) -> bool:
-    """Detect paid/promoted cards in Kleinanzeigen search results.
+def _class_set(element) -> set[str]:
+    if element is None or not hasattr(element, "get"):
+        return set()
+    value = element.get("class") or []
+    if isinstance(value, str):
+        value = value.split()
+    return {str(x).strip().lower() for x in value if str(x).strip()}
 
-    Detection deliberately relies on explicit promotion markers from the search card
-    (classes, data/aria labels and visible labels), not on view-count heuristics. This
-    avoids throwing away genuinely viral fresh listings.
+
+def _is_promoted_listing_node(node) -> bool:
+    """Detect paid/promoted Kleinanzeigen result cards conservatively.
+
+    Important: only explicit markers attached to the listing wrapper (or an
+    explicit advertisement badge inside that same wrapper) are accepted.
+    We intentionally do NOT scan arbitrary ancestors/attributes for generic
+    words such as ``highlight`` or ``sponsor`` because those strings can occur
+    in normal layout/UI classes and would falsely exclude every listing.
     """
     if not FILTER_PROMOTED_LISTINGS:
         return False
 
-    def attrs_blob(element) -> str:
-        parts: list[str] = []
-        for key in ("class", "id", "data-testid", "data-test", "data-adtype",
-                    "data-type", "aria-label", "title"):
-            value = element.get(key) if hasattr(element, "get") else None
-            if isinstance(value, (list, tuple)):
-                parts.extend(str(x) for x in value)
-            elif value:
-                parts.append(str(value))
-        return " ".join(parts).lower()
-
-    # The marker can live on the list item itself, on a parent wrapper, or on a
-    # badge inside the card. Include a few ancestors because our broad candidate
-    # selector can yield both the outer <li> and the inner <article>.
-    elements = [node]
+    # Kleinanzeigen result cards use .ad-listitem as the outer wrapper.  The
+    # known promotion variants are classes on that wrapper, e.g.
+    # .badge-topad / .is-topad / .is-highlight.
+    wrapper = None
     try:
-        parent = node.parent
-        for _ in range(4):
-            if parent is None or getattr(parent, "name", None) in {"body", "html"}:
-                break
-            elements.append(parent)
-            parent = parent.parent
-        elements.extend(node.find_all(True))
+        if "ad-listitem" in _class_set(node):
+            wrapper = node
+        else:
+            wrapper = node.find_parent(
+                lambda tag: tag is not None and "ad-listitem" in _class_set(tag)
+            )
+    except Exception:
+        wrapper = None
+
+    if wrapper is None:
+        wrapper = node
+
+    if _class_set(wrapper) & PROMOTED_WRAPPER_CLASSES:
+        return True
+
+    # Some native-ad variants expose a dedicated badge instead.  Match exact
+    # badge class names, never generic substrings.
+    try:
+        for element in wrapper.find_all(True):
+            if _class_set(element) & PROMOTED_BADGE_CLASSES:
+                return True
+
+            # Visible promotion labels are accepted only when the element is a
+            # very small badge/label by itself.  This avoids titles such as
+            # "Top Anzeige lesen" being treated as paid promotion.
+            classes = _class_set(element)
+            tag_name = str(getattr(element, "name", "") or "").lower()
+            looks_like_badge = (
+                tag_name in {"span", "small", "label"}
+                or any("badge" in c for c in classes)
+            )
+            if not looks_like_badge:
+                continue
+            text = " ".join(element.get_text(" ", strip=True).split())
+            if text and len(text) <= 24 and PROMOTED_LABEL_RE.fullmatch(text):
+                return True
     except Exception:
         pass
-
-    for element in elements:
-        blob = attrs_blob(element)
-        if blob and any(token in blob for token in PROMOTED_CLASS_TOKENS):
-            return True
-
-        # Promotion badges are often short labels. Inspect only short text nodes so
-        # normal descriptions mentioning words like "Highlight" are not excluded.
-        try:
-            text = " ".join(element.get_text(" ", strip=True).split())
-        except Exception:
-            text = ""
-        if text and len(text) <= 40 and PROMOTED_LABEL_RE.search(text):
-            return True
 
     return False
 
