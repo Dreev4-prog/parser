@@ -108,16 +108,43 @@ PAGE_LIMIT_CHOICES = (25, 50, 100)
 # around 3 minutes, then the estimate is recalculated from the real page rate.
 PAGE_LIMIT_BASE_ETA_SECONDS = {25: 60, 50: 120, 100: 180}
 
-# v3.0.5 exact-date mode. The selected date is only a starting point.
-# We locate the first page of that Moscow calendar date with sparse exponential
-# probes + binary search, then collect exactly the user-selected 25/50/100-page
-# window (or stop earlier when the feed moves to an older date).
-# The configured locator cap is only a hard guard. v3.0.5 additionally reads the
-# real result count from Kleinanzeigen and derives the actual last page dynamically.
-DATE_JUMP_MAX_PAGE = max(1000, min(100000, int(os.getenv(
-    "DATE_JUMP_MAX_PAGE", os.getenv("DATE_SCAN_MAX_PAGES", "20000")
-))))
+# v3.0.6 exact-date mode. Kleinanzeigen's public search feed only exposes a
+# limited pagination window. Requests above that window may normalize to/repeat
+# another page, so a single nationwide feed cannot be used to jump arbitrarily
+# deep. We keep the user's simple 25/50/100 depth, but when the chosen date is
+# beyond the public window we transparently use disjoint federal-state feeds and
+# merge unique target-day listings until the requested depth-equivalent is filled.
+PUBLIC_SEARCH_PAGE_CAP = max(10, min(50, int(os.getenv("PUBLIC_SEARCH_PAGE_CAP", "50"))))
 DATE_JUMP_PROBE_DELAY_SECONDS = max(0.0, min(1.0, float(os.getenv("DATE_JUMP_PROBE_DELAY_SECONDS", "0.18"))))
+
+# Hidden implementation detail: these location shards cover Germany without
+# intentionally overlapping. They are not shown to end users; the UI remains
+# category + date + 25/50/100 pages. Smaller feeds are tried first because older
+# dates are more likely to remain inside the public 50-page window.
+GERMAN_STATE_SEGMENTS = (
+    ("Bremen", "bremen", 1),
+    ("Saarland", "saarland", 285),
+    ("Hamburg", "hamburg", 9409),
+    ("Mecklenburg-Vorpommern", "mecklenburg-vorpommern", 61),
+    ("Thüringen", "thueringen", 3548),
+    ("Sachsen-Anhalt", "sachsen-anhalt", 2165),
+    ("Brandenburg", "brandenburg", 7711),
+    ("Schleswig-Holstein", "schleswig-holstein", 408),
+    ("Berlin", "berlin", 3331),
+    ("Rheinland-Pfalz", "rheinland-pfalz", 4938),
+    ("Sachsen", "sachsen", 3799),
+    ("Hessen", "hessen", 4279),
+    ("Niedersachsen", "niedersachsen", 2428),
+    ("Baden-Württemberg", "baden-wuerttemberg", 7970),
+    ("Bayern", "bayern", 5510),
+    ("Nordrhein-Westfalen", "nordrhein-westfalen", 928),
+)
+
+def _regional_category_url(base_url: str, slug: str, location_id: int) -> str:
+    m = re.match(r"^(https://www\.kleinanzeigen\.de/.+)/(c\d+)$", base_url.rstrip("/"))
+    if not m:
+        raise ValueError(f"Unsupported Kleinanzeigen category URL: {base_url}")
+    return f"{m.group(1)}/{slug}/{m.group(2)}l{int(location_id)}"
 
 
 class SettingsInput(StatesGroup):
@@ -1426,8 +1453,8 @@ category_live_progress: dict[str, CategoryLiveProgress] = {}
 
 
 def _date_scan_limit(target_date: str) -> int:
-    """Maximum page index the sparse date locator may probe."""
-    return DATE_JUMP_MAX_PAGE if target_date else MAX_PAGES_PER_CATEGORY
+    """Verified public page window for one Kleinanzeigen result feed."""
+    return PUBLIC_SEARCH_PAGE_CAP if target_date else MAX_PAGES_PER_CATEGORY
 
 
 def _progress_key(category_key: str, target_date: str, page_limit: int | None = None) -> str:
@@ -1441,7 +1468,7 @@ queued_job_ids: list[str] = []
 job_guard = asyncio.Lock()
 category_inflight: dict[str, asyncio.Task[ScanResult]] = {}
 category_inflight_guard = asyncio.Lock()
-# Exact-date cache must preserve the exact 25/50/100-page result set, so v3.0.5
+# Exact-date cache must preserve the exact 25/50/100-page result set, so v3.0.6
 # caches ScanResult (including matched IDs) in memory instead of reconstructing a
 # result from every listing ever seen for that date.
 category_result_cache: dict[str, tuple[float, ScanResult]] = {}
@@ -1541,22 +1568,19 @@ async def record_parser_run(
 
 
 async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page_limit: int, target_date: str) -> ScanResult:
-    """Locate an exact Moscow date, then collect the requested 25/50/100 pages.
+    """Find the selected Moscow date and collect the user's 25/50/100 depth.
 
-    v3.0.5 keeps the simple user model and validates pagination/date metadata:
-      * date = where the scan should start;
-      * 25/50/100 = how many category pages to collect from that date.
-
-    The locator does NOT walk through all preceding pages. It probes 1, 2, 4, 8...
-    until the target date is bracketed, then binary-searches the boundary. Only after
-    the first target-date page is found does the normal 25/50/100-page collection
-    begin. If the selected date ends sooner, collection stops at the older day.
+    Kleinanzeigen normalizes/repeats deep public result pages, so v3.0.6 never
+    treats page numbers above the verified public pagination window as real pages.
+    If the target date is deeper than that window, the scan transparently searches
+    disjoint regional feeds and merges unique target-day listings.  The user still
+    sees one category scan and the same 25/50/100 depth selector.
     """
     depth = page_limit if page_limit in PAGE_LIMIT_CHOICES else 50
-    jump_limit = _date_scan_limit(target_date)
     target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
     progress_key = _progress_key(cat.key, target_date, depth)
     mode = "date"
+    target_equivalent_items = depth * 25
 
     category_live_progress[progress_key] = CategoryLiveProgress(
         category_key=cat.key,
@@ -1581,36 +1605,20 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     reason = ""
     hit_limit = False
     collection_start_page = 0
-
-    # Sparse locating requests and collection requests share this cache, so a page
-    # discovered during binary search is never downloaded again unnecessarily.
-    # v3.0.5 caches the response metadata as well: Kleinanzeigen can normalize a
-    # too-large page number, and treating that repeated response as page 20,000 was
-    # the main cause of the false "still 11.08" diagnostic.
-    page_cache: dict[int, object] = {}
-    requested_pages: set[int] = set()
-    fingerprint_pages: dict[str, int] = {}
-    effective_jump_limit = jump_limit
-    invalid_page_note = ""
+    direct_pages_collected = 0
+    network_requests = 0
+    max_page_reached = 0
 
     def classify(items) -> tuple[str, list, list]:
-        """Classify a result page relative to the requested Moscow date.
-
-        Exact target dates remain a hard signal, but a single stray older/newer card
-        must not move the binary-search boundary.  For non-target pages we therefore
-        use the majority/median of all dated organic cards rather than raw min/max.
-        """
         if not items:
             return "empty", [], []
         pairs = [(item, posted_date_moscow(item.posted_text)) for item in items]
         days = [d for _, d in pairs if d is not None]
         if not days:
             return "unknown", pairs, days
-
         counts = Counter(days)
         if counts.get(target_day, 0) > 0:
             return "target", pairs, days
-
         newer = sum(count for day, count in counts.items() if day > target_day)
         older = sum(count for day, count in counts.items() if day < target_day)
         total = newer + older
@@ -1620,9 +1628,6 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             return "newer", pairs, days
         if older and not newer:
             return "older", pairs, days
-
-        # Strong majority first, then median as a stable tie-breaker.  This protects
-        # the locator from a stale/promoted-looking outlier that escaped card filtering.
         if newer / total >= 0.70:
             return "newer", pairs, days
         if older / total >= 0.70:
@@ -1635,103 +1640,43 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             return "older", pairs, days
         return "mixed", pairs, days
 
-    async def fetch_page(page: int, phase: str):
-        nonlocal oldest_date_seen, effective_jump_limit, invalid_page_note
-        page = max(1, min(effective_jump_limit, int(page)))
-        if page in page_cache:
-            info = page_cache[page]
-        else:
-            info = await parser.parse_category_page_info(page_url(cat.url, page), page)
-            page_cache[page] = info
-            requested_pages.add(page)
-
-            # The result header gives us the real maximum page from the current total
-            # result count.  It is a dynamic safety bound, not a guessed 20k cap.
-            if getattr(info, "max_page", None):
-                effective_jump_limit = max(1, min(effective_jump_limit, int(info.max_page)))
-
-            if phase == "jumping" and DATE_JUMP_PROBE_DELAY_SECONDS:
-                await asyncio.sleep(DATE_JUMP_PROBE_DELAY_SECONDS)
-
-        items = info.items
-        relation, pairs, days = classify(items)
-
-        # Never classify a normalized/redirected page by its listing dates.  Example:
-        # requesting page 20,000 may return a valid HTML result page for a different
-        # offset; previously those fresh cards were incorrectly read as page 20,000.
-        valid_page = bool(getattr(info, "request_matches_page", True))
-        fp = getattr(info, "fingerprint", "") or ""
-        if fp:
-            previous_page = fingerprint_pages.get(fp)
-            if previous_page is None:
-                fingerprint_pages[fp] = page
-            elif previous_page != page and len(items) >= 5:
-                valid_page = False
-                invalid_page_note = f"страница {page} повторила содержимое страницы {previous_page}"
-
-        if not valid_page:
-            actual_page = getattr(info, "actual_page", None)
-            start = getattr(info, "result_start", None)
-            end = getattr(info, "result_end", None)
-            invalid_page_note = invalid_page_note or (
-                f"запрошенная страница {page} была нормализована сайтом"
-                + (f" в страницу {actual_page}" if actual_page else "")
-                + (f" (результаты {start}–{end})" if start and end else "")
-            )
-            relation = "invalid"
-            days = []
-            pairs = []
-
+    def update_live(page: int, days: list, phase: str, collection_index: int | None = None) -> None:
+        nonlocal oldest_date_seen, max_page_reached
+        max_page_reached = max(max_page_reached, int(page or 0))
         page_date_hint = ""
-        if days and relation != "invalid":
+        if days:
             page_oldest = min(days)
             page_newest = max(days)
-            page_date_hint = (
-                page_oldest.isoformat()
-                if page_oldest == page_newest
-                else f"{page_newest.isoformat()}..{page_oldest.isoformat()}"
-            )
+            page_date_hint = page_oldest.isoformat() if page_oldest == page_newest else f"{page_newest.isoformat()}..{page_oldest.isoformat()}"
             if not oldest_date_seen or page_oldest.isoformat() < oldest_date_seen:
                 oldest_date_seen = page_oldest.isoformat()
-
         live = category_live_progress.get(progress_key)
         if live is not None:
             live.page = page
             live.oldest_date_seen = oldest_date_seen
             live.current_page_date = page_date_hint
             live.phase = phase
+            if collection_index is not None:
+                live.collection_index = min(depth, max(0, collection_index))
+                live.page_limit = depth
 
-        counts_text = ",".join(f"{d.isoformat()}:{c}" for d, c in sorted(Counter(days).items(), reverse=True))
-        log.info(
-            "category=%s mode=date-depth phase=%s page=%s relation=%s dated=%s dates=[%s] "
-            "range=%s-%s total=%s actual_page=%s max_page=%s valid=%s requests=%s depth=%s",
-            cat.name, phase, page, relation, len(days), counts_text,
-            getattr(info, "result_start", None), getattr(info, "result_end", None),
-            getattr(info, "total_results", None), getattr(info, "actual_page", None),
-            getattr(info, "max_page", None), valid_page, len(requested_pages), depth,
-        )
-        return items, relation, pairs, days
-
-    async def process_target_items(items, pairs) -> None:
+    async def process_target_items(items, pairs, limit: int | None = None) -> int:
         nonlocal new_count, today_seen, known_total, enriched_total, target_seen_any, first_page_head_ids
         target_items = [
             item for item, item_day in pairs
             if item_day == target_day and item.external_id not in processed_target_ids
         ]
+        if limit is not None:
+            target_items = target_items[:max(0, int(limit))]
         if not target_items:
-            return
-
+            return 0
         processed_target_ids.update(item.external_id for item in target_items)
         target_seen_any = True
         today_seen += len(target_items)
         if not first_page_head_ids:
             first_page_head_ids = [item.external_id for item in target_items[:INCREMENTAL_HEAD_SIZE]]
-
         async with db_write_lock:
-            new_items, known_count, enriched_count = await upsert_page_items(
-                cat.key, cat.name, target_items
-            )
-
+            new_items, known_count, enriched_count = await upsert_page_items(cat.key, cat.name, target_items)
         live = category_live_progress.get(progress_key)
         await enrich_page_view_counts(parser, target_items, live)
         new_count += len(new_items)
@@ -1742,176 +1687,278 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             live.today_seen = today_seen
             live.new_count = new_count
             live.known_count = known_total
+        return len(target_items)
 
-    try:
-        # 1) Exponential jump: bracket the target date using only O(log page) calls.
+    async def locate_feed(base_url: str, feed_name: str):
+        """Locate the first target-date page inside one <=50-page public feed."""
+        nonlocal network_requests
+        cache: dict[int, object] = {}
+        fingerprints: dict[str, int] = {}
+        effective_limit = PUBLIC_SEARCH_PAGE_CAP
+        invalid_note = ""
+
+        async def fetch(page: int, phase: str):
+            nonlocal network_requests, effective_limit, invalid_note
+            page = max(1, min(effective_limit, int(page)))
+            if page in cache:
+                info = cache[page]
+            else:
+                info = await parser.parse_category_page_info(page_url(base_url, page), page)
+                cache[page] = info
+                network_requests += 1
+                if getattr(info, "max_page", None):
+                    effective_limit = max(1, min(PUBLIC_SEARCH_PAGE_CAP, int(info.max_page)))
+                if phase == "jumping" and DATE_JUMP_PROBE_DELAY_SECONDS:
+                    await asyncio.sleep(DATE_JUMP_PROBE_DELAY_SECONDS)
+
+            items = info.items
+            relation, pairs, days = classify(items)
+            valid = bool(getattr(info, "request_matches_page", True))
+            fp = getattr(info, "fingerprint", "") or ""
+            if fp:
+                previous = fingerprints.get(fp)
+                if previous is None:
+                    fingerprints[fp] = page
+                elif previous != page and len(items) >= 5:
+                    valid = False
+                    invalid_note = f"страница {page} повторила содержимое страницы {previous}"
+            if not valid:
+                relation, pairs, days = "invalid", [], []
+                invalid_note = invalid_note or f"страница {page} была нормализована сайтом"
+            update_live(page, days, phase)
+            log.info(
+                "category=%s feed=%s phase=%s page=%s relation=%s actual=%s max=%s valid=%s requests=%s",
+                cat.name, feed_name, phase, page, relation,
+                getattr(info, "actual_page", None), getattr(info, "max_page", None), valid, network_requests,
+            )
+            return items, relation, pairs, days
+
         low_newer = 0
-        high_boundary: int | None = None
+        high: int | None = None
         probe = 1
         while True:
-            try:
-                items, relation, pairs, days = await fetch_page(probe, "jumping")
-            except TemporaryAccessError as exc:
-                reason = f"временный лимит Kleinanzeigen (HTTP {exc.status_code}) во время поиска даты"
+            items, relation, pairs, days = await fetch(probe, "jumping")
+            if relation in {"target", "older", "mixed", "empty"}:
+                high = probe
                 break
-
-            if relation in {"target", "older", "mixed", "empty", "invalid"}:
-                high_boundary = probe
-                break
-
+            if relation == "invalid":
+                return {"status": "invalid", "reason": invalid_note, "fetch": fetch, "limit": effective_limit, "candidate": None}
             if relation == "newer":
                 low_newer = probe
-
-            if probe >= effective_jump_limit:
-                hit_limit = True
-                reason = (
-                    f"не удалось добраться до {_date_label(target_date)}: "
-                    f"последняя доступная страница — {effective_jump_limit}, а выдача там ещё новее выбранной даты"
-                )
-                break
-
-            next_probe = min(effective_jump_limit, 2 if probe == 1 else probe * 2)
+            if probe >= effective_limit:
+                return {"status": "too_deep", "reason": "target beyond public page window", "fetch": fetch, "limit": effective_limit, "candidate": None}
+            next_probe = min(effective_limit, 2 if probe == 1 else probe * 2)
             if next_probe == probe:
-                hit_limit = True
-                reason = f"достигнута последняя доступная страница {effective_jump_limit}"
-                break
+                return {"status": "too_deep", "reason": "target beyond public page window", "fetch": fetch, "limit": effective_limit, "candidate": None}
             probe = next_probe
 
-        # 2) Binary search: first page that is no longer entirely newer.
-        boundary_page: int | None = None
-        if not reason and high_boundary is not None:
-            lo = max(1, low_newer + 1)
-            hi = high_boundary
-            while lo < hi:
-                mid = (lo + hi) // 2
-                try:
-                    items, relation, pairs, days = await fetch_page(mid, "jumping")
-                except TemporaryAccessError as exc:
-                    reason = f"временный лимит Kleinanzeigen (HTTP {exc.status_code}) во время поиска даты"
-                    break
-                if relation == "newer":
-                    lo = mid + 1
-                else:
-                    # target/older/mixed/empty/unknown are all conservative upper bounds.
-                    hi = mid
-            if not reason:
-                boundary_page = lo
+        lo = max(1, low_newer + 1)
+        hi = high
+        while lo < hi:
+            mid = (lo + hi) // 2
+            items, relation, pairs, days = await fetch(mid, "jumping")
+            if relation == "invalid":
+                return {"status": "invalid", "reason": invalid_note, "fetch": fetch, "limit": effective_limit, "candidate": None}
+            if relation == "newer":
+                lo = mid + 1
+            else:
+                hi = mid
+        boundary = lo
 
-        # 3) Find the exact first target-date page around the binary boundary.
-        candidate_page: int | None = None
-        if not reason and boundary_page is not None:
-            neighborhood_start = max(1, boundary_page - 4)
-            neighborhood_end = min(effective_jump_limit, boundary_page + 6)
-            saw_older_or_empty = False
-            saw_newer = False
-            saw_unknown = False
-            saw_invalid = False
-            for page in range(neighborhood_start, neighborhood_end + 1):
-                try:
-                    items, relation, pairs, days = await fetch_page(page, "jumping")
-                except TemporaryAccessError as exc:
-                    reason = f"временный лимит Kleinanzeigen (HTTP {exc.status_code}) во время уточнения даты"
-                    break
+        candidate = None
+        saw_newer = saw_older = saw_unknown = False
+        for page in range(max(1, boundary - 3), min(effective_limit, boundary + 5) + 1):
+            items, relation, pairs, days = await fetch(page, "jumping")
+            if relation == "target":
+                candidate = page
+                break
+            if relation == "newer":
+                saw_newer = True
+            elif relation in {"older", "mixed", "empty"}:
+                saw_older = True
+            elif relation == "unknown":
+                saw_unknown = True
+            elif relation == "invalid":
+                return {"status": "invalid", "reason": invalid_note, "fetch": fetch, "limit": effective_limit, "candidate": None}
+
+        if candidate is not None:
+            for back in range(candidate - 1, max(0, candidate - 3), -1):
+                items, relation, pairs, days = await fetch(back, "jumping")
                 if relation == "target":
-                    candidate_page = page
+                    candidate = back
+                elif relation == "newer":
                     break
-                if relation == "newer":
-                    saw_newer = True
-                elif relation in {"older", "mixed", "empty"}:
-                    saw_older_or_empty = True
-                elif relation == "unknown":
-                    saw_unknown = True
-                elif relation == "invalid":
-                    saw_invalid = True
-
-            # One small backward check protects against minor feed boundary jitter.
-            if candidate_page is not None:
-                for back in range(candidate_page - 1, max(0, candidate_page - 4), -1):
-                    try:
-                        items, relation, pairs, days = await fetch_page(back, "jumping")
-                    except TemporaryAccessError:
-                        break
-                    if relation == "target":
-                        candidate_page = back
-                    elif relation == "newer":
-                        break
-                    else:
-                        break
-            elif not reason:
-                if saw_newer and saw_older_or_empty and not saw_unknown and not saw_invalid:
-                    # The feed crossed the requested calendar day without any normal listing.
-                    request_complete = True
-                    reason = "выбранная дата пройдена; объявлений за неё не найдено"
-                elif saw_older_or_empty and low_newer == 0 and not saw_unknown and not saw_invalid:
-                    request_complete = True
-                    reason = "выбранная дата не представлена в доступной выдаче"
-                elif saw_invalid:
-                    reason = invalid_page_note or "Kleinanzeigen вернул другую страницу вместо запрошенной; дата не подтверждена"
                 else:
-                    reason = "не удалось надёжно определить начало выбранной даты"
-
-        # 4) Normal collection starts HERE. The user's 25/50/100 depth applies here,
-        # not to the throw-away pages before the requested date.
-        if not reason and candidate_page is not None:
-            collection_start_page = candidate_page
-            live = category_live_progress.get(progress_key)
-            if live is not None:
-                live.phase = "collecting"
-                live.collection_start_page = candidate_page
-                live.collection_index = 0
-                live.page_limit = depth
-                live.estimated_pages = depth
-
-            for index in range(1, depth + 1):
-                page = candidate_page + index - 1
-                if page > effective_jump_limit:
-                    hit_limit = True
-                    reason = f"достигнута последняя доступная страница {effective_jump_limit} во время сбора"
                     break
+            return {"status": "found", "reason": "", "fetch": fetch, "limit": effective_limit, "candidate": candidate}
+        if saw_newer and saw_older and not saw_unknown:
+            return {"status": "absent", "reason": "date crossed without target listings", "fetch": fetch, "limit": effective_limit, "candidate": None}
+        if saw_older and low_newer == 0 and not saw_unknown:
+            return {"status": "absent", "reason": "date not represented in feed", "fetch": fetch, "limit": effective_limit, "candidate": None}
+        return {"status": "unknown", "reason": "could not verify date boundary", "fetch": fetch, "limit": effective_limit, "candidate": None}
+
+    async def collect_direct(locator) -> tuple[str, int]:
+        """Collect literal nationwide pages while they are actually accessible."""
+        nonlocal direct_pages_collected, collection_start_page, request_complete, reason, hit_limit
+        candidate = int(locator["candidate"])
+        limit = int(locator["limit"])
+        fetch = locator["fetch"]
+        collection_start_page = candidate
+        live = category_live_progress.get(progress_key)
+        if live is not None:
+            live.phase = "collecting"
+            live.collection_start_page = candidate
+            live.collection_index = 0
+        for index in range(1, depth + 1):
+            page = candidate + index - 1
+            if page > limit:
+                hit_limit = True
+                return "needs_hidden", direct_pages_collected
+            items, relation, pairs, days = await fetch(page, "collecting")
+            if relation == "invalid":
+                hit_limit = True
+                return "needs_hidden", direct_pages_collected
+            if relation == "empty":
+                request_complete = True
+                reason = "выдача закончилась раньше выбранной глубины"
+                return "done", direct_pages_collected
+            if relation == "older" or (relation == "mixed" and not any(d == target_day for d in days)):
+                request_complete = True
+                reason = "выбранная дата закончилась раньше выбранной глубины" if target_seen_any else "выбранная дата пройдена; объявлений за неё не найдено"
+                return "done", direct_pages_collected
+            direct_pages_collected += 1
+            update_live(page, days, "collecting", direct_pages_collected)
+            await process_target_items(items, pairs)
+            if direct_pages_collected >= depth:
+                request_complete = True
+                reason = f"собрано {depth} страниц от начала выбранной даты"
+                return "done", direct_pages_collected
+            if PAGE_DELAY_SECONDS:
+                await asyncio.sleep(min(PAGE_DELAY_SECONDS, 0.25))
+        return "done", direct_pages_collected
+
+    async def hidden_fill(remaining_virtual_pages: int) -> tuple[bool, bool]:
+        """Fill the remaining depth from hidden disjoint location feeds.
+
+        Returns (quota_reached, had_unreachable_segments).  Regions are an internal
+        transport detail; user-visible status remains one scan.
+        """
+        nonlocal request_complete, reason, hit_limit
+        if remaining_virtual_pages <= 0:
+            return True, False
+        goal = today_seen + remaining_virtual_pages * 25
+        had_unreachable = False
+        all_exhausted = True
+        live = category_live_progress.get(progress_key)
+        if live is not None:
+            live.phase = "jumping"
+            live.collection_start_page = 0
+            live.segment_name = ""
+            live.segments_done = 0
+            live.segments_total = 0
+
+        for state_name, slug, location_id in GERMAN_STATE_SEGMENTS:
+            if today_seen >= goal:
+                break
+            try:
+                loc = await locate_feed(_regional_category_url(cat.url, slug, location_id), f"hidden:{state_name}")
+            except TemporaryAccessError as exc:
+                had_unreachable = True
+                all_exhausted = False
+                log.warning("hidden date shard temporary limit category=%s state=%s http=%s", cat.name, state_name, exc.status_code)
+                continue
+            except Exception as exc:
+                had_unreachable = True
+                all_exhausted = False
+                log.warning("hidden date shard failed category=%s state=%s: %s", cat.name, state_name, exc)
+                continue
+
+            status = loc["status"]
+            if status == "too_deep":
+                had_unreachable = True
+                all_exhausted = False
+                continue
+            if status in {"invalid", "unknown"}:
+                had_unreachable = True
+                all_exhausted = False
+                continue
+            if status == "absent":
+                continue
+
+            candidate = int(loc["candidate"])
+            feed_limit = int(loc["limit"])
+            fetch = loc["fetch"]
+            page = candidate
+            state_exhausted = False
+            while page <= feed_limit and today_seen < goal:
                 try:
-                    items, relation, pairs, days = await fetch_page(page, "collecting")
-                except TemporaryAccessError as exc:
-                    reason = (
-                        f"временный лимит Kleinanzeigen (HTTP {exc.status_code}); "
-                        "сохранён частичный результат"
-                    )
+                    items, relation, pairs, days = await fetch(page, "collecting")
+                except TemporaryAccessError:
+                    had_unreachable = True
+                    all_exhausted = False
                     break
-
-                live = category_live_progress.get(progress_key)
-                if live is not None:
-                    live.collection_index = index
-                    live.collection_start_page = candidate_page
-                    live.page_limit = depth
-
+                if relation in {"invalid", "unknown"}:
+                    had_unreachable = True
+                    all_exhausted = False
+                    break
                 if relation == "empty":
-                    request_complete = True
-                    reason = (
-                        "выдача закончилась раньше выбранной глубины"
-                        if target_seen_any else
-                        "конец выдачи; объявлений за выбранную дату не найдено"
-                    )
+                    state_exhausted = True
                     break
-
-                # Once the page contains only older normal listings, the selected day
-                # is finished. We stop even if the user asked for more pages.
                 if relation == "older" or (relation == "mixed" and not any(d == target_day for d in days)):
-                    request_complete = True
-                    reason = (
-                        f"выбранная дата закончилась раньше {depth} страниц"
-                        if target_seen_any else
-                        "выбранная дата пройдена; объявлений за неё не найдено"
-                    )
+                    state_exhausted = True
                     break
-
-                await process_target_items(items, pairs)
-
-                if index >= depth:
-                    request_complete = True
-                    reason = f"собрано {depth} страниц от начала выбранной даты"
-                    break
-
+                remaining_items = max(0, goal - today_seen)
+                await process_target_items(items, pairs, limit=remaining_items)
+                virtual_hidden = max(0, (today_seen - (goal - remaining_virtual_pages * 25) + 24) // 25)
+                update_live(page, days, "collecting", direct_pages_collected + virtual_hidden)
+                page += 1
                 if PAGE_DELAY_SECONDS:
-                    await asyncio.sleep(min(PAGE_DELAY_SECONDS, 0.25))
+                    await asyncio.sleep(min(PAGE_DELAY_SECONDS, 0.15))
+            if page > feed_limit and not state_exhausted and today_seen < goal:
+                had_unreachable = True
+                all_exhausted = False
+
+        if today_seen >= goal:
+            request_complete = True
+            reason = f"собрана глубина {depth} страниц выбранной даты"
+            return True, had_unreachable
+        if all_exhausted and not had_unreachable:
+            request_complete = True
+            reason = "выбранная дата закончилась раньше выбранной глубины"
+            return False, False
+        hit_limit = True
+        reason = (
+            f"частичный результат: публичная выдача Kleinanzeigen ограничена {PUBLIC_SEARCH_PAGE_CAP} страницами; "
+            f"собрано {today_seen} объявлений выбранной даты"
+        )
+        return False, True
+
+    try:
+        # First try the literal nationwide feed, but never trust pages beyond the
+        # public pagination window.  This is fast for today/recent categories.
+        try:
+            nationwide = await locate_feed(cat.url, "nationwide")
+        except TemporaryAccessError as exc:
+            reason = f"временный лимит Kleinanzeigen (HTTP {exc.status_code}) во время поиска даты"
+            nationwide = None
+
+        if nationwide is not None and not reason:
+            if nationwide["status"] == "found":
+                outcome, direct_pages_collected = await collect_direct(nationwide)
+                if outcome == "needs_hidden" and not request_complete:
+                    remaining = max(0, depth - direct_pages_collected)
+                    await hidden_fill(remaining)
+            elif nationwide["status"] == "absent":
+                request_complete = True
+                reason = "выбранная дата пройдена; объявлений за неё не найдено"
+            elif nationwide["status"] == "too_deep":
+                # The important v3.0.6 path: no bogus page 64/20,000 jumps.  Search
+                # inside hidden, non-overlapping feeds and fill the requested volume.
+                await hidden_fill(depth)
+            else:
+                # A normalized/repeated page is not a date signal. Fall back to the
+                # hidden feeds rather than returning a false zero.
+                await hidden_fill(depth)
 
         if not reason:
             reason = "завершено"
@@ -1919,7 +1966,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         interrupted = reason.startswith("временный лимит Kleinanzeigen")
         seed_complete = bool(request_complete and not interrupted)
         seed_capped = bool(hit_limit and not interrupted)
-        pages_scanned = len(requested_pages)
+        pages_scanned = network_requests
 
         await save_category_scan_state(
             cat.key,
@@ -1935,8 +1982,6 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             coverage_pages=depth if request_complete else 0,
         )
 
-        locator_requests = sum(1 for p in requested_pages if collection_start_page <= 0 or p < collection_start_page)
-        avoided_pages = max(0, (collection_start_page - 1) - locator_requests) if collection_start_page else 0
         result = ScanResult(
             new_count=new_count,
             pages_scanned=pages_scanned,
@@ -1946,23 +1991,23 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             hit_limit=hit_limit,
             reason=reason,
             mode=mode,
-            avoided_pages=avoided_pages,
+            avoided_pages=0,
             date_complete=request_complete,
             oldest_date_seen=oldest_date_seen,
-            max_page_reached=max(requested_pages) if requested_pages else 0,
+            max_page_reached=max_page_reached,
             matched_ids=sorted(processed_target_ids),
         )
         await record_parser_run(user_id, cat, result, started_at)
         log.info(
-            "category=%s date-depth complete target=%s depth=%s requests=%s start_page=%s matched=%s reason=%s",
-            cat.name, target_date, depth, pages_scanned, collection_start_page, today_seen, reason,
+            "category=%s date-depth-v306 target=%s depth=%s requests=%s direct_pages=%s matched=%s complete=%s reason=%s",
+            cat.name, target_date, depth, pages_scanned, direct_pages_collected, today_seen, request_complete, reason,
         )
         return result
 
     except Exception as exc:
         failed = ScanResult(
             new_count=new_count,
-            pages_scanned=len(requested_pages),
+            pages_scanned=network_requests,
             today_seen=today_seen,
             known_count=known_total,
             enriched_count=enriched_total,
@@ -1972,7 +2017,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             avoided_pages=0,
             date_complete=False,
             oldest_date_seen=oldest_date_seen,
-            max_page_reached=max(requested_pages) if requested_pages else 0,
+            max_page_reached=max_page_reached,
             matched_ids=sorted(processed_target_ids),
         )
         try:
@@ -1991,7 +2036,7 @@ async def fresh_category_cache_age(category_key: str, page_limit: int, target_da
     """Legacy DB cache hook. Exact-depth scans use the in-memory ScanResult cache.
 
     Reconstructing a 25-page result from every listing ever stored for the same
-    category/date would silently turn it into a 50/100-page result, so v3.0.5
+    category/date would silently turn it into a 50/100-page result, so v3.0.6
     intentionally does not use the old DB-only cache for exact-date scans.
     """
     return None
