@@ -24,6 +24,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import delete, func, select
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 
 from categories import CATEGORIES, GROUPS, categories_for_group, group_root_key
 from db import SessionLocal, USING_PERSISTENT_DATABASE, init_db
@@ -37,7 +39,7 @@ from filters import (
     sort_rows,
     unique_rows,
 )
-from models import CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing, ScanViewHistory, SelectedCategory, UserScan, UserSettings, ViewHistory
+from models import CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing, ScanObservation, ScanViewHistory, SelectedCategory, UserScan, UserSettings, ViewHistory
 from product_identity import TYPE_DISPLAY, ProductIdentity, recognize_product
 from parser import (
     MAX_PAGES_PER_CATEGORY,
@@ -74,6 +76,15 @@ STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVA
 VIEW_COUNT_CACHE_TTL_SECONDS = max(60, int(os.getenv("VIEW_COUNT_CACHE_TTL_SECONDS", "1800")))
 VIEW_COUNT_CONCURRENCY = max(1, min(10, int(os.getenv("VIEW_COUNT_CONCURRENCY", "5"))))
 VIEW_COUNT_EXPORT_MODES = {"newest", "all", "unique", "below_market"}
+
+# v3.0.7 Popularity Tracker. Every completed scan gets automatic public-view
+# checkpoints. They are persisted, so a Railway restart does not lose the plan.
+OBSERVATION_HOURS = (1, 3, 6, 12, 24)
+OBSERVATION_POLL_SECONDS = max(15, int(os.getenv("OBSERVATION_POLL_SECONDS", "30")))
+OBSERVATION_CONCURRENCY = max(1, min(4, int(os.getenv("OBSERVATION_CONCURRENCY", "2"))))
+OBSERVATION_LATE_GRACE_MINUTES = max(5, int(os.getenv("OBSERVATION_LATE_GRACE_MINUTES", "45")))
+GROWTH_TOP_LIMIT = 50
+GROWTH_TELEGRAM_LIMIT = 10
 
 # v2.5 incremental scan tuning (kept in v2.6). A full scan is forced once per category per Berlin day.
 # Later runs stop after the parser crosses the previous head checkpoint and then
@@ -199,7 +210,7 @@ def scan_detail_keyboard(scan_id: int) -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="🔄 Пересканировать", callback_data=f"scanrepeat:{scan_id}")],
         [InlineKeyboardButton(text="🔥 Самые просматриваемые", callback_data=f"scantop:{scan_id}"),
          InlineKeyboardButton(text="🧠 Модели", callback_data=f"scanproducts:{scan_id}")],
-        [InlineKeyboardButton(text="🚀 Динамика", callback_data=f"scangrowth:{scan_id}:1"),
+        [InlineKeyboardButton(text="🚀 TOP роста", callback_data=f"scangrowth:{scan_id}:1"),
          InlineKeyboardButton(text="🕘 История", callback_data=f"scanhistory:{scan_id}")],
         [InlineKeyboardButton(text="📄 Файл этого скана", callback_data=f"scanexport:{scan_id}")],
         [InlineKeyboardButton(text="⬅️ Мои сканы", callback_data="my_scans"),
@@ -207,17 +218,47 @@ def scan_detail_keyboard(scan_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-def growth_period_keyboard(scan_id: int, active_hours: int = 1) -> InlineKeyboardMarkup:
+def growth_period_keyboard(scan_id: int, active_hours: int = 1, category_key: str | None = None) -> InlineKeyboardMarkup:
+    prefix = f"pcg:{scan_id}:{category_key}:" if category_key else f"scangrowth:{scan_id}:"
+    export_prefix = f"pce:{scan_id}:{category_key}:" if category_key else f"scangrowthexport:{scan_id}:"
     def b(hours: int) -> InlineKeyboardButton:
         label = f"{hours}ч"
         if hours == active_hours:
             label = "✅ " + label
-        return InlineKeyboardButton(text=label, callback_data=f"scangrowth:{scan_id}:{hours}")
+        return InlineKeyboardButton(text=label, callback_data=f"{prefix}{hours}")
 
+    back_callback = f"popularcat:{category_key}" if category_key else f"scan:{scan_id}"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [b(1), b(3), b(6), b(24)],
+        [b(1), b(3), b(6)],
+        [b(12), b(24)],
+        [InlineKeyboardButton(text="📊 Скачать TOP-50", callback_data=f"{export_prefix}{active_hours}")],
         [InlineKeyboardButton(text="👁 Обновить сейчас", callback_data=f"scanviews:{scan_id}")],
-        [InlineKeyboardButton(text="⬅️ К скану", callback_data=f"scan:{scan_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback)],
+    ])
+
+
+def popular_categories_keyboard(items: list[tuple[str, UserScan]]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for key, scan in items[:30]:
+        cat = CATEGORIES.get(key)
+        if cat is None:
+            continue
+        icon = GROUPS.get(cat.group).icon if cat.group in GROUPS else "📂"
+        rows.append([InlineKeyboardButton(text=f"{icon} {cat.name[:38]}", callback_data=f"popularcat:{key}")])
+    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def popular_category_keyboard(scan_id: int, category_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👁 Самые просматриваемые", callback_data=f"pcv:{scan_id}:{category_key}")],
+        [InlineKeyboardButton(text="🚀 TOP 1ч", callback_data=f"pcg:{scan_id}:{category_key}:1"),
+         InlineKeyboardButton(text="🚀 TOP 3ч", callback_data=f"pcg:{scan_id}:{category_key}:3")],
+        [InlineKeyboardButton(text="🔥 TOP 6ч", callback_data=f"pcg:{scan_id}:{category_key}:6"),
+         InlineKeyboardButton(text="🔥 TOP 12ч", callback_data=f"pcg:{scan_id}:{category_key}:12")],
+        [InlineKeyboardButton(text="📈 TOP 24ч", callback_data=f"pcg:{scan_id}:{category_key}:24")],
+        [InlineKeyboardButton(text="⬅️ Категории", callback_data="popular_now"),
+         InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
     ])
 
 
@@ -373,6 +414,17 @@ def _scan_title(keys: list[str]) -> str:
     return f"{names[0]} + ещё {len(names) - 1}"
 
 
+@dataclass
+class GrowthMetric:
+    listing: Listing
+    base_views: int
+    current_views: int
+    delta: int
+    elapsed_hours: float
+    per_hour: float
+    observed_at: datetime
+
+
 async def create_user_scan(user_id: int, job_uid: str, category_keys: list[str], page_limit: int, target_date: str) -> UserScan:
     scan = UserScan(
         job_uid=job_uid,
@@ -405,6 +457,35 @@ async def get_user_scans(user_id: int, limit: int = 10) -> list[UserScan]:
         return list(result.scalars().all())
 
 
+async def get_user_popular_categories(user_id: int, limit_scans: int = 100) -> list[tuple[str, UserScan]]:
+    """Return scanned categories, newest scan first, one latest scan per category."""
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(UserScan)
+            .where(
+                UserScan.user_id == user_id,
+                UserScan.status.in_(["done", "partial"]),
+            )
+            .order_by(UserScan.finished_at.desc(), UserScan.created_at.desc())
+            .limit(limit_scans)
+        )
+        scans = list(result.scalars().all())
+    latest: dict[str, UserScan] = {}
+    for scan in scans:
+        for key in _scan_category_keys(scan):
+            if key in CATEGORIES and key not in latest:
+                latest[key] = scan
+    return list(latest.items())
+
+
+async def get_latest_scan_for_category(user_id: int, category_key: str) -> UserScan | None:
+    items = await get_user_popular_categories(user_id)
+    for key, scan in items:
+        if key == category_key:
+            return scan
+    return None
+
+
 async def get_scan_rows(scan_id: int) -> list[tuple[Listing, ScanListing]]:
     async with SessionLocal() as session:
         result = await session.execute(
@@ -413,6 +494,58 @@ async def get_scan_rows(scan_id: int) -> list[tuple[Listing, ScanListing]]:
             .where(ScanListing.scan_id == scan_id)
         )
         return list(result.all())
+
+
+async def ensure_scan_observation_plan(scan_id: int, finished_at: datetime | None = None) -> None:
+    """Create the +1/+3/+6/+12/+24h plan once; safe to call after restarts."""
+    async with db_write_lock:
+        async with SessionLocal() as session:
+            scan = await session.get(UserScan, scan_id)
+            if scan is None or scan.status not in {"done", "partial"}:
+                return
+            base = finished_at or scan.finished_at or scan.created_at
+            existing = await session.execute(
+                select(ScanObservation.target_hours).where(ScanObservation.scan_id == scan_id)
+            )
+            have = {int(x) for x in existing.scalars().all()}
+            for hours in OBSERVATION_HOURS:
+                if hours in have:
+                    continue
+                session.add(ScanObservation(
+                    scan_id=scan_id,
+                    target_hours=hours,
+                    due_at=base + timedelta(hours=hours),
+                    status="pending",
+                ))
+            await session.commit()
+
+
+async def get_scan_observation_statuses(scan_id: int) -> dict[int, str]:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(ScanObservation.target_hours, ScanObservation.status)
+            .where(ScanObservation.scan_id == scan_id)
+            .order_by(ScanObservation.target_hours)
+        )
+        return {int(hours): status for hours, status in result.all()}
+
+
+async def backfill_recent_observation_plans() -> int:
+    """Attach the new plan to still-relevant scans from the last 24h."""
+    cutoff = datetime.utcnow() - timedelta(hours=24)
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(UserScan.id, UserScan.finished_at)
+            .where(
+                UserScan.status.in_(["done", "partial"]),
+                UserScan.finished_at.is_not(None),
+                UserScan.finished_at >= cutoff,
+            )
+        )
+        rows = list(result.all())
+    for scan_id, finished_at in rows:
+        await ensure_scan_observation_plan(int(scan_id), finished_at)
+    return len(rows)
 
 
 async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None:
@@ -466,8 +599,11 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
                     ))
             await session.commit()
 
+    if not cancelled:
+        await ensure_scan_observation_plan(job.scan_id, now)
 
-async def update_scan_view_refresh(scan_id: int) -> int:
+
+async def update_scan_view_refresh(scan_id: int, target_hours: int | None = None) -> int:
     """Store one complete view observation round for a saved scan."""
     now = datetime.utcnow()
     async with db_write_lock:
@@ -475,11 +611,19 @@ async def update_scan_view_refresh(scan_id: int) -> int:
             scan = await session.get(UserScan, scan_id)
             if scan is None:
                 return 0
-            result = await session.execute(
+            query = (
                 select(Listing.external_id, Listing.view_count)
                 .join(ScanListing, Listing.external_id == ScanListing.external_id)
                 .where(ScanListing.scan_id == scan_id)
             )
+            if target_hours is not None:
+                # Scheduled checkpoints must contain freshly read counters, not stale values
+                # left in the listing table after a failed request.
+                query = query.where(
+                    Listing.views_checked_at.is_not(None),
+                    Listing.views_checked_at >= now - timedelta(minutes=15),
+                )
+            result = await session.execute(query)
             values = list(result.all())
             recorded = 0
             for external_id, view_count in values:
@@ -490,6 +634,7 @@ async def update_scan_view_refresh(scan_id: int) -> int:
                     external_id=external_id,
                     view_count=int(view_count),
                     recorded_at=now,
+                    target_hours=target_hours,
                 ))
                 recorded += 1
             scan.viewed_count = recorded
@@ -533,10 +678,19 @@ async def get_scan_history_rounds(scan_id: int, limit: int = 12) -> list[tuple[d
     return [(dt, count, total) for dt, (count, total) in ordered]
 
 
-async def get_scan_growth_rows(scan_id: int, period_hours: int) -> tuple[list[tuple[float, int, float, int, Listing]], int]:
-    """Calculate view velocity from the observation points of one saved scan."""
-    period_hours = period_hours if period_hours in {1, 3, 6, 24} else 1
+async def get_scan_growth_rows(
+    scan_id: int, period_hours: int, category_key: str | None = None
+) -> tuple[list[GrowthMetric], int]:
+    """Return TOP growth, sorted by real absolute view increase.
+
+    If an automatic checkpoint exists for the requested horizon, compare it to
+    the initial scan snapshot. Otherwise fall back to the closest manual history
+    so old scans remain useful.
+    """
+    period_hours = period_hours if period_hours in set(OBSERVATION_HOURS) else 1
     pairs = await get_scan_rows(scan_id)
+    if category_key:
+        pairs = [p for p in pairs if p[0].category_key == category_key]
     listings = {listing.external_id: listing for listing, _ in pairs}
     if not listings:
         return [], 0
@@ -547,6 +701,7 @@ async def get_scan_growth_rows(scan_id: int, period_hours: int) -> tuple[list[tu
                 ScanViewHistory.external_id,
                 ScanViewHistory.view_count,
                 ScanViewHistory.recorded_at,
+                ScanViewHistory.target_hours,
             )
             .where(
                 ScanViewHistory.scan_id == scan_id,
@@ -556,47 +711,74 @@ async def get_scan_growth_rows(scan_id: int, period_hours: int) -> tuple[list[tu
         )
         points = list(result.all())
 
-    # The v2.8 ScanListing snapshot is a valid baseline, so scans created before
-    # v2.9 become useful after just one refresh instead of needing two.
-    by_id: dict[str, list[tuple[datetime, int]]] = {}
-    rounds: set[datetime] = set()
+    baseline: dict[str, tuple[datetime, int]] = {}
     for listing, snap in pairs:
         if snap.initial_view_count is not None:
-            by_id.setdefault(listing.external_id, []).append((snap.captured_at, int(snap.initial_view_count)))
-            rounds.add(snap.captured_at)
-    for external_id, view_count, recorded_at in points:
-        series = by_id.setdefault(external_id, [])
-        point = (recorded_at, int(view_count))
-        if point not in series:
-            series.append(point)
+            baseline[listing.external_id] = (snap.captured_at, int(snap.initial_view_count))
+
+    rounds = {snap.captured_at for _, snap in pairs if snap.initial_view_count is not None}
+    for _, _, recorded_at, _ in points:
         rounds.add(recorded_at)
-    for series in by_id.values():
-        series.sort(key=lambda point: point[0])
 
-    growth: list[tuple[float, int, float, int, Listing]] = []
-    for external_id, series in by_id.items():
-        if len(series) < 2:
-            continue
-        current_at, current_views = series[-1]
-        target_at = current_at - timedelta(hours=period_hours)
-        before = [point for point in series[:-1] if point[0] <= target_at]
-        if before:
-            base_at, base_views = before[-1]
-        else:
-            base_at, base_views = series[0]
-        elapsed_hours = (current_at - base_at).total_seconds() / 3600
-        if elapsed_hours < (2 / 60):
-            continue
-        delta = current_views - base_views
-        if delta <= 0:
-            continue
-        listing = listings.get(external_id)
-        if listing is None:
-            continue
-        growth.append((delta / elapsed_hours, delta, elapsed_hours, current_views, listing))
+    # Prefer the exact scheduled checkpoint for +N hours.
+    exact: dict[str, tuple[datetime, int]] = {}
+    for external_id, view_count, recorded_at, target_hours in points:
+        if target_hours == period_hours:
+            exact[external_id] = (recorded_at, int(view_count))
 
-    growth.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return growth, len(rounds)
+    growth: list[GrowthMetric] = []
+    if exact:
+        for external_id, (current_at, current_views) in exact.items():
+            base = baseline.get(external_id)
+            listing = listings.get(external_id)
+            if base is None or listing is None:
+                continue
+            base_at, base_views = base
+            elapsed_hours = (current_at - base_at).total_seconds() / 3600
+            if elapsed_hours <= 0:
+                continue
+            delta = current_views - base_views
+            if delta <= 0:
+                continue
+            growth.append(GrowthMetric(
+                listing=listing, base_views=base_views, current_views=current_views,
+                delta=delta, elapsed_hours=elapsed_hours, per_hour=delta / elapsed_hours,
+                observed_at=current_at,
+            ))
+    else:
+        # Compatibility fallback for manual v2.9/v3.0 snapshots.
+        by_id: dict[str, list[tuple[datetime, int]]] = {}
+        for external_id, (base_at, base_views) in baseline.items():
+            by_id.setdefault(external_id, []).append((base_at, base_views))
+        for external_id, view_count, recorded_at, _ in points:
+            point = (recorded_at, int(view_count))
+            series = by_id.setdefault(external_id, [])
+            if point not in series:
+                series.append(point)
+        for external_id, series in by_id.items():
+            series.sort(key=lambda point: point[0])
+            if len(series) < 2:
+                continue
+            current_at, current_views = series[-1]
+            target_at = current_at - timedelta(hours=period_hours)
+            before = [point for point in series[:-1] if point[0] <= target_at]
+            base_at, base_views = before[-1] if before else series[0]
+            elapsed_hours = (current_at - base_at).total_seconds() / 3600
+            if elapsed_hours < (2 / 60):
+                continue
+            delta = current_views - base_views
+            listing = listings.get(external_id)
+            if delta <= 0 or listing is None:
+                continue
+            growth.append(GrowthMetric(
+                listing=listing, base_views=base_views, current_views=current_views,
+                delta=delta, elapsed_hours=elapsed_hours, per_hour=delta / elapsed_hours,
+                observed_at=current_at,
+            ))
+
+    # User requested the ranking by actual added views, not by tiny-window velocity.
+    growth.sort(key=lambda item: (item.delta, item.per_hour, item.current_views), reverse=True)
+    return growth[:GROWTH_TOP_LIMIT], len(rounds)
 
 
 def my_scans_keyboard(scans: list[UserScan]) -> InlineKeyboardMarkup:
@@ -1092,15 +1274,20 @@ async def enrich_page_view_counts(
     return len(targets), updated, failed
 
 
-async def refresh_view_counts(rows: list[Listing], message: Message | BotChatAdapter | None = None, *, force: bool = False) -> tuple[int, int, int]:
+async def refresh_view_counts(
+    rows: list[Listing], message: Message | BotChatAdapter | None = None, *,
+    force: bool = False, max_age_seconds: int | None = None,
+) -> tuple[int, int, int]:
     """Refresh missing/stale public view counters and persist them.
 
-    Returns (requested, updated, failed). Recent counters are reused from the DB.
+    Returns (requested, updated, failed). max_age_seconds lets automatic checkpoints
+    safely reuse a counter fetched only a few minutes ago by another scan/user.
     """
     if not rows:
         return 0, 0, 0
 
-    cutoff = datetime.utcnow() - timedelta(seconds=VIEW_COUNT_CACHE_TTL_SECONDS)
+    effective_ttl = VIEW_COUNT_CACHE_TTL_SECONDS if max_age_seconds is None else max(0, int(max_age_seconds))
+    cutoff = datetime.utcnow() - timedelta(seconds=effective_ttl)
     targets = [
         row for row in rows
         if row.url and (force or row.views_checked_at is None or row.views_checked_at < cutoff)
@@ -1109,7 +1296,7 @@ async def refresh_view_counts(rows: list[Listing], message: Message | BotChatAda
         return 0, 0, 0
 
     status = None
-    status_note = "свежий запрос" if force else f"кэш {max(1, VIEW_COUNT_CACHE_TTL_SECONDS // 60)} мин."
+    status_note = "свежий запрос" if force else f"кэш {max(1, effective_ttl // 60)} мин."
     if message is not None:
         try:
             status = await message.answer(
@@ -1187,6 +1374,144 @@ async def refresh_view_counts(rows: list[Listing], message: Message | BotChatAda
         except Exception:
             pass
     return len(targets), updated, failed
+
+
+async def claim_due_observation() -> ScanObservation | None:
+    """Claim one due automatic checkpoint and quickly discard stale missed ones."""
+    for _ in range(100):
+        now = datetime.utcnow()
+        async with db_write_lock:
+            async with SessionLocal() as session:
+                result = await session.execute(
+                    select(ScanObservation)
+                    .where(
+                        ScanObservation.status == "pending",
+                        ScanObservation.due_at <= now,
+                    )
+                    .order_by(ScanObservation.due_at.asc())
+                    .limit(1)
+                )
+                obs = result.scalar_one_or_none()
+                if obs is None:
+                    return None
+                if now - obs.due_at > timedelta(minutes=OBSERVATION_LATE_GRACE_MINUTES):
+                    obs.status = "missed"
+                    obs.completed_at = now
+                    obs.error_text = "checkpoint missed while service was offline/busy"
+                    await session.commit()
+                    continue
+                obs.status = "running"
+                obs.started_at = now
+                await session.commit()
+                await session.refresh(obs)
+                session.expunge(obs)
+                return obs
+    return None
+
+
+async def mark_observation_result(
+    observation_id: int, *, status: str, item_count: int = 0, error_text: str | None = None
+) -> None:
+    async with db_write_lock:
+        async with SessionLocal() as session:
+            obs = await session.get(ScanObservation, observation_id)
+            if obs is None:
+                return
+            obs.status = status
+            obs.completed_at = datetime.utcnow()
+            obs.item_count = item_count
+            obs.error_text = (error_text or "")[:1000] or None
+            await session.commit()
+
+
+async def recover_running_observations() -> int:
+    """Requeue observations left in running state by an interrupted Railway process."""
+    cutoff = datetime.utcnow() - timedelta(minutes=15)
+    changed = 0
+    async with db_write_lock:
+        async with SessionLocal() as session:
+            result = await session.execute(
+                select(ScanObservation).where(
+                    ScanObservation.status == "running",
+                    ScanObservation.started_at.is_not(None),
+                    ScanObservation.started_at < cutoff,
+                )
+            )
+            for obs in result.scalars().all():
+                obs.status = "pending"
+                obs.started_at = None
+                changed += 1
+            await session.commit()
+    return changed
+
+
+async def process_observation(bot: Bot, obs: ScanObservation) -> None:
+    async with SessionLocal() as session:
+        scan = await session.get(UserScan, obs.scan_id)
+    if scan is None or scan.status not in {"done", "partial"}:
+        await mark_observation_result(obs.id, status="error", error_text="scan not available")
+        return
+
+    pairs = await get_scan_rows(scan.id)
+    rows = [row for row, _ in pairs]
+    if not rows:
+        await mark_observation_result(obs.id, status="done", item_count=0)
+        return
+
+    try:
+        requested, updated, failed = await refresh_view_counts(rows, None, force=False, max_age_seconds=300)
+        recorded = await update_scan_view_refresh(scan.id, target_hours=obs.target_hours)
+        if recorded <= 0:
+            await mark_observation_result(
+                obs.id, status="error", item_count=0,
+                error_text=f"no fresh view values; failures={failed}",
+            )
+            log.warning("Observation produced no fresh counters scan=%s +%sh", scan.id, obs.target_hours)
+            return
+        await mark_observation_result(
+            obs.id, status="done", item_count=recorded,
+            error_text=(f"view failures: {failed}" if failed else None),
+        )
+        try:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔥 Открыть популярное", callback_data="popular_now")],
+                [InlineKeyboardButton(text="📊 Открыть скан", callback_data=f"scan:{scan.id}")],
+            ])
+            await bot.send_message(
+                scan.user_id,
+                f"✅ <b>Контрольный замер +{obs.target_hours}ч готов</b>\n\n"
+                f"Скан: <b>{html.escape(scan.title)}</b>\n"
+                f"📅 Дата объявлений: <b>{_date_label(scan.target_date)}</b>\n"
+                f"👁 Свежих значений сохранено: <b>{recorded}</b>\n\n"
+                "Теперь в «🔥 Популярное сейчас» доступен TOP роста по каждой категории отдельно.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+        except Exception:
+            log.debug("Could not notify user about observation scan=%s +%sh", scan.id, obs.target_hours, exc_info=True)
+        log.info(
+            "Observation done scan=%s +%sh requested=%s updated=%s recorded=%s failed=%s",
+            scan.id, obs.target_hours, requested, updated, recorded, failed,
+        )
+    except Exception as exc:
+        log.exception("Automatic observation failed scan=%s +%sh", scan.id, obs.target_hours)
+        await mark_observation_result(obs.id, status="error", error_text=str(exc))
+
+
+async def observation_scheduler(bot: Bot, worker_id: int = 1) -> None:
+    """Persistent +1/+3/+6/+12/+24h view-checkpoint worker."""
+    while True:
+        try:
+            obs = await claim_due_observation()
+            if obs is None:
+                await asyncio.sleep(OBSERVATION_POLL_SECONDS)
+                continue
+            await process_observation(bot, obs)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Observation scheduler loop error")
+            await asyncio.sleep(OBSERVATION_POLL_SECONDS)
 
 
 async def send_smart_export(
@@ -2836,27 +3161,138 @@ async def run_view_test(message: Message, state: FSMContext) -> None:
 async def popular_now(callback: CallbackQuery) -> None:
     if not allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
+    items = await get_user_popular_categories(callback.from_user.id)
     await callback.answer()
-    selected = await get_selected(callback.from_user.id)
-    rows = await today_rows()
-    if selected:
-        rows = [r for r in rows if r.category_key in selected]
-    rows = [r for r in rows if r.view_count is not None]
-    rows.sort(key=lambda r: (r.view_count or 0, r.first_seen_at), reverse=True)
-    top = rows[:12]
-    if not top:
-        text = "🔥 <b>Популярное сейчас</b>\n\nПока нет объявлений с просмотрами. Сначала запусти скан."
+    if not items:
+        text = (
+            "🔥 <b>Популярное сейчас</b>\n\n"
+            "Здесь появятся только категории, которые ты уже сканировал. "
+            "Сначала сделай хотя бы один скан с просмотрами."
+        )
     else:
-        lines = ["🔥 <b>Популярное сейчас</b>", "", "Лидеры по просмотрам среди свежих собранных объявлений:", ""]
-        for i, row in enumerate(top, 1):
-            title = html.escape(row.title[:55])
-            identity = html.escape(row.identity_label[:70]) if (row.identity_label and (row.identity_confidence or 0) >= 70) else ""
-            price = html.escape(_price_display(row.price_text, row.price_eur))
-            identity_line = f"\n🧠 {identity}" if identity else ""
-            lines.append(f"<b>{i}. {title}</b>{identity_line}\n👁 {row.view_count} · 💶 {price}\n<a href=\"{html.escape(row.url)}\">Открыть объявление</a>")
-        lines.append("\n🚀 Скорость роста появится в карточках «Мои сканы» после повторного обновления просмотров.")
+        text = (
+            "🔥 <b>Популярное сейчас</b>\n\n"
+            "Выбери категорию. Рейтинги разных категорий больше не смешиваются.\n\n"
+            "🚀 TOP 1/3/6/12/24ч — по <b>реальному приросту просмотров</b>.\n"
+            "👁 Самые просматриваемые — отдельный рейтинг по общему числу просмотров."
+        )
+    try:
+        await callback.message.edit_text(
+            text, parse_mode=ParseMode.HTML,
+            reply_markup=popular_categories_keyboard(items),
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        await callback.message.answer(
+            text, parse_mode=ParseMode.HTML,
+            reply_markup=popular_categories_keyboard(items),
+            disable_web_page_preview=True,
+        )
+
+
+@dp.callback_query(F.data.startswith("popularcat:"))
+async def popular_category(callback: CallbackQuery) -> None:
+    category_key = callback.data.split(":", 1)[1]
+    cat = CATEGORIES.get(category_key)
+    scan = await get_latest_scan_for_category(callback.from_user.id, category_key)
+    if cat is None or scan is None:
+        await callback.answer("Категория или скан не найдены", show_alert=True); return
+    pairs = await get_scan_rows(scan.id)
+    rows = [row for row, _ in pairs if row.category_key == category_key]
+    viewed = sum(1 for row in rows if row.view_count is not None)
+    await callback.answer()
+    text = (
+        f"🔥 <b>Популярное · {html.escape(cat.name)}</b>\n\n"
+        f"Используется последний скан этой категории: <b>{_date_label(scan.target_date)}</b>\n"
+        f"📦 Объявлений: <b>{len(rows)}</b>\n"
+        f"👁 С просмотрами: <b>{viewed}</b>\n"
+        f"🕐 Первый замер: <b>{_moscow_text(scan.finished_at or scan.created_at)} МСК</b>\n\n"
+        "Выбери рейтинг. Для TOP роста бот сравнивает контрольные замеры с первым замером этого скана."
+    )
+    await callback.message.answer(
+        text, parse_mode=ParseMode.HTML,
+        reply_markup=popular_category_keyboard(scan.id, category_key),
+    )
+
+
+@dp.callback_query(F.data.startswith("pcv:"))
+async def popular_category_views(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректный запрос", show_alert=True); return
+    scan_id, category_key = int(parts[1]), parts[2]
+    scan = await get_user_scan(callback.from_user.id, scan_id)
+    cat = CATEGORIES.get(category_key)
+    if scan is None or cat is None or category_key not in _scan_category_keys(scan):
+        await callback.answer("Скан не найден", show_alert=True); return
+    pairs = await get_scan_rows(scan_id)
+    rows = [row for row, _ in pairs if row.category_key == category_key and row.view_count is not None]
+    rows.sort(key=lambda row: (row.view_count or 0, row.first_seen_at), reverse=True)
+    await callback.answer()
+    if not rows:
+        text = f"👁 <b>{html.escape(cat.name)}</b>\n\nПока нет данных просмотров."
+    else:
+        lines = [f"👁 <b>Самые просматриваемые · {html.escape(cat.name)}</b>", ""]
+        for i, row in enumerate(rows[:GROWTH_TELEGRAM_LIMIT], 1):
+            model = f"\n🧠 {html.escape(row.identity_label[:75])}" if row.identity_label and (row.identity_confidence or 0) >= 70 else ""
+            lines.append(
+                f"<b>{i}. {html.escape(row.title[:60])}</b>{model}\n"
+                f"👁 <b>{row.view_count}</b> · 💶 {html.escape(_price_display(row.price_text, row.price_eur))}\n"
+                f'<a href="{html.escape(row.url)}">Открыть</a>'
+            )
         text = "\n\n".join(lines)
-    await callback.message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=main_keyboard(len(selected)))
+    await callback.message.answer(
+        text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        reply_markup=popular_category_keyboard(scan_id, category_key),
+    )
+
+
+@dp.callback_query(F.data.startswith("pcg:"))
+async def popular_category_growth(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer("Некорректный запрос", show_alert=True); return
+    try:
+        scan_id, category_key, period_hours = int(parts[1]), parts[2], int(parts[3])
+    except Exception:
+        await callback.answer("Некорректный запрос", show_alert=True); return
+    if period_hours not in OBSERVATION_HOURS:
+        period_hours = 1
+    scan = await get_user_scan(callback.from_user.id, scan_id)
+    cat = CATEGORIES.get(category_key)
+    if scan is None or cat is None or category_key not in _scan_category_keys(scan):
+        await callback.answer("Скан не найден", show_alert=True); return
+    growth, rounds = await get_scan_growth_rows(scan_id, period_hours, category_key=category_key)
+    await callback.answer()
+    period_label = f"{period_hours} ч"
+    if not growth:
+        text = (
+            f"🚀 <b>TOP роста · {html.escape(cat.name)} · {period_label}</b>\n\n"
+            "Контрольный замер для этого периода ещё не готов или прироста пока нет. "
+            "Автоматические замеры выполняются через 1 / 3 / 6 / 12 / 24 часа после первого скана."
+        )
+    else:
+        lines = [
+            f"🚀 <b>TOP роста · {html.escape(cat.name)} · {period_label}</b>",
+            "Сортировка: <b>кто набрал больше всего новых просмотров</b>.",
+            "",
+        ]
+        for i, item in enumerate(growth[:GROWTH_TELEGRAM_LIMIT], 1):
+            row = item.listing
+            model = f"\n🧠 {html.escape(row.identity_label[:75])}" if row.identity_label and (row.identity_confidence or 0) >= 70 else ""
+            lines.append(
+                f"<b>{i}. {html.escape(row.title[:60])}</b>{model}\n"
+                f"👁 {item.base_views} → <b>{item.current_views}</b> · "
+                f"🚀 <b>+{item.delta}</b> · ⚡ {item.per_hour:.1f}/ч\n"
+                f"💶 {html.escape(_price_display(row.price_text, row.price_eur))} · "
+                f'<a href="{html.escape(row.url)}">Открыть</a>'
+            )
+        lines += ["", f"📊 Полный рейтинг: до <b>{GROWTH_TOP_LIMIT}</b> товаров в таблице."]
+        text = "\n\n".join(lines)
+    await callback.message.answer(
+        text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        reply_markup=growth_period_keyboard(scan_id, period_hours, category_key=category_key),
+    )
 
 
 @dp.callback_query(F.data == "my_scans")
@@ -2904,6 +3340,12 @@ async def render_scan_detail(scan: UserScan) -> str:
                     Listing.category_key.in_(keys), Listing.first_seen_at > scan.finished_at
                 ))).scalar_one()
     history_rounds = await get_scan_history_rounds(scan.id, limit=50)
+    observation_statuses = await get_scan_observation_statuses(scan.id)
+    status_icons = {"done": "✅", "pending": "⏳", "running": "🔄", "missed": "▫️", "error": "⚠️"}
+    observation_line = " · ".join(
+        f"{hours}ч {status_icons.get(observation_statuses.get(hours, 'pending'), '⏳')}"
+        for hours in OBSERVATION_HOURS
+    )
     status_label = {
         "done": "✅ завершён",
         "partial": "⚠️ частичный",
@@ -2929,12 +3371,13 @@ async def render_scan_detail(scan: UserScan) -> str:
         f"🆕 Новых после скана, уже найденных последующими сканами: <b>{new_since}</b>",
         f"❌ Исчезли: <b>{disappeared}</b>",
         f"📈 Точек наблюдения: <b>{len(history_rounds)}</b>",
+        f"🔔 Автозамеры: <b>{observation_line}</b>",
     ]
     if scan.last_view_refresh_at:
         lines += ["", f"Последнее обновление просмотров: <b>{_moscow_text(scan.last_view_refresh_at)} МСК</b>"]
     if scan.status == "partial" and getattr(scan, "scan_note", ""):
         lines += ["", f"⚠️ <b>Почему результат частичный:</b> {html.escape(scan.scan_note)}"]
-    lines += ["", "💡 Обновляй просмотры позже и открывай «Динамика»: доступны интервалы 1 / 3 / 6 / 24 часа."]
+    lines += ["", "💡 Автозамеры идут через 1 / 3 / 6 / 12 / 24 часа. Открывай «🚀 TOP роста» — там TOP-10 в боте и TOP-50 таблицей."]
     return "\n".join(lines)
 
 
@@ -3069,7 +3512,7 @@ async def scan_growth(callback: CallbackQuery) -> None:
         period_hours = int(parts[2]) if len(parts) > 2 else 1
     except Exception:
         await callback.answer("Скан не найден", show_alert=True); return
-    if period_hours not in {1, 3, 6, 24}:
+    if period_hours not in OBSERVATION_HOURS:
         period_hours = 1
     scan = await get_user_scan(callback.from_user.id, scan_id)
     if scan is None:
@@ -3077,46 +3520,156 @@ async def scan_growth(callback: CallbackQuery) -> None:
 
     growth, rounds = await get_scan_growth_rows(scan_id, period_hours)
     await callback.answer()
-    period_label = {1: "1 час", 3: "3 часа", 6: "6 часов", 24: "24 часа"}[period_hours]
-    if rounds < 2:
+    period_label = f"{period_hours} ч"
+    if not growth:
         text = (
-            f"🚀 <b>Динамика за {period_label}</b>\n\n"
-            "Есть только первая точка наблюдения. Нажми «Обновить просмотры» позже — "
-            "после второй точки бот сможет посчитать реальную скорость роста."
-        )
-    elif not growth:
-        text = (
-            f"🚀 <b>Динамика за {period_label}</b>\n\n"
-            "Рост между доступными точками пока не зафиксирован. "
-            "Можно переключить период или обновить просмотры ещё раз позже."
+            f"🚀 <b>TOP роста за {period_label}</b>\n\n"
+            "Контрольный замер для этого периода ещё не готов или прироста пока нет. "
+            "Бот автоматически делает замеры через 1 / 3 / 6 / 12 / 24 часа после первого скана."
         )
     else:
         lines = [
-            f"🚀 <b>Быстрее всего растут · {period_label}</b>",
+            f"🚀 <b>TOP роста · {period_label}</b>",
             f"<b>{html.escape(scan.title)}</b>",
+            "Сортировка: <b>по реальному приросту просмотров</b>.",
             "",
         ]
-        for i, (per_hour, delta, elapsed_hours, current_views, row) in enumerate(growth[:12], 1):
-            if elapsed_hours < 1:
-                elapsed_text = f"{max(1, round(elapsed_hours * 60))} мин"
-            else:
-                elapsed_text = f"{elapsed_hours:.1f} ч"
+        for i, item in enumerate(growth[:GROWTH_TELEGRAM_LIMIT], 1):
+            row = item.listing
             identity_line = ""
             if row.identity_label and (row.identity_confidence or 0) >= 70:
                 identity_line = f"🧠 {html.escape(row.identity_label[:75])}\n"
             lines.append(
-                f"<b>{i}. {html.escape(row.title[:55])}</b>\n"
+                f"<b>{i}. {html.escape(row.title[:60])}</b>\n"
                 f"{identity_line}"
-                f"🚀 +{delta} за {elapsed_text} · <b>{per_hour:.1f}/ч</b> · 👁 {current_views}\n"
+                f"👁 {item.base_views} → <b>{item.current_views}</b> · "
+                f"🚀 <b>+{item.delta}</b> · ⚡ {item.per_hour:.1f}/ч\n"
                 f"💶 {html.escape(_price_display(row.price_text, row.price_eur))} · "
                 f'<a href="{html.escape(row.url)}">Открыть</a>'
             )
-        lines += ["", f"📈 Точек наблюдения в этом скане: <b>{rounds}</b>"]
+        lines += ["", f"📊 Полный рейтинг: до <b>{GROWTH_TOP_LIMIT}</b> товаров в таблице."]
         text = "\n\n".join(lines)
     await callback.message.answer(
         text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
         reply_markup=growth_period_keyboard(scan_id, period_hours),
     )
+
+
+def build_growth_top_xlsx(
+    scan: UserScan, period_hours: int, growth: list[GrowthMetric], category_key: str | None = None
+) -> Path:
+    """Build the downloadable TOP-50 table."""
+    cat = CATEGORIES.get(category_key) if category_key else None
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "TOP growth"
+    title = f"TOP-{min(GROWTH_TOP_LIMIT, len(growth))} роста за {period_hours}ч"
+    if cat is not None:
+        title += f" · {cat.name}"
+    ws.append([title])
+    ws.merge_cells("A1:M1")
+    ws["A1"].font = Font(bold=True, size=14)
+    ws["A1"].alignment = Alignment(horizontal="center")
+    ws.append([
+        "#", "Товар", "Распознанная модель", "Категория", "Цена €",
+        "Было просмотров", "Сейчас просмотров", "Прирост", "Просмотров/час",
+        "Фактический интервал, ч", "Дата объявления", "ID", "Ссылка",
+    ])
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+    for cell in ws[2]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for idx, item in enumerate(growth[:GROWTH_TOP_LIMIT], 1):
+        row = item.listing
+        ws.append([
+            idx, row.title, row.identity_label or "", row.category, row.price_eur,
+            item.base_views, item.current_views, item.delta, round(item.per_hour, 2),
+            round(item.elapsed_hours, 2), row.posted_date_msk or row.posted_text or "",
+            row.external_id, row.url,
+        ])
+    ws.freeze_panes = "A3"
+    ws.auto_filter.ref = f"A2:M{max(2, ws.max_row)}"
+    widths = {
+        "A": 6, "B": 44, "C": 34, "D": 26, "E": 11, "F": 16, "G": 17,
+        "H": 12, "I": 16, "J": 19, "K": 16, "L": 16, "M": 52,
+    }
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+    for row_cells in ws.iter_rows(min_row=3):
+        for cell in row_cells:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    growth_fill = PatternFill("solid", fgColor="E2F0D9")
+    for cell in ws["H"][2:]:
+        cell.fill = growth_fill
+        cell.font = Font(bold=True)
+    for cell in ws["M"][2:]:
+        if cell.value:
+            cell.hyperlink = str(cell.value)
+            cell.style = "Hyperlink"
+
+    out_dir = Path(tempfile.mkdtemp(prefix="growth_top_"))
+    safe_cat = re.sub(r"[^A-Za-z0-9_-]+", "_", category_key or "scan")
+    out = out_dir / f"TOP50_{safe_cat}_{period_hours}h_scan_{scan.id}.xlsx"
+    wb.save(out)
+    return out
+
+
+async def send_growth_xlsx(
+    message: Message, scan: UserScan, period_hours: int, category_key: str | None = None
+) -> None:
+    growth, _ = await get_scan_growth_rows(scan.id, period_hours, category_key=category_key)
+    if not growth:
+        await message.answer(
+            f"📊 TOP-{GROWTH_TOP_LIMIT} за {period_hours}ч пока нельзя сформировать: "
+            "контрольный замер ещё не готов или прироста нет."
+        )
+        return
+    path = build_growth_top_xlsx(scan, period_hours, growth, category_key=category_key)
+    try:
+        cat = CATEGORIES.get(category_key) if category_key else None
+        suffix = f" · {cat.name}" if cat else ""
+        await message.answer_document(
+            FSInputFile(path),
+            caption=f"📊 TOP-{min(GROWTH_TOP_LIMIT, len(growth))} роста за {period_hours}ч{suffix}",
+        )
+    finally:
+        shutil.rmtree(path.parent, ignore_errors=True)
+
+
+@dp.callback_query(F.data.startswith("scangrowthexport:"))
+async def scan_growth_export(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    try:
+        scan_id, period_hours = int(parts[1]), int(parts[2])
+    except Exception:
+        await callback.answer("Некорректный запрос", show_alert=True); return
+    scan = await get_user_scan(callback.from_user.id, scan_id)
+    if scan is None or period_hours not in OBSERVATION_HOURS:
+        await callback.answer("Скан не найден", show_alert=True); return
+    await callback.answer("Формирую TOP-50")
+    await send_growth_xlsx(callback.message, scan, period_hours)
+
+
+@dp.callback_query(F.data.startswith("pce:"))
+async def popular_growth_export(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer("Некорректный запрос", show_alert=True); return
+    try:
+        scan_id, category_key, period_hours = int(parts[1]), parts[2], int(parts[3])
+    except Exception:
+        await callback.answer("Некорректный запрос", show_alert=True); return
+    scan = await get_user_scan(callback.from_user.id, scan_id)
+    if (
+        scan is None or period_hours not in OBSERVATION_HOURS
+        or category_key not in _scan_category_keys(scan)
+    ):
+        await callback.answer("Скан не найден", show_alert=True); return
+    await callback.answer("Формирую TOP-50")
+    await send_growth_xlsx(callback.message, scan, period_hours, category_key=category_key)
 
 
 @dp.callback_query(F.data.startswith("scanhistory:"))
@@ -3437,6 +3990,10 @@ async def main() -> None:
     backfilled = await backfill_product_identities()
     if backfilled:
         log.info("v3.0 product identity backfill: %s listings", backfilled)
+    recovered = await recover_running_observations()
+    planned = await backfill_recent_observation_plans()
+    if recovered or planned:
+        log.info("v3.0.7 observations: recovered=%s recent_scans_planned=%s", recovered, planned)
     bot = Bot(BOT_TOKEN)
     me = await bot.get_me()
     log.info(
@@ -3454,13 +4011,19 @@ async def main() -> None:
         for i in range(1, MAX_CONCURRENT_JOBS + 1)
     ]
     ticker_task = asyncio.create_task(progress_ticker(bot), name="user-progress-ticker")
+    observation_tasks = [
+        asyncio.create_task(observation_scheduler(bot, i), name=f"view-observation-worker-{i}")
+        for i in range(1, OBSERVATION_CONCURRENCY + 1)
+    ]
     try:
         await dp.start_polling(bot)
     finally:
         ticker_task.cancel()
+        for task in observation_tasks:
+            task.cancel()
         for task in worker_tasks:
             task.cancel()
-        await asyncio.gather(ticker_task, *worker_tasks, return_exceptions=True)
+        await asyncio.gather(ticker_task, *observation_tasks, *worker_tasks, return_exceptions=True)
         async with category_inflight_guard:
             inflight = list(category_inflight.values())
         for task in inflight:

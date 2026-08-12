@@ -173,7 +173,7 @@ class ScanListing(Base):
 
 
 class ScanViewHistory(Base):
-    """Per-user-scan view snapshots used for 1/3/6/24h velocity analytics."""
+    """Per-user-scan view snapshots used for scheduled/manual velocity analytics."""
 
     __tablename__ = "scan_view_history"
 
@@ -182,3 +182,22 @@ class ScanViewHistory(Base):
     external_id: Mapped[str] = mapped_column(String(64), index=True)
     view_count: Mapped[int] = mapped_column(Integer)
     recorded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    # None = manual refresh/baseline-compatible point. 1/3/6/12/24 = automatic checkpoint.
+    target_hours: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
+
+class ScanObservation(Base):
+    """Persistent automatic observation plan for one saved scan."""
+
+    __tablename__ = "scan_observations"
+    __table_args__ = (UniqueConstraint("scan_id", "target_hours", name="uq_scan_observation"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scan_id: Mapped[int] = mapped_column(index=True)
+    target_hours: Mapped[int] = mapped_column(Integer, index=True)
+    due_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    item_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_text: Mapped[str | None] = mapped_column(String(1000), nullable=True)

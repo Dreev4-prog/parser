@@ -102,6 +102,10 @@ async def init_db() -> None:
         if scan_columns and "target_date" not in scan_columns:
             await conn.execute(text("ALTER TABLE category_scan_state ADD COLUMN target_date VARCHAR(10) DEFAULT ''"))
 
+        scan_view_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "scan_view_history"))
+        if scan_view_columns and "target_hours" not in scan_view_columns:
+            await conn.execute(text("ALTER TABLE scan_view_history ADD COLUMN target_hours INTEGER"))
+
         user_scan_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "user_scans"))
         if user_scan_columns and "target_date" not in user_scan_columns:
             await conn.execute(text("ALTER TABLE user_scans ADD COLUMN target_date VARCHAR(10) DEFAULT ''"))
