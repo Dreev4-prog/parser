@@ -20,11 +20,11 @@ _IS_RAILWAY = bool(
     or os.getenv("RAILWAY_SERVICE_ID")
 )
 
-# v3.2.2: PostgreSQL is mandatory on Railway. Local SQLite remains available only
+# v3.2.3: PostgreSQL is mandatory on Railway. Local SQLite remains available only
 # as a zero-setup development/test fallback so the included unit tests still run.
 if _IS_RAILWAY and not RAW_DATABASE_URL:
     raise RuntimeError(
-        "DATABASE_URL is required on Railway in v3.2.2. Add a PostgreSQL service "
+        "DATABASE_URL is required on Railway in v3.2.3. Add a PostgreSQL service "
         "and set DATABASE_URL=${{Postgres.DATABASE_URL}} in the parser service Variables."
     )
 
@@ -36,7 +36,7 @@ _IS_POSTGRES = DATABASE_URL.startswith("postgresql+asyncpg://")
 
 if _IS_RAILWAY and not _IS_POSTGRES:
     raise RuntimeError(
-        "v3.2.2 requires PostgreSQL on Railway. DATABASE_URL must point to the Railway PostgreSQL service."
+        "v3.2.3 requires PostgreSQL on Railway. DATABASE_URL must point to the Railway PostgreSQL service."
     )
 if not _IS_SQLITE and not _IS_POSTGRES:
     raise RuntimeError("Unsupported DATABASE_URL. Use PostgreSQL (postgresql://...) or local SQLite for development.")
@@ -130,6 +130,8 @@ async def init_db() -> None:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN posted_date_msk VARCHAR(10)"))
         if columns and "is_active" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN is_active BOOLEAN DEFAULT TRUE"))
+        if columns and "is_promoted" not in columns:
+            await conn.execute(text("ALTER TABLE listings ADD COLUMN is_promoted BOOLEAN DEFAULT FALSE"))
         if columns and "disappeared_at" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN disappeared_at TIMESTAMP"))
         if columns and "view_count" not in columns:

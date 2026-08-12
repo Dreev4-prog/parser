@@ -111,6 +111,7 @@ class CategoryPageInfo:
     fingerprint: str = ""
     raw_candidates: int = 0
     promoted_filtered: int = 0
+    promoted_ids: list[str] | None = None
     duplicate_cards: int = 0
     missing_date_count: int = 0
     missing_price_count: int = 0
@@ -417,14 +418,38 @@ PROMOTED_WRAPPER_CLASSES = {
     "badge-topad",
     "is-topad",
     "is-highlight",
+    "is-bumpup",
+    "is-gallery",
 }
 PROMOTED_BADGE_CLASSES = {
     "badge-advertisement",
     "badge-sponsored",
     "badge-promoted",
+    # Kleinanzeigen paid feature markers.  In particular, ``bumpup`` is the
+    # Hochschieben feature; older versions only handled topad/highlight and
+    # therefore allowed bumped listings through.
+    "featurelabel-bumpup",
+    "featuretag-bumpup",
+    "icon-feature-bumpup",
+    "featurelabel-topad",
+    "featuretag-topad",
+    "icon-feature-topad",
+    "featurelabel-highlight",
+    "featuretag-highlight",
+    "icon-feature-highlight",
+    "featurelabel-gallery",
+    "featuretag-gallery",
+    "icon-feature-gallery",
 }
+PROMOTED_FEATURE_CLASS_RE = re.compile(
+    r"^(?:featurelabel|featuretag|icon-feature|badge|is)[-_](?:"
+    r"bumpup|bump-up|topad|top-ad|highlight|gallery|galerie|"
+    r"promoted|sponsored|advertisement)\b",
+    re.IGNORECASE,
+)
 PROMOTED_LABEL_RE = re.compile(
-    r"^(?:Top[- ]?Anzeige|Werbeanzeige|Gesponsert|Sponsored|Promoted)$",
+    r"^(?:Top[- ]?Anzeige|Werbeanzeige|Gesponsert|Sponsored|Promoted|"
+    r"Hochgeschoben|Hochschieben|Highlight|Galerie)$",
     re.IGNORECASE,
 )
 FILTER_PROMOTED_LISTINGS = os.getenv("FILTER_PROMOTED_LISTINGS", "1").strip().lower() not in {
@@ -470,14 +495,41 @@ def _is_promoted_listing_node(node) -> bool:
     if wrapper is None:
         wrapper = node
 
-    if _class_set(wrapper) & PROMOTED_WRAPPER_CLASSES:
+    wrapper_classes = _class_set(wrapper)
+    if wrapper_classes & PROMOTED_WRAPPER_CLASSES:
+        return True
+    if any(PROMOTED_FEATURE_CLASS_RE.match(cls) for cls in wrapper_classes):
         return True
 
-    # Some native-ad variants expose a dedicated badge instead.  Match exact
-    # badge class names, never generic substrings.
+    # Some promotion variants expose a featurelabel/featuretag/icon-feature
+    # inside the card.  Match the explicit Kleinanzeigen feature naming scheme
+    # so ordinary titles such as "Push Up Board" are never filtered.
     try:
         for element in wrapper.find_all(True):
-            if _class_set(element) & PROMOTED_BADGE_CLASSES:
+            classes = _class_set(element)
+            if classes & PROMOTED_BADGE_CLASSES:
+                return True
+            if any(PROMOTED_FEATURE_CLASS_RE.match(cls) for cls in classes):
+                return True
+
+            # A/B templates can move the marker to metadata attributes while
+            # keeping the same explicit feature token.
+            attrs = []
+            for attr_name in ("id", "data-testid", "aria-label", "title"):
+                try:
+                    value = element.get(attr_name)
+                except Exception:
+                    value = None
+                if value:
+                    attrs.append(str(value).strip())
+            if any(
+                re.search(
+                    r"(?:^|[-_: ])(?:bumpup|bump-up|hochgeschoben|hochschieben|topad|top-ad|highlight|gallery|galerie|promoted|sponsored)(?:$|[-_: ])",
+                    value,
+                    flags=re.IGNORECASE,
+                )
+                for value in attrs
+            ):
                 return True
 
             # Visible promotion labels are accepted only when the element is a
@@ -500,17 +552,28 @@ def _is_promoted_listing_node(node) -> bool:
     return False
 
 
-def _parse_category_html_with_stats(html_text: str) -> tuple[list[ParsedListing], dict[str, int | float]]:
+def _parse_category_html_with_stats(html_text: str) -> tuple[list[ParsedListing], dict[str, object]]:
     soup = BeautifulSoup(html_text, "html.parser")
     items: list[ParsedListing] = []
     seen_urls: set[str] = set()
     seen_ids: set[str] = set()
+    promoted_ids: list[str] = []
 
     candidates = soup.select("article, li.ad-listitem, .ad-listitem")
     promoted = duplicate_cards = missing_date = missing_price = 0
     for node in candidates:
         if _is_promoted_listing_node(node):
             promoted += 1
+            try:
+                promoted_link = node.select_one("a[href*='/s-anzeige/']")
+                if promoted_link and promoted_link.get("href"):
+                    promoted_url = urljoin(BASE_URL, promoted_link["href"])
+                    if _allowed_url(promoted_url):
+                        promoted_id = extract_external_id(promoted_url)
+                        if promoted_id and promoted_id not in promoted_ids:
+                            promoted_ids.append(promoted_id)
+            except Exception:
+                pass
             continue
 
         link = node.select_one("a[href*='/s-anzeige/']")
@@ -557,6 +620,7 @@ def _parse_category_html_with_stats(html_text: str) -> tuple[list[ParsedListing]
     return items, {
         "raw_candidates": len(candidates),
         "promoted_filtered": promoted,
+        "promoted_ids": promoted_ids,
         "duplicate_cards": duplicate_cards,
         "missing_date_count": missing_date,
         "missing_price_count": missing_price,
@@ -743,6 +807,7 @@ def category_page_info_from_html(
         fingerprint=fingerprint,
         raw_candidates=int(stats["raw_candidates"]),
         promoted_filtered=int(stats["promoted_filtered"]),
+        promoted_ids=list(stats.get("promoted_ids") or []),
         duplicate_cards=int(stats["duplicate_cards"]),
         missing_date_count=int(stats["missing_date_count"]),
         missing_price_count=int(stats["missing_price_count"]),

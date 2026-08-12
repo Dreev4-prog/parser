@@ -54,6 +54,56 @@ class ParserQualityTests(unittest.TestCase):
         self.assertEqual(info.promoted_filtered, 1)
         self.assertEqual(info.items[0].title, "Normal")
 
+    def test_bumpup_card_is_removed(self):
+        html = r"""
+        <html><body>
+          <li class="ad-listitem">
+            <span class="featurelabel-bumpup"><i class="icon-feature-bumpup"></i></span>
+            <a href="/s-anzeige/bumped-monitor/333456789-225-1"><h2>Samsung Odyssey G5 34</h2></a>
+            <div class="aditem-main--top--right">Gestern, 18:00</div>
+            <div class="aditem-main--middle--price-shipping--price">50 €</div>
+          </li>
+        </body></html>
+        """
+        info = category_page_info_from_html(
+            html, requested_page=1, final_url="https://www.kleinanzeigen.de/s-pc-zubehoer-software/c225"
+        )
+        self.assertEqual(info.items, [])
+        self.assertEqual(info.promoted_filtered, 1)
+        self.assertEqual(info.promoted_ids, ["333456789"])
+
+    def test_bumpup_attribute_variant_is_removed(self):
+        html = r"""
+        <html><body>
+          <li class="ad-listitem">
+            <span data-testid="feature-bumpup" aria-label="Hochgeschoben"></span>
+            <a href="/s-anzeige/bumped-item/433456789-225-1"><h2>Monitor</h2></a>
+            <div class="aditem-main--top--right">Gestern, 18:00</div>
+            <div class="aditem-main--middle--price-shipping--price">50 €</div>
+          </li>
+        </body></html>
+        """
+        info = category_page_info_from_html(
+            html, requested_page=1, final_url="https://www.kleinanzeigen.de/s-pc-zubehoer-software/c225"
+        )
+        self.assertEqual(info.items, [])
+        self.assertEqual(info.promoted_filtered, 1)
+        self.assertEqual(info.promoted_ids, ["433456789"])
+
+    def test_product_title_push_up_is_not_treated_as_promotion(self):
+        html = r"""
+        <html><body>
+          <li class="ad-listitem">
+            <a href="/s-anzeige/push-up-board/533456789-230-1"><h2>Perfect Push Up Board</h2></a>
+            <div class="aditem-main--top--right">Heute, 18:00</div>
+            <div class="aditem-main--middle--price-shipping--price">15 €</div>
+          </li>
+        </body></html>
+        """
+        rows = parse_category_html(html)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].title, "Perfect Push Up Board")
+
     def test_normalized_page_is_not_trusted(self):
         html = '''
         <html><body>

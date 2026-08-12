@@ -1,4 +1,4 @@
-# Kleinanzeigen Parser Bot v3.2.2
+# Kleinanzeigen Parser Bot v3.2.4
 
 ## v3.2.2 — PostgreSQL Production
 
@@ -175,7 +175,7 @@ MIN_PAGE_DATE_COVERAGE=0.55
 MIN_PAGE_DATED_ITEMS=3
 ```
 
-On Railway v3.2.2 uses PostgreSQL only. SQLite is retained solely for local
+On Railway v3.2.2+ uses PostgreSQL only. SQLite is retained solely for local
 development/testing outside Railway.
 
 
@@ -237,4 +237,19 @@ The default plans are 1, 3, 7 and 30 days. Environment prices are only used when
 
 Keep `ACCESS_MODE=admin_only` while testing. After both payment tokens are configured and a real test invoice has been checked, switch to `subscription` from `/admin`.
 
-v3.2.2 requires Railway PostgreSQL in production so user access, payments, scans and background history survive redeploys reliably.
+v3.2.2+ requires Railway PostgreSQL in production so user access, payments, scans and background history survive redeploys reliably.
+
+## v3.2.3 — фильтр платных поднятий
+
+- Добавлено распознавание Kleinanzeigen `bumpup` / **Hochschieben**.
+- Учитываются варианты `featurelabel-bumpup`, `featuretag-bumpup`, `icon-feature-bumpup` и A/B-варианты в metadata.
+- Расширена фильтрация Top-Anzeige / Highlight / Galerie.
+- Обычные названия товаров со словами `Push Up` не считаются продвижением.
+
+
+## v3.2.4 — hard Start/Stop
+- Active scan cards now have a clear **⏹ Остановить парсер** action.
+- `/stop` is available in the Telegram command menu.
+- A stop detaches the user job immediately; if no other user shares that category scan, the underlying network/parser task is cancelled too.
+- Cancelled scans are marked `cancelled` and do not create a result snapshot or automatic view-observation plan.
+- After stopping, the bot offers **Выбрать категории** and **Запустить парсер** so a new run can start immediately.

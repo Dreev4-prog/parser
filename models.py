@@ -24,6 +24,9 @@ class Listing(Base):
     first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    # Paid Kleinanzeigen visibility feature (Hochschieben/Top/Highlight/Galerie).
+    # Kept separately from is_active so a promoted ad can become organic again later.
+    is_promoted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     disappeared_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     view_count: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     views_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)

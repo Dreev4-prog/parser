@@ -12,7 +12,7 @@ import statistics
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -45,6 +45,7 @@ from filters import (
 from models import BotUser, CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing, ScanObservation, ScanViewHistory, SelectedCategory, SubscriptionPayment, SubscriptionPlan, UserScan, UserSettings, ViewHistory
 from product_identity import TYPE_DISPLAY, ProductIdentity, recognize_product
 from traffic import TRAFFIC
+from scan_control import ScanStopRequested, wait_for_task_or_stop
 from commerce import (
     PAYMENT_POLL_SECONDS, PaymentProviderError, admin_stats, cached_access_until,
     create_subscription_payment, current_access_mode, find_users, get_payment,
@@ -74,7 +75,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "3.2.1"
+APP_VERSION = "3.2.4"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
@@ -201,7 +202,7 @@ def main_keyboard(selected_count: int = 0) -> InlineKeyboardMarkup:
     """Simple user-facing home screen. Technical/debug actions stay out of the way."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔥 Популярное сейчас", callback_data="popular_now")],
-        [InlineKeyboardButton(text="🔎 Новый скан", callback_data="start_scan")],
+        [InlineKeyboardButton(text="▶️ Запустить парсер", callback_data="start_scan")],
         [InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
         [InlineKeyboardButton(text=f"🗂 Категории ({selected_count})", callback_data="groups"),
          InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
@@ -888,7 +889,7 @@ def my_scans_keyboard(scans: list[UserScan]) -> InlineKeyboardMarkup:
         target_label = _date_label(scan.target_date) if scan.target_date else _moscow_text(scan.finished_at or scan.created_at)[:10]
         label = f"{icon} {scan.title[:22]} · {target_label[:5]}"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"scan:{scan.id}")])
-    rows.append([InlineKeyboardButton(text="🔎 Новый скан", callback_data="start_scan")])
+    rows.append([InlineKeyboardButton(text="▶️ Запустить парсер", callback_data="start_scan")])
     rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1009,7 +1010,7 @@ async def upsert_page_items(
                     title=item.title, price_text=item.price_text, price_eur=item.price_eur,
                     posted_text=item.posted_text, posted_date_msk=(posted_date_moscow(item.posted_text).isoformat() if posted_date_moscow(item.posted_text) else None),
                     url=item.url, first_seen_at=now, last_seen_at=now,
-                    is_active=True, disappeared_at=None,
+                    is_active=True, is_promoted=False, disappeared_at=None,
                     **identity_values,
                 ))
                 if item.price_text:
@@ -1047,9 +1048,34 @@ async def upsert_page_items(
                 row.url = item.url
                 row.last_seen_at = now
                 row.is_active = True
+                row.is_promoted = False
                 row.disappeared_at = None
         await session.commit()
         return new_items, len(unique) - len(new_items), enriched_count
+
+
+async def mark_promoted_listings(external_ids: list[str] | set[str]) -> int:
+    """Hide paid-visibility ads that were already stored by an older parser run.
+
+    We do not create rows for promoted-only cards. Existing rows are marked so
+    today's global exports/popular lists stop showing them immediately. If the
+    feature expires, a later organic sighting resets is_promoted in upsert_page_items.
+    """
+    ids = {str(x).strip() for x in external_ids if str(x).strip()}
+    if not ids:
+        return 0
+    async with db_write_lock:
+        async with SessionLocal() as session:
+            result = await session.execute(select(Listing).where(Listing.external_id.in_(list(ids))))
+            rows = list(result.scalars().all())
+            changed = 0
+            for row in rows:
+                if not getattr(row, "is_promoted", False):
+                    row.is_promoted = True
+                    changed += 1
+            if changed:
+                await session.commit()
+            return changed
 
 
 def berlin_today_utc_bounds() -> tuple[datetime, datetime]:
@@ -1067,6 +1093,7 @@ async def today_rows() -> list[Listing]:
     async with SessionLocal() as session:
         result = await session.execute(select(Listing).where(
             Listing.first_seen_at >= start_utc, Listing.first_seen_at < end_utc,
+            Listing.is_promoted.is_(False),
         ))
         return list(result.scalars().all())
 
@@ -1958,6 +1985,7 @@ class ScanJob:
     matched_ids: set[str] | None = None
     quality_scores: list[int] | None = None
     quality_notes: list[str] | None = None
+    stop_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False, compare=False)
 
 
 @dataclass
@@ -2005,6 +2033,7 @@ active_jobs: dict[int, ScanJob] = {}
 queued_job_ids: list[str] = []
 job_guard = asyncio.Lock()
 category_inflight: dict[str, asyncio.Task[ScanResult]] = {}
+category_inflight_waiters: dict[str, int] = {}
 category_inflight_guard = asyncio.Lock()
 # Exact-date cache must preserve the exact 25/50/100-page result set, so v3.0.6
 # caches ScanResult (including matched IDs) in memory instead of reconstructing a
@@ -2292,6 +2321,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             else:
                 info = await parser.parse_category_page_info(page_url(base_url, page), page)
                 cache[page] = info
+                promoted_ids = list(getattr(info, "promoted_ids", None) or [])
+                if promoted_ids:
+                    await mark_promoted_listings(promoted_ids)
                 network_requests += 1
                 cards_seen += int(getattr(info, "raw_candidates", 0) or 0)
                 listings_parsed += len(info.items)
@@ -2762,7 +2794,15 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
 
 def job_keyboard(job_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отменить парсинг", callback_data=f"cancel_scan:{job_id}")],
+        [InlineKeyboardButton(text="⏹ Остановить парсер", callback_data=f"cancel_scan:{job_id}")],
+    ])
+
+
+def stopped_job_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗂 Выбрать категории", callback_data="groups")],
+        [InlineKeyboardButton(text="▶️ Запустить парсер", callback_data="start_scan")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")],
     ])
 
 
@@ -2784,9 +2824,25 @@ async def _scan_category_task(cat, user_id: int, page_limit: int, target_date: s
         await parser.close()
 
 
-async def dispatch_category(cat, user_id: int, page_limit: int, target_date: str) -> CategoryDispatchResult:
-    """Reuse only results with the same category + date + requested depth."""
+async def dispatch_category(
+    cat,
+    user_id: int,
+    page_limit: int,
+    target_date: str,
+    *,
+    stop_event: asyncio.Event | None = None,
+) -> CategoryDispatchResult:
+    """Reuse only results with the same category + date + requested depth.
+
+    Each user job is a subscriber to the shared category task. Pressing Stop
+    detaches that job immediately. If it was the last subscriber, the actual
+    network parser task is cancelled too; if another user still needs the same
+    shared scan, their work is left untouched.
+    """
     inflight_key = _progress_key(cat.key, target_date, page_limit)
+
+    if stop_event is not None and stop_event.is_set():
+        raise ScanStopRequested()
 
     if CATEGORY_CACHE_TTL_SECONDS > 0:
         cached = category_result_cache.get(inflight_key)
@@ -2794,6 +2850,8 @@ async def dispatch_category(cat, user_id: int, page_limit: int, target_date: str
             cached_at, cached_result = cached
             age = max(0, int(time.monotonic() - cached_at))
             if age <= CATEGORY_CACHE_TTL_SECONDS:
+                if stop_event is not None and stop_event.is_set():
+                    raise ScanStopRequested()
                 return CategoryDispatchResult(source="cache", result=cached_result, cache_age_seconds=age)
             category_result_cache.pop(inflight_key, None)
 
@@ -2808,17 +2866,41 @@ async def dispatch_category(cat, user_id: int, page_limit: int, target_date: str
             source = "scan"
         else:
             source = "shared"
+        category_inflight_waiters[inflight_key] = category_inflight_waiters.get(inflight_key, 0) + 1
 
+    stopped = False
+    cancel_underlying = False
     try:
-        result = await asyncio.shield(task)
+        result = await wait_for_task_or_stop(task, stop_event)
         if CATEGORY_CACHE_TTL_SECONDS > 0:
             category_result_cache[inflight_key] = (time.monotonic(), result)
         return CategoryDispatchResult(source=source, result=result)
+    except ScanStopRequested:
+        stopped = True
+        raise
     finally:
-        if task.done():
+        async with category_inflight_guard:
+            remaining = max(0, category_inflight_waiters.get(inflight_key, 1) - 1)
+            if remaining:
+                category_inflight_waiters[inflight_key] = remaining
+            else:
+                category_inflight_waiters.pop(inflight_key, None)
+                # No one else needs this network scan. A user-requested stop must
+                # terminate the HTTP/parser task rather than merely hide progress.
+                if stopped and category_inflight.get(inflight_key) is task and not task.done():
+                    cancel_underlying = True
+                    task.cancel()
+
+            if task.done() and category_inflight.get(inflight_key) is task:
+                category_inflight.pop(inflight_key, None)
+
+        if cancel_underlying:
+            await asyncio.gather(task, return_exceptions=True)
             async with category_inflight_guard:
                 if category_inflight.get(inflight_key) is task:
                     category_inflight.pop(inflight_key, None)
+
+        if task.done() or cancel_underlying:
             category_live_progress.pop(inflight_key, None)
 
 
@@ -2989,7 +3071,7 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
     job.state = "cancelled" if cancelled else ("partial" if job.incomplete_categories else "done")
     if cancelled:
         text = (
-            "❌ <b>Парсинг отменён</b>\n\n"
+            "⏹ <b>Парсинг остановлен</b>\n\n"
             f"Категорий обработано: <b>{job.completed_categories}/{len(job.category_keys)}</b>\n"
             f"Новых найдено: <b>{job.total_new}</b>\n"
             f"⏱ Время: <b>{elapsed_text}</b>"
@@ -3014,6 +3096,15 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
             "📄 Формирую файл с результатом…"
         )
     await edit_job_status(bot, job, text, force=True)
+    if cancelled:
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=job.chat_id,
+                message_id=job.status_message_id,
+                reply_markup=stopped_job_keyboard(),
+            )
+        except Exception:
+            log.debug("Could not attach stopped-job actions job=%s", job.job_id, exc_info=True)
 
     if not cancelled:
         try:
@@ -3113,7 +3204,11 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
         )
         try:
             await edit_job_status(bot, job, render_user_job_status(job), force=True)
-            dispatched = await dispatch_category(cat, job.user_id, job.page_limit, job.target_date)
+            dispatched = await dispatch_category(
+                cat, job.user_id, job.page_limit, job.target_date, stop_event=job.stop_event
+            )
+            if job.cancel_requested or job.stop_event.is_set():
+                raise ScanStopRequested()
             result = dispatched.result
             source_label = "♻️ кэш"
             if dispatched.source == "cache":
@@ -3188,6 +3283,10 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
                 break
             # User sees only useful progress; cache/shared/worker details stay internal.
             await edit_job_status(bot, job, render_user_job_status(job), force=True)
+        except ScanStopRequested:
+            job.cancel_requested = True
+            log.info("User stopped scan job=%s category=%s", job.job_id, cat.name)
+            break
         except Exception as exc:
             log.exception("Queue scan error job=%s category=%s", job.job_id, cat.name)
             note = f"{cat.name}: ошибка скана — {str(exc)[:160]}"
@@ -4084,7 +4183,8 @@ async def setup_bot_commands(bot: Bot) -> None:
     """Configure Telegram's bottom-left Menu button and command list."""
     user_commands = [
         BotCommand(command="start", description="🏠 Главное меню"),
-        BotCommand(command="new_scan", description="🔎 Новый скан"),
+        BotCommand(command="new_scan", description="▶️ Запустить парсер"),
+        BotCommand(command="stop", description="⏹ Остановить парсер"),
         BotCommand(command="my_scans", description="📊 Мои сканы"),
         BotCommand(command="popular", description="🔥 Популярное сейчас"),
         BotCommand(command="categories", description="🗂 Категории"),
@@ -4118,7 +4218,7 @@ async def _send_home_message(message: Message, user_id: int, *, intro: bool = Fa
             f"<b>🔍 Kleinanzeigen Parser v{APP_VERSION}</b>\n\n"
             "Здесь всё строится вокруг сохранённых сканов:\n"
             "🔥 <b>Популярное сейчас</b> — лидеры по просмотрам\n"
-            "🔎 <b>Новый скан</b> — собрать свежие объявления\n"
+            "▶️ <b>Запустить парсер</b> — собрать свежие объявления\n"
             "📊 <b>Мои сканы</b> — вернуться к любому запуску, обновить просмотры и увидеть рост\n\n"
             "После скана результат не теряется: его карточка остаётся в «Мои сканы»."
         )
@@ -4272,7 +4372,7 @@ async def help_command(message: Message, state: FSMContext) -> None:
     await message.answer(
         "<b>ℹ️ Быстрое меню</b>\n\n"
         "Нажми кнопку <b>Menu</b> рядом со строкой ввода — там собраны основные разделы бота.\n\n"
-        "🔎 Новый скан — начать сбор\n"
+        "▶️ Запустить парсер — начать сбор\n"
         "📊 Мои сканы — история запусков\n"
         "🔥 Популярное — рейтинги просмотров и роста\n"
         "🗂 Категории — выбрать, что сканировать\n"
@@ -5343,29 +5443,71 @@ async def queue_status(callback: CallbackQuery) -> None:
     await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
+async def request_user_scan_stop(user_id: int, job_id: str | None = None) -> tuple[ScanJob | None, str]:
+    """Set the hard-stop signal used by both the button and /stop command."""
+    async with job_guard:
+        job = active_jobs.get(user_id)
+        if job is None or (job_id is not None and job.job_id != job_id):
+            return None, "missing"
+        if job.state not in {"queued", "running"}:
+            return None, "finished"
+        job.cancel_requested = True
+        job.stop_event.set()
+        if job.job_id in queued_job_ids:
+            queued_job_ids.remove(job.job_id)
+        return job, job.state
+
+
+@dp.message(Command("stop"))
+async def stop_scan_command(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if not allowed(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+    job, previous_state = await request_user_scan_stop(message.from_user.id)
+    if job is None:
+        await message.answer(
+            "✅ Сейчас активного парсинга нет.",
+            reply_markup=main_keyboard(len(await get_selected(message.from_user.id))),
+        )
+        return
+    if previous_state == "queued":
+        await message.answer(
+            "⏹ <b>Парсинг остановлен.</b> Задание снято до начала сетевого сканирования.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=stopped_job_keyboard(),
+        )
+    else:
+        await message.answer(
+            "⏹ <b>Останавливаю парсер прямо сейчас…</b>\n\n"
+            "Новые страницы и объявления больше не будут запускаться. Можно сразу выбрать другую категорию.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=stopped_job_keyboard(),
+        )
+
+
 @dp.callback_query(F.data.startswith("cancel_scan:"))
 async def cancel_scan(callback: CallbackQuery) -> None:
     job_id = callback.data.split(":", 1)[1]
-    async with job_guard:
-        job = active_jobs.get(callback.from_user.id)
-        if job is None or job.job_id != job_id:
-            await callback.answer("Активная задача уже не найдена", show_alert=True)
-            return
-        job.cancel_requested = True
-        if job.job_id in queued_job_ids:
-            queued_job_ids.remove(job.job_id)
-        state = job.state
-    if state == "queued":
-        await callback.answer("Задача отменена")
+    job, previous_state = await request_user_scan_stop(callback.from_user.id, job_id)
+    if job is None:
+        await callback.answer("Активная задача уже не найдена", show_alert=True)
+        return
+
+    if previous_state == "queued":
+        await callback.answer("Парсинг остановлен")
         await callback.message.edit_text(
-            "❌ <b>Парсинг отменён</b>",
+            "⏹ <b>Парсинг остановлен</b>\n\nЗадание снято до начала сканирования.",
             parse_mode=ParseMode.HTML,
+            reply_markup=stopped_job_keyboard(),
         )
     else:
-        await callback.answer("Отмена принята")
+        await callback.answer("Останавливаю парсер")
         await callback.message.edit_text(
-            "⏳ <b>Останавливаю парсинг…</b>\n\nТекущая категория завершится, после чего запуск остановится.",
+            "⏹ <b>Останавливаю парсер прямо сейчас…</b>\n\n"
+            "Текущий сетевой скан отменяется. Можно сразу выбрать другую категорию.",
             parse_mode=ParseMode.HTML,
+            reply_markup=stopped_job_keyboard(),
         )
 
 
