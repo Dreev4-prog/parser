@@ -1,4 +1,4 @@
-# Kleinanzeigen Parser Bot v3.1.4
+# Kleinanzeigen Parser Bot v3.1.5
 
 ## v3.1.3 — 403 Recovery / Safe Multi-User
 
@@ -29,7 +29,7 @@ traffic controller for commercial multi-user operation.
 - **Actual measurement time remains authoritative.** Background popularity checkpoints can be delayed
   by traffic pressure without pretending they ran at an exact clock second.
 
-Recommended starting values are included in `.env.example`; v3.1.4 uses lightweight direct-only mass view refreshes and lower view concurrency. Tune upward only after observing real 403 rate and latency.
+Recommended starting values are included in `.env.example`; v3.1.5 uses real direct-only control measurements and lower view concurrency. Tune upward only after observing real 403 rate and latency.
 
 ## v3.1.1 — Multi-category isolation fix
 
@@ -143,3 +143,14 @@ redeploys depending on storage configuration.
 - Повторное нажатие для того же скана не создаёт второй сбор. После окончания бот сам присылает уведомление и кнопки к динамике/скану.
 - Фоновые ручные и автоматические замеры проходят через один лёгкий collector. После первого задания следующее заново проверяет DB cache, поэтому одинаковые ID из пересекающихся пользовательских сканов не запрашиваются повторно в течение 5 минут.
 - Общий DB cache `views_checked_at` продолжает переиспользовать свежие значения между пользователями и пересекающимися сканами.
+
+
+## v3.1.5 — Real View Snapshots + Animated Background Progress
+
+- Manual `👁 Обновить просмотры` runs as a true background task and immediately shows a separate live percentage/progress message.
+- The Telegram UI remains usable while the measurement runs; progress edits are throttled to roughly once every 1.5 seconds / batch.
+- Manual and scheduled 1/3/6/12/24h checkpoints require genuinely fresh Direct View values. The normal multi-minute cache can no longer create a fake observation point.
+- A tiny `VIEW_MEASUREMENT_REUSE_SECONDS` window (20s default) only coalesces truly simultaneous measurements across users.
+- If zero fresh values are available, no new observation point is created.
+- Completion replaces the progress message with a clear summary: fresh values, direct requests, simultaneous reuse, missing counters, listings that grew, maximum and total growth.
+- Chromium/browser fallback remains disabled for mass measurement jobs.

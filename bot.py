@@ -77,6 +77,10 @@ STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVA
 # Recent values are cached so shared/multi-user scans do not reopen the same ad.
 VIEW_COUNT_CACHE_TTL_SECONDS = max(60, int(os.getenv("VIEW_COUNT_CACHE_TTL_SECONDS", "1800")))
 VIEW_COUNT_CONCURRENCY = max(1, min(10, int(os.getenv("VIEW_COUNT_CONCURRENCY", "3"))))
+# A control measurement must be fresh. This tiny window is only for coalescing
+# truly simultaneous checks of the same IDs across users/scans; it is not a
+# normal cache and cannot replace a 1/3/6/12/24h measurement.
+VIEW_MEASUREMENT_REUSE_SECONDS = max(0, min(60, int(os.getenv("VIEW_MEASUREMENT_REUSE_SECONDS", "20"))))
 VIEW_COUNT_EXPORT_MODES = {"newest", "all", "unique", "below_market"}
 
 # v3.1 keeps the v3.0.7 Popularity Tracker. Every completed scan gets automatic public-view
@@ -608,8 +612,15 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
         await ensure_scan_observation_plan(job.scan_id, now)
 
 
-async def update_scan_view_refresh(scan_id: int, target_hours: int | None = None) -> int:
-    """Store one complete view observation round for a saved scan."""
+async def update_scan_view_refresh(
+    scan_id: int, target_hours: int | None = None, *, fresh_after: datetime | None = None
+) -> int:
+    """Store one real view observation round for a saved scan.
+
+    v3.1.5 never creates a new point from arbitrary stale values already sitting
+    in ``listings``. ``fresh_after`` is the start of the current measurement
+    (minus the tiny simultaneous-request reuse window).
+    """
     now = datetime.utcnow()
     async with db_write_lock:
         async with SessionLocal() as session:
@@ -621,12 +632,16 @@ async def update_scan_view_refresh(scan_id: int, target_hours: int | None = None
                 .join(ScanListing, Listing.external_id == ScanListing.external_id)
                 .where(ScanListing.scan_id == scan_id)
             )
-            if target_hours is not None:
-                # Scheduled checkpoints must contain freshly read counters, not stale values
-                # left in the listing table after a failed request.
+            if fresh_after is not None:
                 query = query.where(
                     Listing.views_checked_at.is_not(None),
-                    Listing.views_checked_at >= now - timedelta(minutes=15),
+                    Listing.views_checked_at >= fresh_after,
+                )
+            elif target_hours is not None:
+                # Compatibility safety for older callers.
+                query = query.where(
+                    Listing.views_checked_at.is_not(None),
+                    Listing.views_checked_at >= now - timedelta(minutes=2),
                 )
             result = await session.execute(query)
             values = list(result.all())
@@ -642,8 +657,9 @@ async def update_scan_view_refresh(scan_id: int, target_hours: int | None = None
                     target_hours=target_hours,
                 ))
                 recorded += 1
-            scan.viewed_count = recorded
-            scan.last_view_refresh_at = now
+            if recorded > 0:
+                scan.viewed_count = recorded
+                scan.last_view_refresh_at = now
             await session.commit()
             return recorded
 
@@ -681,6 +697,63 @@ async def get_scan_history_rounds(scan_id: int, limit: int = 12) -> list[tuple[d
         merged[dt] = (int(count or 0), int(total or 0))
     ordered = sorted(merged.items(), key=lambda item: item[0], reverse=True)[:limit]
     return [(dt, count, total) for dt, (count, total) in ordered]
+
+
+async def get_latest_manual_growth_summary(scan_id: int) -> tuple[int, int, int]:
+    """Return (grew_count, max_delta, total_delta) for the latest real round.
+
+    The comparison is against the immediately previous observation point for
+    each listing (or the initial scan snapshot when this is the first refresh).
+    """
+    pairs = await get_scan_rows(scan_id)
+    if not pairs:
+        return 0, 0, 0
+    baseline = {
+        listing.external_id: (snap.captured_at, int(snap.initial_view_count))
+        for listing, snap in pairs if snap.initial_view_count is not None
+    }
+    ids = list(baseline)
+    if not ids:
+        return 0, 0, 0
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(
+                ScanViewHistory.external_id,
+                ScanViewHistory.view_count,
+                ScanViewHistory.recorded_at,
+            )
+            .where(
+                ScanViewHistory.scan_id == scan_id,
+                ScanViewHistory.external_id.in_(ids),
+            )
+            .order_by(ScanViewHistory.external_id, ScanViewHistory.recorded_at)
+        )
+        points = list(result.all())
+
+    by_id: dict[str, list[tuple[datetime, int]]] = {}
+    for external_id, (captured_at, initial_views) in baseline.items():
+        by_id[external_id] = [(captured_at, initial_views)]
+    for external_id, view_count, recorded_at in points:
+        by_id.setdefault(external_id, []).append((recorded_at, int(view_count)))
+
+    grew = 0
+    max_delta = 0
+    total_delta = 0
+    for series in by_id.values():
+        series.sort(key=lambda item: item[0])
+        # Deduplicate an identical timestamp/value pair defensively.
+        compact: list[tuple[datetime, int]] = []
+        for point in series:
+            if not compact or point != compact[-1]:
+                compact.append(point)
+        if len(compact) < 2:
+            continue
+        delta = compact[-1][1] - compact[-2][1]
+        if delta > 0:
+            grew += 1
+            total_delta += delta
+            max_delta = max(max_delta, delta)
+    return grew, max_delta, total_delta
 
 
 async def get_scan_growth_rows(
@@ -1286,6 +1359,8 @@ async def refresh_view_counts(
     rows: list[Listing], message: Message | BotChatAdapter | None = None, *,
     force: bool = False, max_age_seconds: int | None = None,
     traffic_priority: str = "manual",
+    progress_message: Message | None = None,
+    progress_title: str | None = None,
 ) -> tuple[int, int, int]:
     """Refresh missing/stale public view counters and persist them.
 
@@ -1297,19 +1372,19 @@ async def refresh_view_counts(
 
     effective_ttl = VIEW_COUNT_CACHE_TTL_SECONDS if max_age_seconds is None else max(0, int(max_age_seconds))
     cutoff = datetime.utcnow() - timedelta(seconds=effective_ttl)
+    eligible = [row for row in rows if row.url]
     targets = [
-        row for row in rows
-        if row.url and (force or row.views_checked_at is None or row.views_checked_at < cutoff)
+        row for row in eligible
+        if force or row.views_checked_at is None or row.views_checked_at < cutoff
     ]
-    if not targets:
-        return 0, 0, 0
+    reused_count = max(0, len(eligible) - len(targets))
 
-    status = None
-    status_note = "свежий запрос" if force else f"кэш {max(1, effective_ttl // 60)} мин."
-    if message is not None:
+    status = progress_message
+    status_note = "свежий контрольный замер" if effective_ttl <= 60 else f"кэш {max(1, effective_ttl // 60)} мин."
+    if status is None and message is not None:
         try:
             status = await message.answer(
-                f"👁 Собираю просмотры для <b>{len(targets)}</b> объявлений…\n"
+                f"👁 Собираю просмотры для <b>{len(eligible)}</b> объявлений…\n"
                 f"⚡ Лёгкий прямой счётчик · без browser fallback · {status_note}",
                 parse_mode=ParseMode.HTML,
             )
@@ -1322,18 +1397,30 @@ async def refresh_view_counts(
         nonlocal last_progress_edit
         if status is not None and hasattr(status, "edit_text"):
             now_mono = time.monotonic()
-            if done < total and now_mono - last_progress_edit < 2.0:
+            completed = min(len(eligible), reused_count + done)
+            all_total = max(1, len(eligible))
+            if completed < all_total and now_mono - last_progress_edit < 1.5:
                 return
             last_progress_edit = now_mono
             try:
-                pct = round(done / total * 100) if total else 100
+                pct = round(completed / all_total * 100) if eligible else 100
+                title = progress_title or "👁 Собираю просмотры"
                 await status.edit_text(
-                    f"👁 Собираю просмотры… <b>{done}/{total}</b> ({pct}%)\n"
-                    f"⚡ Лёгкий прямой счётчик · без browser fallback · {status_note}",
+                    f"<b>{html.escape(title)}</b>\n\n"
+                    f"{_progress_bar(pct)} <b>{pct}%</b>\n"
+                    f"📦 Проверено: <b>{completed}/{len(eligible)}</b>\n"
+                    f"⚡ Direct-запросы: <b>{done}/{len(targets)}</b>\n"
+                    f"♻️ Уже свежих: <b>{reused_count}</b>\n\n"
+                    "Можно пользоваться другими разделами — замер идёт в фоне.",
                     parse_mode=ParseMode.HTML,
                 )
             except Exception:
                 pass
+
+    if status is not None:
+        await progress_cb(0, len(targets))
+    if not targets:
+        return 0, 0, 0
 
     parser = KleinanzeigenParser()
     try:
@@ -1478,11 +1565,15 @@ async def process_observation(bot: Bot, obs: ScanObservation) -> None:
         return
 
     try:
+        measurement_started = datetime.utcnow() - timedelta(seconds=VIEW_MEASUREMENT_REUSE_SECONDS)
         async with background_view_refresh_lock:
             requested, updated, failed = await refresh_view_counts(
-                rows, None, force=False, max_age_seconds=300, traffic_priority="background"
+                rows, None, force=False, max_age_seconds=VIEW_MEASUREMENT_REUSE_SECONDS,
+                traffic_priority="background"
             )
-            recorded = await update_scan_view_refresh(scan.id, target_hours=obs.target_hours)
+            recorded = await update_scan_view_refresh(
+                scan.id, target_hours=obs.target_hours, fresh_after=measurement_started
+            )
         if recorded <= 0:
             await mark_observation_result(
                 obs.id, status="error", item_count=0,
@@ -1909,7 +2000,7 @@ category_inflight_guard = asyncio.Lock()
 category_result_cache: dict[str, tuple[float, ScanResult]] = {}
 db_write_lock = asyncio.Lock()
 
-# v3.1.4 manual view refreshes are true background jobs. A user can navigate
+# v3.1.5 manual view refreshes are true background jobs. A user can navigate
 # anywhere in the bot while the refresh continues, and duplicate refreshes of the
 # same scan are coalesced into one task.
 manual_view_tasks: dict[int, asyncio.Task] = {}
@@ -3220,7 +3311,7 @@ async def start(message: Message, state: FSMContext) -> None:
         return
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>🔍 Kleinanzeigen Parser v3.1.4</b>\n\n"
+        "<b>🔍 Kleinanzeigen Parser v3.1.5</b>\n\n"
         "Здесь всё строится вокруг сохранённых сканов:\n"
         "🔥 <b>Популярное сейчас</b> — лидеры по просмотрам\n"
         "🔎 <b>Новый скан</b> — собрать свежие объявления\n"
@@ -3238,7 +3329,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v3.1.4</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v3.1.5</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == "post_settings")
@@ -3259,7 +3350,7 @@ async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
     await callback.message.answer(
-        "<b>🔍 Kleinanzeigen Parser v3.1.4</b>\n\nЧто хочешь посмотреть?",
+        "<b>🔍 Kleinanzeigen Parser v3.1.5</b>\n\nЧто хочешь посмотреть?",
         reply_markup=main_keyboard(len(selected)),
         parse_mode=ParseMode.HTML,
     )
@@ -3506,7 +3597,7 @@ async def run_view_test(message: Message, state: FSMContext) -> None:
         lines += [
             "",
             f"📈 Ускорение на тесте: <b>примерно ×{speedup:.1f}</b>",
-            "✅ Массовый сбор v3.1.4 использует только быстрый direct-счётчик. Chromium оставлен только для этого точечного теста/диагностики.",
+            "✅ Массовый сбор v3.1.5 использует только быстрый direct-счётчик. Chromium оставлен только для этого точечного теста/диагностики.",
         ]
     else:
         lines += [
@@ -4068,7 +4159,9 @@ async def scan_history(callback: CallbackQuery) -> None:
     await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan_id))
 
 
-async def _manual_view_refresh_job(bot: Bot, user_id: int, scan_id: int) -> None:
+async def _manual_view_refresh_job(
+    bot: Bot, user_id: int, scan_id: int, progress_message: Message | None = None
+) -> None:
     try:
         scan = await get_user_scan(user_id, scan_id)
         if scan is None:
@@ -4076,42 +4169,80 @@ async def _manual_view_refresh_job(bot: Bot, user_id: int, scan_id: int) -> None
         pairs = await get_scan_rows(scan_id)
         rows = [row for row, _ in pairs]
         if not rows:
-            await bot.send_message(user_id, "ℹ️ В этом скане пока нет объявлений для обновления.")
+            if progress_message is not None:
+                await progress_message.edit_text("ℹ️ В этом скане пока нет объявлений для обновления.")
+            else:
+                await bot.send_message(user_id, "ℹ️ В этом скане пока нет объявлений для обновления.")
             return
 
-        # Manual mass refresh is intentionally low-impact. New category scans keep
-        # priority in the shared Traffic Manager while this job advances in batches.
+        title = html.escape(scan.title)
+        measurement_started = datetime.utcnow() - timedelta(seconds=VIEW_MEASUREMENT_REUSE_SECONDS)
+
+        # A manual control measurement is fresh: the normal 5/30-minute view cache
+        # cannot substitute it. Only values fetched in the last few seconds may be
+        # shared with another simultaneous user's measurement.
         async with background_view_refresh_lock:
             requested, updated, failed = await refresh_view_counts(
-                rows, None, force=False, max_age_seconds=300, traffic_priority="background"
+                rows, None, force=False, max_age_seconds=VIEW_MEASUREMENT_REUSE_SECONDS,
+                traffic_priority="background",
+                progress_message=progress_message,
+                progress_title=f"👁 Повторный замер · {scan.title}",
             )
-            recorded = await update_scan_view_refresh(scan_id)
-        scan = await get_user_scan(user_id, scan_id)
-        title = html.escape(scan.title) if scan is not None else f"Скан #{scan_id}"
+            recorded = await update_scan_view_refresh(
+                scan_id, fresh_after=measurement_started
+            )
+
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🚀 Открыть динамику", callback_data=f"scangrowth:{scan_id}:1"),
              InlineKeyboardButton(text="🔥 Топ", callback_data=f"scantop:{scan_id}")],
             [InlineKeyboardButton(text="📊 Открыть этот скан", callback_data=f"scan:{scan_id}")],
         ])
-        await bot.send_message(
-            user_id,
+
+        if recorded <= 0:
+            text = (
+                f"⚠️ <b>Замер не выполнен</b>\n\n"
+                f"Скан: <b>{title}</b>\n"
+                f"📦 Объявлений: <b>{len(rows)}</b>\n"
+                f"👁 Свежих значений получить не удалось.\n\n"
+                "Новая точка наблюдения не создана. Остальными разделами бота можно пользоваться как обычно."
+            )
+            if progress_message is not None:
+                await progress_message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            else:
+                await bot.send_message(user_id, text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            return
+
+        reused = max(0, recorded - updated)
+        grew_count, max_delta, total_delta = await get_latest_manual_growth_summary(scan_id)
+        text = (
             f"✅ <b>Просмотры обновлены</b>\n\n"
             f"Скан: <b>{title}</b>\n"
-            f"👁 Запрошено: <b>{requested}</b>\n"
-            f"✅ Получено значений: <b>{updated}</b>\n"
-            f"▫️ Без данных: <b>{failed}</b>\n"
-            f"📈 Сохранено в точку наблюдения: <b>{recorded}</b>\n\n"
-            "Можно открывать динамику и TOP — бот всё это время остаётся доступен для других действий.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
+            f"📦 Объявлений: <b>{len(rows)}</b>\n"
+            f"👁 Свежих значений: <b>{recorded}</b>\n"
+            f"⚡ Получено direct-запросами: <b>{updated}</b>\n"
+            f"♻️ Переиспользовано одновременно свежих: <b>{reused}</b>\n"
+            f"▫️ Без данных: <b>{max(0, len(rows) - recorded)}</b>\n\n"
+            f"🚀 Выросли с прошлого замера: <b>{grew_count}</b>\n"
+            f"🔥 Максимальный прирост: <b>+{max_delta}</b>\n"
+            f"📈 Суммарный прирост: <b>+{total_delta}</b>\n"
+            f"🕐 Замер: <b>{_moscow_text(datetime.utcnow())} МСК</b>\n\n"
+            "TOP и динамика уже пересчитаны по этой реальной точке наблюдения."
         )
-    except Exception as exc:
+        if progress_message is not None:
+            await progress_message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        else:
+            await bot.send_message(user_id, text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    except Exception:
         log.exception("Manual background view refresh failed scan=%s", scan_id)
         try:
-            await bot.send_message(
-                user_id,
-                "⚠️ Не удалось полностью обновить просмотры. Остальные разделы бота продолжают работать; попробуй обновить этот скан позже.",
+            text = (
+                "⚠️ Не удалось полностью обновить просмотры. Новая точка наблюдения не будет считаться готовой; "
+                "остальные разделы бота продолжают работать."
             )
+            if progress_message is not None:
+                await progress_message.edit_text(text)
+            else:
+                await bot.send_message(user_id, text)
         except Exception:
             pass
     finally:
@@ -4138,15 +4269,23 @@ async def scan_refresh_views(callback: CallbackQuery, bot: Bot) -> None:
         if existing is not None and not existing.done():
             await callback.answer("👁 Просмотры этого скана уже обновляются в фоне")
             return
+
+        # This is a separate message, so navigating menus cannot overwrite it.
+        progress_message = await callback.message.answer(
+            f"<b>👁 Повторный замер · {html.escape(scan.title)}</b>\n\n"
+            f"{_progress_bar(0)} <b>0%</b>\n"
+            f"📦 Проверено: <b>0/{len(pairs)}</b>\n\n"
+            "Можно сразу переходить в другие разделы — замер работает в фоне.",
+            parse_mode=ParseMode.HTML,
+        )
         task = asyncio.create_task(
-            _manual_view_refresh_job(bot, callback.from_user.id, scan_id),
+            _manual_view_refresh_job(bot, callback.from_user.id, scan_id, progress_message),
             name=f"manual-view-refresh-{scan_id}",
         )
         manual_view_tasks[scan_id] = task
 
-    # Return control to Telegram immediately. No long handler and no hundreds of
-    # editMessage calls: menus/buttons stay responsive while the background task runs.
-    await callback.answer("✅ Обновление запущено в фоне")
+    # Handler returns immediately; the progress message is edited at most every ~1.5 s.
+    await callback.answer("👁 Замер запущен в фоне")
 
 
 @dp.callback_query(F.data.startswith("scanexport:"))
