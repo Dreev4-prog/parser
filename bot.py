@@ -2867,26 +2867,22 @@ def _progress_bar(percent: int) -> str:
 
 
 def render_user_job_status(job: ScanJob) -> str:
+    """Compact user-facing scan progress. Technical diagnostics stay in logs/results."""
     total = max(1, len(job.category_keys))
     depth = job.page_limit if job.page_limit in PAGE_LIMIT_CHOICES else 50
 
     if job.state == "queued":
         waited = max(0, int((datetime.utcnow() - job.created_at).total_seconds()))
         return (
-            "⏳ <b>Подготавливаю парсинг…</b>\n\n"
-            f"Выбрано категорий: <b>{total}</b>\n"
-            f"Дата: <b>{_date_label(job.target_date)} (МСК)</b>\n"
-            f"Глубина: <b>{depth} страниц от начала этой даты</b>\n"
-            f"Подготовка: <b>{waited} сек</b>\n\n"
-            "⚡ Сначала бот быстро найдёт стартовую страницу выбранного дня."
+            "⏳ <b>Готовлю скан…</b>\n\n"
+            f"📂 Категорий: <b>{total}</b>\n"
+            f"📅 <b>{_date_label(job.target_date)}</b> · 📄 <b>{depth} стр.</b>\n"
+            f"⏱ <b>{_human_duration(waited)}</b>"
         )
 
     live = category_live_progress.get(job.current_progress_key) if job.current_progress_key else None
-    current_page = live.page if live is not None else 0
     current_today = live.today_seen if live is not None else 0
-    live_new = live.new_count if live is not None else 0
     live_views_ready = live.views_ready if live is not None else 0
-    live_views_failed = live.views_failed if live is not None else 0
 
     current_fraction = 0.0
     if live is not None and live.phase == "collecting" and depth > 0:
@@ -2900,57 +2896,30 @@ def render_user_job_status(job: ScanJob) -> str:
         elapsed = max(0, int(time.monotonic() - job.started_running_monotonic))
 
     category_line = html.escape(job.current_category) if job.current_category else "Подготовка…"
-    detail_lines = []
-    if live is not None:
-        if live.phase == "collecting":
-            detail_lines.append("🎯 Начало выбранной даты найдено")
-            if live.collection_start_page:
-                detail_lines.append(f"Стартовая страница Kleinanzeigen: <b>{live.collection_start_page}</b>")
-            detail_lines.append(
-                f"Страниц выбранной даты: <b>{live.collection_index}/{depth}</b>"
-            )
-            detail_lines.append("Этап: <b>собираю выбранную глубину</b>")
-        else:
-            if current_page:
-                detail_lines.append(f"Проверяю страницу: <b>{current_page}</b>")
-            if live.current_page_date:
-                hint = live.current_page_date
-                if ".." in hint:
-                    newer, older = hint.split("..", 1)
-                    detail_lines.append(
-                        f"Дата на ней: <b>{_date_label(newer)} — {_date_label(older)}</b>"
-                    )
-                else:
-                    detail_lines.append(f"Дата на ней: <b>{_date_label(hint)}</b>")
-            detail_lines.append("Этап: <b>⚡ ищу начало выбранной даты</b>")
+    category_index = max(1, job.current_category_index)
 
-    if current_today:
-        detail_lines.append(f"Найдено объявлений: <b>{current_today}</b>")
-        views = f"👁 Просмотры готовы: <b>{live_views_ready}/{current_today}</b>"
-        if live_views_failed:
-            views += f" · ошибок: <b>{live_views_failed}</b>"
-        detail_lines.append(views)
-    if live is not None and live.date_coverage_pct:
-        quality_icon = "🟢" if live.quality_score >= 90 else "🟡" if live.quality_score >= 75 else "🔴"
-        detail_lines.append(
-            f"{quality_icon} Проверка качества: <b>{live.quality_score}/100</b> · дат распознано <b>{live.date_coverage_pct}%</b>"
+    # Date-location can use jumps and internal fallback feeds, so page numbers and
+    # quality telemetry are intentionally hidden from the everyday UI.
+    if live is None or live.phase != "collecting":
+        return (
+            "🔄 <b>Парсинг</b>\n\n"
+            f"📂 <b>{category_line}</b> · {category_index}/{total}\n"
+            f"⚡ Ищу объявления за <b>{_date_label(job.target_date)}</b>…\n"
+            f"⏱ <b>{_human_duration(elapsed)}</b>"
         )
 
-    visible_new = job.total_new + live_new
-    detail_text = "\n".join(detail_lines)
-    if detail_text:
-        detail_text = "\n" + detail_text
+    pages_done = max(0, min(depth, int(live.collection_index or 0)))
+    views_text = ""
+    if current_today:
+        views_text = f" · 👁 <b>{min(live_views_ready, current_today)}</b>"
 
     return (
-        "🔄 <b>Парсинг идёт</b>\n\n"
-        f"{_progress_bar(percent)} <b>{percent}%</b>\n"
-        f"Категории: <b>{job.completed_categories}/{total}</b> готово\n"
-        f"Дата: <b>{_date_label(job.target_date)} (МСК)</b>\n"
-        f"Глубина: <b>{depth} страниц от начала даты</b>\n"
-        f"Сейчас: <b>{category_line}</b> · категория <b>{max(1, job.current_category_index)}/{total}</b>{detail_text}\n\n"
-        f"🆕 Найдено новых: <b>{visible_new}</b>\n"
-        f"⏱ Прошло: <b>{_human_duration(elapsed)}</b>\n\n"
-        "Прогресс обновляется автоматически."
+        f"🔄 <b>Парсинг · {percent}%</b>\n"
+        f"{_progress_bar(percent)}\n\n"
+        f"📂 <b>{category_line}</b> · {category_index}/{total}\n"
+        f"📄 <b>{pages_done}/{depth}</b> страниц\n"
+        f"📦 <b>{current_today}</b> объявлений{views_text}\n"
+        f"⏱ <b>{_human_duration(elapsed)}</b>"
     )
 
 
@@ -3303,7 +3272,7 @@ async def start(message: Message, state: FSMContext) -> None:
         return
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>🔍 Kleinanzeigen Parser v3.1.6</b>\n\n"
+        "<b>🔍 Kleinanzeigen Parser v3.1.7</b>\n\n"
         "Здесь всё строится вокруг сохранённых сканов:\n"
         "🔥 <b>Популярное сейчас</b> — лидеры по просмотрам\n"
         "🔎 <b>Новый скан</b> — собрать свежие объявления\n"
@@ -3321,7 +3290,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v3.1.6</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v3.1.7</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == "post_settings")
@@ -3342,7 +3311,7 @@ async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
     await callback.message.answer(
-        "<b>🔍 Kleinanzeigen Parser v3.1.6</b>\n\nЧто хочешь посмотреть?",
+        "<b>🔍 Kleinanzeigen Parser v3.1.7</b>\n\nЧто хочешь посмотреть?",
         reply_markup=main_keyboard(len(selected)),
         parse_mode=ParseMode.HTML,
     )
@@ -4500,14 +4469,7 @@ async def start_scan_with_pages(callback: CallbackQuery, state: FSMContext) -> N
 
     await update_setting(callback.from_user.id, "page_limit", page_limit)
     await state.clear()
-    await callback.answer("Запускаю скан")
-    await callback.message.answer(
-        f"<b>🔎 Запускаю скан</b>\n"
-        f"Дата: <b>{_date_label(target_date)} (МСК)</b>\n"
-        f"Глубина: <b>{page_limit} страниц от начала этой даты</b>\n"
-        "⚡ Сначала быстро найду стартовую страницу, затем начнётся обычный сбор.",
-        parse_mode=ParseMode.HTML,
-    )
+    await callback.answer("Скан запущен")
     await enqueue_user_scan(
         callback.message, callback.from_user.id, [cat.key for cat in selected_cats], page_limit, target_date
     )

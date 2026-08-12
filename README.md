@@ -1,4 +1,12 @@
-# Kleinanzeigen Parser Bot v3.1.6
+# Kleinanzeigen Parser Bot v3.1.7
+
+## v3.1.7 — Clean Live Progress
+
+- Simplified the live scan message to the essentials: current category, selected-date search state, page progress, listing count, view count, elapsed time, and one progress bar.
+- Hidden start-page numbers, date-coverage telemetry, parser quality diagnostics, internal phase labels, and other implementation details from the normal live UI. Diagnostics remain available in logs and final quality/warning handling.
+- Removed the extra “Launching scan” message. A scan now creates one live status card that changes from preparation → date search → collection.
+- Multi-category progress remains visible as `current/total`, while each category still performs its own independent date search.
+
 
 ## v3.1.6 — Clean Scan UI
 
