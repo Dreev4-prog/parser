@@ -41,6 +41,7 @@ from filters import (
 )
 from models import CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing, ScanObservation, ScanViewHistory, SelectedCategory, UserScan, UserSettings, ViewHistory
 from product_identity import TYPE_DISPLAY, ProductIdentity, recognize_product
+from traffic import TRAFFIC
 from parser import (
     MAX_PAGES_PER_CATEGORY,
     PAGE_DELAY_SECONDS,
@@ -51,6 +52,7 @@ from parser import (
     TemporaryAccessError,
     is_today_text,
     posted_date_moscow,
+    profile_page_dates,
     page_url,
 )
 
@@ -66,7 +68,7 @@ AVAILABILITY_CONCURRENCY = max(1, min(8, int(os.getenv("AVAILABILITY_CONCURRENCY
 
 # v2.6 Multi-User Core. User launches go into a queue. Only a limited number
 # of jobs are processed at once, while category scans are shared globally.
-MAX_CONCURRENT_JOBS = max(1, min(8, int(os.getenv("MAX_CONCURRENT_JOBS", "3"))))
+MAX_CONCURRENT_JOBS = max(1, min(12, int(os.getenv("MAX_CONCURRENT_JOBS", "4"))))
 MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
 CATEGORY_CACHE_TTL_SECONDS = max(0, int(os.getenv("CATEGORY_CACHE_TTL_SECONDS", "300")))
 STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVAL_SECONDS", "1.5")))
@@ -77,7 +79,7 @@ VIEW_COUNT_CACHE_TTL_SECONDS = max(60, int(os.getenv("VIEW_COUNT_CACHE_TTL_SECON
 VIEW_COUNT_CONCURRENCY = max(1, min(10, int(os.getenv("VIEW_COUNT_CONCURRENCY", "5"))))
 VIEW_COUNT_EXPORT_MODES = {"newest", "all", "unique", "below_market"}
 
-# v3.0.7 Popularity Tracker. Every completed scan gets automatic public-view
+# v3.1 keeps the v3.0.7 Popularity Tracker. Every completed scan gets automatic public-view
 # checkpoints. They are persisted, so a Railway restart does not lose the plan.
 OBSERVATION_HOURS = (1, 3, 6, 12, 24)
 OBSERVATION_POLL_SECONDS = max(15, int(os.getenv("OBSERVATION_POLL_SECONDS", "30")))
@@ -564,6 +566,9 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
             scan.new_count = job.total_new
             scan.target_complete = bool(not cancelled and job.incomplete_categories == 0)
             scan.scan_note = " | ".join((job.scan_notes or [])[:4])[:500]
+            quality_scores = [int(x) for x in (job.quality_scores or []) if x is not None]
+            scan.quality_score = round(sum(quality_scores) / len(quality_scores)) if quality_scores else 0
+            scan.quality_note = " | ".join((job.quality_notes or [])[:4])[:500]
             if cancelled:
                 await session.commit()
                 return
@@ -1238,6 +1243,7 @@ async def enrich_page_view_counts(
     results = await parser.fetch_public_view_counts(
         [item.url for item in targets],
         concurrency=VIEW_COUNT_CONCURRENCY,
+        traffic_priority="scan_inline",
     )
 
     now = datetime.utcnow()
@@ -1277,6 +1283,7 @@ async def enrich_page_view_counts(
 async def refresh_view_counts(
     rows: list[Listing], message: Message | BotChatAdapter | None = None, *,
     force: bool = False, max_age_seconds: int | None = None,
+    traffic_priority: str = "manual",
 ) -> tuple[int, int, int]:
     """Refresh missing/stale public view counters and persist them.
 
@@ -1325,6 +1332,7 @@ async def refresh_view_counts(
             [row.url for row in targets],
             concurrency=VIEW_COUNT_CONCURRENCY,
             progress_cb=progress_cb,
+            traffic_priority=traffic_priority,
         )
     finally:
         await parser.close()
@@ -1459,7 +1467,7 @@ async def process_observation(bot: Bot, obs: ScanObservation) -> None:
         return
 
     try:
-        requested, updated, failed = await refresh_view_counts(rows, None, force=False, max_age_seconds=300)
+        requested, updated, failed = await refresh_view_counts(rows, None, force=False, max_age_seconds=300, traffic_priority="background")
         recorded = await update_scan_view_refresh(scan.id, target_hours=obs.target_hours)
         if recorded <= 0:
             await mark_observation_result(
@@ -1663,6 +1671,19 @@ async def stats_text() -> str:
         scan_new = (await session.execute(select(func.coalesce(func.sum(ParserRun.new_count), 0)).where(
             ParserRun.started_at >= start_utc, ParserRun.started_at < end_utc, ParserRun.success.is_(True),
         ))).scalar_one()
+        avg_quality = (await session.execute(select(func.coalesce(func.avg(ParserRun.quality_score), 0)).where(
+            ParserRun.started_at >= start_utc, ParserRun.started_at < end_utc, ParserRun.success.is_(True),
+            ParserRun.quality_score > 0,
+        ))).scalar_one()
+        missing_dates = (await session.execute(select(func.coalesce(func.sum(ParserRun.missing_date_count), 0)).where(
+            ParserRun.started_at >= start_utc, ParserRun.started_at < end_utc, ParserRun.success.is_(True),
+        ))).scalar_one()
+        invalid_pages = (await session.execute(select(func.coalesce(func.sum(ParserRun.invalid_pages), 0)).where(
+            ParserRun.started_at >= start_utc, ParserRun.started_at < end_utc, ParserRun.success.is_(True),
+        ))).scalar_one()
+        repeated_pages = (await session.execute(select(func.coalesce(func.sum(ParserRun.repeated_pages), 0)).where(
+            ParserRun.started_at >= start_utc, ParserRun.started_at < end_utc, ParserRun.success.is_(True),
+        ))).scalar_one()
         fast_ready = (await session.execute(select(func.count(CategoryScanState.category_key)).where(
             CategoryScanState.scan_date == day_key, CategoryScanState.day_seed_complete.is_(True),
         ))).scalar_one()
@@ -1681,11 +1702,13 @@ async def stats_text() -> str:
         f"С просмотрами: <b>{viewed}</b> ({view_coverage}%)\n"
         f"Всего сохранено: <b>{total}</b>\n"
         f"Записей истории цен: <b>{drops}</b>\n\n"
-        f"<b>⚡ v2.6 сегодня</b>\n"
+        f"<b>🛡 v3.1 качество сегодня</b>\n"
         f"Запусков категорий: <b>{runs}</b>\n"
-        f"Быстрых запусков: <b>{fast_runs}</b>\n"
-        f"Категорий готовы к fast-mode: <b>{fast_ready}</b>\n"
-        f"Пройдено страниц: <b>{pages}</b>\n"
+        f"Среднее качество: <b>{round(float(avg_quality or 0))}/100</b>\n"
+        f"Дат не распознано: <b>{missing_dates}</b>\n"
+        f"Невалидных страниц: <b>{invalid_pages}</b>\n"
+        f"Повторов страниц: <b>{repeated_pages}</b>\n"
+        f"Сетевых страниц: <b>{pages}</b>\n"
         f"Найдено новых за запуски: <b>{scan_new}</b>\n\n"
         f"База: <b>{storage}</b>{warning}"
     )
@@ -1706,6 +1729,74 @@ class ScanResult:
     oldest_date_seen: str = ""
     max_page_reached: int = 0
     matched_ids: list[str] | None = None
+    # v3.1 quality telemetry. These fields are intentionally part of the shared
+    # ScanResult so cached/shared scans preserve the same reliability verdict.
+    cards_seen: int = 0
+    listings_parsed: int = 0
+    missing_date_count: int = 0
+    missing_price_count: int = 0
+    promoted_filtered: int = 0
+    duplicate_count: int = 0
+    invalid_pages: int = 0
+    repeated_pages: int = 0
+    low_quality_pages: int = 0
+    verified_pages: int = 0
+    view_failures: int = 0
+    quality_score: int = 0
+    quality_note: str = ""
+
+
+def _calculate_scan_quality(
+    *,
+    listings_parsed: int,
+    missing_dates: int,
+    missing_prices: int,
+    invalid_pages: int,
+    repeated_pages: int,
+    low_quality_pages: int,
+    verified_pages: int,
+    pages_scanned: int,
+    view_failures: int,
+    date_complete: bool,
+) -> tuple[int, str]:
+    """Return a conservative 0-100 quality score plus one compact reason."""
+    score = 100.0
+    notes: list[str] = []
+    if listings_parsed > 0:
+        date_cov = max(0.0, min(1.0, (listings_parsed - missing_dates) / listings_parsed))
+        price_cov = max(0.0, min(1.0, (listings_parsed - missing_prices) / listings_parsed))
+        score -= (1.0 - date_cov) * 35.0
+        score -= (1.0 - price_cov) * 8.0
+        if date_cov < 0.80:
+            notes.append(f"дат распознано {round(date_cov * 100)}%")
+    elif date_complete:
+        # A verified empty day can still be a valid scan.
+        notes.append("объявлений за дату не найдено")
+
+    score -= min(30.0, invalid_pages * 10.0)
+    score -= min(25.0, repeated_pages * 12.0)
+    score -= min(20.0, low_quality_pages * 4.0)
+    if pages_scanned and verified_pages == 0:
+        score -= 10.0
+        notes.append("страницы слабо подтверждены")
+    if invalid_pages:
+        notes.append(f"невалидных страниц {invalid_pages}")
+    if repeated_pages:
+        notes.append(f"повторов страниц {repeated_pages}")
+    if view_failures:
+        # Views are secondary data: a few failures should not make the category
+        # parser look broken, but a large number is still worth surfacing.
+        score -= min(8.0, view_failures * 0.15)
+    if not date_complete:
+        score = min(score, 69.0)
+        if listings_parsed == 0:
+            score = min(score, 45.0)
+        notes.append("охват даты не подтверждён")
+
+    final = max(0, min(100, int(round(score))))
+    if not notes:
+        notes.append("проверки пройдены")
+    return final, "; ".join(notes[:3])
 
 
 @dataclass
@@ -1748,6 +1839,8 @@ class ScanJob:
     incomplete_categories: int = 0
     scan_notes: list[str] | None = None
     matched_ids: set[str] | None = None
+    quality_scores: list[int] | None = None
+    quality_notes: list[str] | None = None
 
 
 @dataclass
@@ -1772,6 +1865,9 @@ class CategoryLiveProgress:
     segments_total: int = 0
     collection_index: int = 0
     collection_start_page: int = 0
+    date_coverage_pct: int = 0
+    quality_score: int = 100
+    quality_warning: str = ""
 
 
 category_live_progress: dict[str, CategoryLiveProgress] = {}
@@ -1885,6 +1981,17 @@ async def record_parser_run(
             new_count=result.new_count,
             known_count=result.known_count,
             enriched_count=result.enriched_count,
+            cards_seen=result.cards_seen,
+            listings_parsed=result.listings_parsed,
+            missing_date_count=result.missing_date_count,
+            missing_price_count=result.missing_price_count,
+            promoted_filtered=result.promoted_filtered,
+            duplicate_count=result.duplicate_count,
+            invalid_pages=result.invalid_pages,
+            repeated_pages=result.repeated_pages,
+            low_quality_pages=result.low_quality_pages,
+            view_failures=result.view_failures,
+            quality_score=result.quality_score,
             stop_reason=result.reason[:255],
             success=success,
             error_text=(error_text[:1000] if error_text else None),
@@ -1893,19 +2000,17 @@ async def record_parser_run(
 
 
 async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page_limit: int, target_date: str) -> ScanResult:
-    """Find the selected Moscow date and collect the user's 25/50/100 depth.
+    """Reliably locate the selected Moscow date and collect 25/50/100-page depth.
 
-    Kleinanzeigen normalizes/repeats deep public result pages, so v3.0.6 never
-    treats page numbers above the verified public pagination window as real pages.
-    If the target date is deeper than that window, the scan transparently searches
-    disjoint regional feeds and merges unique target-day listings.  The user still
-    sees one category scan and the same 25/50/100 depth selector.
+    v3.1 treats page identity and publication-date coverage as data-quality signals.
+    A weak/normalized/repeated page may contribute diagnostics, but it is never used
+    as proof that a date is absent. This prevents a silent parser degradation from
+    turning into a believable zero-result scan.
     """
     depth = page_limit if page_limit in PAGE_LIMIT_CHOICES else 50
     target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
     progress_key = _progress_key(cat.key, target_date, depth)
     mode = "date"
-    target_equivalent_items = depth * 25
 
     category_live_progress[progress_key] = CategoryLiveProgress(
         category_key=cat.key,
@@ -1934,36 +2039,45 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     network_requests = 0
     max_page_reached = 0
 
-    def classify(items) -> tuple[str, list, list]:
-        if not items:
-            return "empty", [], []
-        pairs = [(item, posted_date_moscow(item.posted_text)) for item in items]
-        days = [d for _, d in pairs if d is not None]
-        if not days:
-            return "unknown", pairs, days
-        counts = Counter(days)
-        if counts.get(target_day, 0) > 0:
-            return "target", pairs, days
-        newer = sum(count for day, count in counts.items() if day > target_day)
-        older = sum(count for day, count in counts.items() if day < target_day)
-        total = newer + older
-        if total <= 0:
-            return "unknown", pairs, days
-        if newer and not older:
-            return "newer", pairs, days
-        if older and not newer:
-            return "older", pairs, days
-        if newer / total >= 0.70:
-            return "newer", pairs, days
-        if older / total >= 0.70:
-            return "older", pairs, days
-        ordered = sorted(days)
-        median_day = ordered[len(ordered) // 2]
-        if median_day > target_day:
-            return "newer", pairs, days
-        if median_day < target_day:
-            return "older", pairs, days
-        return "mixed", pairs, days
+    # v3.1 quality telemetry. Counters increase only for actual network responses,
+    # never when a page is reused from the locator's in-memory cache.
+    cards_seen = 0
+    listings_parsed = 0
+    missing_date_count = 0
+    missing_price_count = 0
+    promoted_filtered = 0
+    duplicate_count = 0
+    invalid_pages = 0
+    repeated_pages = 0
+    low_quality_pages = 0
+    verified_pages = 0
+    view_failures = 0
+
+    def classify(items):
+        profile = profile_page_dates(items, target_day)
+        return profile.relation, profile.pairs, profile.days, profile
+
+    def update_quality_live(note: str = "") -> None:
+        live = category_live_progress.get(progress_key)
+        if live is None:
+            return
+        if listings_parsed:
+            coverage = max(0.0, min(1.0, (listings_parsed - missing_date_count) / listings_parsed))
+            live.date_coverage_pct = round(coverage * 100)
+        rough, rough_note = _calculate_scan_quality(
+            listings_parsed=listings_parsed,
+            missing_dates=missing_date_count,
+            missing_prices=missing_price_count,
+            invalid_pages=invalid_pages,
+            repeated_pages=repeated_pages,
+            low_quality_pages=low_quality_pages,
+            verified_pages=verified_pages,
+            pages_scanned=network_requests,
+            view_failures=view_failures,
+            date_complete=True,
+        )
+        live.quality_score = rough
+        live.quality_warning = note or (rough_note if rough < 85 else "")
 
     def update_live(page: int, days: list, phase: str, collection_index: int | None = None) -> None:
         nonlocal oldest_date_seen, max_page_reached
@@ -1984,9 +2098,10 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             if collection_index is not None:
                 live.collection_index = min(depth, max(0, collection_index))
                 live.page_limit = depth
+        update_quality_live()
 
     async def process_target_items(items, pairs, limit: int | None = None) -> int:
-        nonlocal new_count, today_seen, known_total, enriched_total, target_seen_any, first_page_head_ids
+        nonlocal new_count, today_seen, known_total, enriched_total, target_seen_any, first_page_head_ids, view_failures
         target_items = [
             item for item, item_day in pairs
             if item_day == target_day and item.external_id not in processed_target_ids
@@ -2003,7 +2118,8 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         async with db_write_lock:
             new_items, known_count, enriched_count = await upsert_page_items(cat.key, cat.name, target_items)
         live = category_live_progress.get(progress_key)
-        await enrich_page_view_counts(parser, target_items, live)
+        _, _, failed_views = await enrich_page_view_counts(parser, target_items, live)
+        view_failures += failed_views
         new_count += len(new_items)
         known_total += known_count
         enriched_total += enriched_count
@@ -2012,49 +2128,93 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             live.today_seen = today_seen
             live.new_count = new_count
             live.known_count = known_total
+        update_quality_live()
         return len(target_items)
 
     async def locate_feed(base_url: str, feed_name: str):
-        """Locate the first target-date page inside one <=50-page public feed."""
-        nonlocal network_requests
+        """Locate the first target-date page inside one verified <=50-page feed."""
+        nonlocal network_requests, cards_seen, listings_parsed, missing_date_count
+        nonlocal missing_price_count, promoted_filtered, duplicate_count, invalid_pages
+        nonlocal repeated_pages, low_quality_pages, verified_pages
         cache: dict[int, object] = {}
         fingerprints: dict[str, int] = {}
         effective_limit = PUBLIC_SEARCH_PAGE_CAP
+        site_max_page: int | None = None
+        discovered_shards: list[tuple[str, int | None]] = []
         invalid_note = ""
 
+        def locator_result(status: str, reason_text: str = "", candidate_page: int | None = None):
+            return {
+                "status": status, "reason": reason_text, "fetch": fetch,
+                "limit": effective_limit, "site_max_page": site_max_page,
+                "candidate": candidate_page, "shards": list(discovered_shards),
+            }
+
         async def fetch(page: int, phase: str):
-            nonlocal network_requests, effective_limit, invalid_note
+            nonlocal network_requests, effective_limit, site_max_page, discovered_shards, invalid_note
+            nonlocal cards_seen, listings_parsed, missing_date_count, missing_price_count
+            nonlocal promoted_filtered, duplicate_count, invalid_pages, repeated_pages
+            nonlocal low_quality_pages, verified_pages
             page = max(1, min(effective_limit, int(page)))
-            if page in cache:
+            fresh = page not in cache
+            if not fresh:
                 info = cache[page]
             else:
                 info = await parser.parse_category_page_info(page_url(base_url, page), page)
                 cache[page] = info
                 network_requests += 1
+                cards_seen += int(getattr(info, "raw_candidates", 0) or 0)
+                listings_parsed += len(info.items)
+                missing_date_count += int(getattr(info, "missing_date_count", 0) or 0)
+                missing_price_count += int(getattr(info, "missing_price_count", 0) or 0)
+                promoted_filtered += int(getattr(info, "promoted_filtered", 0) or 0)
+                duplicate_count += int(getattr(info, "duplicate_cards", 0) or 0)
+                if bool(getattr(info, "page_verified", False)):
+                    verified_pages += 1
                 if getattr(info, "max_page", None):
-                    effective_limit = max(1, min(PUBLIC_SEARCH_PAGE_CAP, int(info.max_page)))
+                    site_max_page = max(1, int(info.max_page))
+                    effective_limit = max(1, min(PUBLIC_SEARCH_PAGE_CAP, site_max_page))
+                if page == 1 and getattr(info, "location_shards", None):
+                    discovered_shards = list(info.location_shards or [])
                 if phase == "jumping" and DATE_JUMP_PROBE_DELAY_SECONDS:
                     await asyncio.sleep(DATE_JUMP_PROBE_DELAY_SECONDS)
 
             items = info.items
-            relation, pairs, days = classify(items)
-            valid = bool(getattr(info, "request_matches_page", True))
+            relation, pairs, days, profile = classify(items)
+            valid = bool(getattr(info, "request_matches_page", True)) and not bool(getattr(info, "suspicious", False))
             fp = getattr(info, "fingerprint", "") or ""
+            repeated = False
             if fp:
                 previous = fingerprints.get(fp)
                 if previous is None:
                     fingerprints[fp] = page
                 elif previous != page and len(items) >= 5:
                     valid = False
+                    repeated = True
                     invalid_note = f"страница {page} повторила содержимое страницы {previous}"
+            if fresh and repeated:
+                repeated_pages += 1
+            if fresh and not valid:
+                invalid_pages += 1
+            if fresh and items and relation == "unknown":
+                low_quality_pages += 1
+
             if not valid:
                 relation, pairs, days = "invalid", [], []
-                invalid_note = invalid_note or f"страница {page} была нормализована сайтом"
+                invalid_note = invalid_note or f"страница {page} была нормализована/не подтверждена сайтом"
             update_live(page, days, phase)
+            if relation == "unknown":
+                update_quality_live(f"не хватает дат на странице {page}")
+            elif relation == "invalid":
+                update_quality_live(invalid_note)
             log.info(
-                "category=%s feed=%s phase=%s page=%s relation=%s actual=%s max=%s valid=%s requests=%s",
+                "category=%s feed=%s phase=%s page=%s relation=%s actual=%s max=%s verified=%s "
+                "date_cov=%.0f%% parsed=%s missing_date=%s raw=%s promoted=%s duplicates=%s valid=%s requests=%s",
                 cat.name, feed_name, phase, page, relation,
-                getattr(info, "actual_page", None), getattr(info, "max_page", None), valid, network_requests,
+                getattr(info, "actual_page", None), getattr(info, "max_page", None),
+                getattr(info, "page_verified", False), float(getattr(info, "date_coverage", 0.0) or 0.0) * 100,
+                len(items), getattr(info, "missing_date_count", 0), getattr(info, "raw_candidates", 0),
+                getattr(info, "promoted_filtered", 0), getattr(info, "duplicate_cards", 0), valid, network_requests,
             )
             return items, relation, pairs, days
 
@@ -2067,14 +2227,19 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 high = probe
                 break
             if relation == "invalid":
-                return {"status": "invalid", "reason": invalid_note, "fetch": fetch, "limit": effective_limit, "candidate": None}
+                return locator_result("invalid", invalid_note)
+            if relation == "unknown":
+                # Unknown chronology is not a valid jump signal. Nearby pages may be
+                # healthier, but if the current probe is page 1 we cannot safely infer
+                # a direction and therefore return a partial result instead of zero.
+                return locator_result("unknown", "publication dates could not be verified")
             if relation == "newer":
                 low_newer = probe
             if probe >= effective_limit:
-                return {"status": "too_deep", "reason": "target beyond public page window", "fetch": fetch, "limit": effective_limit, "candidate": None}
+                return locator_result("too_deep", "target beyond public page window")
             next_probe = min(effective_limit, 2 if probe == 1 else probe * 2)
             if next_probe == probe:
-                return {"status": "too_deep", "reason": "target beyond public page window", "fetch": fetch, "limit": effective_limit, "candidate": None}
+                return locator_result("too_deep", "target beyond public page window")
             probe = next_probe
 
         lo = max(1, low_newer + 1)
@@ -2083,7 +2248,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             mid = (lo + hi) // 2
             items, relation, pairs, days = await fetch(mid, "jumping")
             if relation == "invalid":
-                return {"status": "invalid", "reason": invalid_note, "fetch": fetch, "limit": effective_limit, "candidate": None}
+                return locator_result("invalid", invalid_note)
+            if relation == "unknown":
+                return locator_result("unknown", "weak date coverage near boundary")
             if relation == "newer":
                 lo = mid + 1
             else:
@@ -2104,26 +2271,39 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             elif relation == "unknown":
                 saw_unknown = True
             elif relation == "invalid":
-                return {"status": "invalid", "reason": invalid_note, "fetch": fetch, "limit": effective_limit, "candidate": None}
+                return locator_result("invalid", invalid_note)
 
         if candidate is not None:
-            for back in range(candidate - 1, max(0, candidate - 3), -1):
+            # Walk back a few pages so the first boundary card cannot be missed.
+            for back in range(candidate - 1, max(0, candidate - 4), -1):
                 items, relation, pairs, days = await fetch(back, "jumping")
                 if relation == "target":
                     candidate = back
                 elif relation == "newer":
                     break
+                elif relation in {"unknown", "invalid"}:
+                    return locator_result("unknown", "could not verify page immediately before target")
                 else:
                     break
-            return {"status": "found", "reason": "", "fetch": fetch, "limit": effective_limit, "candidate": candidate}
+            return locator_result("found", candidate_page=candidate)
+
+        # A zero is allowed only when the *whole* feed is visible inside the public
+        # page window. For a large feed (>50 pages), a local crossing is not enough
+        # evidence to conclude that an entire category has zero listings on that day;
+        # we must split this category into smaller official location feeds first.
+        full_feed_visible = site_max_page is not None and site_max_page <= effective_limit
         if saw_newer and saw_older and not saw_unknown:
-            return {"status": "absent", "reason": "date crossed without target listings", "fetch": fetch, "limit": effective_limit, "candidate": None}
+            if full_feed_visible:
+                return locator_result("absent", "verified date crossing without target listings")
+            return locator_result("ambiguous_absent", "large feed requires independent sub-feed verification")
         if saw_older and low_newer == 0 and not saw_unknown:
-            return {"status": "absent", "reason": "date not represented in feed", "fetch": fetch, "limit": effective_limit, "candidate": None}
-        return {"status": "unknown", "reason": "could not verify date boundary", "fetch": fetch, "limit": effective_limit, "candidate": None}
+            if full_feed_visible:
+                return locator_result("absent", "feed starts after the selected calendar day")
+            return locator_result("ambiguous_absent", "large feed requires independent sub-feed verification")
+        return locator_result("unknown", "could not verify date boundary")
 
     async def collect_direct(locator) -> tuple[str, int]:
-        """Collect literal nationwide pages while they are actually accessible."""
+        """Collect literal nationwide pages while they remain verified."""
         nonlocal direct_pages_collected, collection_start_page, request_complete, reason, hit_limit
         candidate = int(locator["candidate"])
         limit = int(locator["limit"])
@@ -2140,7 +2320,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 hit_limit = True
                 return "needs_hidden", direct_pages_collected
             items, relation, pairs, days = await fetch(page, "collecting")
-            if relation == "invalid":
+            if relation in {"invalid", "unknown"}:
                 hit_limit = True
                 return "needs_hidden", direct_pages_collected
             if relation == "empty":
@@ -2163,17 +2343,26 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         return "done", direct_pages_collected
 
     async def hidden_fill(remaining_virtual_pages: int) -> tuple[bool, bool]:
-        """Fill the remaining depth from hidden disjoint location feeds.
+        """Fill remaining depth from independent location feeds.
 
-        Returns (quota_reached, had_unreachable_segments).  Regions are an internal
-        transport detail; user-visible status remains one scan.
+        v3.1.2 keeps the multi-category false-zero fix and adds adaptive traffic control. Every category owns its own
+        locator state. If a state feed is itself larger than Kleinanzeigen's public
+        50-page window, it is recursively split into smaller official location feeds
+        discovered from that category page. Nothing from the previous selected
+        category is reused.
         """
         nonlocal request_complete, reason, hit_limit
         if remaining_virtual_pages <= 0:
             return True, False
-        goal = today_seen + remaining_virtual_pages * 25
-        had_unreachable = False
-        all_exhausted = True
+
+        start_count = today_seen
+        goal = start_count + remaining_virtual_pages * 25
+        unresolved = False
+        visited: set[str] = set()
+        max_hidden_feeds = 180
+        max_shard_depth = 2
+        feeds_processed = 0
+
         live = category_live_progress.get(progress_key)
         if live is not None:
             live.phase = "jumping"
@@ -2182,32 +2371,64 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             live.segments_done = 0
             live.segments_total = 0
 
-        for state_name, slug, location_id in GERMAN_STATE_SEGMENTS:
-            if today_seen >= goal:
-                break
+        queue: list[tuple[str, str, int]] = [
+            (state_name, _regional_category_url(cat.url, slug, location_id), 0)
+            for state_name, slug, location_id in GERMAN_STATE_SEGMENTS
+        ]
+
+        def add_children(parent_name: str, loc: dict, level: int) -> bool:
+            if level >= max_shard_depth:
+                return False
+            children = list(loc.get("shards") or [])
+            if not children:
+                return False
+            added = 0
+            # Prefer smaller counted feeds; they are more likely to expose the
+            # requested historical date within the public 50-page window.
+            children.sort(key=lambda item: (item[1] is None, item[1] or 10**12, item[0]))
+            for child_url, child_count in children:
+                if child_url in visited or any(existing[1] == child_url for existing in queue):
+                    continue
+                label = f"{parent_name}/{added + 1}"
+                queue.append((label, child_url, level + 1))
+                added += 1
+                if added >= 60:
+                    break
+            return added > 0
+
+        while queue and today_seen < goal and feeds_processed < max_hidden_feeds:
+            state_name, feed_url, level = queue.pop(0)
+            if feed_url in visited:
+                continue
+            visited.add(feed_url)
+            feeds_processed += 1
+            if live is not None:
+                live.segment_name = state_name
+                live.segments_done = feeds_processed - 1
+                live.segments_total = max(feeds_processed, feeds_processed + len(queue))
+
             try:
-                loc = await locate_feed(_regional_category_url(cat.url, slug, location_id), f"hidden:{state_name}")
+                loc = await locate_feed(feed_url, f"hidden:{state_name}")
             except TemporaryAccessError as exc:
-                had_unreachable = True
-                all_exhausted = False
+                unresolved = True
                 log.warning("hidden date shard temporary limit category=%s state=%s http=%s", cat.name, state_name, exc.status_code)
                 continue
             except Exception as exc:
-                had_unreachable = True
-                all_exhausted = False
+                unresolved = True
                 log.warning("hidden date shard failed category=%s state=%s: %s", cat.name, state_name, exc)
                 continue
 
             status = loc["status"]
-            if status == "too_deep":
-                had_unreachable = True
-                all_exhausted = False
+            if status in {"too_deep", "ambiguous_absent"}:
+                if not add_children(state_name, loc, level):
+                    unresolved = True
                 continue
             if status in {"invalid", "unknown"}:
-                had_unreachable = True
-                all_exhausted = False
+                unresolved = True
                 continue
             if status == "absent":
+                # This is a trustworthy zero only because locate_feed returns
+                # `absent` exclusively for a fully visible feed.
                 continue
 
             candidate = int(loc["candidate"])
@@ -2219,12 +2440,10 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 try:
                     items, relation, pairs, days = await fetch(page, "collecting")
                 except TemporaryAccessError:
-                    had_unreachable = True
-                    all_exhausted = False
+                    unresolved = True
                     break
                 if relation in {"invalid", "unknown"}:
-                    had_unreachable = True
-                    all_exhausted = False
+                    unresolved = True
                     break
                 if relation == "empty":
                     state_exhausted = True
@@ -2234,33 +2453,41 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     break
                 remaining_items = max(0, goal - today_seen)
                 await process_target_items(items, pairs, limit=remaining_items)
-                virtual_hidden = max(0, (today_seen - (goal - remaining_virtual_pages * 25) + 24) // 25)
+                virtual_hidden = max(0, (today_seen - start_count + 24) // 25)
                 update_live(page, days, "collecting", direct_pages_collected + virtual_hidden)
                 page += 1
                 if PAGE_DELAY_SECONDS:
                     await asyncio.sleep(min(PAGE_DELAY_SECONDS, 0.15))
+
             if page > feed_limit and not state_exhausted and today_seen < goal:
-                had_unreachable = True
-                all_exhausted = False
+                # The target day continues beyond this feed's visible window. Drill
+                # down again instead of declaring the category empty/skipped.
+                if not add_children(state_name, loc, level):
+                    unresolved = True
 
         if today_seen >= goal:
             request_complete = True
             reason = f"собрана глубина {depth} страниц выбранной даты"
-            return True, had_unreachable
-        if all_exhausted and not had_unreachable:
+            return True, unresolved
+
+        if queue and feeds_processed >= max_hidden_feeds:
+            unresolved = True
+
+        if not unresolved and not queue:
+            # All independent feeds were fully verified and the selected date ended
+            # before the requested depth. This may be a real zero for a tiny category.
             request_complete = True
             reason = "выбранная дата закончилась раньше выбранной глубины"
             return False, False
+
         hit_limit = True
         reason = (
-            f"частичный результат: публичная выдача Kleinanzeigen ограничена {PUBLIC_SEARCH_PAGE_CAP} страницами; "
+            f"частичный результат: выбранная дата проверена не во всех частях категории; "
             f"собрано {today_seen} объявлений выбранной даты"
         )
         return False, True
 
     try:
-        # First try the literal nationwide feed, but never trust pages beyond the
-        # public pagination window.  This is fast for today/recent categories.
         try:
             nationwide = await locate_feed(cat.url, "nationwide")
         except TemporaryAccessError as exc:
@@ -2275,18 +2502,29 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     await hidden_fill(remaining)
             elif nationwide["status"] == "absent":
                 request_complete = True
-                reason = "выбранная дата пройдена; объявлений за неё не найдено"
+                reason = "выбранная дата надёжно пройдена; объявлений за неё не найдено"
             elif nationwide["status"] == "too_deep":
-                # The important v3.0.6 path: no bogus page 64/20,000 jumps.  Search
-                # inside hidden, non-overlapping feeds and fill the requested volume.
                 await hidden_fill(depth)
             else:
-                # A normalized/repeated page is not a date signal. Fall back to the
-                # hidden feeds rather than returning a false zero.
+                # Never convert an unknown/invalid date boundary into zero.
                 await hidden_fill(depth)
 
         if not reason:
             reason = "завершено"
+
+        quality_score, quality_note = _calculate_scan_quality(
+            listings_parsed=listings_parsed,
+            missing_dates=missing_date_count,
+            missing_prices=missing_price_count,
+            invalid_pages=invalid_pages,
+            repeated_pages=repeated_pages,
+            low_quality_pages=low_quality_pages,
+            verified_pages=verified_pages,
+            pages_scanned=network_requests,
+            view_failures=view_failures,
+            date_complete=request_complete,
+        )
+        update_quality_live(quality_note if quality_score < 85 else "")
 
         interrupted = reason.startswith("временный лимит Kleinanzeigen")
         seed_complete = bool(request_complete and not interrupted)
@@ -2321,15 +2559,43 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             oldest_date_seen=oldest_date_seen,
             max_page_reached=max_page_reached,
             matched_ids=sorted(processed_target_ids),
+            cards_seen=cards_seen,
+            listings_parsed=listings_parsed,
+            missing_date_count=missing_date_count,
+            missing_price_count=missing_price_count,
+            promoted_filtered=promoted_filtered,
+            duplicate_count=duplicate_count,
+            invalid_pages=invalid_pages,
+            repeated_pages=repeated_pages,
+            low_quality_pages=low_quality_pages,
+            verified_pages=verified_pages,
+            view_failures=view_failures,
+            quality_score=quality_score,
+            quality_note=quality_note,
         )
         await record_parser_run(user_id, cat, result, started_at)
         log.info(
-            "category=%s date-depth-v306 target=%s depth=%s requests=%s direct_pages=%s matched=%s complete=%s reason=%s",
-            cat.name, target_date, depth, pages_scanned, direct_pages_collected, today_seen, request_complete, reason,
+            "category=%s v3.1-quality target=%s depth=%s requests=%s matched=%s complete=%s quality=%s "
+            "cards=%s parsed=%s missing_date=%s promoted=%s duplicates=%s invalid_pages=%s repeated_pages=%s low_quality=%s views_failed=%s reason=%s",
+            cat.name, target_date, depth, pages_scanned, today_seen, request_complete, quality_score,
+            cards_seen, listings_parsed, missing_date_count, promoted_filtered, duplicate_count,
+            invalid_pages, repeated_pages, low_quality_pages, view_failures, reason,
         )
         return result
 
     except Exception as exc:
+        quality_score, quality_note = _calculate_scan_quality(
+            listings_parsed=listings_parsed,
+            missing_dates=missing_date_count,
+            missing_prices=missing_price_count,
+            invalid_pages=invalid_pages,
+            repeated_pages=repeated_pages,
+            low_quality_pages=low_quality_pages,
+            verified_pages=verified_pages,
+            pages_scanned=network_requests,
+            view_failures=view_failures,
+            date_complete=False,
+        )
         failed = ScanResult(
             new_count=new_count,
             pages_scanned=network_requests,
@@ -2344,6 +2610,19 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             oldest_date_seen=oldest_date_seen,
             max_page_reached=max_page_reached,
             matched_ids=sorted(processed_target_ids),
+            cards_seen=cards_seen,
+            listings_parsed=listings_parsed,
+            missing_date_count=missing_date_count,
+            missing_price_count=missing_price_count,
+            promoted_filtered=promoted_filtered,
+            duplicate_count=duplicate_count,
+            invalid_pages=invalid_pages,
+            repeated_pages=repeated_pages,
+            low_quality_pages=low_quality_pages,
+            verified_pages=verified_pages,
+            view_failures=view_failures,
+            quality_score=quality_score,
+            quality_note=quality_note,
         )
         try:
             await record_parser_run(user_id, cat, failed, started_at, success=False, error_text=str(exc))
@@ -2545,6 +2824,11 @@ def render_user_job_status(job: ScanJob) -> str:
         if live_views_failed:
             views += f" · ошибок: <b>{live_views_failed}</b>"
         detail_lines.append(views)
+    if live is not None and live.date_coverage_pct:
+        quality_icon = "🟢" if live.quality_score >= 90 else "🟡" if live.quality_score >= 75 else "🔴"
+        detail_lines.append(
+            f"{quality_icon} Проверка качества: <b>{live.quality_score}/100</b> · дат распознано <b>{live.date_coverage_pct}%</b>"
+        )
 
     visible_new = job.total_new + live_new
     detail_text = "\n".join(detail_lines)
@@ -2557,7 +2841,7 @@ def render_user_job_status(job: ScanJob) -> str:
         f"Категории: <b>{job.completed_categories}/{total}</b> готово\n"
         f"Дата: <b>{_date_label(job.target_date)} (МСК)</b>\n"
         f"Глубина: <b>{depth} страниц от начала даты</b>\n"
-        f"Сейчас: <b>{category_line}</b>{detail_text}\n\n"
+        f"Сейчас: <b>{category_line}</b> · категория <b>{max(1, job.current_category_index)}/{total}</b>{detail_text}\n\n"
         f"🆕 Найдено новых: <b>{visible_new}</b>\n"
         f"⏱ Прошло: <b>{_human_duration(elapsed)}</b>\n\n"
         "Прогресс обновляется автоматически."
@@ -2617,9 +2901,12 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
             f"⚠️ Не удалось надёжно начать/закончить выбранную глубину в категориях: <b>{job.incomplete_categories}</b>\n"
             if job.incomplete_categories else ""
         )
+        quality_values = [int(x) for x in (job.quality_scores or []) if x is not None]
+        quality_avg = round(sum(quality_values) / len(quality_values)) if quality_values else 0
         text = (
             f"{headline}\n\n"
             f"🗂 Категорий обработано: <b>{job.completed_categories}/{len(job.category_keys)}</b>\n"
+            f"🛡 Качество данных: <b>{quality_avg}/100</b>\n"
             f"📅 Дата объявлений: <b>{_date_label(job.target_date)} (МСК)</b>\n"
             f"📄 Глубина: <b>{job.page_limit} страниц от начала даты</b>\n"
             f"{completeness_line}"
@@ -2640,6 +2927,7 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
                 f"📄 Глубина: <b>{job.page_limit} страниц от начала даты</b>\n"
                 f"⚡ Поиск даты: <b>быстрый переход к старту</b>\n"
                 f"🆕 Новых найдено: <b>{job.total_new}</b>\n"
+                f"🛡 Качество: <b>{round(sum(job.quality_scores or [0]) / max(1, len(job.quality_scores or [])))}/100</b>\n"
                 f"⏱ Время: <b>{elapsed_text}</b>\n"
                 f"Режим: <b>{MODE_LABELS.get(settings.output_mode, settings.output_mode)}</b>\n"
                 f"Дата поиска: <b>{_date_label(job.target_date)} (МСК)</b>\n"
@@ -2697,6 +2985,8 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
     job.warnings = job.warnings or []
     job.scan_notes = job.scan_notes or []
     job.matched_ids = job.matched_ids or set()
+    job.quality_scores = job.quality_scores or []
+    job.quality_notes = job.quality_notes or []
     await edit_job_status(bot, job, render_user_job_status(job), force=True)
 
     for idx, key in enumerate(job.category_keys, start=1):
@@ -2705,11 +2995,23 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
         cat = CATEGORIES.get(key)
         if cat is None:
             job.warnings.append(f"Неизвестная категория: {key}")
+            job.incomplete_categories += 1
+            job.completed_categories += 1
+            job.quality_scores = job.quality_scores or []
+            job.quality_scores.append(0)
             continue
         job.current_category = cat.name
         job.current_category_key = cat.key
         job.current_progress_key = _progress_key(cat.key, job.target_date, job.page_limit)
         job.current_category_index = idx
+        # Multi-category isolation: every selected category starts with a clean
+        # live-progress slot and performs its own date location cycle. No boundary
+        # or progress state from the previous category may leak into this one.
+        category_live_progress.pop(job.current_progress_key, None)
+        log.info(
+            "multi-category start job=%s category=%s index=%s/%s target=%s depth=%s",
+            job.job_id, cat.name, idx, len(job.category_keys), job.target_date, job.page_limit,
+        )
         try:
             await edit_job_status(bot, job, render_user_job_status(job), force=True)
             dispatched = await dispatch_category(cat, job.user_id, job.page_limit, job.target_date)
@@ -2728,6 +3030,10 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
             if result is not None:
                 job.matched_ids = job.matched_ids or set()
                 job.matched_ids.update(result.matched_ids or [])
+                job.quality_scores = job.quality_scores or []
+                job.quality_notes = job.quality_notes or []
+                job.quality_scores.append(int(result.quality_score or 0))
+                job.quality_notes.append(f"{cat.name}: {result.quality_score}/100 — {result.quality_note}")
                 # New_count is a global DB fact from this shared scan. Pages are counted
                 # only for the job that actually started the network scan.
                 job.total_new += result.new_count
@@ -2742,9 +3048,9 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
                     job.incomplete_categories += 1
                     reached = _date_label(result.oldest_date_seen) if result.oldest_date_seen else "не определена"
                     note = (
-                        f"{cat.name}: не удалось надёжно начать сбор за {_date_label(job.target_date)}; "
-                        f"самая старая подтверждённая дата — {reached}; "
-                        f"сетевых страниц запрошено {result.pages_scanned}, достигнута стр. {result.max_page_reached or '?'}; "
+                        f"{cat.name}: охват {_date_label(job.target_date)} не подтверждён полностью; "
+                        f"самая старая распознанная дата — {reached}; "
+                        f"сетевых запросов {result.pages_scanned}; качество {result.quality_score}/100; "
                         f"причина: {result.reason}"
                     )
                     job.warnings.append(note)
@@ -2756,12 +3062,26 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
                         f"успели сделать {result.pages_scanned} запросов (до стр. {result.max_page_reached or '?'}), можно повторить позже"
                     )
 
+            log.info(
+                "multi-category finish job=%s category=%s matched=%s complete=%s reason=%s",
+                job.job_id, cat.name, (result.today_seen if result is not None else 0),
+                (result.date_complete if result is not None else False),
+                (result.reason if result is not None else "no result"),
+            )
             job.completed_categories += 1
             # User sees only useful progress; cache/shared/worker details stay internal.
             await edit_job_status(bot, job, render_user_job_status(job), force=True)
         except Exception as exc:
             log.exception("Queue scan error job=%s category=%s", job.job_id, cat.name)
-            job.warnings.append(f"{cat.name}: {str(exc)[:120]}")
+            note = f"{cat.name}: ошибка скана — {str(exc)[:160]}"
+            job.warnings.append(note)
+            job.scan_notes = job.scan_notes or []
+            job.scan_notes.append(note)
+            job.quality_scores = job.quality_scores or []
+            job.quality_notes = job.quality_notes or []
+            job.quality_scores.append(0)
+            job.quality_notes.append(f"{cat.name}: 0/100 — ошибка скана")
+            job.incomplete_categories += 1
             job.completed_categories += 1
 
     await finish_job(bot, job, cancelled=job.cancel_requested)
@@ -2784,7 +3104,11 @@ async def scan_worker(bot: Bot, worker_id: int) -> None:
             if job.cancel_requested:
                 await finish_job(bot, job, cancelled=True)
             else:
-                await process_scan_job(bot, job, worker_id)
+                await TRAFFIC.scan_job_started()
+                try:
+                    await process_scan_job(bot, job, worker_id)
+                finally:
+                    await TRAFFIC.scan_job_finished()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2855,7 +3179,7 @@ async def start(message: Message, state: FSMContext) -> None:
         return
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>🔍 Kleinanzeigen Parser v3.0.0</b>\n\n"
+        "<b>🔍 Kleinanzeigen Parser v3.1.2</b>\n\n"
         "Здесь всё строится вокруг сохранённых сканов:\n"
         "🔥 <b>Популярное сейчас</b> — лидеры по просмотрам\n"
         "🔎 <b>Новый скан</b> — собрать свежие объявления\n"
@@ -2873,7 +3197,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v3.0.0</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v3.1.2</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == "post_settings")
@@ -2894,7 +3218,7 @@ async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
     await callback.message.answer(
-        "<b>🔍 Kleinanzeigen Parser v3.0.0</b>\n\nЧто хочешь посмотреть?",
+        "<b>🔍 Kleinanzeigen Parser v3.1.2</b>\n\nЧто хочешь посмотреть?",
         reply_markup=main_keyboard(len(selected)),
         parse_mode=ParseMode.HTML,
     )
@@ -3141,7 +3465,7 @@ async def run_view_test(message: Message, state: FSMContext) -> None:
         lines += [
             "",
             f"📈 Ускорение на тесте: <b>примерно ×{speedup:.1f}</b>",
-            "✅ Обычный массовый парсинг v3.0.0 уже сначала использует быстрый способ. Chromium включается только для объявлений, где прямой счётчик не сработал.",
+            "✅ Обычный массовый парсинг v3.1.2 уже сначала использует быстрый способ. Chromium включается только для объявлений, где прямой счётчик не сработал.",
         ]
     else:
         lines += [
@@ -3346,6 +3670,8 @@ async def render_scan_detail(scan: UserScan) -> str:
         f"{hours}ч {status_icons.get(observation_statuses.get(hours, 'pending'), '⏳')}"
         for hours in OBSERVATION_HOURS
     )
+    quality_value = int(getattr(scan, "quality_score", 0) or 0)
+    quality_label = f"{quality_value}/100" if quality_value > 0 else "нет замера (старый скан)"
     status_label = {
         "done": "✅ завершён",
         "partial": "⚠️ частичный",
@@ -3363,6 +3689,7 @@ async def render_scan_detail(scan: UserScan) -> str:
         f"Глубина: <b>{scan.page_limit if scan.page_limit in PAGE_LIMIT_CHOICES else 50} страниц от начала даты</b>",
         "Поиск даты: <b>⚡ быстрый переход к стартовой странице</b>",
         f"Категорий: <b>{scan.completed_categories}/{scan.total_categories}</b>",
+        f"🛡 Качество парсинга: <b>{quality_label}</b>",
         "",
         f"📦 В снимке: <b>{len(rows)}</b> объявлений",
         f"👁 С просмотрами: <b>{viewed}</b>",
@@ -3375,6 +3702,8 @@ async def render_scan_detail(scan: UserScan) -> str:
     ]
     if scan.last_view_refresh_at:
         lines += ["", f"Последнее обновление просмотров: <b>{_moscow_text(scan.last_view_refresh_at)} МСК</b>"]
+    if getattr(scan, "quality_note", ""):
+        lines += ["", f"🩺 <b>Проверка:</b> {html.escape(scan.quality_note)}"]
     if scan.status == "partial" and getattr(scan, "scan_note", ""):
         lines += ["", f"⚠️ <b>Почему результат частичный:</b> {html.escape(scan.scan_note)}"]
     lines += ["", "💡 Автозамеры идут через 1 / 3 / 6 / 12 / 24 часа. Открывай «🚀 TOP роста» — там TOP-10 в боте и TOP-50 таблицей."]
@@ -3993,12 +4322,14 @@ async def main() -> None:
     recovered = await recover_running_observations()
     planned = await backfill_recent_observation_plans()
     if recovered or planned:
-        log.info("v3.0.7 observations: recovered=%s recent_scans_planned=%s", recovered, planned)
+        log.info("v3.1 observations: recovered=%s recent_scans_planned=%s", recovered, planned)
     bot = Bot(BOT_TOKEN)
     me = await bot.get_me()
+    traffic = await TRAFFIC.snapshot()
     log.info(
-        "Starting @%s | workers=%s cache_ttl=%ss",
+        "Starting @%s | workers=%s cache_ttl=%ss | traffic scan=%s view=%s browser=%s global=%s",
         me.username, MAX_CONCURRENT_JOBS, CATEGORY_CACHE_TTL_SECONDS,
+        traffic.scan_limit, traffic.view_limit, traffic.browser_limit, traffic.global_limit,
     )
     if not USING_PERSISTENT_DATABASE:
         log.warning(

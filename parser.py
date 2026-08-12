@@ -9,10 +9,12 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
+from urllib.parse import unquote, urljoin, urlparse, urlsplit, urlunsplit
 
 import httpx
 from bs4 import BeautifulSoup
+
+from traffic import TRAFFIC
 
 BASE_URL = "https://www.kleinanzeigen.de"
 BERLIN_TZ = ZoneInfo("Europe/Berlin")
@@ -33,16 +35,12 @@ CATEGORY_403_BACKOFF_SECONDS = max(3.0, float(os.getenv("CATEGORY_403_BACKOFF_SE
 CATEGORY_RETRY_JITTER_SECONDS = max(0.0, float(os.getenv("CATEGORY_RETRY_JITTER_SECONDS", "2.0")))
 STOP_AFTER_EMPTY_TODAY_PAGES = max(1, int(os.getenv("STOP_AFTER_EMPTY_TODAY_PAGES", "2")))
 AVAILABILITY_TIMEOUT = max(5.0, float(os.getenv("AVAILABILITY_TIMEOUT", "20")))
+# v3.1 parser-quality thresholds. A page with too few trustworthy publication
+# timestamps is never used as proof that a target date is absent.
+MIN_PAGE_DATE_COVERAGE = min(0.95, max(0.20, float(os.getenv("MIN_PAGE_DATE_COVERAGE", "0.55"))))
+MIN_PAGE_DATED_ITEMS = max(1, int(os.getenv("MIN_PAGE_DATED_ITEMS", "3")))
 VIEW_COUNT_GLOBAL_CONCURRENCY = max(1, min(16, int(os.getenv("VIEW_COUNT_GLOBAL_CONCURRENCY", "6"))))
 DIRECT_VIEW_CONCURRENCY = max(1, min(16, int(os.getenv("DIRECT_VIEW_CONCURRENCY", "8"))))
-_GLOBAL_VIEW_SEMAPHORE = None
-
-
-def _global_view_semaphore() -> asyncio.Semaphore:
-    global _GLOBAL_VIEW_SEMAPHORE
-    if _GLOBAL_VIEW_SEMAPHORE is None:
-        _GLOBAL_VIEW_SEMAPHORE = asyncio.Semaphore(VIEW_COUNT_GLOBAL_CONCURRENCY)
-    return _GLOBAL_VIEW_SEMAPHORE
 
 log = logging.getLogger("kleinanzeigen-parser")
 
@@ -101,7 +99,31 @@ class CategoryPageInfo:
     actual_page: int | None = None
     max_page: int | None = None
     request_matches_page: bool = True
+    page_verified: bool = False
     fingerprint: str = ""
+    raw_candidates: int = 0
+    promoted_filtered: int = 0
+    duplicate_cards: int = 0
+    missing_date_count: int = 0
+    missing_price_count: int = 0
+    date_coverage: float = 0.0
+    suspicious: bool = False
+    warnings: list[str] | None = None
+    location_shards: list[tuple[str, int | None]] | None = None
+
+
+@dataclass
+class PageDateProfile:
+    relation: str
+    pairs: list[tuple[ParsedListing, object]]
+    days: list
+    parsed_count: int
+    missing_count: int
+    target_count: int
+    newer_count: int
+    older_count: int
+    coverage: float
+    confidence: float
 
 
 PRICE_NUMBER_RE = re.compile(r"(?<!\d)(\d{1,3}(?:\.\d{3})*|\d+)\s*€(?:\s*(?:VB|Festpreis))?", re.IGNORECASE)
@@ -427,14 +449,17 @@ def _is_promoted_listing_node(node) -> bool:
     return False
 
 
-def parse_category_html(html_text: str) -> list[ParsedListing]:
+def _parse_category_html_with_stats(html_text: str) -> tuple[list[ParsedListing], dict[str, int | float]]:
     soup = BeautifulSoup(html_text, "html.parser")
     items: list[ParsedListing] = []
     seen_urls: set[str] = set()
+    seen_ids: set[str] = set()
 
     candidates = soup.select("article, li.ad-listitem, .ad-listitem")
+    promoted = duplicate_cards = missing_date = missing_price = 0
     for node in candidates:
         if _is_promoted_listing_node(node):
+            promoted += 1
             continue
 
         link = node.select_one("a[href*='/s-anzeige/']")
@@ -443,8 +468,15 @@ def parse_category_html(html_text: str) -> list[ParsedListing]:
 
         full_url = urljoin(BASE_URL, link["href"])
         if full_url in seen_urls or not _allowed_url(full_url):
+            if full_url in seen_urls:
+                duplicate_cards += 1
+            continue
+        external_id = extract_external_id(full_url)
+        if external_id in seen_ids:
+            duplicate_cards += 1
             continue
         seen_urls.add(full_url)
+        seen_ids.add(external_id)
 
         title_node = node.select_one("h2, .ellipsis, [class*='title']")
         title = (title_node or link).get_text(" ", strip=True)
@@ -453,10 +485,14 @@ def parse_category_html(html_text: str) -> list[ParsedListing]:
 
         price_text = _extract_price_text(node)
         posted_text = _extract_posted_text(node)
+        if posted_text is None:
+            missing_date += 1
+        if price_text is None:
+            missing_price += 1
 
         items.append(
             ParsedListing(
-                external_id=extract_external_id(full_url),
+                external_id=external_id,
                 title=title,
                 price_text=price_text,
                 price_eur=parse_price(price_text),
@@ -465,7 +501,71 @@ def parse_category_html(html_text: str) -> list[ParsedListing]:
             )
         )
 
-    return items
+    parsed = len(items)
+    dated = parsed - missing_date
+    return items, {
+        "raw_candidates": len(candidates),
+        "promoted_filtered": promoted,
+        "duplicate_cards": duplicate_cards,
+        "missing_date_count": missing_date,
+        "missing_price_count": missing_price,
+        "date_coverage": (dated / parsed) if parsed else 0.0,
+    }
+
+
+def parse_category_html(html_text: str) -> list[ParsedListing]:
+    return _parse_category_html_with_stats(html_text)[0]
+
+
+def profile_page_dates(items: list[ParsedListing], target_day) -> PageDateProfile:
+    """Classify page chronology without allowing weak date extraction to prove absence.
+
+    A target-day card may legitimately be the last card on a boundary page, so one
+    target hit is enough when the page has good overall date coverage. Conversely,
+    pages where most cards have no parseable publication timestamp are `unknown`.
+    """
+    if not items:
+        return PageDateProfile("empty", [], [], 0, 0, 0, 0, 0, 1.0, 1.0)
+    pairs = [(item, posted_date_moscow(item.posted_text)) for item in items]
+    days = [d for _, d in pairs if d is not None]
+    parsed = len(days)
+    missing = max(0, len(items) - parsed)
+    coverage = parsed / len(items) if items else 0.0
+    if not days:
+        return PageDateProfile("unknown", pairs, days, 0, missing, 0, 0, 0, coverage, 0.0)
+
+    counts = {}
+    for day in days:
+        counts[day] = counts.get(day, 0) + 1
+    target_count = counts.get(target_day, 0)
+    newer = sum(count for day, count in counts.items() if day > target_day)
+    older = sum(count for day, count in counts.items() if day < target_day)
+    enough_dates = parsed >= min(MIN_PAGE_DATED_ITEMS, len(items))
+    reliable = enough_dates and coverage >= MIN_PAGE_DATE_COVERAGE
+
+    # Good-coverage boundary pages may contain only one target card.
+    if target_count and (reliable or (parsed >= 2 and target_count == parsed)):
+        confidence = min(1.0, max(coverage, target_count / max(1, parsed)))
+        return PageDateProfile("target", pairs, days, parsed, missing, target_count, newer, older, coverage, confidence)
+    if not reliable:
+        return PageDateProfile("unknown", pairs, days, parsed, missing, target_count, newer, older, coverage, coverage * 0.5)
+
+    total_directional = newer + older
+    if total_directional <= 0:
+        relation = "target" if target_count else "unknown"
+        return PageDateProfile(relation, pairs, days, parsed, missing, target_count, newer, older, coverage, coverage)
+    if newer and not older:
+        return PageDateProfile("newer", pairs, days, parsed, missing, target_count, newer, older, coverage, coverage)
+    if older and not newer:
+        return PageDateProfile("older", pairs, days, parsed, missing, target_count, newer, older, coverage, coverage)
+    dominance = max(newer, older) / total_directional
+    if dominance >= 0.70:
+        relation = "newer" if newer > older else "older"
+        return PageDateProfile(relation, pairs, days, parsed, missing, target_count, newer, older, coverage, coverage * dominance)
+    ordered = sorted(days)
+    median_day = ordered[len(ordered) // 2]
+    relation = "newer" if median_day > target_day else "older" if median_day < target_day else "mixed"
+    return PageDateProfile(relation, pairs, days, parsed, missing, target_count, newer, older, coverage, coverage * dominance)
 
 
 def _de_int(value: str | None) -> int | None:
@@ -481,44 +581,103 @@ def category_page_info_from_html(
     requested_page: int,
     final_url: str,
 ) -> CategoryPageInfo:
-    """Parse listings plus pagination metadata from a category/search response.
-
-    The result-range header (e.g. ``26 - 50 von 469.976``) lets the date locator
-    detect when Kleinanzeigen normalized/redirected an out-of-range page instead of
-    silently treating repeated fresh listings as if they came from page 20,000.
-    """
-    items = parse_category_html(html_text)
-    text = " ".join(BeautifulSoup(html_text, "html.parser").get_text(" ", strip=True).split())
+    """Parse one result page and attach verification/quality diagnostics."""
+    items, stats = _parse_category_html_with_stats(html_text)
+    soup = BeautifulSoup(html_text, "html.parser")
+    text = " ".join(soup.get_text(" ", strip=True).split())
     range_match = re.search(
-        r"(?<!\d)(\d[\d.]*)\s*-\s*(\d[\d.]*)\s+von\s+(\d[\d.]*)",
+        r"(?<!\d)(\d[\d.]*)\s*[-–]\s*(\d[\d.]*)\s+von\s+(\d[\d.]*)",
         text,
         flags=re.IGNORECASE,
     )
     result_start = result_end = total_results = actual_page = max_page = None
     request_matches = True
+    page_verified = requested_page <= 1
+    warnings: list[str] = []
+
     if range_match:
         result_start = _de_int(range_match.group(1))
         result_end = _de_int(range_match.group(2))
         total_results = _de_int(range_match.group(3))
         if result_start and result_end and result_end >= result_start:
-            # Kleinanzeigen's category result pages currently expose 25 organic slots.
-            # Derive the current page from the result offset, which is more reliable
-            # than trusting the requested URL after a redirect/normalization.
+            page_size = max(1, result_end - result_start + 1)
+            # Normal Kleinanzeigen category pages contain 25 organic slots. On a
+            # partially filled last page the offset still maps correctly with 25.
             actual_page = ((result_start - 1) // 25) + 1
+            page_verified = actual_page == max(1, requested_page)
         if total_results is not None:
             max_page = max(1, (total_results + 24) // 25)
         expected_start = 1 + (max(1, requested_page) - 1) * 25
         if result_start is not None and result_start != expected_start:
             request_matches = False
+            warnings.append(f"result offset {result_start} != expected {expected_start}")
         if max_page is not None and requested_page > max_page:
             request_matches = False
+            warnings.append(f"requested page {requested_page} > calculated max {max_page}")
 
-    # A compact content fingerprint catches normalization even if the range header
-    # changes or is temporarily missing.  Use several IDs so one moving ad cannot
-    # accidentally collide.
+    # Verify page identity from the final URL when possible. This catches redirects
+    # even when the result-range header is absent.
+    decoded_final = unquote(final_url or "")
+    final_page_match = re.search(r"/seite:(\d+)(?:/|$)", decoded_final)
+    if final_page_match:
+        final_page = int(final_page_match.group(1))
+        if final_page != max(1, requested_page):
+            request_matches = False
+            warnings.append(f"final URL page {final_page} != requested {requested_page}")
+        else:
+            page_verified = True
+    elif requested_page == 1:
+        page_verified = True
+
     ids = [x.external_id for x in items if x.external_id]
     fingerprint_ids = ids if len(ids) <= 9 else (ids[:6] + ids[-3:])
     fingerprint = "|".join(fingerprint_ids) if fingerprint_ids else ""
+
+    # Discover smaller official location feeds from the same result page.
+    # This is used only as an internal fallback when a large category/date lies
+    # beyond Kleinanzeigen's public page window. Counted location links from the
+    # filter sidebar are preferred; footer/popular links normally have no count.
+    decoded_current = unquote(final_url or "")
+    category_match = re.search(r"/(c\d+)(?:l\d+)?(?:$|[/?])", decoded_current)
+    location_shards: list[tuple[str, int | None]] = []
+    if category_match:
+        category_code = category_match.group(1)
+        current_location_match = re.search(rf"/{category_code}l(\d+)(?:$|[/?])", decoded_current)
+        current_location_id = current_location_match.group(1) if current_location_match else None
+        seen_shards: set[str] = set()
+        counted: list[tuple[str, int | None]] = []
+        uncounted: list[tuple[str, int | None]] = []
+        for anchor in soup.find_all("a", href=True):
+            href = unquote(str(anchor.get("href") or ""))
+            m = re.search(rf"/{category_code}l(\d+)(?:$|[/?])", href)
+            if not m:
+                continue
+            loc_id = m.group(1)
+            if current_location_id and loc_id == current_location_id:
+                continue
+            full = urljoin(BASE_URL, anchor.get("href"))
+            if not _allowed_url(full) or full in seen_shards:
+                continue
+            seen_shards.add(full)
+            parent_text = " ".join((anchor.parent.get_text(" ", strip=True) if anchor.parent else anchor.get_text(" ", strip=True)).split())
+            cm = re.search(r"\(([\d.]+)\)", parent_text)
+            count = _de_int(cm.group(1)) if cm else None
+            entry = (full, count)
+            (counted if count is not None else uncounted).append(entry)
+        counted.sort(key=lambda x: (x[1] if x[1] is not None else 10**12, x[0]))
+        location_shards = counted[:120] if counted else uncounted[:40]
+
+    lower = text.lower()
+    suspicious_markers = (
+        "captcha", "ungewöhnliche aktivität", "ungewoehnliche aktivitaet",
+        "zugriff verweigert", "access denied", "robot",
+    )
+    suspicious = any(marker in lower for marker in suspicious_markers)
+    if suspicious:
+        warnings.append("challenge/access page detected")
+    if items and float(stats["date_coverage"]) < MIN_PAGE_DATE_COVERAGE:
+        warnings.append(f"low date coverage {float(stats['date_coverage']):.0%}")
+
     return CategoryPageInfo(
         requested_page=max(1, int(requested_page)),
         final_url=final_url,
@@ -529,7 +688,17 @@ def category_page_info_from_html(
         actual_page=actual_page,
         max_page=max_page,
         request_matches_page=request_matches,
+        page_verified=page_verified,
         fingerprint=fingerprint,
+        raw_candidates=int(stats["raw_candidates"]),
+        promoted_filtered=int(stats["promoted_filtered"]),
+        duplicate_cards=int(stats["duplicate_cards"]),
+        missing_date_count=int(stats["missing_date_count"]),
+        missing_price_count=int(stats["missing_price_count"]),
+        date_coverage=float(stats["date_coverage"]),
+        suspicious=suspicious,
+        warnings=warnings,
+        location_shards=location_shards,
     )
 
 
@@ -678,32 +847,37 @@ class KleinanzeigenParser:
         self._playwright = None
         await self.client.aclose()
 
-    async def _fetch_response(self, url: str) -> httpx.Response:
+    async def _fetch_response(
+        self, url: str, *, traffic_kind: str = "scan", traffic_priority: str = "high"
+    ) -> httpx.Response:
         if not _allowed_url(url):
             raise ValueError("Only public kleinanzeigen.de HTTPS URLs are allowed")
 
         last_error: Exception | None = None
         for attempt in range(CATEGORY_HTTP_RETRIES):
             try:
-                response = await self.client.get(url)
+                async with TRAFFIC.lease(traffic_kind, traffic_priority):
+                    response = await self.client.get(url)
                 status = response.status_code
 
-                # Do not try to defeat site protection. A temporary 403/429 gets a
-                # small respectful cooldown and a bounded retry; persistent refusal
-                # is surfaced to the caller so the scan can stop cleanly.
+                # Respect site protection. The process-wide traffic manager lowers
+                # concurrency and starts a shared cooldown after 403/429, so other
+                # scans/view jobs do not keep hammering the site while this request retries.
                 if status in {403, 429}:
+                    await TRAFFIC.report_refusal(status, traffic_kind)
                     if attempt >= CATEGORY_HTTP_RETRIES - 1:
                         raise TemporaryAccessError(status, url)
                     delay = min(45.0, CATEGORY_403_BACKOFF_SECONDS * (attempt + 1))
                     delay += random.uniform(0.0, CATEGORY_RETRY_JITTER_SECONDS)
                     log.warning(
-                        "Category request temporarily refused status=%s attempt=%s/%s; cooling down %.1fs: %s",
-                        status, attempt + 1, CATEGORY_HTTP_RETRIES, delay, url,
+                        "Request temporarily refused kind=%s status=%s attempt=%s/%s; cooling down %.1fs: %s",
+                        traffic_kind, status, attempt + 1, CATEGORY_HTTP_RETRIES, delay, url,
                     )
                     await asyncio.sleep(delay)
                     continue
 
                 response.raise_for_status()
+                await TRAFFIC.report_success(traffic_kind)
                 return response
             except TemporaryAccessError:
                 raise
@@ -715,13 +889,17 @@ class KleinanzeigenParser:
             except httpx.HTTPStatusError as exc:
                 last_error = exc
                 status = exc.response.status_code
+                if status in {403, 429}:
+                    await TRAFFIC.report_refusal(status, traffic_kind)
                 if attempt >= CATEGORY_HTTP_RETRIES - 1 or status not in {500, 502, 503, 504}:
                     raise
                 await asyncio.sleep(1.5 * (attempt + 1) + random.uniform(0.0, 0.8))
         raise RuntimeError(str(last_error))
 
-    async def fetch_html(self, url: str) -> str:
-        return (await self._fetch_response(url)).text
+    async def fetch_html(
+        self, url: str, *, traffic_kind: str = "scan", traffic_priority: str = "high"
+    ) -> str:
+        return (await self._fetch_response(url, traffic_kind=traffic_kind, traffic_priority=traffic_priority)).text
 
     async def parse_category_page(self, url: str) -> list[ParsedListing]:
         return parse_category_html(await self.fetch_html(url))
@@ -988,15 +1166,20 @@ class KleinanzeigenParser:
             "Sec-Fetch-Site": "same-origin",
         }
 
-    async def _direct_view_http(self, url: str) -> ViewCountResult:
+    async def _direct_view_http(self, url: str, *, traffic_priority: str = "normal") -> ViewCountResult:
         ad_id = extract_external_id(url)
         endpoint = self._direct_view_url(ad_id)
         try:
-            response = await self.client.get(
-                endpoint,
-                headers=self._direct_view_headers(url),
-                timeout=12.0,
-            )
+            async with TRAFFIC.lease("view", traffic_priority):
+                response = await self.client.get(
+                    endpoint,
+                    headers=self._direct_view_headers(url),
+                    timeout=12.0,
+                )
+            if response.status_code in {403, 429}:
+                await TRAFFIC.report_refusal(response.status_code, "view")
+            elif response.status_code == 200:
+                await TRAFFIC.report_success("view")
             if response.status_code != 200:
                 return ViewCountResult(
                     None, None, f"direct-http:status-{response.status_code}",
@@ -1032,25 +1215,32 @@ class KleinanzeigenParser:
         except Exception:
             pass
 
-    async def _direct_view_context_request(self, url: str) -> ViewCountResult:
+    async def _direct_view_context_request(self, url: str, *, traffic_priority: str = "normal") -> ViewCountResult:
         ad_id = extract_external_id(url)
         endpoint = self._direct_view_url(ad_id)
         try:
             context = await self._ensure_view_browser()
-            response = await context.request.get(
-                endpoint,
-                headers=self._direct_view_headers(url),
-                timeout=12_000,
-                fail_on_status_code=False,
-            )
-            if response.status in {403, 429} and not self._context_session_seeded:
-                await self._seed_context_request_session(context)
+            async with TRAFFIC.lease("view", traffic_priority):
                 response = await context.request.get(
                     endpoint,
                     headers=self._direct_view_headers(url),
                     timeout=12_000,
                     fail_on_status_code=False,
                 )
+            if response.status in {403, 429} and not self._context_session_seeded:
+                await TRAFFIC.report_refusal(response.status, "view")
+                await self._seed_context_request_session(context)
+                async with TRAFFIC.lease("view", traffic_priority):
+                    response = await context.request.get(
+                        endpoint,
+                        headers=self._direct_view_headers(url),
+                        timeout=12_000,
+                        fail_on_status_code=False,
+                    )
+            if response.status in {403, 429}:
+                await TRAFFIC.report_refusal(response.status, "view")
+            elif response.status == 200:
+                await TRAFFIC.report_success("view")
             if response.status != 200:
                 return ViewCountResult(
                     None, None, f"direct-context:status-{response.status}",
@@ -1067,7 +1257,7 @@ class KleinanzeigenParser:
         except Exception as exc:
             return ViewCountResult(None, None, "direct-context:error", error=str(exc)[:300])
 
-    async def probe_direct_view_mode(self, url: str, *, force: bool = False) -> tuple[str, ViewCountResult]:
+    async def probe_direct_view_mode(self, url: str, *, force: bool = False, traffic_priority: str = "normal") -> tuple[str, ViewCountResult]:
         """Find the cheapest working public counter path once per parser instance.
 
         Order: plain HTTP -> Playwright APIRequestContext -> normal browser page.
@@ -1078,33 +1268,33 @@ class KleinanzeigenParser:
         async with self._direct_mode_lock:
             if not force and self._direct_view_mode != "unknown":
                 return self._direct_view_mode, ViewCountResult(None, None, f"mode:{self._direct_view_mode}")
-            direct = await self._direct_view_http(url)
+            direct = await self._direct_view_http(url, traffic_priority=traffic_priority)
             if direct.views is not None:
                 self._direct_view_mode = "http"
                 return "http", direct
-            context_direct = await self._direct_view_context_request(url)
+            context_direct = await self._direct_view_context_request(url, traffic_priority=traffic_priority)
             if context_direct.views is not None:
                 self._direct_view_mode = "context"
                 return "context", context_direct
             self._direct_view_mode = "browser"
             return "browser", context_direct
 
-    async def fetch_public_view_count_direct(self, url: str, *, mode: str | None = None) -> ViewCountResult:
+    async def fetch_public_view_count_direct(self, url: str, *, mode: str | None = None, traffic_priority: str = "normal") -> ViewCountResult:
         """Fast counter fetch that does not render an ad page when a direct path works."""
         if not _allowed_url(url) or "/s-anzeige/" not in url:
             return ViewCountResult(None, None, "invalid-url", error="Нужна публичная ссылка на объявление Kleinanzeigen")
         chosen = mode or self._direct_view_mode
         if chosen == "unknown":
-            chosen, probe = await self.probe_direct_view_mode(url)
+            chosen, probe = await self.probe_direct_view_mode(url, traffic_priority=traffic_priority)
             if probe.views is not None:
                 return probe
         if chosen == "http":
-            return await self._direct_view_http(url)
+            return await self._direct_view_http(url, traffic_priority=traffic_priority)
         if chosen == "context":
-            return await self._direct_view_context_request(url)
+            return await self._direct_view_context_request(url, traffic_priority=traffic_priority)
         return ViewCountResult(None, None, "direct:browser-required")
 
-    async def fetch_public_view_count(self, url: str, *, browser_fallback: bool = True, http_fast_path: bool = True) -> ViewCountResult:
+    async def fetch_public_view_count(self, url: str, *, browser_fallback: bool = True, http_fast_path: bool = True, traffic_priority: str = "normal") -> ViewCountResult:
         """Read the public view counter without authentication.
 
         First try the normal HTML response (cheap). If the counter is injected only
@@ -1116,7 +1306,7 @@ class KleinanzeigenParser:
 
         if http_fast_path:
             try:
-                html_text = await self.fetch_html(url)
+                html_text = await self.fetch_html(url, traffic_kind="view", traffic_priority=traffic_priority)
                 value, raw = self._view_count_from_html(html_text)
                 if value is not None:
                     return ViewCountResult(value, raw, "http:#viewad-cntr-num", url, None)
@@ -1139,7 +1329,13 @@ class KleinanzeigenParser:
             ad_id = extract_external_id(url)
             passive_future, passive_tasks = self._attach_passive_view_capture(page, ad_id)
 
-            await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+            async with TRAFFIC.lease("browser", traffic_priority):
+                nav_response = await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+            if nav_response is not None:
+                if nav_response.status in {403, 429}:
+                    await TRAFFIC.report_refusal(nav_response.status, "browser")
+                elif 200 <= nav_response.status < 400:
+                    await TRAFFIC.report_success("browser")
             final_url = page.url
             page_title = await page.title()
 
@@ -1362,7 +1558,7 @@ class KleinanzeigenParser:
                 except Exception:
                     pass
 
-    async def fetch_public_view_counts(self, urls: list[str], *, concurrency: int = 6, progress_cb=None) -> dict[str, ViewCountResult]:
+    async def fetch_public_view_counts(self, urls: list[str], *, concurrency: int = 6, progress_cb=None, traffic_priority: str = "normal") -> dict[str, ViewCountResult]:
         """Batch public view counters with a direct-first fast path.
 
         v2.7.2 probes the public s-vac-inc-get endpoint once. If plain HTTP or a
@@ -1377,11 +1573,11 @@ class KleinanzeigenParser:
         results: dict[str, ViewCountResult] = {}
         total = len(urls)
 
-        mode, probe = await self.probe_direct_view_mode(urls[0])
+        mode, probe = await self.probe_direct_view_mode(urls[0], traffic_priority=traffic_priority)
         if probe.views is not None:
             results[urls[0]] = probe
 
-        direct_sem = asyncio.Semaphore(DIRECT_VIEW_CONCURRENCY)
+        direct_sem = asyncio.Semaphore(max(1, min(DIRECT_VIEW_CONCURRENCY, concurrency)))
         done_count = len(results)
         done_lock = asyncio.Lock()
 
@@ -1400,7 +1596,7 @@ class KleinanzeigenParser:
             if url in results:
                 return
             async with direct_sem:
-                vr = await self.fetch_public_view_count_direct(url, mode=mode)
+                vr = await self.fetch_public_view_count_direct(url, mode=mode, traffic_priority=traffic_priority)
                 results[url] = vr
             async with done_lock:
                 done_count += 1
@@ -1421,14 +1617,14 @@ class KleinanzeigenParser:
         # Browser fallback is intentionally gentler than direct requests. This is
         # only used for the minority of URLs that the fast endpoint cannot read.
         page_sem = asyncio.Semaphore(max(1, min(6, concurrency)))
-        global_sem = _global_view_semaphore()
 
         async def browser_one(url: str):
             nonlocal done_count
             async with page_sem:
-                async with global_sem:
-                    vr = await self.fetch_public_view_count(url, http_fast_path=False)
-                    results[url] = vr
+                vr = await self.fetch_public_view_count(
+                    url, http_fast_path=False, traffic_priority=traffic_priority
+                )
+                results[url] = vr
             # Direct attempts already incremented progress; in pure browser mode they did not.
             if mode == "browser":
                 async with done_lock:
@@ -1450,7 +1646,12 @@ class KleinanzeigenParser:
         if not _allowed_url(url):
             return None
         try:
-            response = await self.client.get(url, timeout=AVAILABILITY_TIMEOUT)
+            async with TRAFFIC.lease("view", "background"):
+                response = await self.client.get(url, timeout=AVAILABILITY_TIMEOUT)
+            if response.status_code in {403, 429}:
+                await TRAFFIC.report_refusal(response.status_code, "view")
+            elif response.status_code < 500:
+                await TRAFFIC.report_success("view")
         except httpx.HTTPError:
             return None
         if response.status_code in {404, 410}:

@@ -126,6 +126,19 @@ class ParserRun(Base):
     new_count: Mapped[int] = mapped_column(Integer, default=0)
     known_count: Mapped[int] = mapped_column(Integer, default=0)
     enriched_count: Mapped[int] = mapped_column(Integer, default=0)
+    # v3.1 parser-quality diagnostics. These counters describe the actual HTML
+    # responses used by the scan and make silent parser degradation visible.
+    cards_seen: Mapped[int] = mapped_column(Integer, default=0)
+    listings_parsed: Mapped[int] = mapped_column(Integer, default=0)
+    missing_date_count: Mapped[int] = mapped_column(Integer, default=0)
+    missing_price_count: Mapped[int] = mapped_column(Integer, default=0)
+    promoted_filtered: Mapped[int] = mapped_column(Integer, default=0)
+    duplicate_count: Mapped[int] = mapped_column(Integer, default=0)
+    invalid_pages: Mapped[int] = mapped_column(Integer, default=0)
+    repeated_pages: Mapped[int] = mapped_column(Integer, default=0)
+    low_quality_pages: Mapped[int] = mapped_column(Integer, default=0)
+    view_failures: Mapped[int] = mapped_column(Integer, default=0)
+    quality_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
     stop_reason: Mapped[str] = mapped_column(String(255), default="")
     success: Mapped[bool] = mapped_column(Boolean, default=True)
     error_text: Mapped[str | None] = mapped_column(String(1000), nullable=True)
@@ -157,6 +170,8 @@ class UserScan(Base):
     # before the requested calendar day is fully crossed.
     target_complete: Mapped[bool] = mapped_column(Boolean, default=False)
     scan_note: Mapped[str] = mapped_column(String(500), default="")
+    quality_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    quality_note: Mapped[str] = mapped_column(String(500), default="")
 
 
 class ScanListing(Base):

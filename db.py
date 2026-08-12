@@ -106,6 +106,24 @@ async def init_db() -> None:
         if scan_view_columns and "target_hours" not in scan_view_columns:
             await conn.execute(text("ALTER TABLE scan_view_history ADD COLUMN target_hours INTEGER"))
 
+        parser_run_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "parser_runs"))
+        parser_quality_columns = {
+            "cards_seen": "INTEGER DEFAULT 0",
+            "listings_parsed": "INTEGER DEFAULT 0",
+            "missing_date_count": "INTEGER DEFAULT 0",
+            "missing_price_count": "INTEGER DEFAULT 0",
+            "promoted_filtered": "INTEGER DEFAULT 0",
+            "duplicate_count": "INTEGER DEFAULT 0",
+            "invalid_pages": "INTEGER DEFAULT 0",
+            "repeated_pages": "INTEGER DEFAULT 0",
+            "low_quality_pages": "INTEGER DEFAULT 0",
+            "view_failures": "INTEGER DEFAULT 0",
+            "quality_score": "INTEGER DEFAULT 0",
+        }
+        for column_name, sql_type in parser_quality_columns.items():
+            if parser_run_columns and column_name not in parser_run_columns:
+                await conn.execute(text(f"ALTER TABLE parser_runs ADD COLUMN {column_name} {sql_type}"))
+
         user_scan_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "user_scans"))
         if user_scan_columns and "target_date" not in user_scan_columns:
             await conn.execute(text("ALTER TABLE user_scans ADD COLUMN target_date VARCHAR(10) DEFAULT ''"))
@@ -113,3 +131,7 @@ async def init_db() -> None:
             await conn.execute(text("ALTER TABLE user_scans ADD COLUMN target_complete BOOLEAN DEFAULT FALSE"))
         if user_scan_columns and "scan_note" not in user_scan_columns:
             await conn.execute(text("ALTER TABLE user_scans ADD COLUMN scan_note VARCHAR(500) DEFAULT ''"))
+        if user_scan_columns and "quality_score" not in user_scan_columns:
+            await conn.execute(text("ALTER TABLE user_scans ADD COLUMN quality_score INTEGER DEFAULT 0"))
+        if user_scan_columns and "quality_note" not in user_scan_columns:
+            await conn.execute(text("ALTER TABLE user_scans ADD COLUMN quality_note VARCHAR(500) DEFAULT ''"))
