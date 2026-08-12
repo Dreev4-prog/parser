@@ -33,6 +33,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from categories import CATEGORIES, GROUPS, categories_for_group, group_root_key
 from db import DATABASE_BACKEND, SessionLocal, init_db
 from filters import (
+    apply_listing_settings,
     base_filter,
     below_market_rows,
     dedupe_rows,
@@ -75,7 +76,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "3.2.4"
+APP_VERSION = "3.2.7"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
@@ -125,7 +126,6 @@ MODE_LABELS = {
     "fast_disappearing": "⚡ Быстро исчезающие",
     "price_drop": "📉 Снижение цены",
 }
-PERIOD_LABELS = {"1h": "1 час", "3h": "3 часа", "6h": "6 часов", "today": "Сегодня"}
 PRICE_LABELS = {
     "any": "Любая",
     "0_50": "0–50 €",
@@ -256,7 +256,10 @@ def growth_period_keyboard(scan_id: int, active_hours: int = 1, category_key: st
         [b(1), b(3), b(6)],
         [b(12), b(24)],
         [InlineKeyboardButton(text="📊 Скачать TOP-50", callback_data=f"{export_prefix}{active_hours}")],
-        [InlineKeyboardButton(text="👁 Обновить сейчас", callback_data=f"scanviews:{scan_id}")],
+        [InlineKeyboardButton(
+            text="👁 Обновить последний скан" if category_key else "👁 Обновить сейчас",
+            callback_data=f"scanviews:{scan_id}",
+        )],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback)],
     ])
 
@@ -275,7 +278,7 @@ def popular_categories_keyboard(items: list[tuple[str, UserScan]]) -> InlineKeyb
 
 def popular_category_keyboard(scan_id: int, category_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👁 Самые просматриваемые", callback_data=f"pcv:{scan_id}:{category_key}")],
+        [InlineKeyboardButton(text="👁 Самые просматриваемые · все сканы", callback_data=f"pcv:{scan_id}:{category_key}")],
         [InlineKeyboardButton(text="🚀 TOP 1ч", callback_data=f"pcg:{scan_id}:{category_key}:1"),
          InlineKeyboardButton(text="🚀 TOP 3ч", callback_data=f"pcg:{scan_id}:{category_key}:3")],
         [InlineKeyboardButton(text="🔥 TOP 6ч", callback_data=f"pcg:{scan_id}:{category_key}:6"),
@@ -359,7 +362,6 @@ def settings_keyboard(s: UserSettings) -> InlineKeyboardMarkup:
         [_mode_button(s, "price_drop")],
         [InlineKeyboardButton(text=f"🚫 Умные дубли: {'ВКЛ' if s.smart_dedupe else 'ВЫКЛ'}", callback_data="toggle_dedupe")],
         [InlineKeyboardButton(text=f"🧹 Чистить услуги/поиск: {'ВКЛ' if s.clean_noise else 'ВЫКЛ'}", callback_data="toggle_noise")],
-        [InlineKeyboardButton(text=f"🕐 Период: {PERIOD_LABELS.get(s.period, s.period)}", callback_data="set_period")],
         [InlineKeyboardButton(text=f"💶 Цена: {PRICE_LABELS.get(s.price_filter, s.price_filter)}", callback_data="set_price")],
         [InlineKeyboardButton(text=f"↕️ Сортировка: {SORT_LABELS.get(s.sort_mode, s.sort_mode)}", callback_data="set_sort")],
         [InlineKeyboardButton(text="✅ Ключевые слова", callback_data="set_include"),
@@ -375,6 +377,17 @@ def page_limit_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="25 страниц", callback_data="scanpages:25"),
          InlineKeyboardButton(text="50 страниц", callback_data="scanpages:50")],
         [InlineKeyboardButton(text="100 страниц", callback_data="scanpages:100")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="home")],
+    ])
+
+
+def scan_date_keyboard() -> InlineKeyboardMarkup:
+    today = datetime.now(MOSCOW).date()
+    yesterday = today - timedelta(days=1)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📅 Сегодня · {today:%d.%m}", callback_data="scan_date:today"),
+         InlineKeyboardButton(text=f"↩️ Вчера · {yesterday:%d.%m}", callback_data="scan_date:yesterday")],
+        [InlineKeyboardButton(text="🗓 Выбрать дату", callback_data="scan_date:custom")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="home")],
     ])
 
@@ -482,7 +495,12 @@ async def get_user_scans(user_id: int, limit: int = 10) -> list[UserScan]:
 
 
 async def get_user_popular_categories(user_id: int, limit_scans: int = 100) -> list[tuple[str, UserScan]]:
-    """Return scanned categories, newest scan first, one latest scan per category."""
+    """Return category menu entries, newest representative scan first.
+
+    The representative scan is used only to build compact Telegram callbacks.
+    Category analytics themselves aggregate every completed scan for that
+    category (see ``get_user_category_scans`` / ``get_category_scan_rows``).
+    """
     async with SessionLocal() as session:
         result = await session.execute(
             select(UserScan)
@@ -502,12 +520,67 @@ async def get_user_popular_categories(user_id: int, limit_scans: int = 100) -> l
     return list(latest.items())
 
 
+async def get_user_category_scans(user_id: int, category_key: str) -> list[UserScan]:
+    """Return every completed user scan that contains ``category_key``.
+
+    Exact key matching is intentionally done in Python instead of SQL ``LIKE``
+    because ``category_keys`` is a comma-separated legacy field and category
+    names may share prefixes. Newest scans are returned first.
+    """
+    if category_key not in CATEGORIES:
+        return []
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(UserScan)
+            .where(
+                UserScan.user_id == user_id,
+                UserScan.status.in_(["done", "partial"]),
+            )
+            .order_by(UserScan.finished_at.desc(), UserScan.created_at.desc())
+        )
+        scans = list(result.scalars().all())
+    return [scan for scan in scans if category_key in _scan_category_keys(scan)]
+
+
+async def get_category_scan_rows(user_id: int, category_key: str) -> tuple[list[Listing], list[UserScan]]:
+    """Union all saved listings from all completed scans of one category.
+
+    One Kleinanzeigen listing may be present in several repeated scans. The SQL
+    ``DISTINCT`` keeps it only once. The current listing view counter is used,
+    while paid/promoted rows are excluded from Popular just like global output.
+    """
+    scans = await get_user_category_scans(user_id, category_key)
+    if not scans:
+        return [], []
+    scan_ids = [scan.id for scan in scans]
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Listing)
+            .join(ScanListing, Listing.external_id == ScanListing.external_id)
+            .where(
+                ScanListing.scan_id.in_(scan_ids),
+                Listing.category_key == category_key,
+                Listing.is_promoted.is_(False),
+            )
+            .distinct()
+        )
+        rows = list(result.scalars().all())
+    return rows, scans
+
+
+def _category_scan_dates(scans: list[UserScan], max_items: int = 8) -> str:
+    dates = sorted({scan.target_date for scan in scans if scan.target_date}, reverse=True)
+    if not dates:
+        return "—"
+    shown = [_date_label(value) for value in dates[:max_items]]
+    if len(dates) > max_items:
+        shown.append(f"+ ещё {len(dates) - max_items}")
+    return ", ".join(shown)
+
+
 async def get_latest_scan_for_category(user_id: int, category_key: str) -> UserScan | None:
-    items = await get_user_popular_categories(user_id)
-    for key, scan in items:
-        if key == category_key:
-            return scan
-    return None
+    scans = await get_user_category_scans(user_id, category_key)
+    return scans[0] if scans else None
 
 
 async def get_scan_rows(scan_id: int) -> list[tuple[Listing, ScanListing]]:
@@ -605,6 +678,17 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
                 rows = list(result.scalars().all())
             else:
                 rows = []
+
+            # Freeze the user's active parser settings into this saved scan.
+            # The raw crawl stays in Listing for analytics, while ScanListing
+            # contains only what the user asked to see at scan completion.
+            scan_settings = await session.get(UserSettings, job.user_id)
+            if scan_settings is None:
+                scan_settings = UserSettings(user_id=job.user_id)
+            rows = apply_listing_settings(
+                rows, scan_settings, exact_date_scan=True, apply_output_mode=True
+            )
+
             scan.result_count = len(rows)
             scan.viewed_count = sum(1 for row in rows if row.view_count is not None)
             scan.last_view_refresh_at = now if scan.viewed_count else None
@@ -877,6 +961,42 @@ async def get_scan_growth_rows(
     return growth[:GROWTH_TOP_LIMIT], len(rounds)
 
 
+async def get_category_growth_rows(
+    user_id: int, category_key: str, period_hours: int
+) -> tuple[list[GrowthMetric], int, int]:
+    """Aggregate growth metrics from every completed scan of one category.
+
+    Repeated scans can contain the same Kleinanzeigen ad. In that case the most
+    recent observation wins, so the category TOP never shows duplicate rows.
+    Returns ``(growth, scan_count, observation_round_count)``.
+    """
+    scans = await get_user_category_scans(user_id, category_key)
+    if not scans:
+        return [], 0, 0
+
+    merged: dict[str, GrowthMetric] = {}
+    total_rounds = 0
+    for scan in scans:
+        growth, rounds = await get_scan_growth_rows(
+            scan.id, period_hours, category_key=category_key
+        )
+        total_rounds += rounds
+        for item in growth:
+            external_id = item.listing.external_id
+            previous = merged.get(external_id)
+            if previous is None:
+                merged[external_id] = item
+                continue
+            # Prefer the newest real observation. On an identical timestamp,
+            # keep the larger delta as a deterministic tie breaker.
+            if (item.observed_at, item.delta) > (previous.observed_at, previous.delta):
+                merged[external_id] = item
+
+    values = list(merged.values())
+    values.sort(key=lambda item: (item.delta, item.per_hour, item.current_views), reverse=True)
+    return values[:GROWTH_TOP_LIMIT], len(scans), total_rounds
+
+
 def my_scans_keyboard(scans: list[UserScan]) -> InlineKeyboardMarkup:
     rows = []
     for scan in scans[:8]:
@@ -1102,7 +1222,7 @@ async def filtered_rows(user_id: int) -> tuple[UserSettings, list[Listing]]:
     s = await get_settings(user_id)
     rows = await today_rows()
     rows = base_filter(
-        rows, period=s.period, price_filter=s.price_filter, clean_noise=s.clean_noise,
+        rows, period=None, price_filter=s.price_filter, clean_noise=s.clean_noise,
         include_words=s.include_words or "", exclude_words=s.exclude_words or "",
     )
     if s.smart_dedupe:
@@ -1681,15 +1801,20 @@ async def send_smart_export(
     if selected_keys:
         all_rows = [row for row in all_rows if row.category_key in selected_keys]
     raw_base = base_filter(
-        all_rows, period=("today" if rows_override is not None else s.period), price_filter=s.price_filter, clean_noise=s.clean_noise,
+        all_rows, period=None, price_filter=s.price_filter, clean_noise=s.clean_noise,
         include_words=s.include_words or "", exclude_words=s.exclude_words or "",
     )
 
     # Frequency intentionally sees all distinct IDs; otherwise smart de-duplication
-    # would hide the very repetitions this mode is meant to measure.
-    base = raw_base
-    if s.smart_dedupe and mode != "frequent":
-        base = dedupe_rows(base)
+    # would hide the very repetitions this mode is meant to measure. Unique is
+    # also evaluated on raw filtered rows so duplicates cannot turn into a fake
+    # unique product after being collapsed.
+    if mode == "unique":
+        base = unique_rows(raw_base)
+    else:
+        base = raw_base
+        if s.smart_dedupe and mode != "frequent":
+            base = dedupe_rows(base)
 
     # v2.7.0: view counters are collected during the category scan itself.
     # Export is intentionally read-only so the result file is available immediately.
@@ -1719,7 +1844,7 @@ async def send_smart_export(
         # Reload rows because availability status may have changed.
         all_rows = await today_rows()
         refreshed = base_filter(
-            all_rows, period=s.period, price_filter=s.price_filter, clean_noise=s.clean_noise,
+            all_rows, period=None, price_filter=s.price_filter, clean_noise=s.clean_noise,
             include_words=s.include_words or "", exclude_words=s.exclude_words or "",
         )
         if s.smart_dedupe:
@@ -1751,9 +1876,7 @@ async def send_smart_export(
         caption = f"📉 Снижение цены: {len(result)}"
 
     else:
-        result = unique_rows(base) if mode == "unique" else sort_rows(base, s.sort_mode)
-        if mode == "unique":
-            result = sort_rows(result, s.sort_mode)
+        result = sort_rows(base, s.sort_mode)
         if not result:
             await message.answer("📦 По текущим фильтрам ничего не найдено.", reply_markup=main_keyboard(selected_count))
             return 0
@@ -1772,18 +1895,15 @@ def settings_text(s: UserSettings) -> str:
     exclude = html.escape(s.exclude_words) if s.exclude_words else "—"
     return (
         "<b>⚙️ Настройки парсинга</b>\n\n"
-        "Парсер всё равно сохраняет полный массив. Эти настройки меняют только результат/выгрузку.\n\n"
+        "Эти правила применяются к результату независимо от даты запуска. Дата выбирается отдельно при старте парсера.\n\n"
         f"Режим: <b>{MODE_LABELS.get(s.output_mode, s.output_mode)}</b>\n"
         f"Умные дубли: <b>{'ВКЛ' if s.smart_dedupe else 'ВЫКЛ'}</b>\n"
         f"Чистить услуги/поиск: <b>{'ВКЛ' if s.clean_noise else 'ВЫКЛ'}</b>\n"
-        f"Период: <b>{PERIOD_LABELS.get(s.period, s.period)}</b>\n"
         f"Цена: <b>{PRICE_LABELS.get(s.price_filter, s.price_filter)}</b>\n"
         f"Сортировка: <b>{SORT_LABELS.get(s.sort_mode, s.sort_mode)}</b>\n"
-        "Скан по дате: <b>дата + глубина 25 / 50 / 100</b>\n"
         f"Ключевые слова: <b>{include}</b>\n"
         f"Исключить: <b>{exclude}</b>\n\n"
-        "<i>Точный поиск по дате сначала быстро находит начало выбранного дня, а затем применяет выбранную глубину 25 / 50 / 100 страниц. Внутренняя очередь, кэш и совместные сканы скрыты от пользователей. "
-        "Нажми «ℹ️ Как работают режимы», чтобы увидеть текущие критерии.</i>"
+        "<i>При запуске выбери «Сегодня», «Вчера» или «Выбрать дату». После этого все настройки выше применятся к выбранному дню.</i>"
     )
 
 
@@ -4284,15 +4404,11 @@ async def _begin_scan_from_message(message: Message, state: FSMContext) -> None:
             return
 
     await state.set_state(ScanInput.target_date)
-    today_label = datetime.now(MOSCOW).strftime("%d.%m.%Y")
     await message.answer(
-        "<b>📅 За какое число искать объявления?</b>\n\n"
-        "Всё считаем по <b>московскому времени (МСК)</b>.\n"
-        f"Сегодня по МСК: <b>{today_label}</b>.\n\n"
-        "Можно отправить просто число текущего месяца, например <code>12</code>, "
-        "или полную дату <code>10.08.2026</code>.\n\n"
-        "После даты выбери глубину <b>25 / 50 / 100 страниц</b>.",
+        "<b>📅 За какой день запустить парсер?</b>\n\n"
+        "Выбери дату отдельно от настроек. Всё считаем по <b>московскому времени (МСК)</b>.",
         parse_mode=ParseMode.HTML,
+        reply_markup=scan_date_keyboard(),
     )
 
 
@@ -4495,16 +4611,17 @@ async def toggle_noise(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "set_period")
 async def set_period(callback: CallbackQuery) -> None:
-    await callback.answer()
-    await callback.message.edit_text("<b>🕐 Период результата</b>", reply_markup=choice_keyboard("period", [(k, v) for k, v in PERIOD_LABELS.items()]), parse_mode=ParseMode.HTML)
+    # Compatibility for old Telegram messages created before v3.2.7.
+    s = await get_settings(callback.from_user.id)
+    await callback.answer("Период перенесён в запуск парсера")
+    await callback.message.edit_text(settings_text(s), reply_markup=settings_keyboard(s), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data.startswith("period:"))
 async def choose_period(callback: CallbackQuery) -> None:
-    value = callback.data.split(":", 1)[1]
-    if value not in PERIOD_LABELS: return
-    s = await update_setting(callback.from_user.id, "period", value)
-    await callback.answer("Период сохранён")
+    # Do not preserve a hidden legacy period: date is now selected only at scan start.
+    s = await get_settings(callback.from_user.id)
+    await callback.answer("Эта настройка больше не используется")
     await callback.message.edit_text(settings_text(s), reply_markup=settings_keyboard(s), parse_mode=ParseMode.HTML)
 
 
@@ -4712,20 +4829,24 @@ async def popular_now(callback: CallbackQuery) -> None:
 async def popular_category(callback: CallbackQuery) -> None:
     category_key = callback.data.split(":", 1)[1]
     cat = CATEGORIES.get(category_key)
-    scan = await get_latest_scan_for_category(callback.from_user.id, category_key)
-    if cat is None or scan is None:
-        await callback.answer("Категория или скан не найдены", show_alert=True); return
-    pairs = await get_scan_rows(scan.id)
-    rows = [row for row, _ in pairs if row.category_key == category_key]
+    rows, scans = await get_category_scan_rows(callback.from_user.id, category_key)
+    if cat is None or not scans:
+        await callback.answer("Категория или сканы не найдены", show_alert=True); return
+    scan_settings = await get_settings(callback.from_user.id)
+    rows = apply_listing_settings(rows, scan_settings, exact_date_scan=True, apply_output_mode=True)
+    scan = scans[0]  # newest representative scan; analytics below use all scans
     viewed = sum(1 for row in rows if row.view_count is not None)
+    unique_dates = {item.target_date for item in scans if item.target_date}
     await callback.answer()
     text = (
         f"🔥 <b>Популярное · {html.escape(cat.name)}</b>\n\n"
-        f"Используется последний скан этой категории: <b>{_date_label(scan.target_date)}</b>\n"
-        f"📦 Объявлений: <b>{len(rows)}</b>\n"
-        f"👁 С просмотрами: <b>{viewed}</b>\n"
-        f"🕐 Первый замер: <b>{_moscow_text(scan.finished_at or scan.created_at)} МСК</b>\n\n"
-        "Выбери рейтинг. Для TOP роста бот сравнивает контрольные замеры с первым замером этого скана."
+        f"🧩 Объединено запусков: <b>{len(scans)}</b>\n"
+        f"📅 Даты парсинга объявлений: <b>{html.escape(_category_scan_dates(scans))}</b>\n"
+        f"📦 Уникальных объявлений: <b>{len(rows)}</b>\n"
+        f"👁 С просмотрами: <b>{viewed}</b>\n\n"
+        "Теперь рейтинг собирается <b>по всем сохранённым сканам этой категории</b>, "
+        "а повторно встретившееся объявление показывается только один раз. "
+        f"Всего разных дат в выборке: <b>{len(unique_dates)}</b>."
     )
     await callback.message.answer(
         text, parse_mode=ParseMode.HTML,
@@ -4738,23 +4859,35 @@ async def popular_category_views(callback: CallbackQuery) -> None:
     parts = callback.data.split(":")
     if len(parts) != 3:
         await callback.answer("Некорректный запрос", show_alert=True); return
-    scan_id, category_key = int(parts[1]), parts[2]
-    scan = await get_user_scan(callback.from_user.id, scan_id)
+    try:
+        representative_scan_id, category_key = int(parts[1]), parts[2]
+    except Exception:
+        await callback.answer("Некорректный запрос", show_alert=True); return
     cat = CATEGORIES.get(category_key)
-    if scan is None or cat is None or category_key not in _scan_category_keys(scan):
-        await callback.answer("Скан не найден", show_alert=True); return
-    pairs = await get_scan_rows(scan_id)
-    rows = [row for row, _ in pairs if row.category_key == category_key and row.view_count is not None]
+    rows, scans = await get_category_scan_rows(callback.from_user.id, category_key)
+    if cat is None or not scans:
+        await callback.answer("Сканы категории не найдены", show_alert=True); return
+    # Prefer the newest owned scan for navigation even when an old Telegram
+    # message contains a stale representative scan id.
+    scan_id = scans[0].id
+    scan_settings = await get_settings(callback.from_user.id)
+    rows = apply_listing_settings(rows, scan_settings, exact_date_scan=True, apply_output_mode=True)
+    rows = [row for row in rows if row.view_count is not None]
     rows.sort(key=lambda row: (row.view_count or 0, row.first_seen_at), reverse=True)
     await callback.answer()
     if not rows:
-        text = f"👁 <b>{html.escape(cat.name)}</b>\n\nПока нет данных просмотров."
+        text = f"👁 <b>{html.escape(cat.name)}</b>\n\nПока нет данных просмотров ни в одном сохранённом скане."
     else:
-        lines = [f"👁 <b>Самые просматриваемые · {html.escape(cat.name)}</b>", ""]
+        lines = [
+            f"👁 <b>Самые просматриваемые · {html.escape(cat.name)}</b>",
+            f"Сводно по <b>{len(scans)}</b> запускам · даты: <b>{html.escape(_category_scan_dates(scans))}</b>",
+            "",
+        ]
         for i, row in enumerate(rows[:GROWTH_TELEGRAM_LIMIT], 1):
             lines.append(
                 f"<b>{i}. {html.escape(row.title[:60])}</b>\n"
-                f"👁 <b>{row.view_count}</b> · 💶 {html.escape(_price_display(row.price_text, row.price_eur))}\n"
+                f"📅 {_date_label(row.posted_date_msk)} · 👁 <b>{row.view_count}</b> · "
+                f"💶 {html.escape(_price_display(row.price_text, row.price_eur))}\n"
                 f'<a href="{html.escape(row.url)}">Открыть</a>'
             )
         text = "\n\n".join(lines)
@@ -4770,27 +4903,38 @@ async def popular_category_growth(callback: CallbackQuery) -> None:
     if len(parts) != 4:
         await callback.answer("Некорректный запрос", show_alert=True); return
     try:
-        scan_id, category_key, period_hours = int(parts[1]), parts[2], int(parts[3])
+        representative_scan_id, category_key, period_hours = int(parts[1]), parts[2], int(parts[3])
     except Exception:
         await callback.answer("Некорректный запрос", show_alert=True); return
     if period_hours not in OBSERVATION_HOURS:
         period_hours = 1
-    scan = await get_user_scan(callback.from_user.id, scan_id)
+    scans = await get_user_category_scans(callback.from_user.id, category_key)
     cat = CATEGORIES.get(category_key)
-    if scan is None or cat is None or category_key not in _scan_category_keys(scan):
-        await callback.answer("Скан не найден", show_alert=True); return
-    growth, rounds = await get_scan_growth_rows(scan_id, period_hours, category_key=category_key)
+    if not scans or cat is None:
+        await callback.answer("Сканы категории не найдены", show_alert=True); return
+    scan_id = scans[0].id
+    growth, scan_count, rounds = await get_category_growth_rows(
+        callback.from_user.id, category_key, period_hours
+    )
+    scan_settings = await get_settings(callback.from_user.id)
+    allowed_growth_rows = apply_listing_settings(
+        [item.listing for item in growth], scan_settings, exact_date_scan=True, apply_output_mode=True
+    )
+    allowed_growth_ids = {row.external_id for row in allowed_growth_rows}
+    growth = [item for item in growth if item.listing.external_id in allowed_growth_ids]
     await callback.answer()
     period_label = f"{period_hours} ч"
     if not growth:
         text = (
             f"🚀 <b>TOP роста · {html.escape(cat.name)} · {period_label}</b>\n\n"
-            "Контрольный замер для этого периода ещё не готов или прироста пока нет. "
-            "Автоматические замеры выполняются через 1 / 3 / 6 / 12 / 24 часа после первого скана."
+            f"Проверены все сохранённые сканы категории: <b>{scan_count}</b>. "
+            "Контрольные замеры для этого периода ещё не готовы или прироста пока нет. "
+            "Автоматические замеры выполняются через 1 / 3 / 6 / 12 / 24 часа после каждого скана."
         )
     else:
         lines = [
             f"🚀 <b>TOP роста · {html.escape(cat.name)} · {period_label}</b>",
+            f"Сводно по <b>{scan_count}</b> запускам · без дублей объявлений.",
             "Сортировка: <b>кто набрал больше всего новых просмотров</b>.",
             "",
         ]
@@ -4798,7 +4942,7 @@ async def popular_category_growth(callback: CallbackQuery) -> None:
             row = item.listing
             lines.append(
                 f"<b>{i}. {html.escape(row.title[:60])}</b>\n"
-                f"👁 {item.base_views} → <b>{item.current_views}</b> · "
+                f"📅 {_date_label(row.posted_date_msk)} · 👁 {item.base_views} → <b>{item.current_views}</b> · "
                 f"🚀 <b>+{item.delta}</b> · ⚡ {item.per_hour:.1f}/ч\n"
                 f"💶 {html.escape(_price_display(row.price_text, row.price_eur))} · "
                 f'<a href="{html.escape(row.url)}">Открыть</a>'
@@ -4834,6 +4978,12 @@ async def my_scans(callback: CallbackQuery) -> None:
 async def render_scan_detail(scan: UserScan) -> str:
     """Compact scan card for non-technical users."""
     pairs = await get_scan_rows(scan.id)
+    scan_settings = await get_settings(scan.user_id)
+    allowed_rows = apply_listing_settings(
+        [listing for listing, _ in pairs], scan_settings, exact_date_scan=True, apply_output_mode=True
+    )
+    allowed_ids = {row.external_id for row in allowed_rows}
+    pairs = [pair for pair in pairs if pair[0].external_id in allowed_ids]
     rows = [listing for listing, _ in pairs]
     viewed = sum(1 for row in rows if row.view_count is not None)
     disappeared = sum(1 for row in rows if not row.is_active)
@@ -4978,7 +5128,12 @@ async def scan_top(callback: CallbackQuery) -> None:
     if scan is None:
         await callback.answer("Скан не найден", show_alert=True); return
     pairs = await get_scan_rows(scan_id)
-    pairs = [p for p in pairs if p[0].view_count is not None]
+    scan_settings = await get_settings(callback.from_user.id)
+    allowed_rows = apply_listing_settings(
+        [p[0] for p in pairs], scan_settings, exact_date_scan=True, apply_output_mode=True
+    )
+    allowed_ids = {row.external_id for row in allowed_rows}
+    pairs = [p for p in pairs if p[0].external_id in allowed_ids and p[0].view_count is not None]
     pairs.sort(key=lambda p: p[0].view_count or 0, reverse=True)
     await callback.answer()
     if not pairs:
@@ -5012,6 +5167,12 @@ async def scan_growth(callback: CallbackQuery) -> None:
         await callback.answer("Скан не найден", show_alert=True); return
 
     growth, rounds = await get_scan_growth_rows(scan_id, period_hours)
+    scan_settings = await get_settings(callback.from_user.id)
+    allowed_growth_rows = apply_listing_settings(
+        [item.listing for item in growth], scan_settings, exact_date_scan=True, apply_output_mode=True
+    )
+    allowed_growth_ids = {row.external_id for row in allowed_growth_rows}
+    growth = [item for item in growth if item.listing.external_id in allowed_growth_ids]
     await callback.answer()
     period_label = f"{period_hours} ч"
     if not growth:
@@ -5110,6 +5271,12 @@ async def send_growth_xlsx(
     message: Message, scan: UserScan, period_hours: int, category_key: str | None = None
 ) -> None:
     growth, _ = await get_scan_growth_rows(scan.id, period_hours, category_key=category_key)
+    scan_settings = await get_settings(scan.user_id)
+    allowed_rows = apply_listing_settings(
+        [item.listing for item in growth], scan_settings, exact_date_scan=True, apply_output_mode=True
+    )
+    allowed_ids = {row.external_id for row in allowed_rows}
+    growth = [item for item in growth if item.listing.external_id in allowed_ids]
     if not growth:
         await message.answer(
             f"📊 TOP-{GROWTH_TOP_LIMIT} за {period_hours}ч пока нельзя сформировать: "
@@ -5123,6 +5290,41 @@ async def send_growth_xlsx(
         await message.answer_document(
             FSInputFile(path),
             caption=f"📊 TOP-{min(GROWTH_TOP_LIMIT, len(growth))} роста за {period_hours}ч{suffix}",
+        )
+    finally:
+        shutil.rmtree(path.parent, ignore_errors=True)
+
+
+async def send_category_growth_xlsx(
+    message: Message, user_id: int, category_key: str, period_hours: int
+) -> None:
+    scans = await get_user_category_scans(user_id, category_key)
+    growth, scan_count, _ = await get_category_growth_rows(user_id, category_key, period_hours)
+    scan_settings = await get_settings(user_id)
+    allowed_rows = apply_listing_settings(
+        [item.listing for item in growth], scan_settings, exact_date_scan=True, apply_output_mode=True
+    )
+    allowed_ids = {row.external_id for row in allowed_rows}
+    growth = [item for item in growth if item.listing.external_id in allowed_ids]
+    if not scans or not growth:
+        await message.answer(
+            f"📊 TOP-{GROWTH_TOP_LIMIT} за {period_hours}ч пока нельзя сформировать: "
+            "контрольные замеры ещё не готовы или прироста нет."
+        )
+        return
+    representative = scans[0]
+    path = build_growth_top_xlsx(
+        representative, period_hours, growth, category_key=category_key
+    )
+    try:
+        cat = CATEGORIES.get(category_key)
+        suffix = f" · {cat.name}" if cat else ""
+        await message.answer_document(
+            FSInputFile(path),
+            caption=(
+                f"📊 TOP-{min(GROWTH_TOP_LIMIT, len(growth))} роста за {period_hours}ч{suffix} "
+                f"· сводно по {scan_count} запускам"
+            ),
         )
     finally:
         shutil.rmtree(path.parent, ignore_errors=True)
@@ -5148,17 +5350,18 @@ async def popular_growth_export(callback: CallbackQuery) -> None:
     if len(parts) != 4:
         await callback.answer("Некорректный запрос", show_alert=True); return
     try:
-        scan_id, category_key, period_hours = int(parts[1]), parts[2], int(parts[3])
+        representative_scan_id, category_key, period_hours = int(parts[1]), parts[2], int(parts[3])
     except Exception:
         await callback.answer("Некорректный запрос", show_alert=True); return
-    scan = await get_user_scan(callback.from_user.id, scan_id)
-    if (
-        scan is None or period_hours not in OBSERVATION_HOURS
-        or category_key not in _scan_category_keys(scan)
-    ):
-        await callback.answer("Скан не найден", show_alert=True); return
-    await callback.answer("Формирую TOP-50")
-    await send_growth_xlsx(callback.message, scan, period_hours, category_key=category_key)
+    if period_hours not in OBSERVATION_HOURS or category_key not in CATEGORIES:
+        await callback.answer("Некорректный запрос", show_alert=True); return
+    scans = await get_user_category_scans(callback.from_user.id, category_key)
+    if not scans:
+        await callback.answer("Сканы категории не найдены", show_alert=True); return
+    await callback.answer("Формирую сводный TOP-50")
+    await send_category_growth_xlsx(
+        callback.message, callback.from_user.id, category_key, period_hours
+    )
 
 
 @dp.callback_query(F.data.startswith("scanhistory:"))
@@ -5531,17 +5734,69 @@ async def start_scan(callback: CallbackQuery, state: FSMContext) -> None:
 
     await state.set_state(ScanInput.target_date)
     await callback.answer()
-    today_label = datetime.now(MOSCOW).strftime("%d.%m.%Y")
     await callback.message.answer(
-        "<b>📅 За какое число искать объявления?</b>\n\n"
-        "Всё считаем по <b>московскому времени (МСК)</b>.\n"
-        f"Сегодня по МСК: <b>{today_label}</b>.\n\n"
-        "Можно отправить просто число текущего месяца, например <code>12</code>, "
-        "или полную дату <code>10.08.2026</code>.\n\n"
-        "После даты выбери глубину <b>25 / 50 / 100 страниц</b>. Бот сначала быстро "
-        "найдёт начало нужного дня, а выбранная глубина будет считаться уже от этой точки.",
+        "<b>📅 За какой день запустить парсер?</b>\n\n"
+        "Выбери дату отдельно от настроек. Всё считаем по <b>московскому времени (МСК)</b>.",
         parse_mode=ParseMode.HTML,
+        reply_markup=scan_date_keyboard(),
     )
+
+
+async def _show_scan_depth_choice(message: Message, state: FSMContext, user_id: int, target_date: str) -> None:
+    await state.update_data(target_date=target_date)
+    selected = await get_selected(user_id)
+    selected_cats = [CATEGORIES[k] for k in CATEGORIES if k in selected]
+    if not selected_cats:
+        await state.clear()
+        await message.answer("Сначала выбери хотя бы одну категорию.")
+        return
+
+    scan_settings = await get_settings(user_id)
+    include = html.escape(scan_settings.include_words) if scan_settings.include_words else "—"
+    exclude = html.escape(scan_settings.exclude_words) if scan_settings.exclude_words else "—"
+    await message.answer(
+        f"<b>📅 Дата: {_date_label(target_date)} (МСК)</b>\n\n"
+        "<b>⚙️ Активные настройки результата</b>\n"
+        f"Режим: <b>{MODE_LABELS.get(scan_settings.output_mode, scan_settings.output_mode)}</b>\n"
+        f"Умные дубли: <b>{'ВКЛ' if scan_settings.smart_dedupe else 'ВЫКЛ'}</b>\n"
+        f"Чистить услуги/поиск: <b>{'ВКЛ' if scan_settings.clean_noise else 'ВЫКЛ'}</b>\n"
+        f"Цена: <b>{PRICE_LABELS.get(scan_settings.price_filter, scan_settings.price_filter)}</b>\n"
+        f"Сортировка: <b>{SORT_LABELS.get(scan_settings.sort_mode, scan_settings.sort_mode)}</b>\n"
+        f"Ключевые слова: <b>{include}</b>\n"
+        f"Исключить: <b>{exclude}</b>\n\n"
+        "Теперь выбери глубину <b>25 / 50 / 100 страниц</b>. Все настройки выше применятся именно к выбранной дате.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=page_limit_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("scan_date:"))
+async def choose_scan_date(callback: CallbackQuery, state: FSMContext) -> None:
+    if not allowed(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    choice = callback.data.split(":", 1)[1]
+    today = datetime.now(MOSCOW).date()
+    if choice == "today":
+        target_date = today.isoformat()
+    elif choice == "yesterday":
+        target_date = (today - timedelta(days=1)).isoformat()
+    elif choice == "custom":
+        await state.set_state(ScanInput.target_date)
+        await callback.answer()
+        await callback.message.answer(
+            "<b>🗓 Отправь нужную дату</b>\n\n"
+            "Например: <code>10.08.2026</code>, <code>10.08</code> или просто <code>10</code> для текущего месяца.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    else:
+        await callback.answer("Неизвестная дата", show_alert=True)
+        return
+
+    await callback.answer()
+    await _show_scan_depth_choice(callback.message, state, callback.from_user.id, target_date)
 
 
 @dp.message(ScanInput.target_date)
@@ -5553,29 +5808,12 @@ async def receive_scan_date(message: Message, state: FSMContext) -> None:
     target_date = _parse_scan_date_input(message.text)
     if target_date is None:
         await message.answer(
-            "⚠️ Не понял дату. Отправь, например, <code>12</code> или <code>10.08.2026</code>. "
+            "⚠️ Не понял дату. Отправь, например, <code>12</code>, <code>10.08</code> или <code>10.08.2026</code>. "
             "Будущую дату выбрать нельзя.",
             parse_mode=ParseMode.HTML,
         )
         return
-    await state.update_data(target_date=target_date)
-    selected = await get_selected(message.from_user.id)
-    selected_cats = [CATEGORIES[k] for k in CATEGORIES if k in selected]
-    if not selected_cats:
-        await state.clear()
-        await message.answer("Сначала выбери хотя бы одну категорию.")
-        return
-
-    await message.answer(
-        f"<b>📅 Дата: {_date_label(target_date)} (МСК)</b>\n\n"
-        "Теперь выбери глубину. Эти страницы будут считаться <b>от начала выбранной даты</b>, "
-        "а не от первой страницы Kleinanzeigen.\n\n"
-        "Например, если 10.08 начинается примерно на странице 1700, при выборе 50 бот "
-        "быстро найдёт эту точку и соберёт максимум 50 страниц начиная с неё.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=page_limit_keyboard(),
-    )
-
+    await _show_scan_depth_choice(message, state, message.from_user.id, target_date)
 
 
 @dp.callback_query(F.data.startswith("scanpages:"))

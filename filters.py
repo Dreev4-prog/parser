@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
-from models import Listing, PriceHistory
+from models import Listing, PriceHistory, UserSettings
 from product_identity import recognize_product
 
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -350,13 +350,13 @@ def price_bounds(price_filter: str) -> tuple[int | None, int | None]:
 def base_filter(
     rows: list[Listing],
     *,
-    period: str,
+    period: str | None,
     price_filter: str,
     clean_noise: bool,
     include_words: str,
     exclude_words: str,
 ) -> list[Listing]:
-    cutoff = period_cutoff(period)
+    cutoff = period_cutoff(period) if period else None
     min_price, max_price = price_bounds(price_filter)
     include = [x.strip() for x in include_words.split(",") if x.strip()]
     exclude = [x.strip() for x in exclude_words.split(",") if x.strip()]
@@ -377,6 +377,35 @@ def base_filter(
             continue
         out.append(row)
     return out
+
+
+def apply_listing_settings(
+    rows: list[Listing],
+    settings: UserSettings,
+    *,
+    exact_date_scan: bool = False,
+    apply_output_mode: bool = True,
+) -> list[Listing]:
+    """Apply visible parser settings consistently to a list of listings.
+
+    Since v3.2.7 the calendar date is selected only when a scan starts. The old
+    ``UserSettings.period`` column is retained only for database compatibility
+    and is intentionally ignored here. ``unique`` is evaluated before smart
+    de-duplication so repeated products cannot collapse into a fake unique item.
+    """
+    filtered = base_filter(
+        list(rows),
+        period=None,
+        price_filter=settings.price_filter,
+        clean_noise=settings.clean_noise,
+        include_words=settings.include_words or "",
+        exclude_words=settings.exclude_words or "",
+    )
+    if apply_output_mode and settings.output_mode == "unique":
+        filtered = unique_rows(filtered)
+    elif settings.smart_dedupe and settings.output_mode != "frequent":
+        filtered = dedupe_rows(filtered)
+    return sort_rows(filtered, settings.sort_mode)
 
 
 def dedupe_rows(rows: list[Listing]) -> list[Listing]:

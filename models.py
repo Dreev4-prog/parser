@@ -80,6 +80,7 @@ class UserSettings(Base):
     output_mode: Mapped[str] = mapped_column(String(32), default="newest")
     smart_dedupe: Mapped[bool] = mapped_column(Boolean, default=True)
     clean_noise: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Legacy v3.2.6 field kept for schema compatibility; ignored since v3.2.7.
     period: Mapped[str] = mapped_column(String(16), default="today")
     price_filter: Mapped[str] = mapped_column(String(32), default="any")
     sort_mode: Mapped[str] = mapped_column(String(32), default="newest")
