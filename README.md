@@ -1,59 +1,52 @@
-# Kleinanzeigen Parser Bot v3.0.3
+# Kleinanzeigen Parser Bot v3.0.4
 
+## Date Start + 25 / 50 / 100 pages
 
-v3.0.1 fixes exact-date scanning and keeps all v3.0 product-recognition/view-history features.
+v3.0.4 restores the simple scan flow:
 
-## Exact date = automatic depth
+1. choose categories;
+2. enter the Moscow calendar date;
+3. choose **25 / 50 / 100 pages**;
+4. the bot quickly locates the first page of that date;
+5. only then does the requested page depth begin.
 
-The old 25 / 50 / 100-page choice no longer limits a scan for a concrete Moscow date.
+Example: if `10.08.2026` starts around Kleinanzeigen page 1730 and the user selects 50 pages, the locator reaches that area with sparse jumps and binary search, then the real collection window is approximately pages 1730–1779. Listings from newer dates encountered during locating are not stored and do not receive view-counter requests.
 
-After the user enters a date (for example `10.08.2026`), the bot automatically:
+If the selected date ends before all requested pages are used, the scan stops when the feed moves to the previous calendar date. Results contain only listings whose normalized publication date matches the selected Moscow date.
 
-1. starts from the newest category page;
-2. skips newer calendar days;
-3. begins collecting when the requested Moscow date is reached;
-4. keeps paging until the feed is entirely older than that date;
-5. stops only after the selected day is fully crossed.
+## Fast Date Jump
 
-The Telegram progress card shows the current page and the oldest calendar date reached instead of a misleading fixed ETA.
+The bot does not walk pages 1 → 2 → 3 → ... to reach an older date. It probes approximately:
 
-## No more false zero because of shallow depth
+`1 → 2 → 4 → 8 → 16 → ...`
 
-If Kleinanzeigen temporarily refuses requests or the high safety cap is reached before the requested date is fully collected, the scan is marked **partial** instead of pretending that `0 listings` is a complete answer. The saved scan card keeps the reason.
+and then binary-searches the boundary. `DATE_JUMP_MAX_PAGE` is only a high technical guard for the sparse locator. It is not the user's scan depth.
 
-A true zero is only treated as complete when the parser actually crosses the requested calendar day (or reaches the physical end of the feed) without finding matching listings.
+Default: `DATE_JUMP_MAX_PAGE=20000` (optional; no Railway change is required).
 
-## Safety cap
+## Exact saved scan snapshots
 
-`DATE_SCAN_MAX_PAGES=1000` is only a guard against endless scanning if Kleinanzeigen changes its ordering. It is **not** the normal user-visible depth. Increase it in Railway only if a very large category genuinely needs more than 1000 pages to reach the target date.
+Saved scans now keep the exact listing IDs collected by that 25/50/100-page run. A 25-page scan will therefore not silently turn into a larger result just because the database already contains more listings from the same date.
 
-## Preserved from v3.0
+Simultaneous/cache reuse is keyed by **category + date + depth**, so a 25-page and a 100-page request are not confused with one another.
+
+## Preserved features
 
 - fast direct public view counter with browser fallback
 - promoted/Top/Highlight listing filter
 - Moscow-time publication-date normalization
-- multi-user queue/shared category cache
+- multi-user queue and shared identical scans
 - saved `Мои сканы`
 - manual view refresh and 1/3/6/24h view velocity
-- product identity recognition
-- model grouping and CSV identity columns
-- Smart Analytics modes
+- product identity recognition and model grouping
+- CSV identity columns and Smart Analytics modes
 
 ## Railway
 
-No required setting changes. Existing deployments work with the default safety cap.
+No required setting changes.
 
 Start command:
 
 ```bash
 python bot.py
 ```
-
-
-## v3.0.3 — Date Jump Search
-
-Exact-date scans no longer walk every page from page 1. The bot probes pages exponentially, binary-searches the date boundary, then sequentially collects only the selected calendar day. View counters are fetched only for matching listings. Promoted Top/Highlight listings remain excluded before date logic.
-
-
-## v3.0.3 — Smart Date Search
-Если общая выдача категории слишком плотная и Date Jump на странице 1000 всё ещё видит более новую дату, бот не увеличивает лимит. Он автоматически разбивает Германию на 16 федеральных земель, параллельно (по умолчанию до 3 сегментов) находит нужную дату внутри каждой, собирает только объявления выбранного дня и объединяет их обратно в один скан. Это особенно полезно для огромных категорий вроде Film & DVD.
