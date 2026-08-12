@@ -1,38 +1,76 @@
+import asyncio
+import logging
 import os
-
 from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from models import Base
 
+log = logging.getLogger(__name__)
 
-def normalize_database_url(url: str) -> str:
-    if url.startswith("postgres://"):
-        return "postgresql+asyncpg://" + url[len("postgres://"):]
-    if url.startswith("postgresql://"):
-        return "postgresql+asyncpg://" + url[len("postgresql://"):]
-    return url
+
+from db_url import normalize_database_url
 
 
 RAW_DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-DATABASE_URL = normalize_database_url(
-    RAW_DATABASE_URL or "sqlite+aiosqlite:///./kleinanzeigen.db"
+_IS_RAILWAY = bool(
+    os.getenv("RAILWAY_ENVIRONMENT")
+    or os.getenv("RAILWAY_ENVIRONMENT_ID")
+    or os.getenv("RAILWAY_PROJECT_ID")
+    or os.getenv("RAILWAY_SERVICE_ID")
 )
-USING_PERSISTENT_DATABASE = bool(RAW_DATABASE_URL) and not DATABASE_URL.startswith("sqlite")
 
-_IS_SQLITE = DATABASE_URL.startswith("sqlite")
-_connect_args = {"timeout": 30} if _IS_SQLITE else {}
-engine = create_async_engine(
-    DATABASE_URL, echo=False, pool_pre_ping=True, connect_args=_connect_args
+# v3.2.2: PostgreSQL is mandatory on Railway. Local SQLite remains available only
+# as a zero-setup development/test fallback so the included unit tests still run.
+if _IS_RAILWAY and not RAW_DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is required on Railway in v3.2.2. Add a PostgreSQL service "
+        "and set DATABASE_URL=${{Postgres.DATABASE_URL}} in the parser service Variables."
+    )
+
+DATABASE_URL = normalize_database_url(
+    RAW_DATABASE_URL or "sqlite+aiosqlite:///./kleinanzeigen.dev.db"
 )
+_IS_SQLITE = DATABASE_URL.startswith("sqlite")
+_IS_POSTGRES = DATABASE_URL.startswith("postgresql+asyncpg://")
+
+if _IS_RAILWAY and not _IS_POSTGRES:
+    raise RuntimeError(
+        "v3.2.2 requires PostgreSQL on Railway. DATABASE_URL must point to the Railway PostgreSQL service."
+    )
+if not _IS_SQLITE and not _IS_POSTGRES:
+    raise RuntimeError("Unsupported DATABASE_URL. Use PostgreSQL (postgresql://...) or local SQLite for development.")
+
+USING_PERSISTENT_DATABASE = _IS_POSTGRES
+DATABASE_BACKEND = "PostgreSQL" if _IS_POSTGRES else "SQLite (local development)"
+
+if _IS_SQLITE:
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_pre_ping=True,
+        connect_args={"timeout": 30},
+    )
+else:
+    pool_size = max(1, int(os.getenv("DB_POOL_SIZE", "5")))
+    max_overflow = max(0, int(os.getenv("DB_MAX_OVERFLOW", "5")))
+    pool_timeout = max(5, int(os.getenv("DB_POOL_TIMEOUT_SECONDS", "30")))
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_pre_ping=True,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
+        pool_timeout=pool_timeout,
+        pool_recycle=1800,
+    )
+
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
 if _IS_SQLITE:
     @event.listens_for(engine.sync_engine, "connect")
     def _sqlite_pragmas(dbapi_connection, _connection_record):
-        # v2.6 can run several parser workers in one process. WAL + busy timeout
-        # makes temporary SQLite much more tolerant of concurrent readers/writers.
         cursor = dbapi_connection.cursor()
         try:
             cursor.execute("PRAGMA journal_mode=WAL")
@@ -53,11 +91,36 @@ def _table_columns(sync_conn, table_name: str) -> set[str]:
     return {column["name"] for column in inspector.get_columns(table_name)}
 
 
+async def wait_for_database() -> None:
+    """Wait for Railway PostgreSQL to accept connections during a fresh deploy."""
+    attempts = max(1, int(os.getenv("DB_CONNECT_ATTEMPTS", "15")))
+    delay = max(0.5, float(os.getenv("DB_CONNECT_RETRY_SECONDS", "2")))
+    last_error: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            if _IS_POSTGRES:
+                log.info("PostgreSQL connection ready")
+            return
+        except Exception as exc:  # pragma: no cover - depends on external DB state
+            last_error = exc
+            if attempt >= attempts:
+                break
+            log.warning("Database not ready (%s/%s): %s", attempt, attempts, exc)
+            await asyncio.sleep(delay)
+
+    raise RuntimeError(f"Database is unavailable after {attempts} attempts: {last_error}") from last_error
+
+
 async def init_db() -> None:
+    await wait_for_database()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-        # Lightweight migrations so v2.0/v2.1/v2.2 databases can be reused.
+        # Lightweight additive migrations so existing PostgreSQL databases can be
+        # upgraded in place without destructive schema changes.
         columns = await conn.run_sync(_listing_columns)
         if columns and "category_key" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN category_key VARCHAR(80)"))
@@ -74,8 +137,6 @@ async def init_db() -> None:
         if columns and "views_checked_at" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN views_checked_at TIMESTAMP"))
 
-        # v3.0 product-recognition columns. Kept as simple additive migrations so
-        # existing Railway SQLite/PostgreSQL data can be reused in-place.
         identity_columns = {
             "identity_key": "VARCHAR(500)",
             "identity_label": "VARCHAR(500)",
@@ -135,3 +196,5 @@ async def init_db() -> None:
             await conn.execute(text("ALTER TABLE user_scans ADD COLUMN quality_score INTEGER DEFAULT 0"))
         if user_scan_columns and "quality_note" not in user_scan_columns:
             await conn.execute(text("ALTER TABLE user_scans ADD COLUMN quality_note VARCHAR(500) DEFAULT ''"))
+
+    log.info("Database initialized: %s", DATABASE_BACKEND)

@@ -1,4 +1,33 @@
-# Kleinanzeigen Parser Bot v3.2.0
+# Kleinanzeigen Parser Bot v3.2.2
+
+## v3.2.2 — PostgreSQL Production
+
+- Railway production now **requires PostgreSQL**. The bot no longer silently falls back to an ephemeral SQLite file when `DATABASE_URL` is missing.
+- Railway `postgres://` / `postgresql://` URLs are normalized automatically for SQLAlchemy + asyncpg.
+- Startup waits/retries while a newly-created Railway PostgreSQL service becomes reachable.
+- PostgreSQL connection pooling is enabled with conservative defaults (`5 + 5` connections) and `pool_pre_ping`.
+- All existing parser, scan history, view observations, users, subscription plans, invoices/payments and admin settings use the same PostgreSQL database through SQLAlchemy.
+- Additive schema migrations remain automatic on startup.
+- Local SQLite remains available only as a development/test fallback outside Railway.
+
+### Railway PostgreSQL setup
+
+1. In the Railway project choose **New → Database → PostgreSQL**.
+2. Open the **parser** service → **Variables**.
+3. Add `DATABASE_URL` with value `${{Postgres.DATABASE_URL}}` (replace `Postgres` only if your database service has a different name).
+4. Redeploy the parser service.
+5. Open `/admin` → database/parser statistics and verify the backend is `PostgreSQL`.
+
+No PostgreSQL username/password/host variables need to be copied separately when `DATABASE_URL` references the Railway Postgres service.
+
+
+## v3.2.1 — Telegram Menu
+
+- Added the standard Telegram **Menu** button with ready-to-tap commands; users no longer need to type commands manually.
+- User commands: `/start`, `/new_scan`, `/my_scans`, `/popular`, `/categories`, `/settings`, `/subscription`, `/result`, `/help`.
+- Admin chats additionally see `/admin`.
+- Command handlers open the same existing screens and workflows as the inline buttons, so parser/payment logic remains unchanged.
+- `/subscription` stays reachable for users without active access.
 
 ## v3.1.7 — Clean Live Progress
 
@@ -138,7 +167,7 @@ Railway start command remains:
 python bot.py
 ```
 
-No new required variables. Existing SQLite/PostgreSQL databases are upgraded
+`DATABASE_URL` is required on Railway in v3.2.2. PostgreSQL databases are upgraded
 with additive columns on startup. Optional v3.1.1 tuning:
 
 ```text
@@ -146,9 +175,8 @@ MIN_PAGE_DATE_COVERAGE=0.55
 MIN_PAGE_DATED_ITEMS=3
 ```
 
-For production/multi-user paid use, PostgreSQL is still recommended; SQLite is
-appropriate for current development/testing but may not survive Railway
-redeploys depending on storage configuration.
+On Railway v3.2.2 uses PostgreSQL only. SQLite is retained solely for local
+development/testing outside Railway.
 
 
 ## v3.1.4 — Lightweight Views Engine + Responsive UI
@@ -209,4 +237,4 @@ The default plans are 1, 3, 7 and 30 days. Environment prices are only used when
 
 Keep `ACCESS_MODE=admin_only` while testing. After both payment tokens are configured and a real test invoice has been checked, switch to `subscription` from `/admin`.
 
-SQLite remains fine for development/testing. Before opening the paid service to many users, use Railway PostgreSQL so user access, payments and background jobs survive redeploys reliably.
+v3.2.2 requires Railway PostgreSQL in production so user access, payments, scans and background history survive redeploys reliably.

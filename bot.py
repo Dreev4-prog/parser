@@ -22,13 +22,16 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BotCommand, BotCommandScopeChat, BotCommandScopeDefault, CallbackQuery, FSInputFile,
+    InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, Message,
+)
 from sqlalchemy import delete, func, select
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from categories import CATEGORIES, GROUPS, categories_for_group, group_root_key
-from db import SessionLocal, USING_PERSISTENT_DATABASE, init_db
+from db import DATABASE_BACKEND, SessionLocal, init_db
 from filters import (
     base_filter,
     below_market_rows,
@@ -71,6 +74,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+APP_VERSION = "3.2.1"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
@@ -1800,8 +1804,8 @@ async def stats_text() -> str:
         fast_ready = (await session.execute(select(func.count(CategoryScanState.category_key)).where(
             CategoryScanState.scan_date == day_key, CategoryScanState.day_seed_complete.is_(True),
         ))).scalar_one()
-    storage = "PostgreSQL / DATABASE_URL" if USING_PERSISTENT_DATABASE else "SQLite"
-    warning = "" if USING_PERSISTENT_DATABASE else "\n\n⚠️ На Railway SQLite может потеряться после redeploy/restart."
+    storage = DATABASE_BACKEND
+    warning = ""
     coverage = round(priced / today * 100) if today else 0
     view_coverage = round(viewed / today * 100) if today else 0
     async with job_guard:
@@ -3526,6 +3530,10 @@ class ActivityAccessMiddleware(BaseMiddleware):
                 return await handler(event, data)
             if text.startswith("/admin"):
                 return await handler(event, data)
+            if text.startswith("/subscription"):
+                return await handler(event, data)
+            if text.startswith("/help"):
+                return await handler(event, data)
             await send_access_screen(event, uid)
             return None
 
@@ -4071,6 +4079,123 @@ async def payment_scheduler(bot: Bot) -> None:
         await asyncio.sleep(PAYMENT_POLL_SECONDS)
 
 
+
+async def setup_bot_commands(bot: Bot) -> None:
+    """Configure Telegram's bottom-left Menu button and command list."""
+    user_commands = [
+        BotCommand(command="start", description="🏠 Главное меню"),
+        BotCommand(command="new_scan", description="🔎 Новый скан"),
+        BotCommand(command="my_scans", description="📊 Мои сканы"),
+        BotCommand(command="popular", description="🔥 Популярное сейчас"),
+        BotCommand(command="categories", description="🗂 Категории"),
+        BotCommand(command="settings", description="⚙️ Настройки"),
+        BotCommand(command="subscription", description="💎 Подписка"),
+        BotCommand(command="result", description="📦 Текущий результат"),
+        BotCommand(command="help", description="ℹ️ Помощь"),
+    ]
+    admin_commands = user_commands + [
+        BotCommand(command="admin", description="🛠 Админ-панель"),
+    ]
+
+    # Default command menu for every private user.
+    await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+    # Admin chats get the same menu plus /admin.
+    for admin_id in sorted(ADMIN_IDS):
+        try:
+            await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception:
+            log.exception("Could not set admin command menu for chat=%s", admin_id)
+
+    # Force Telegram to render the standard Commands menu button instead of
+    # requiring users to type slash commands manually.
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+
+
+async def _send_home_message(message: Message, user_id: int, *, intro: bool = False) -> None:
+    selected = await get_selected(user_id)
+    if intro:
+        text = (
+            f"<b>🔍 Kleinanzeigen Parser v{APP_VERSION}</b>\n\n"
+            "Здесь всё строится вокруг сохранённых сканов:\n"
+            "🔥 <b>Популярное сейчас</b> — лидеры по просмотрам\n"
+            "🔎 <b>Новый скан</b> — собрать свежие объявления\n"
+            "📊 <b>Мои сканы</b> — вернуться к любому запуску, обновить просмотры и увидеть рост\n\n"
+            "После скана результат не теряется: его карточка остаётся в «Мои сканы»."
+        )
+    else:
+        text = f"<b>🔍 Kleinanzeigen Parser v{APP_VERSION}</b>\n\nЧто хочешь посмотреть?"
+    await message.answer(text, reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+
+
+async def _send_popular_message(message: Message, user_id: int) -> None:
+    items = await get_user_popular_categories(user_id)
+    if not items:
+        text = (
+            "🔥 <b>Популярное сейчас</b>\n\n"
+            "Здесь появятся только категории, которые ты уже сканировал. "
+            "Сначала сделай хотя бы один скан с просмотрами."
+        )
+    else:
+        text = (
+            "🔥 <b>Популярное сейчас</b>\n\n"
+            "Выбери категорию. Рейтинги разных категорий больше не смешиваются.\n\n"
+            "🚀 TOP 1/3/6/12/24ч — по <b>реальному приросту просмотров</b>.\n"
+            "👁 Самые просматриваемые — отдельный рейтинг по общему числу просмотров."
+        )
+    await message.answer(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=popular_categories_keyboard(items),
+        disable_web_page_preview=True,
+    )
+
+
+async def _send_my_scans_message(message: Message, user_id: int) -> None:
+    scans = await get_user_scans(user_id, 10)
+    if not scans:
+        text = (
+            "<b>📊 Мои сканы</b>\n\nПока пусто. Сделай первый скан — он сохранится здесь, "
+            "и к нему можно будет вернуться позже."
+        )
+    else:
+        text = (
+            "<b>📊 Мои сканы</b>\n\nОткрой нужный запуск. Внутри можно обновить просмотры, "
+            "посмотреть рост, топ и повторить скан."
+        )
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=my_scans_keyboard(scans))
+
+
+async def _begin_scan_from_message(message: Message, state: FSMContext) -> None:
+    user_id = message.from_user.id
+    selected_keys = await get_selected(user_id)
+    selected_cats = [CATEGORIES[k] for k in CATEGORIES if k in selected_keys]
+    if not selected_cats:
+        await message.answer(
+            "⚠️ <b>Сначала выбери хотя бы одну категорию.</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=groups_keyboard(selected_keys),
+        )
+        return
+
+    async with job_guard:
+        existing = active_jobs.get(user_id)
+        if existing and existing.state in {"queued", "running"} and not existing.cancel_requested:
+            await message.answer("⏳ У тебя уже идёт парсинг.")
+            return
+
+    await state.set_state(ScanInput.target_date)
+    today_label = datetime.now(MOSCOW).strftime("%d.%m.%Y")
+    await message.answer(
+        "<b>📅 За какое число искать объявления?</b>\n\n"
+        "Всё считаем по <b>московскому времени (МСК)</b>.\n"
+        f"Сегодня по МСК: <b>{today_label}</b>.\n\n"
+        "Можно отправить просто число текущего месяца, например <code>12</code>, "
+        "или полную дату <code>10.08.2026</code>.\n\n"
+        "После даты выбери глубину <b>25 / 50 / 100 страниц</b>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -4078,16 +4203,84 @@ async def start(message: Message, state: FSMContext) -> None:
     if not allowed(message.from_user.id):
         await send_access_screen(message, message.from_user.id)
         return
+    await _send_home_message(message, message.from_user.id, intro=True)
+
+
+@dp.message(Command("menu"))
+async def menu_command(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await _send_home_message(message, message.from_user.id)
+
+
+@dp.message(Command("new_scan"))
+async def new_scan_command(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await _begin_scan_from_message(message, state)
+
+
+@dp.message(Command("my_scans"))
+async def my_scans_command(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await _send_my_scans_message(message, message.from_user.id)
+
+
+@dp.message(Command("popular"))
+async def popular_command(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await _send_popular_message(message, message.from_user.id)
+
+
+@dp.message(Command("categories"))
+async def categories_command(message: Message, state: FSMContext) -> None:
+    await state.clear()
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>🔍 Kleinanzeigen Parser v3.2.0</b>\n\n"
-        "Здесь всё строится вокруг сохранённых сканов:\n"
-        "🔥 <b>Популярное сейчас</b> — лидеры по просмотрам\n"
-        "🔎 <b>Новый скан</b> — собрать свежие объявления\n"
-        "📊 <b>Мои сканы</b> — вернуться к любому запуску, обновить просмотры и увидеть рост\n"
-        "\n"
-        "После скана результат не теряется: его карточка остаётся в «Мои сканы».",
-        reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML,
+        "<b>🗂 Категории Kleinanzeigen</b>\n\nОткрой раздел и отметь, что нужно парсить.",
+        reply_markup=groups_keyboard(selected),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.message(Command("settings"))
+async def settings_command(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    s = await get_settings(message.from_user.id)
+    await message.answer(settings_text(s), reply_markup=settings_keyboard(s), parse_mode=ParseMode.HTML)
+
+
+@dp.message(Command("subscription"))
+async def subscription_command(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        await subscription_text(message.from_user.id),
+        parse_mode=ParseMode.HTML,
+        reply_markup=await subscription_keyboard(message.from_user.id),
+    )
+
+
+@dp.message(Command("result"))
+async def result_command(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    selected = await get_selected(message.from_user.id)
+    await send_smart_export(message, message.from_user.id, len(selected))
+
+
+@dp.message(Command("help"))
+async def help_command(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    selected = await get_selected(message.from_user.id)
+    await message.answer(
+        "<b>ℹ️ Быстрое меню</b>\n\n"
+        "Нажми кнопку <b>Menu</b> рядом со строкой ввода — там собраны основные разделы бота.\n\n"
+        "🔎 Новый скан — начать сбор\n"
+        "📊 Мои сканы — история запусков\n"
+        "🔥 Популярное — рейтинги просмотров и роста\n"
+        "🗂 Категории — выбрать, что сканировать\n"
+        "⚙️ Настройки — фильтры и параметры\n"
+        "💎 Подписка — статус и тарифы\n"
+        "📦 Текущий результат — скачать текущую выборку",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard(len(selected)),
     )
 
 
@@ -4098,7 +4291,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v3.2.0</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text(f"<b>🔍 Kleinanzeigen Parser v{APP_VERSION}</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == "post_settings")
@@ -4119,7 +4312,7 @@ async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
     await callback.message.answer(
-        "<b>🔍 Kleinanzeigen Parser v3.2.0</b>\n\nЧто хочешь посмотреть?",
+        f"<b>🔍 Kleinanzeigen Parser v{APP_VERSION}</b>\n\nЧто хочешь посмотреть?",
         reply_markup=main_keyboard(len(selected)),
         parse_mode=ParseMode.HTML,
     )
@@ -5295,6 +5488,11 @@ async def main() -> None:
     if recovered or planned:
         log.info("v3.1 observations: recovered=%s recent_scans_planned=%s", recovered, planned)
     bot = Bot(BOT_TOKEN)
+    try:
+        await setup_bot_commands(bot)
+    except Exception:
+        # A Telegram menu configuration error must never keep the parser offline.
+        log.exception("Could not configure Telegram command menu")
     me = await bot.get_me()
     traffic = await TRAFFIC.snapshot()
     log.info(
@@ -5302,11 +5500,7 @@ async def main() -> None:
         me.username, MAX_CONCURRENT_JOBS, CATEGORY_CACHE_TTL_SECONDS,
         traffic.scan_limit, traffic.view_limit, traffic.browser_limit, traffic.global_limit,
     )
-    if not USING_PERSISTENT_DATABASE:
-        log.warning(
-            "DATABASE_URL is not set. v2.6 queue/cache work on SQLite, but the queue is in-memory "
-            "and SQLite data may be lost after Railway redeploy/restart. PostgreSQL is the next step."
-        )
+    log.info("Database backend: %s", DATABASE_BACKEND)
 
     worker_tasks = [
         asyncio.create_task(scan_worker(bot, i), name=f"scan-worker-{i}")
