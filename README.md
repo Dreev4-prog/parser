@@ -1,4 +1,4 @@
-# Kleinanzeigen Parser Bot v3.1.3
+# Kleinanzeigen Parser Bot v3.1.4
 
 ## v3.1.3 — 403 Recovery / Safe Multi-User
 
@@ -29,8 +29,7 @@ traffic controller for commercial multi-user operation.
 - **Actual measurement time remains authoritative.** Background popularity checkpoints can be delayed
   by traffic pressure without pretending they ran at an exact clock second.
 
-Recommended starting values are already included in `.env.example`: 4 scan jobs, 6 direct-view slots,
-1 browser fallback, and 10 total network slots. Tune upward only after observing real 403 rate and latency.
+Recommended starting values are included in `.env.example`; v3.1.4 uses lightweight direct-only mass view refreshes and lower view concurrency. Tune upward only after observing real 403 rate and latency.
 
 ## v3.1.1 — Multi-category isolation fix
 
@@ -133,3 +132,14 @@ MIN_PAGE_DATED_ITEMS=3
 For production/multi-user paid use, PostgreSQL is still recommended; SQLite is
 appropriate for current development/testing but may not survive Railway
 redeploys depending on storage configuration.
+
+
+## v3.1.4 — Lightweight Views Engine + Responsive UI
+
+- Массовые первичные и повторные замеры просмотров используют только быстрый direct HTTP counter. Chromium/browser fallback больше не запускается для сотен объявлений автоматически.
+- Неудачные direct-счётчики помечаются как «без данных» и не тормозят весь скан. Browser fallback оставлен только для точечной диагностики одного объявления.
+- Повторные замеры идут пакетами (по умолчанию 40 ID с короткой паузой), а автоматический observation worker по умолчанию один.
+- `👁 Обновить просмотры` запускает фоновую задачу и мгновенно возвращает управление Telegram. Можно сразу открывать другие меню и запускать сканы.
+- Повторное нажатие для того же скана не создаёт второй сбор. После окончания бот сам присылает уведомление и кнопки к динамике/скану.
+- Фоновые ручные и автоматические замеры проходят через один лёгкий collector. После первого задания следующее заново проверяет DB cache, поэтому одинаковые ID из пересекающихся пользовательских сканов не запрашиваются повторно в течение 5 минут.
+- Общий DB cache `views_checked_at` продолжает переиспользовать свежие значения между пользователями и пересекающимися сканами.

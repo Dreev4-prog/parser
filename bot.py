@@ -76,14 +76,14 @@ STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVA
 # Public view counts are collected inline while category pages are scanned.
 # Recent values are cached so shared/multi-user scans do not reopen the same ad.
 VIEW_COUNT_CACHE_TTL_SECONDS = max(60, int(os.getenv("VIEW_COUNT_CACHE_TTL_SECONDS", "1800")))
-VIEW_COUNT_CONCURRENCY = max(1, min(10, int(os.getenv("VIEW_COUNT_CONCURRENCY", "5"))))
+VIEW_COUNT_CONCURRENCY = max(1, min(10, int(os.getenv("VIEW_COUNT_CONCURRENCY", "3"))))
 VIEW_COUNT_EXPORT_MODES = {"newest", "all", "unique", "below_market"}
 
 # v3.1 keeps the v3.0.7 Popularity Tracker. Every completed scan gets automatic public-view
 # checkpoints. They are persisted, so a Railway restart does not lose the plan.
 OBSERVATION_HOURS = (1, 3, 6, 12, 24)
 OBSERVATION_POLL_SECONDS = max(15, int(os.getenv("OBSERVATION_POLL_SECONDS", "30")))
-OBSERVATION_CONCURRENCY = max(1, min(4, int(os.getenv("OBSERVATION_CONCURRENCY", "2"))))
+OBSERVATION_CONCURRENCY = max(1, min(4, int(os.getenv("OBSERVATION_CONCURRENCY", "1"))))
 OBSERVATION_LATE_GRACE_MINUTES = max(5, int(os.getenv("OBSERVATION_LATE_GRACE_MINUTES", "45")))
 GROWTH_TOP_LIMIT = 50
 GROWTH_TELEGRAM_LIMIT = 10
@@ -1244,6 +1244,8 @@ async def enrich_page_view_counts(
         [item.url for item in targets],
         concurrency=VIEW_COUNT_CONCURRENCY,
         traffic_priority="scan_inline",
+        browser_fallback=False,
+        direct_http_only=True,
     )
 
     now = datetime.utcnow()
@@ -1308,19 +1310,26 @@ async def refresh_view_counts(
         try:
             status = await message.answer(
                 f"👁 Собираю просмотры для <b>{len(targets)}</b> объявлений…\n"
-                f"⚡ Прямой счётчик + browser fallback · {status_note}",
+                f"⚡ Лёгкий прямой счётчик · без browser fallback · {status_note}",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
             status = None
 
+    last_progress_edit = 0.0
+
     async def progress_cb(done: int, total: int):
+        nonlocal last_progress_edit
         if status is not None and hasattr(status, "edit_text"):
+            now_mono = time.monotonic()
+            if done < total and now_mono - last_progress_edit < 2.0:
+                return
+            last_progress_edit = now_mono
             try:
                 pct = round(done / total * 100) if total else 100
                 await status.edit_text(
                     f"👁 Собираю просмотры… <b>{done}/{total}</b> ({pct}%)\n"
-                    f"⚡ Прямой счётчик + browser fallback · {status_note}",
+                    f"⚡ Лёгкий прямой счётчик · без browser fallback · {status_note}",
                     parse_mode=ParseMode.HTML,
                 )
             except Exception:
@@ -1333,6 +1342,8 @@ async def refresh_view_counts(
             concurrency=VIEW_COUNT_CONCURRENCY,
             progress_cb=progress_cb,
             traffic_priority=traffic_priority,
+            browser_fallback=False,
+            direct_http_only=True,
         )
     finally:
         await parser.close()
@@ -1467,8 +1478,11 @@ async def process_observation(bot: Bot, obs: ScanObservation) -> None:
         return
 
     try:
-        requested, updated, failed = await refresh_view_counts(rows, None, force=False, max_age_seconds=300, traffic_priority="background")
-        recorded = await update_scan_view_refresh(scan.id, target_hours=obs.target_hours)
+        async with background_view_refresh_lock:
+            requested, updated, failed = await refresh_view_counts(
+                rows, None, force=False, max_age_seconds=300, traffic_priority="background"
+            )
+            recorded = await update_scan_view_refresh(scan.id, target_hours=obs.target_hours)
         if recorded <= 0:
             await mark_observation_result(
                 obs.id, status="error", item_count=0,
@@ -1894,6 +1908,15 @@ category_inflight_guard = asyncio.Lock()
 # result from every listing ever seen for that date.
 category_result_cache: dict[str, tuple[float, ScanResult]] = {}
 db_write_lock = asyncio.Lock()
+
+# v3.1.4 manual view refreshes are true background jobs. A user can navigate
+# anywhere in the bot while the refresh continues, and duplicate refreshes of the
+# same scan are coalesced into one task.
+manual_view_tasks: dict[int, asyncio.Task] = {}
+manual_view_tasks_guard = asyncio.Lock()
+# One lightweight background collector at a time. This makes DB cache reuse deterministic
+# across users/scans and prevents automatic checkpoints from multiplying the same ID requests.
+background_view_refresh_lock = asyncio.Lock()
 
 
 def berlin_date_key() -> str:
@@ -3197,7 +3220,7 @@ async def start(message: Message, state: FSMContext) -> None:
         return
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>🔍 Kleinanzeigen Parser v3.1.3</b>\n\n"
+        "<b>🔍 Kleinanzeigen Parser v3.1.4</b>\n\n"
         "Здесь всё строится вокруг сохранённых сканов:\n"
         "🔥 <b>Популярное сейчас</b> — лидеры по просмотрам\n"
         "🔎 <b>Новый скан</b> — собрать свежие объявления\n"
@@ -3215,7 +3238,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v3.1.3</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v3.1.4</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == "post_settings")
@@ -3236,7 +3259,7 @@ async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
     await callback.message.answer(
-        "<b>🔍 Kleinanzeigen Parser v3.1.3</b>\n\nЧто хочешь посмотреть?",
+        "<b>🔍 Kleinanzeigen Parser v3.1.4</b>\n\nЧто хочешь посмотреть?",
         reply_markup=main_keyboard(len(selected)),
         parse_mode=ParseMode.HTML,
     )
@@ -3483,12 +3506,12 @@ async def run_view_test(message: Message, state: FSMContext) -> None:
         lines += [
             "",
             f"📈 Ускорение на тесте: <b>примерно ×{speedup:.1f}</b>",
-            "✅ Обычный массовый парсинг v3.1.3 уже сначала использует быстрый способ. Chromium включается только для объявлений, где прямой счётчик не сработал.",
+            "✅ Массовый сбор v3.1.4 использует только быстрый direct-счётчик. Chromium оставлен только для этого точечного теста/диагностики.",
         ]
     else:
         lines += [
             "",
-            "ℹ️ Для массового парсинга останется автоматический browser fallback, поэтому объявления не потеряются.",
+            "ℹ️ В массовом сборе browser fallback отключён: проблемные объявления будут отмечены как «без данных», чтобы не перегружать сервис.",
         ]
 
     await status.edit_text(
@@ -4045,23 +4068,85 @@ async def scan_history(callback: CallbackQuery) -> None:
     await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan_id))
 
 
+async def _manual_view_refresh_job(bot: Bot, user_id: int, scan_id: int) -> None:
+    try:
+        scan = await get_user_scan(user_id, scan_id)
+        if scan is None:
+            return
+        pairs = await get_scan_rows(scan_id)
+        rows = [row for row, _ in pairs]
+        if not rows:
+            await bot.send_message(user_id, "ℹ️ В этом скане пока нет объявлений для обновления.")
+            return
+
+        # Manual mass refresh is intentionally low-impact. New category scans keep
+        # priority in the shared Traffic Manager while this job advances in batches.
+        async with background_view_refresh_lock:
+            requested, updated, failed = await refresh_view_counts(
+                rows, None, force=False, max_age_seconds=300, traffic_priority="background"
+            )
+            recorded = await update_scan_view_refresh(scan_id)
+        scan = await get_user_scan(user_id, scan_id)
+        title = html.escape(scan.title) if scan is not None else f"Скан #{scan_id}"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Открыть динамику", callback_data=f"scangrowth:{scan_id}:1"),
+             InlineKeyboardButton(text="🔥 Топ", callback_data=f"scantop:{scan_id}")],
+            [InlineKeyboardButton(text="📊 Открыть этот скан", callback_data=f"scan:{scan_id}")],
+        ])
+        await bot.send_message(
+            user_id,
+            f"✅ <b>Просмотры обновлены</b>\n\n"
+            f"Скан: <b>{title}</b>\n"
+            f"👁 Запрошено: <b>{requested}</b>\n"
+            f"✅ Получено значений: <b>{updated}</b>\n"
+            f"▫️ Без данных: <b>{failed}</b>\n"
+            f"📈 Сохранено в точку наблюдения: <b>{recorded}</b>\n\n"
+            "Можно открывать динамику и TOP — бот всё это время остаётся доступен для других действий.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+    except Exception as exc:
+        log.exception("Manual background view refresh failed scan=%s", scan_id)
+        try:
+            await bot.send_message(
+                user_id,
+                "⚠️ Не удалось полностью обновить просмотры. Остальные разделы бота продолжают работать; попробуй обновить этот скан позже.",
+            )
+        except Exception:
+            pass
+    finally:
+        async with manual_view_tasks_guard:
+            current = manual_view_tasks.get(scan_id)
+            if current is asyncio.current_task() or (current is not None and current.done()):
+                manual_view_tasks.pop(scan_id, None)
+
+
 @dp.callback_query(F.data.startswith("scanviews:"))
-async def scan_refresh_views(callback: CallbackQuery) -> None:
+async def scan_refresh_views(callback: CallbackQuery, bot: Bot) -> None:
     scan_id = int(callback.data.split(":", 1)[1])
     scan = await get_user_scan(callback.from_user.id, scan_id)
     if scan is None:
-        await callback.answer("Скан не найден", show_alert=True); return
+        await callback.answer("Скан не найден", show_alert=True)
+        return
     pairs = await get_scan_rows(scan_id)
-    rows = [row for row, _ in pairs]
-    if not rows:
-        await callback.answer("В этом скане пока нет объявлений", show_alert=True); return
-    await callback.answer("Обновляю просмотры")
-    await refresh_view_counts(rows, callback.message, force=True)
-    await update_scan_view_refresh(scan_id)
-    scan = await get_user_scan(callback.from_user.id, scan_id)
-    await callback.message.answer(
-        await render_scan_detail(scan), parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan_id)
-    )
+    if not pairs:
+        await callback.answer("В этом скане пока нет объявлений", show_alert=True)
+        return
+
+    async with manual_view_tasks_guard:
+        existing = manual_view_tasks.get(scan_id)
+        if existing is not None and not existing.done():
+            await callback.answer("👁 Просмотры этого скана уже обновляются в фоне")
+            return
+        task = asyncio.create_task(
+            _manual_view_refresh_job(bot, callback.from_user.id, scan_id),
+            name=f"manual-view-refresh-{scan_id}",
+        )
+        manual_view_tasks[scan_id] = task
+
+    # Return control to Telegram immediately. No long handler and no hundreds of
+    # editMessage calls: menus/buttons stay responsive while the background task runs.
+    await callback.answer("✅ Обновление запущено в фоне")
 
 
 @dp.callback_query(F.data.startswith("scanexport:"))

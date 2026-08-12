@@ -46,7 +46,9 @@ AVAILABILITY_TIMEOUT = max(5.0, float(os.getenv("AVAILABILITY_TIMEOUT", "20")))
 MIN_PAGE_DATE_COVERAGE = min(0.95, max(0.20, float(os.getenv("MIN_PAGE_DATE_COVERAGE", "0.55"))))
 MIN_PAGE_DATED_ITEMS = max(1, int(os.getenv("MIN_PAGE_DATED_ITEMS", "3")))
 VIEW_COUNT_GLOBAL_CONCURRENCY = max(1, min(16, int(os.getenv("VIEW_COUNT_GLOBAL_CONCURRENCY", "6"))))
-DIRECT_VIEW_CONCURRENCY = max(1, min(16, int(os.getenv("DIRECT_VIEW_CONCURRENCY", "8"))))
+DIRECT_VIEW_CONCURRENCY = max(1, min(16, int(os.getenv("DIRECT_VIEW_CONCURRENCY", "3"))))
+VIEW_DIRECT_BATCH_SIZE = max(5, min(200, int(os.getenv("VIEW_DIRECT_BATCH_SIZE", "40"))))
+VIEW_DIRECT_BATCH_PAUSE_SECONDS = max(0.0, min(5.0, float(os.getenv("VIEW_DIRECT_BATCH_PAUSE_SECONDS", "0.35"))))
 
 log = logging.getLogger("kleinanzeigen-parser")
 
@@ -1591,28 +1593,38 @@ class KleinanzeigenParser:
                 except Exception:
                     pass
 
-    async def fetch_public_view_counts(self, urls: list[str], *, concurrency: int = 6, progress_cb=None, traffic_priority: str = "normal") -> dict[str, ViewCountResult]:
-        """Batch public view counters with a direct-first fast path.
+    async def fetch_public_view_counts(
+        self,
+        urls: list[str],
+        *,
+        concurrency: int = 3,
+        progress_cb=None,
+        traffic_priority: str = "normal",
+        browser_fallback: bool = False,
+        direct_http_only: bool = True,
+        batch_size: int | None = None,
+        batch_pause_seconds: float | None = None,
+    ) -> dict[str, ViewCountResult]:
+        """Batch public view counters with a lightweight direct-first strategy.
 
-        v2.7.2 probes the public s-vac-inc-get endpoint once. If plain HTTP or a
-        Playwright APIRequestContext works, counters are fetched without rendering ad
-        pages. Only failed counters fall back to the lightweight browser-page method.
+        v3.1.4 deliberately keeps mass view refreshes cheap: by default it uses
+        only the public direct HTTP counter and *does not* open Chromium for failed
+        listings. Browser fallback remains available for explicit one-off diagnostics
+        by passing ``browser_fallback=True`` and ``direct_http_only=False``.
+
+        Requests are processed in small batches so background 1/3/6/12/24-hour
+        checkpoints do not create a burst that competes with interactive scans.
         """
         if not urls:
             return {}
 
-        # Preserve order while dropping duplicates.
         urls = list(dict.fromkeys(urls))
         results: dict[str, ViewCountResult] = {}
         total = len(urls)
-
-        mode, probe = await self.probe_direct_view_mode(urls[0], traffic_priority=traffic_priority)
-        if probe.views is not None:
-            results[urls[0]] = probe
-
-        direct_sem = asyncio.Semaphore(max(1, min(DIRECT_VIEW_CONCURRENCY, concurrency)))
-        done_count = len(results)
+        done_count = 0
         done_lock = asyncio.Lock()
+        effective_batch = max(1, int(batch_size or VIEW_DIRECT_BATCH_SIZE))
+        effective_pause = VIEW_DIRECT_BATCH_PAUSE_SECONDS if batch_pause_seconds is None else max(0.0, float(batch_pause_seconds))
 
         async def report_progress():
             if progress_cb is None:
@@ -1624,54 +1636,59 @@ class KleinanzeigenParser:
             except Exception:
                 pass
 
+        # Mass refreshes stay HTTP-only. This avoids creating a Playwright context
+        # merely because one direct request failed.
+        mode = "http"
+        if not direct_http_only:
+            mode, probe = await self.probe_direct_view_mode(urls[0], traffic_priority=traffic_priority)
+            if probe.views is not None:
+                results[urls[0]] = probe
+                done_count = 1
+
+        direct_sem = asyncio.Semaphore(max(1, min(DIRECT_VIEW_CONCURRENCY, concurrency)))
+
         async def direct_one(url: str):
             nonlocal done_count
             if url in results:
                 return
             async with direct_sem:
-                vr = await self.fetch_public_view_count_direct(url, mode=mode, traffic_priority=traffic_priority)
+                if direct_http_only:
+                    vr = await self._direct_view_http(url, traffic_priority=traffic_priority)
+                else:
+                    vr = await self.fetch_public_view_count_direct(url, mode=mode, traffic_priority=traffic_priority)
                 results[url] = vr
             async with done_lock:
                 done_count += 1
-            await report_progress()
 
-        if mode in {"http", "context"}:
-            await asyncio.gather(*(direct_one(url) for url in urls if url not in results))
-        else:
-            # Browser mode: leave all URLs for the fallback pass below.
-            results = {}
-            done_count = 0
+        # Chunking is intentional: it yields the event loop and smooths network
+        # pressure while Telegram UI callbacks remain responsive.
+        pending_urls = [url for url in urls if url not in results]
+        for offset in range(0, len(pending_urls), effective_batch):
+            chunk = pending_urls[offset:offset + effective_batch]
+            await asyncio.gather(*(direct_one(url) for url in chunk))
+            await report_progress()
+            if offset + effective_batch < len(pending_urls) and effective_pause > 0:
+                await asyncio.sleep(effective_pause)
 
         failed_urls = [url for url in urls if results.get(url) is None or results[url].views is None]
-        if not failed_urls:
+        if not failed_urls or not browser_fallback:
             await report_progress()
             return results
 
-        # Browser fallback is intentionally gentler than direct requests. This is
-        # only used for the minority of URLs that the fast endpoint cannot read.
-        page_sem = asyncio.Semaphore(max(1, min(6, concurrency)))
+        # Explicit opt-in only. This path is kept for diagnostics/small targeted
+        # checks, never for automatic or manual mass refreshes.
+        page_sem = asyncio.Semaphore(1)
 
         async def browser_one(url: str):
-            nonlocal done_count
             async with page_sem:
                 vr = await self.fetch_public_view_count(
                     url, http_fast_path=False, traffic_priority=traffic_priority
                 )
                 results[url] = vr
-            # Direct attempts already incremented progress; in pure browser mode they did not.
-            if mode == "browser":
-                async with done_lock:
-                    done_count += 1
-                await report_progress()
 
-        chunk_size = max(12, concurrency * 5)
-        for i in range(0, len(failed_urls), chunk_size):
-            chunk = failed_urls[i:i + chunk_size]
-            await asyncio.gather(*(browser_one(url) for url in chunk))
-        if mode != "browser":
-            # Progress was already counted during direct attempts; final fallback only
-            # changes quality, not the number of processed URLs.
-            await report_progress()
+        for url in failed_urls:
+            await browser_one(url)
+        await report_progress()
         return results
 
     async def check_listing_active(self, url: str) -> bool | None:
