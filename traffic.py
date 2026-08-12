@@ -51,18 +51,18 @@ class AdaptiveTrafficManager:
     """
 
     def __init__(self) -> None:
-        self.base_scan_limit = _env_int("TRAFFIC_SCAN_CONCURRENCY", 4, 1, 12)
-        self.base_view_limit = _env_int("TRAFFIC_VIEW_CONCURRENCY", 6, 1, 24)
+        self.base_scan_limit = _env_int("TRAFFIC_SCAN_CONCURRENCY", 3, 1, 12)
+        self.base_view_limit = _env_int("TRAFFIC_VIEW_CONCURRENCY", 4, 1, 24)
         self.base_browser_limit = _env_int("TRAFFIC_BROWSER_CONCURRENCY", 1, 1, 4)
-        self.base_global_limit = _env_int("TRAFFIC_GLOBAL_CONCURRENCY", 10, 2, 32)
+        self.base_global_limit = _env_int("TRAFFIC_GLOBAL_CONCURRENCY", 7, 2, 32)
         self.background_during_scans = _env_int("TRAFFIC_BACKGROUND_VIEWS_DURING_SCANS", 1, 0, 6)
         self.reserved_scan_slots = _env_int("TRAFFIC_RESERVED_SCAN_SLOTS", 2, 0, 8)
 
-        self.scan_min_interval = _env_float("TRAFFIC_SCAN_MIN_INTERVAL_SECONDS", 0.35, 0.0, 5.0)
-        self.view_min_interval = _env_float("TRAFFIC_VIEW_MIN_INTERVAL_SECONDS", 0.08, 0.0, 2.0)
+        self.scan_min_interval = _env_float("TRAFFIC_SCAN_MIN_INTERVAL_SECONDS", 0.55, 0.0, 5.0)
+        self.view_min_interval = _env_float("TRAFFIC_VIEW_MIN_INTERVAL_SECONDS", 0.12, 0.0, 2.0)
         self.browser_min_interval = _env_float("TRAFFIC_BROWSER_MIN_INTERVAL_SECONDS", 0.75, 0.0, 10.0)
-        self.base_cooldown = _env_float("TRAFFIC_403_COOLDOWN_SECONDS", 4.0, 1.0, 30.0)
-        self.max_cooldown = _env_float("TRAFFIC_MAX_COOLDOWN_SECONDS", 45.0, 5.0, 180.0)
+        self.base_cooldown = _env_float("TRAFFIC_403_COOLDOWN_SECONDS", 8.0, 1.0, 60.0)
+        self.max_cooldown = _env_float("TRAFFIC_MAX_COOLDOWN_SECONDS", 60.0, 5.0, 240.0)
         self.recovery_successes = _env_int("TRAFFIC_RECOVERY_SUCCESS_COUNT", 60, 10, 1000)
         self.recovery_quiet_seconds = _env_float("TRAFFIC_RECOVERY_QUIET_SECONDS", 60.0, 10.0, 600.0)
 

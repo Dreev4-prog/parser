@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -33,6 +34,11 @@ PAGE_DELAY_SECONDS = max(0.0, float(os.getenv("PAGE_DELAY_SECONDS", "1.0")))
 CATEGORY_HTTP_RETRIES = max(1, min(4, int(os.getenv("CATEGORY_HTTP_RETRIES", "3"))))
 CATEGORY_403_BACKOFF_SECONDS = max(3.0, float(os.getenv("CATEGORY_403_BACKOFF_SECONDS", "10")))
 CATEGORY_RETRY_JITTER_SECONDS = max(0.0, float(os.getenv("CATEGORY_RETRY_JITTER_SECONDS", "2.0")))
+# v3.1.3: an interactive category scan should survive a temporary site-wide
+# refusal instead of immediately becoming a false/partial zero. This is a wait,
+# not a bypass: all traffic goes through the shared circuit breaker.
+CATEGORY_ACCESS_MAX_WAIT_SECONDS = max(30.0, min(900.0, float(os.getenv("CATEGORY_ACCESS_MAX_WAIT_SECONDS", "180"))))
+CATEGORY_ACCESS_RETRY_MIN_SECONDS = max(5.0, min(120.0, float(os.getenv("CATEGORY_ACCESS_RETRY_MIN_SECONDS", "12"))))
 STOP_AFTER_EMPTY_TODAY_PAGES = max(1, int(os.getenv("STOP_AFTER_EMPTY_TODAY_PAGES", "2")))
 AVAILABILITY_TIMEOUT = max(5.0, float(os.getenv("AVAILABILITY_TIMEOUT", "20")))
 # v3.1 parser-quality thresholds. A page with too few trustworthy publication
@@ -853,47 +859,74 @@ class KleinanzeigenParser:
         if not _allowed_url(url):
             raise ValueError("Only public kleinanzeigen.de HTTPS URLs are allowed")
 
+        # Category-page requests are the interactive core of the product. A 403/429
+        # is treated as temporary site pressure: the shared Traffic Manager closes
+        # the gate, lowers concurrency and this request waits for recovery. Direct
+        # view-counter work stays short-lived so background checkpoints can yield.
+        started = time.monotonic()
+        refusal_attempt = 0
+        transient_attempt = 0
         last_error: Exception | None = None
-        for attempt in range(CATEGORY_HTTP_RETRIES):
+
+        while True:
             try:
                 async with TRAFFIC.lease(traffic_kind, traffic_priority):
                     response = await self.client.get(url)
                 status = response.status_code
 
-                # Respect site protection. The process-wide traffic manager lowers
-                # concurrency and starts a shared cooldown after 403/429, so other
-                # scans/view jobs do not keep hammering the site while this request retries.
                 if status in {403, 429}:
+                    refusal_attempt += 1
                     await TRAFFIC.report_refusal(status, traffic_kind)
-                    if attempt >= CATEGORY_HTTP_RETRIES - 1:
-                        raise TemporaryAccessError(status, url)
-                    delay = min(45.0, CATEGORY_403_BACKOFF_SECONDS * (attempt + 1))
-                    delay += random.uniform(0.0, CATEGORY_RETRY_JITTER_SECONDS)
-                    log.warning(
-                        "Request temporarily refused kind=%s status=%s attempt=%s/%s; cooling down %.1fs: %s",
-                        traffic_kind, status, attempt + 1, CATEGORY_HTTP_RETRIES, delay, url,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
+                    elapsed = time.monotonic() - started
+
+                    # Only normal category-page scans get the long recovery window.
+                    # This deliberately waits for the public site to recover; it does
+                    # not change identity, headers or otherwise evade the refusal.
+                    if traffic_kind == "scan" and elapsed < CATEGORY_ACCESS_MAX_WAIT_SECONDS:
+                        snap = await TRAFFIC.snapshot()
+                        progressive = CATEGORY_ACCESS_RETRY_MIN_SECONDS * min(refusal_attempt, 3)
+                        delay = max(CATEGORY_ACCESS_RETRY_MIN_SECONDS, snap.cooldown_seconds, progressive)
+                        delay = min(60.0, delay) + random.uniform(0.0, CATEGORY_RETRY_JITTER_SECONDS)
+                        remaining = max(0.0, CATEGORY_ACCESS_MAX_WAIT_SECONDS - elapsed)
+                        delay = min(delay, remaining) if remaining > 0 else 0
+                        log.warning(
+                            "Category access refused status=%s attempt=%s; shared cooldown %.1fs, "
+                            "waiting %.1fs (recovery window %.0fs): %s",
+                            status, refusal_attempt, snap.cooldown_seconds, delay,
+                            CATEGORY_ACCESS_MAX_WAIT_SECONDS, url,
+                        )
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                        continue
+
+                    # Background/manual view work or an exhausted category recovery
+                    # window may fail cleanly. The caller will mark a partial result,
+                    # never a confident zero.
+                    raise TemporaryAccessError(status, url)
 
                 response.raise_for_status()
                 await TRAFFIC.report_success(traffic_kind)
                 return response
+
             except TemporaryAccessError:
                 raise
             except httpx.TimeoutException as exc:
                 last_error = exc
-                if attempt >= CATEGORY_HTTP_RETRIES - 1:
+                transient_attempt += 1
+                if transient_attempt >= CATEGORY_HTTP_RETRIES:
                     raise
-                await asyncio.sleep(1.5 * (attempt + 1) + random.uniform(0.0, 0.8))
+                await asyncio.sleep(1.5 * transient_attempt + random.uniform(0.0, 0.8))
             except httpx.HTTPStatusError as exc:
                 last_error = exc
                 status = exc.response.status_code
                 if status in {403, 429}:
                     await TRAFFIC.report_refusal(status, traffic_kind)
-                if attempt >= CATEGORY_HTTP_RETRIES - 1 or status not in {500, 502, 503, 504}:
+                    raise TemporaryAccessError(status, url)
+                transient_attempt += 1
+                if transient_attempt >= CATEGORY_HTTP_RETRIES or status not in {500, 502, 503, 504}:
                     raise
-                await asyncio.sleep(1.5 * (attempt + 1) + random.uniform(0.0, 0.8))
+                await asyncio.sleep(1.5 * transient_attempt + random.uniform(0.0, 0.8))
+
         raise RuntimeError(str(last_error))
 
     async def fetch_html(

@@ -1,4 +1,14 @@
-# Kleinanzeigen Parser Bot v3.1.2
+# Kleinanzeigen Parser Bot v3.1.3
+
+## v3.1.3 — 403 Recovery / Safe Multi-User
+
+- A 403/429 during date location no longer immediately ends the category with zero successful pages.
+- Interactive category-page requests may wait up to 180 seconds (configurable) behind the shared circuit breaker and retry after quiet cooldowns.
+- Every refusal reduces process-wide concurrency; background view checkpoints also wait behind the same gate.
+- Safer default network limits: 3 category requests, 4 view requests, 1 browser fallback, 7 total. `MAX_CONCURRENT_JOBS` may remain 4; the network gate decides how many requests actually run at once.
+- If the public site is still refusing requests after the full recovery window, the current category is partial and the remaining categories in that same job are not hammered one-by-one. Existing successful category results remain saved.
+- This is graceful backoff only; the release does not attempt to bypass Kleinanzeigen protections.
+
 
 ## v3.1.2 — Adaptive Traffic Manager
 

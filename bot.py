@@ -2345,7 +2345,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     async def hidden_fill(remaining_virtual_pages: int) -> tuple[bool, bool]:
         """Fill remaining depth from independent location feeds.
 
-        v3.1.2 keeps the multi-category false-zero fix and adds adaptive traffic control. Every category owns its own
+        v3.1.3 keeps the multi-category false-zero fix and adds resilient 403 recovery. Every category owns its own
         locator state. If a state feed is itself larger than Kleinanzeigen's public
         50-page window, it is recursively split into smaller official location feeds
         discovered from that category page. Nothing from the previous selected
@@ -3069,6 +3069,24 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
                 (result.reason if result is not None else "no result"),
             )
             job.completed_categories += 1
+
+            # If an interactive category already spent the full recovery window and
+            # Kleinanzeigen still refuses the process, immediately trying the next
+            # selected category only extends the block. Stop this job gracefully;
+            # completed categories remain saved and no false zeros are produced.
+            if result is not None and "временный лимит Kleinanzeigen" in (result.reason or ""):
+                remaining_categories = max(0, len(job.category_keys) - idx)
+                if remaining_categories:
+                    note = (
+                        f"Kleinanzeigen всё ещё ограничивает доступ после автоматического ожидания. "
+                        f"Оставшиеся категории ({remaining_categories}) не запускались, чтобы не усиливать лимит."
+                    )
+                    job.warnings.append(note)
+                    job.scan_notes = job.scan_notes or []
+                    job.scan_notes.append(note)
+                    job.incomplete_categories += remaining_categories
+                    job.completed_categories += remaining_categories
+                break
             # User sees only useful progress; cache/shared/worker details stay internal.
             await edit_job_status(bot, job, render_user_job_status(job), force=True)
         except Exception as exc:
@@ -3179,7 +3197,7 @@ async def start(message: Message, state: FSMContext) -> None:
         return
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>🔍 Kleinanzeigen Parser v3.1.2</b>\n\n"
+        "<b>🔍 Kleinanzeigen Parser v3.1.3</b>\n\n"
         "Здесь всё строится вокруг сохранённых сканов:\n"
         "🔥 <b>Популярное сейчас</b> — лидеры по просмотрам\n"
         "🔎 <b>Новый скан</b> — собрать свежие объявления\n"
@@ -3197,7 +3215,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v3.1.2</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v3.1.3</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == "post_settings")
@@ -3218,7 +3236,7 @@ async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
     await callback.message.answer(
-        "<b>🔍 Kleinanzeigen Parser v3.1.2</b>\n\nЧто хочешь посмотреть?",
+        "<b>🔍 Kleinanzeigen Parser v3.1.3</b>\n\nЧто хочешь посмотреть?",
         reply_markup=main_keyboard(len(selected)),
         parse_mode=ParseMode.HTML,
     )
@@ -3465,7 +3483,7 @@ async def run_view_test(message: Message, state: FSMContext) -> None:
         lines += [
             "",
             f"📈 Ускорение на тесте: <b>примерно ×{speedup:.1f}</b>",
-            "✅ Обычный массовый парсинг v3.1.2 уже сначала использует быстрый способ. Chromium включается только для объявлений, где прямой счётчик не сработал.",
+            "✅ Обычный массовый парсинг v3.1.3 уже сначала использует быстрый способ. Chromium включается только для объявлений, где прямой счётчик не сработал.",
         ]
     else:
         lines += [
