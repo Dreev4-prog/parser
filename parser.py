@@ -90,6 +90,20 @@ class ParsedListing:
     posted_text: str | None = None
 
 
+@dataclass
+class CategoryPageInfo:
+    requested_page: int
+    final_url: str
+    items: list[ParsedListing]
+    result_start: int | None = None
+    result_end: int | None = None
+    total_results: int | None = None
+    actual_page: int | None = None
+    max_page: int | None = None
+    request_matches_page: bool = True
+    fingerprint: str = ""
+
+
 PRICE_NUMBER_RE = re.compile(r"(?<!\d)(\d{1,3}(?:\.\d{3})*|\d+)\s*€(?:\s*(?:VB|Festpreis))?", re.IGNORECASE)
 PRICE_WORD_RE = re.compile(r"\b(?:Zu verschenken|VB|Festpreis)\b", re.IGNORECASE)
 UNAVAILABLE_PHRASES = (
@@ -137,16 +151,64 @@ def page_url(base_url: str, page: int) -> str:
 
 
 def _extract_posted_text(node) -> str | None:
-    text = node.get_text(" ", strip=True)
+    """Extract the publication timestamp from the listing metadata, not its title.
+
+    A full-card regex is dangerous because product titles/descriptions can themselves
+    contain dates (for example a DVD/event date).  Kleinanzeigen currently renders the
+    publication timestamp in the compact top-right metadata area of each result card,
+    so we inspect those small metadata nodes first and only then use a conservative
+    fallback.
+    """
     patterns = [
         r"\bHeute(?:,?\s*\d{1,2}:\d{2})?\b",
         r"\bGestern(?:,?\s*\d{1,2}:\d{2})?\b",
-        r"\b\d{1,2}\.\d{1,2}\.\d{4}\b",
+        r"\b\d{1,2}\.\d{1,2}\.\d{4}(?:,?\s*\d{1,2}:\d{2})?\b",
     ]
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            return match.group(0)
+
+    # Known/likely Kleinanzeigen metadata containers.  Keep this list narrow: the
+    # purpose is specifically to avoid matching an arbitrary date in the ad title.
+    selectors = (
+        ".aditem-main--top--right",
+        "[class~='aditem-main--top--right']",
+        "time",
+        "[class*='timestamp']",
+        "[class*='date']",
+    )
+    for selector in selectors:
+        try:
+            elements = node.select(selector)
+        except Exception:
+            elements = []
+        for element in elements:
+            # If a semantic <time> carries an ISO datetime, prefer the visible German
+            # label when present, otherwise retain the machine timestamp.
+            visible = " ".join(element.get_text(" ", strip=True).split())
+            for pattern in patterns:
+                match = re.search(pattern, visible, flags=re.IGNORECASE)
+                if match:
+                    return match.group(0)
+            dt_value = element.get("datetime") if hasattr(element, "get") else None
+            if dt_value and re.search(r"\d{4}-\d{2}-\d{2}", str(dt_value)):
+                return str(dt_value).strip()
+
+    # Conservative fallback: inspect only short leaf-ish metadata strings.  Do not run
+    # the date regex over the whole card because that reintroduces the title-date bug.
+    try:
+        for element in node.find_all(["span", "div", "small"], limit=80):
+            text = " ".join(element.get_text(" ", strip=True).split())
+            if not text or len(text) > 48:
+                continue
+            child_texts = [" ".join(c.get_text(" ", strip=True).split()) for c in element.find_all(recursive=False)]
+            if child_texts and any(t and t != text for t in child_texts):
+                # Container with richer nested content: skip unless a direct known label
+                # selector above already handled it.
+                continue
+            for pattern in patterns:
+                match = re.search(pattern, text, flags=re.IGNORECASE)
+                if match:
+                    return match.group(0)
+    except Exception:
+        pass
     return None
 
 
@@ -165,6 +227,22 @@ def posted_date_moscow(text: str | None, now_berlin: datetime | None = None):
     if not text:
         return None
     raw = " ".join(str(text).split())
+
+    # Semantic <time datetime=...> fallback.  Offset-aware timestamps are converted
+    # directly to Moscow; a bare ISO date is treated as a calendar date.
+    iso = re.search(r"\b(\d{4})-(\d{2})-(\d{2})(?:[T\s](\d{2}):(\d{2})(?::(\d{2}))?(Z|[+-]\d{2}:?\d{2})?)?", raw)
+    if iso:
+        try:
+            if iso.group(4):
+                iso_text = iso.group(0).replace("Z", "+00:00")
+                dt = datetime.fromisoformat(iso_text)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=BERLIN_TZ)
+                return dt.astimezone(MOSCOW_TZ).date()
+            return datetime(int(iso.group(1)), int(iso.group(2)), int(iso.group(3))).date()
+        except (ValueError, TypeError):
+            pass
+
     explicit = re.search(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b", raw)
     if explicit:
         try:
@@ -390,6 +468,71 @@ def parse_category_html(html_text: str) -> list[ParsedListing]:
     return items
 
 
+def _de_int(value: str | None) -> int | None:
+    if not value:
+        return None
+    digits = re.sub(r"\D", "", value)
+    return int(digits) if digits else None
+
+
+def category_page_info_from_html(
+    html_text: str,
+    *,
+    requested_page: int,
+    final_url: str,
+) -> CategoryPageInfo:
+    """Parse listings plus pagination metadata from a category/search response.
+
+    The result-range header (e.g. ``26 - 50 von 469.976``) lets the date locator
+    detect when Kleinanzeigen normalized/redirected an out-of-range page instead of
+    silently treating repeated fresh listings as if they came from page 20,000.
+    """
+    items = parse_category_html(html_text)
+    text = " ".join(BeautifulSoup(html_text, "html.parser").get_text(" ", strip=True).split())
+    range_match = re.search(
+        r"(?<!\d)(\d[\d.]*)\s*-\s*(\d[\d.]*)\s+von\s+(\d[\d.]*)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    result_start = result_end = total_results = actual_page = max_page = None
+    request_matches = True
+    if range_match:
+        result_start = _de_int(range_match.group(1))
+        result_end = _de_int(range_match.group(2))
+        total_results = _de_int(range_match.group(3))
+        if result_start and result_end and result_end >= result_start:
+            # Kleinanzeigen's category result pages currently expose 25 organic slots.
+            # Derive the current page from the result offset, which is more reliable
+            # than trusting the requested URL after a redirect/normalization.
+            actual_page = ((result_start - 1) // 25) + 1
+        if total_results is not None:
+            max_page = max(1, (total_results + 24) // 25)
+        expected_start = 1 + (max(1, requested_page) - 1) * 25
+        if result_start is not None and result_start != expected_start:
+            request_matches = False
+        if max_page is not None and requested_page > max_page:
+            request_matches = False
+
+    # A compact content fingerprint catches normalization even if the range header
+    # changes or is temporarily missing.  Use several IDs so one moving ad cannot
+    # accidentally collide.
+    ids = [x.external_id for x in items if x.external_id]
+    fingerprint_ids = ids if len(ids) <= 9 else (ids[:6] + ids[-3:])
+    fingerprint = "|".join(fingerprint_ids) if fingerprint_ids else ""
+    return CategoryPageInfo(
+        requested_page=max(1, int(requested_page)),
+        final_url=final_url,
+        items=items,
+        result_start=result_start,
+        result_end=result_end,
+        total_results=total_results,
+        actual_page=actual_page,
+        max_page=max_page,
+        request_matches_page=request_matches,
+        fingerprint=fingerprint,
+    )
+
+
 PASSIVE_VIEW_ENDPOINT_RE = re.compile(r"/s-vac-inc-get\.json(?:\?|$)", re.IGNORECASE)
 VIEW_KEY_RE = re.compile(r"(?:^|[_-])(view(?:s|count)?|counter|cntr|aufruf(?:e)?|impression(?:s)?|visit(?:s)?)(?:$|[_-])", re.IGNORECASE)
 
@@ -535,7 +678,7 @@ class KleinanzeigenParser:
         self._playwright = None
         await self.client.aclose()
 
-    async def fetch_html(self, url: str) -> str:
+    async def _fetch_response(self, url: str) -> httpx.Response:
         if not _allowed_url(url):
             raise ValueError("Only public kleinanzeigen.de HTTPS URLs are allowed")
 
@@ -561,7 +704,7 @@ class KleinanzeigenParser:
                     continue
 
                 response.raise_for_status()
-                return response.text
+                return response
             except TemporaryAccessError:
                 raise
             except httpx.TimeoutException as exc:
@@ -577,8 +720,19 @@ class KleinanzeigenParser:
                 await asyncio.sleep(1.5 * (attempt + 1) + random.uniform(0.0, 0.8))
         raise RuntimeError(str(last_error))
 
+    async def fetch_html(self, url: str) -> str:
+        return (await self._fetch_response(url)).text
+
     async def parse_category_page(self, url: str) -> list[ParsedListing]:
         return parse_category_html(await self.fetch_html(url))
+
+    async def parse_category_page_info(self, url: str, requested_page: int) -> CategoryPageInfo:
+        response = await self._fetch_response(url)
+        return category_page_info_from_html(
+            response.text,
+            requested_page=requested_page,
+            final_url=str(response.url),
+        )
 
 
     @staticmethod

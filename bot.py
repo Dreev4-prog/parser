@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+from collections import Counter
 import html
 import logging
 import os
@@ -107,12 +108,12 @@ PAGE_LIMIT_CHOICES = (25, 50, 100)
 # around 3 minutes, then the estimate is recalculated from the real page rate.
 PAGE_LIMIT_BASE_ETA_SECONDS = {25: 60, 50: 120, 100: 180}
 
-# v3.0.4 exact-date mode. The selected date is only a starting point.
+# v3.0.5 exact-date mode. The selected date is only a starting point.
 # We locate the first page of that Moscow calendar date with sparse exponential
 # probes + binary search, then collect exactly the user-selected 25/50/100-page
 # window (or stop earlier when the feed moves to an older date).
-# The locator cap is intentionally much higher than the collection depth because
-# reaching page 8,000 still needs only about a dozen sparse probes, not 8,000 reads.
+# The configured locator cap is only a hard guard. v3.0.5 additionally reads the
+# real result count from Kleinanzeigen and derives the actual last page dynamically.
 DATE_JUMP_MAX_PAGE = max(1000, min(100000, int(os.getenv(
     "DATE_JUMP_MAX_PAGE", os.getenv("DATE_SCAN_MAX_PAGES", "20000")
 ))))
@@ -1440,7 +1441,7 @@ queued_job_ids: list[str] = []
 job_guard = asyncio.Lock()
 category_inflight: dict[str, asyncio.Task[ScanResult]] = {}
 category_inflight_guard = asyncio.Lock()
-# Exact-date cache must preserve the exact 25/50/100-page result set, so v3.0.4
+# Exact-date cache must preserve the exact 25/50/100-page result set, so v3.0.5
 # caches ScanResult (including matched IDs) in memory instead of reconstructing a
 # result from every listing ever seen for that date.
 category_result_cache: dict[str, tuple[float, ScanResult]] = {}
@@ -1542,7 +1543,7 @@ async def record_parser_run(
 async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page_limit: int, target_date: str) -> ScanResult:
     """Locate an exact Moscow date, then collect the requested 25/50/100 pages.
 
-    v3.0.4 restores the simple user model:
+    v3.0.5 keeps the simple user model and validates pagination/date metadata:
       * date = where the scan should start;
       * 25/50/100 = how many category pages to collect from that date.
 
@@ -1583,40 +1584,106 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
 
     # Sparse locating requests and collection requests share this cache, so a page
     # discovered during binary search is never downloaded again unnecessarily.
-    page_cache: dict[int, list] = {}
+    # v3.0.5 caches the response metadata as well: Kleinanzeigen can normalize a
+    # too-large page number, and treating that repeated response as page 20,000 was
+    # the main cause of the false "still 11.08" diagnostic.
+    page_cache: dict[int, object] = {}
     requested_pages: set[int] = set()
+    fingerprint_pages: dict[str, int] = {}
+    effective_jump_limit = jump_limit
+    invalid_page_note = ""
 
     def classify(items) -> tuple[str, list, list]:
-        """Classify a normal-listing page relative to the requested Moscow date."""
+        """Classify a result page relative to the requested Moscow date.
+
+        Exact target dates remain a hard signal, but a single stray older/newer card
+        must not move the binary-search boundary.  For non-target pages we therefore
+        use the majority/median of all dated organic cards rather than raw min/max.
+        """
         if not items:
             return "empty", [], []
         pairs = [(item, posted_date_moscow(item.posted_text)) for item in items]
         days = [d for _, d in pairs if d is not None]
         if not days:
             return "unknown", pairs, days
-        if any(d == target_day for d in days):
+
+        counts = Counter(days)
+        if counts.get(target_day, 0) > 0:
             return "target", pairs, days
-        if min(days) > target_day:
+
+        newer = sum(count for day, count in counts.items() if day > target_day)
+        older = sum(count for day, count in counts.items() if day < target_day)
+        total = newer + older
+        if total <= 0:
+            return "unknown", pairs, days
+        if newer and not older:
             return "newer", pairs, days
-        if max(days) < target_day:
+        if older and not newer:
+            return "older", pairs, days
+
+        # Strong majority first, then median as a stable tie-breaker.  This protects
+        # the locator from a stale/promoted-looking outlier that escaped card filtering.
+        if newer / total >= 0.70:
+            return "newer", pairs, days
+        if older / total >= 0.70:
+            return "older", pairs, days
+        ordered = sorted(days)
+        median_day = ordered[len(ordered) // 2]
+        if median_day > target_day:
+            return "newer", pairs, days
+        if median_day < target_day:
             return "older", pairs, days
         return "mixed", pairs, days
 
     async def fetch_page(page: int, phase: str):
-        nonlocal oldest_date_seen
-        page = max(1, min(jump_limit, int(page)))
+        nonlocal oldest_date_seen, effective_jump_limit, invalid_page_note
+        page = max(1, min(effective_jump_limit, int(page)))
         if page in page_cache:
-            items = page_cache[page]
+            info = page_cache[page]
         else:
-            items = await parser.parse_category_page(page_url(cat.url, page))
-            page_cache[page] = items
+            info = await parser.parse_category_page_info(page_url(cat.url, page), page)
+            page_cache[page] = info
             requested_pages.add(page)
+
+            # The result header gives us the real maximum page from the current total
+            # result count.  It is a dynamic safety bound, not a guessed 20k cap.
+            if getattr(info, "max_page", None):
+                effective_jump_limit = max(1, min(effective_jump_limit, int(info.max_page)))
+
             if phase == "jumping" and DATE_JUMP_PROBE_DELAY_SECONDS:
                 await asyncio.sleep(DATE_JUMP_PROBE_DELAY_SECONDS)
 
+        items = info.items
         relation, pairs, days = classify(items)
+
+        # Never classify a normalized/redirected page by its listing dates.  Example:
+        # requesting page 20,000 may return a valid HTML result page for a different
+        # offset; previously those fresh cards were incorrectly read as page 20,000.
+        valid_page = bool(getattr(info, "request_matches_page", True))
+        fp = getattr(info, "fingerprint", "") or ""
+        if fp:
+            previous_page = fingerprint_pages.get(fp)
+            if previous_page is None:
+                fingerprint_pages[fp] = page
+            elif previous_page != page and len(items) >= 5:
+                valid_page = False
+                invalid_page_note = f"страница {page} повторила содержимое страницы {previous_page}"
+
+        if not valid_page:
+            actual_page = getattr(info, "actual_page", None)
+            start = getattr(info, "result_start", None)
+            end = getattr(info, "result_end", None)
+            invalid_page_note = invalid_page_note or (
+                f"запрошенная страница {page} была нормализована сайтом"
+                + (f" в страницу {actual_page}" if actual_page else "")
+                + (f" (результаты {start}–{end})" if start and end else "")
+            )
+            relation = "invalid"
+            days = []
+            pairs = []
+
         page_date_hint = ""
-        if days:
+        if days and relation != "invalid":
             page_oldest = min(days)
             page_newest = max(days)
             page_date_hint = (
@@ -1634,9 +1701,14 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             live.current_page_date = page_date_hint
             live.phase = phase
 
+        counts_text = ",".join(f"{d.isoformat()}:{c}" for d, c in sorted(Counter(days).items(), reverse=True))
         log.info(
-            "category=%s mode=date-depth phase=%s page=%s relation=%s dated=%s requests=%s depth=%s",
-            cat.name, phase, page, relation, len(days), len(requested_pages), depth,
+            "category=%s mode=date-depth phase=%s page=%s relation=%s dated=%s dates=[%s] "
+            "range=%s-%s total=%s actual_page=%s max_page=%s valid=%s requests=%s depth=%s",
+            cat.name, phase, page, relation, len(days), counts_text,
+            getattr(info, "result_start", None), getattr(info, "result_end", None),
+            getattr(info, "total_results", None), getattr(info, "actual_page", None),
+            getattr(info, "max_page", None), valid_page, len(requested_pages), depth,
         )
         return items, relation, pairs, days
 
@@ -1683,25 +1755,25 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 reason = f"временный лимит Kleinanzeigen (HTTP {exc.status_code}) во время поиска даты"
                 break
 
-            if relation in {"target", "older", "mixed", "empty"}:
+            if relation in {"target", "older", "mixed", "empty", "invalid"}:
                 high_boundary = probe
                 break
 
             if relation == "newer":
                 low_newer = probe
 
-            if probe >= jump_limit:
+            if probe >= effective_jump_limit:
                 hit_limit = True
                 reason = (
                     f"не удалось добраться до {_date_label(target_date)}: "
-                    f"даже на странице {jump_limit} выдача новее выбранной даты"
+                    f"последняя доступная страница — {effective_jump_limit}, а выдача там ещё новее выбранной даты"
                 )
                 break
 
-            next_probe = min(jump_limit, 2 if probe == 1 else probe * 2)
+            next_probe = min(effective_jump_limit, 2 if probe == 1 else probe * 2)
             if next_probe == probe:
                 hit_limit = True
-                reason = f"достигнут предел поиска страницы {jump_limit}"
+                reason = f"достигнута последняя доступная страница {effective_jump_limit}"
                 break
             probe = next_probe
 
@@ -1729,10 +1801,11 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         candidate_page: int | None = None
         if not reason and boundary_page is not None:
             neighborhood_start = max(1, boundary_page - 4)
-            neighborhood_end = min(jump_limit, boundary_page + 6)
+            neighborhood_end = min(effective_jump_limit, boundary_page + 6)
             saw_older_or_empty = False
             saw_newer = False
             saw_unknown = False
+            saw_invalid = False
             for page in range(neighborhood_start, neighborhood_end + 1):
                 try:
                     items, relation, pairs, days = await fetch_page(page, "jumping")
@@ -1748,6 +1821,8 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     saw_older_or_empty = True
                 elif relation == "unknown":
                     saw_unknown = True
+                elif relation == "invalid":
+                    saw_invalid = True
 
             # One small backward check protects against minor feed boundary jitter.
             if candidate_page is not None:
@@ -1763,13 +1838,15 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     else:
                         break
             elif not reason:
-                if saw_newer and saw_older_or_empty and not saw_unknown:
+                if saw_newer and saw_older_or_empty and not saw_unknown and not saw_invalid:
                     # The feed crossed the requested calendar day without any normal listing.
                     request_complete = True
                     reason = "выбранная дата пройдена; объявлений за неё не найдено"
-                elif saw_older_or_empty and low_newer == 0 and not saw_unknown:
+                elif saw_older_or_empty and low_newer == 0 and not saw_unknown and not saw_invalid:
                     request_complete = True
                     reason = "выбранная дата не представлена в доступной выдаче"
+                elif saw_invalid:
+                    reason = invalid_page_note or "Kleinanzeigen вернул другую страницу вместо запрошенной; дата не подтверждена"
                 else:
                     reason = "не удалось надёжно определить начало выбранной даты"
 
@@ -1787,9 +1864,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
 
             for index in range(1, depth + 1):
                 page = candidate_page + index - 1
-                if page > jump_limit:
+                if page > effective_jump_limit:
                     hit_limit = True
-                    reason = f"достигнут технический предел страницы {jump_limit} во время сбора"
+                    reason = f"достигнута последняя доступная страница {effective_jump_limit} во время сбора"
                     break
                 try:
                     items, relation, pairs, days = await fetch_page(page, "collecting")
@@ -1914,7 +1991,7 @@ async def fresh_category_cache_age(category_key: str, page_limit: int, target_da
     """Legacy DB cache hook. Exact-depth scans use the in-memory ScanResult cache.
 
     Reconstructing a 25-page result from every listing ever stored for the same
-    category/date would silently turn it into a 50/100-page result, so v3.0.4
+    category/date would silently turn it into a 50/100-page result, so v3.0.5
     intentionally does not use the old DB-only cache for exact-date scans.
     """
     return None
@@ -2296,8 +2373,9 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
                     reached = _date_label(result.oldest_date_seen) if result.oldest_date_seen else "не определена"
                     note = (
                         f"{cat.name}: не удалось надёжно начать сбор за {_date_label(job.target_date)}; "
-                        f"самая старая достигнутая дата — {reached}; "
-                        f"сетевых страниц запрошено {result.pages_scanned}, достигнута стр. {result.max_page_reached or '?'}"
+                        f"самая старая подтверждённая дата — {reached}; "
+                        f"сетевых страниц запрошено {result.pages_scanned}, достигнута стр. {result.max_page_reached or '?'}; "
+                        f"причина: {result.reason}"
                     )
                     job.warnings.append(note)
                     job.scan_notes = job.scan_notes or []
