@@ -1,4 +1,13 @@
-# Kleinanzeigen Parser Bot v3.1.5
+# Kleinanzeigen Parser Bot v3.1.6
+
+## v3.1.6 — Clean Scan UI
+
+- Removed the user-facing **Models** section/button. Recognition data may remain internal for future analytics, but it is not shown in everyday scan UX.
+- Compact scan card: date/depth/quality, result, observation. Successful diagnostic noise is hidden.
+- Simplified actions: **Update views**, **Top views**, **Top growth**, **Repeat scan**, **History**, **Download result**.
+- Model labels were removed from Telegram Top/Top growth and from the TOP-50 growth workbook.
+- Legacy Model buttons from old messages safely return to the scan card.
+
 
 ## v3.1.3 — 403 Recovery / Safe Multi-User
 
@@ -29,7 +38,7 @@ traffic controller for commercial multi-user operation.
 - **Actual measurement time remains authoritative.** Background popularity checkpoints can be delayed
   by traffic pressure without pretending they ran at an exact clock second.
 
-Recommended starting values are included in `.env.example`; v3.1.5 uses real direct-only control measurements and lower view concurrency. Tune upward only after observing real 403 rate and latency.
+Recommended starting values are included in `.env.example`; v3.1.6 uses real direct-only control measurements and lower view concurrency. Tune upward only after observing real 403 rate and latency.
 
 ## v3.1.1 — Multi-category isolation fix
 
@@ -145,7 +154,7 @@ redeploys depending on storage configuration.
 - Общий DB cache `views_checked_at` продолжает переиспользовать свежие значения между пользователями и пересекающимися сканами.
 
 
-## v3.1.5 — Real View Snapshots + Animated Background Progress
+## v3.1.6 — Real View Snapshots + Animated Background Progress
 
 - Manual `👁 Обновить просмотры` runs as a true background task and immediately shows a separate live percentage/progress message.
 - The Telegram UI remains usable while the measurement runs; progress edits are throttled to roughly once every 1.5 seconds / batch.

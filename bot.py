@@ -191,19 +191,16 @@ def main_keyboard(selected_count: int = 0) -> InlineKeyboardMarkup:
 
 
 def post_scan_keyboard(scan_id: int | None = None) -> InlineKeyboardMarkup:
-    """Actions shown under the automatic result file."""
+    """Compact actions shown under the automatic result file."""
     rows = []
     if scan_id is not None:
-        rows.append([InlineKeyboardButton(text="📊 Открыть этот скан", callback_data=f"scan:{scan_id}")])
+        rows.append([InlineKeyboardButton(text="📊 Открыть скан", callback_data=f"scan:{scan_id}")])
+        rows.append([InlineKeyboardButton(text="👁 Обновить просмотры", callback_data=f"scanviews:{scan_id}")])
         rows.append([
-            InlineKeyboardButton(text="👁 Обновить просмотры", callback_data=f"scanviews:{scan_id}"),
-            InlineKeyboardButton(text="🔄 Повторить", callback_data=f"scanrepeat:{scan_id}"),
+            InlineKeyboardButton(text="🔥 Топ просмотров", callback_data=f"scantop:{scan_id}"),
+            InlineKeyboardButton(text="🚀 Топ роста", callback_data=f"scangrowth:{scan_id}:1"),
         ])
-        rows.append([
-            InlineKeyboardButton(text="🔥 Топ", callback_data=f"scantop:{scan_id}"),
-            InlineKeyboardButton(text="🚀 Динамика", callback_data=f"scangrowth:{scan_id}:1"),
-        ])
-        rows.append([InlineKeyboardButton(text="🧠 Распознанные модели", callback_data=f"scanproducts:{scan_id}")])
+        rows.append([InlineKeyboardButton(text="🔄 Повторить скан", callback_data=f"scanrepeat:{scan_id}")])
     else:
         rows.append([InlineKeyboardButton(text="🔄 Запустить снова", callback_data="start_scan")])
     rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="post_home")])
@@ -211,14 +208,14 @@ def post_scan_keyboard(scan_id: int | None = None) -> InlineKeyboardMarkup:
 
 
 def scan_detail_keyboard(scan_id: int) -> InlineKeyboardMarkup:
+    """User-facing scan actions: only the actions that matter for everyday use."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👁 Обновить просмотры", callback_data=f"scanviews:{scan_id}"),
-         InlineKeyboardButton(text="🔄 Пересканировать", callback_data=f"scanrepeat:{scan_id}")],
-        [InlineKeyboardButton(text="🔥 Самые просматриваемые", callback_data=f"scantop:{scan_id}"),
-         InlineKeyboardButton(text="🧠 Модели", callback_data=f"scanproducts:{scan_id}")],
-        [InlineKeyboardButton(text="🚀 TOP роста", callback_data=f"scangrowth:{scan_id}:1"),
+        [InlineKeyboardButton(text="👁 Обновить просмотры", callback_data=f"scanviews:{scan_id}")],
+        [InlineKeyboardButton(text="🔥 Топ просмотров", callback_data=f"scantop:{scan_id}"),
+         InlineKeyboardButton(text="🚀 Топ роста", callback_data=f"scangrowth:{scan_id}:1")],
+        [InlineKeyboardButton(text="🔄 Повторить скан", callback_data=f"scanrepeat:{scan_id}"),
          InlineKeyboardButton(text="🕘 История", callback_data=f"scanhistory:{scan_id}")],
-        [InlineKeyboardButton(text="📄 Файл этого скана", callback_data=f"scanexport:{scan_id}")],
+        [InlineKeyboardButton(text="📄 Скачать результат", callback_data=f"scanexport:{scan_id}")],
         [InlineKeyboardButton(text="⬅️ Мои сканы", callback_data="my_scans"),
          InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
     ])
@@ -617,7 +614,7 @@ async def update_scan_view_refresh(
 ) -> int:
     """Store one real view observation round for a saved scan.
 
-    v3.1.5 never creates a new point from arbitrary stale values already sitting
+    v3.1.6 never creates a new point from arbitrary stale values already sitting
     in ``listings``. ``fresh_after`` is the start of the current measurement
     (minus the tiny simultaneous-request reuse window).
     """
@@ -1133,17 +1130,12 @@ def write_listing_csv(rows: list[Listing], mode: str) -> Path:
     path, writer, f = _temp_csv(f"kleinanzeigen_{mode}_{now:%Y-%m-%d_%H-%M}.csv")
     try:
         writer.writerow([
-            "Категория", "Название", "🧠 Распознанный товар", "Бренд", "Модель", "Версия",
-            "Память, GB", "RAM, GB", "Точность распознавания, %",
-            "Цена", "Цена, €", "👁 Просмотры", "Дата (МСК)", "Как показано на Kleinanzeigen", "Ссылка"
+            "Категория", "Название", "Цена", "Цена, €", "👁 Просмотры",
+            "Дата (МСК)", "Как показано на Kleinanzeigen", "Ссылка"
         ])
         for row in rows:
             writer.writerow([
-                row.category, row.title, row.identity_label or "", row.identity_brand or "",
-                row.identity_model or "", row.identity_variant or "",
-                row.identity_storage_gb if row.identity_storage_gb is not None else "",
-                row.identity_ram_gb if row.identity_ram_gb is not None else "",
-                row.identity_confidence if row.identity_confidence is not None else "",
+                row.category, row.title,
                 _price_display(row.price_text, row.price_eur),
                 row.price_eur if row.price_eur is not None else "",
                 row.view_count if row.view_count is not None else "",
@@ -2000,7 +1992,7 @@ category_inflight_guard = asyncio.Lock()
 category_result_cache: dict[str, tuple[float, ScanResult]] = {}
 db_write_lock = asyncio.Lock()
 
-# v3.1.5 manual view refreshes are true background jobs. A user can navigate
+# v3.1.6 manual view refreshes are true background jobs. A user can navigate
 # anywhere in the bot while the refresh continues, and duplicate refreshes of the
 # same scan are coalesced into one task.
 manual_view_tasks: dict[int, asyncio.Task] = {}
@@ -3130,10 +3122,10 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
             await edit_job_status(bot, job, render_user_job_status(job), force=True)
             dispatched = await dispatch_category(cat, job.user_id, job.page_limit, job.target_date)
             result = dispatched.result
-            source_label = "🧠 кэш"
+            source_label = "♻️ кэш"
             if dispatched.source == "cache":
                 job.cache_hits += 1
-                source_label = f"🧠 кэш ({dispatched.cache_age_seconds} сек.)"
+                source_label = f"♻️ кэш ({dispatched.cache_age_seconds} сек.)"
             elif dispatched.source == "shared":
                 job.shared_hits += 1
                 source_label = "🤝 общий скан"
@@ -3311,12 +3303,12 @@ async def start(message: Message, state: FSMContext) -> None:
         return
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>🔍 Kleinanzeigen Parser v3.1.5</b>\n\n"
+        "<b>🔍 Kleinanzeigen Parser v3.1.6</b>\n\n"
         "Здесь всё строится вокруг сохранённых сканов:\n"
         "🔥 <b>Популярное сейчас</b> — лидеры по просмотрам\n"
         "🔎 <b>Новый скан</b> — собрать свежие объявления\n"
         "📊 <b>Мои сканы</b> — вернуться к любому запуску, обновить просмотры и увидеть рост\n"
-        "🧠 <b>Распознавание</b> — бот объединяет разные написания одной модели и сохраняет важные версии/память\n\n"
+        "\n"
         "После скана результат не теряется: его карточка остаётся в «Мои сканы».",
         reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML,
     )
@@ -3329,7 +3321,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v3.1.5</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v3.1.6</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == "post_settings")
@@ -3350,7 +3342,7 @@ async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
     await callback.message.answer(
-        "<b>🔍 Kleinanzeigen Parser v3.1.5</b>\n\nЧто хочешь посмотреть?",
+        "<b>🔍 Kleinanzeigen Parser v3.1.6</b>\n\nЧто хочешь посмотреть?",
         reply_markup=main_keyboard(len(selected)),
         parse_mode=ParseMode.HTML,
     )
@@ -3597,7 +3589,7 @@ async def run_view_test(message: Message, state: FSMContext) -> None:
         lines += [
             "",
             f"📈 Ускорение на тесте: <b>примерно ×{speedup:.1f}</b>",
-            "✅ Массовый сбор v3.1.5 использует только быстрый direct-счётчик. Chromium оставлен только для этого точечного теста/диагностики.",
+            "✅ Массовый сбор v3.1.6 использует только быстрый direct-счётчик. Chromium оставлен только для этого точечного теста/диагностики.",
         ]
     else:
         lines += [
@@ -3690,9 +3682,8 @@ async def popular_category_views(callback: CallbackQuery) -> None:
     else:
         lines = [f"👁 <b>Самые просматриваемые · {html.escape(cat.name)}</b>", ""]
         for i, row in enumerate(rows[:GROWTH_TELEGRAM_LIMIT], 1):
-            model = f"\n🧠 {html.escape(row.identity_label[:75])}" if row.identity_label and (row.identity_confidence or 0) >= 70 else ""
             lines.append(
-                f"<b>{i}. {html.escape(row.title[:60])}</b>{model}\n"
+                f"<b>{i}. {html.escape(row.title[:60])}</b>\n"
                 f"👁 <b>{row.view_count}</b> · 💶 {html.escape(_price_display(row.price_text, row.price_eur))}\n"
                 f'<a href="{html.escape(row.url)}">Открыть</a>'
             )
@@ -3735,9 +3726,8 @@ async def popular_category_growth(callback: CallbackQuery) -> None:
         ]
         for i, item in enumerate(growth[:GROWTH_TELEGRAM_LIMIT], 1):
             row = item.listing
-            model = f"\n🧠 {html.escape(row.identity_label[:75])}" if row.identity_label and (row.identity_confidence or 0) >= 70 else ""
             lines.append(
-                f"<b>{i}. {html.escape(row.title[:60])}</b>{model}\n"
+                f"<b>{i}. {html.escape(row.title[:60])}</b>\n"
                 f"👁 {item.base_views} → <b>{item.current_views}</b> · "
                 f"🚀 <b>+{item.delta}</b> · ⚡ {item.per_hour:.1f}/ч\n"
                 f"💶 {html.escape(_price_display(row.price_text, row.price_eur))} · "
@@ -3772,13 +3762,12 @@ async def my_scans(callback: CallbackQuery) -> None:
 
 
 async def render_scan_detail(scan: UserScan) -> str:
+    """Compact scan card for non-technical users."""
     pairs = await get_scan_rows(scan.id)
     rows = [listing for listing, _ in pairs]
     viewed = sum(1 for row in rows if row.view_count is not None)
     disappeared = sum(1 for row in rows if not row.is_active)
-    recognized = [row for row in rows if (row.identity_confidence or 0) >= 70 and row.identity_key]
-    recognized_models = len({row.identity_key for row in recognized})
-    recognition_pct = round(len(recognized) / len(rows) * 100) if rows else 0
+
     growers = 0
     total_growth = 0
     for listing, snap in pairs:
@@ -3787,6 +3776,7 @@ async def render_scan_detail(scan: UserScan) -> str:
             if delta > 0:
                 growers += 1
                 total_growth += delta
+
     new_since = 0
     if scan.finished_at is not None:
         keys = _scan_category_keys(scan)
@@ -3795,50 +3785,77 @@ async def render_scan_detail(scan: UserScan) -> str:
                 new_since = (await session.execute(select(func.count(Listing.id)).where(
                     Listing.category_key.in_(keys), Listing.first_seen_at > scan.finished_at
                 ))).scalar_one()
+
     history_rounds = await get_scan_history_rounds(scan.id, limit=50)
     observation_statuses = await get_scan_observation_statuses(scan.id)
     status_icons = {"done": "✅", "pending": "⏳", "running": "🔄", "missed": "▫️", "error": "⚠️"}
     observation_line = " · ".join(
-        f"{hours}ч {status_icons.get(observation_statuses.get(hours, 'pending'), '⏳')}"
+        f"{hours}ч{status_icons.get(observation_statuses.get(hours, 'pending'), '⏳')}"
         for hours in OBSERVATION_HOURS
     )
+
     quality_value = int(getattr(scan, "quality_score", 0) or 0)
-    quality_label = f"{quality_value}/100" if quality_value > 0 else "нет замера (старый скан)"
+    quality_label = f"{quality_value}/100" if quality_value > 0 else "—"
     status_label = {
-        "done": "✅ завершён",
-        "partial": "⚠️ частичный",
-        "running": "🔄 идёт",
-        "queued": "⏳ ожидает",
-        "cancelled": "❌ отменён",
-        "failed": "❌ ошибка",
+        "done": "✅ Завершён",
+        "partial": "⚠️ Частичный результат",
+        "running": "🔄 Выполняется",
+        "queued": "⏳ Ожидает",
+        "cancelled": "❌ Отменён",
+        "failed": "❌ Ошибка",
     }.get(scan.status, scan.status)
+
+    depth = scan.page_limit if scan.page_limit in PAGE_LIMIT_CHOICES else 50
     lines = [
         f"<b>📊 {html.escape(scan.title)}</b>",
+        f"{status_label}",
         "",
-        f"Статус: <b>{status_label}</b>",
-        f"Запуск: <b>{_moscow_text(scan.created_at)} МСК</b>",
-        f"Дата объявлений: <b>{_date_label(scan.target_date)} (МСК)</b>",
-        f"Глубина: <b>{scan.page_limit if scan.page_limit in PAGE_LIMIT_CHOICES else 50} страниц от начала даты</b>",
-        "Поиск даты: <b>⚡ быстрый переход к стартовой странице</b>",
-        f"Категорий: <b>{scan.completed_categories}/{scan.total_categories}</b>",
-        f"🛡 Качество парсинга: <b>{quality_label}</b>",
+        f"📅 Объявления за: <b>{_date_label(scan.target_date)}</b>",
+        f"📄 Глубина: <b>{depth} стр.</b>",
+        f"🛡 Качество: <b>{quality_label}</b>",
+    ]
+    if scan.total_categories > 1:
+        lines.append(f"🗂 Категории: <b>{scan.completed_categories}/{scan.total_categories}</b>")
+
+    lines += [
         "",
-        f"📦 В снимке: <b>{len(rows)}</b> объявлений",
-        f"👁 С просмотрами: <b>{viewed}</b>",
-        f"🧠 Распознано уверенно: <b>{len(recognized)}</b> ({recognition_pct}%) · моделей: <b>{recognized_models}</b>",
-        f"🚀 Выросли после скана: <b>{growers}</b>" + (f" · суммарно +{total_growth}" if total_growth else ""),
-        f"🆕 Новых после скана, уже найденных последующими сканами: <b>{new_since}</b>",
-        f"❌ Исчезли: <b>{disappeared}</b>",
-        f"📈 Точек наблюдения: <b>{len(history_rounds)}</b>",
-        f"🔔 Автозамеры: <b>{observation_line}</b>",
+        "<b>Результат</b>",
+        f"📦 Объявлений: <b>{len(rows)}</b>",
+        f"👁 С просмотрами: <b>{viewed}/{len(rows)}</b>",
+    ]
+
+    if len(history_rounds) >= 2 or growers > 0:
+        growth_text = f"🚀 Набрали просмотры: <b>{growers}</b>"
+        if total_growth > 0:
+            growth_text += f" · всего <b>+{total_growth}</b>"
+        lines.append(growth_text)
+    else:
+        lines.append("🚀 Рост: <b>появится после повторного замера</b>")
+
+    if new_since > 0:
+        lines.append(f"🆕 Новых найдено позже: <b>{new_since}</b>")
+    if disappeared > 0:
+        lines.append(f"❌ Исчезли: <b>{disappeared}</b>")
+
+    lines += [
+        "",
+        "<b>Наблюдение</b>",
+        f"📈 Замеров просмотров: <b>{len(history_rounds)}</b>",
+        f"🔔 Авто: <b>{observation_line}</b>",
     ]
     if scan.last_view_refresh_at:
-        lines += ["", f"Последнее обновление просмотров: <b>{_moscow_text(scan.last_view_refresh_at)} МСК</b>"]
-    if getattr(scan, "quality_note", ""):
-        lines += ["", f"🩺 <b>Проверка:</b> {html.escape(scan.quality_note)}"]
+        lines.append(f"🕒 Обновлено: <b>{_moscow_text(scan.last_view_refresh_at)} МСК</b>")
+
+    # Diagnostics should only appear when they actually need the user's attention.
     if scan.status == "partial" and getattr(scan, "scan_note", ""):
-        lines += ["", f"⚠️ <b>Почему результат частичный:</b> {html.escape(scan.scan_note)}"]
-    lines += ["", "💡 Автозамеры идут через 1 / 3 / 6 / 12 / 24 часа. Открывай «🚀 TOP роста» — там TOP-10 в боте и TOP-50 таблицей."]
+        lines += ["", f"⚠️ <b>Что не удалось:</b> {html.escape(scan.scan_note)}"]
+    elif quality_value and quality_value < 90 and getattr(scan, "quality_note", ""):
+        lines += ["", f"⚠️ <b>Проверка качества:</b> {html.escape(scan.quality_note)}"]
+
+    lines += [
+        "",
+        "💡 <b>Топ просмотров</b> — что уже популярно. <b>Топ роста</b> — что быстрее всего набирает просмотры.",
+    ]
     return "\n".join(lines)
 
 
@@ -3867,6 +3884,7 @@ async def scan_detail(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("scanproducts:"))
 async def scan_products(callback: CallbackQuery) -> None:
+    """Legacy callback from old messages. The model section was removed in v3.1.6."""
     try:
         scan_id = int(callback.data.split(":", 1)[1])
     except Exception:
@@ -3874,64 +3892,12 @@ async def scan_products(callback: CallbackQuery) -> None:
     scan = await get_user_scan(callback.from_user.id, scan_id)
     if scan is None:
         await callback.answer("Скан не найден", show_alert=True); return
-
-    pairs = await get_scan_rows(scan_id)
-    all_rows = [row for row, _ in pairs]
-    recognized = [
-        row for row in all_rows
-        if row.identity_key and row.identity_label and (row.identity_confidence or 0) >= 70
-    ]
-    groups: dict[str, list[Listing]] = {}
-    for row in recognized:
-        groups.setdefault(row.identity_key, []).append(row)
-
-    ranked = sorted(
-        groups.values(),
-        key=lambda items: (
-            len(items),
-            max((row.view_count or 0) for row in items),
-            max((row.first_seen_at for row in items), default=datetime.min),
-        ),
-        reverse=True,
-    )
-    await callback.answer()
-    if not all_rows:
-        text = "🧠 <b>Распознанные модели</b>\n\nВ этом скане пока нет объявлений."
-    elif not ranked:
-        text = (
-            "🧠 <b>Распознанные модели</b>\n\n"
-            "Пока нет моделей с уверенностью распознавания от 70%. "
-            "Такие объявления остаются в результате, но не смешиваются в ценовые группы."
-        )
-    else:
-        coverage = round(len(recognized) / len(all_rows) * 100)
-        lines = [
-            f"🧠 <b>Модели скана: {html.escape(scan.title)}</b>",
-            f"Распознано уверенно: <b>{len(recognized)}/{len(all_rows)} ({coverage}%)</b> · групп: <b>{len(ranked)}</b>",
-            "",
-        ]
-        for i, items in enumerate(ranked[:15], 1):
-            example = max(items, key=lambda row: ((row.view_count or 0), row.first_seen_at))
-            prices = [row.price_eur for row in items if row.price_eur is not None and row.price_eur > 0]
-            median_price = int(statistics.median(prices)) if prices else None
-            max_views = max((row.view_count or 0) for row in items)
-            type_label = TYPE_DISPLAY.get(example.identity_product_type or "", example.identity_product_type or "товар")
-            price_part = f" · 💶 медиана {median_price} €" if median_price is not None else ""
-            views_part = f" · 👁 макс. {max_views}" if max_views else ""
-            lines.append(
-                f"<b>{i}. {html.escape(example.identity_label or example.title)}</b>\n"
-                f"{html.escape(type_label)} · 📦 {len(items)} объявл.{price_part}{views_part}\n"
-                f"Точность: {example.identity_confidence or 0}% · "
-                f'<a href="{html.escape(example.url)}">пример</a>'
-            )
-        lines += [
-            "",
-            "💡 Разные написания одной модели объединяются, а важные версии, память и RAM сохраняются отдельно.",
-        ]
-        text = "\n\n".join(lines)
+    await callback.answer("Раздел «Модели» убран — открыл карточку скана")
     await callback.message.answer(
-        text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        await render_scan_detail(scan),
+        parse_mode=ParseMode.HTML,
         reply_markup=scan_detail_keyboard(scan_id),
+        disable_web_page_preview=True,
     )
 
 
@@ -3952,13 +3918,9 @@ async def scan_top(callback: CallbackQuery) -> None:
         for i, (row, snap) in enumerate(pairs[:12], 1):
             delta = (row.view_count - snap.initial_view_count) if snap.initial_view_count is not None else None
             growth = f" · 🚀 +{delta}" if delta is not None and delta > 0 else ""
-            identity_line = ""
-            if row.identity_label and (row.identity_confidence or 0) >= 70:
-                identity_line = f"🧠 {html.escape(row.identity_label[:75])}\n"
             lines.append(
                 f"<b>{i}. {html.escape(row.title[:55])}</b>\n"
-                f"{identity_line}"
-                f"👁 {row.view_count}{growth} · 💶 {html.escape(_price_display(row.price_text, row.price_eur))}\n"
+                                f"👁 {row.view_count}{growth} · 💶 {html.escape(_price_display(row.price_text, row.price_eur))}\n"
                 f"<a href=\"{html.escape(row.url)}\">Открыть</a>"
             )
         text = "\n\n".join(lines)
@@ -3997,13 +3959,9 @@ async def scan_growth(callback: CallbackQuery) -> None:
         ]
         for i, item in enumerate(growth[:GROWTH_TELEGRAM_LIMIT], 1):
             row = item.listing
-            identity_line = ""
-            if row.identity_label and (row.identity_confidence or 0) >= 70:
-                identity_line = f"🧠 {html.escape(row.identity_label[:75])}\n"
             lines.append(
                 f"<b>{i}. {html.escape(row.title[:60])}</b>\n"
-                f"{identity_line}"
-                f"👁 {item.base_views} → <b>{item.current_views}</b> · "
+                                f"👁 {item.base_views} → <b>{item.current_views}</b> · "
                 f"🚀 <b>+{item.delta}</b> · ⚡ {item.per_hour:.1f}/ч\n"
                 f"💶 {html.escape(_price_display(row.price_text, row.price_eur))} · "
                 f'<a href="{html.escape(row.url)}">Открыть</a>'
@@ -4028,11 +3986,11 @@ def build_growth_top_xlsx(
     if cat is not None:
         title += f" · {cat.name}"
     ws.append([title])
-    ws.merge_cells("A1:M1")
+    ws.merge_cells("A1:L1")
     ws["A1"].font = Font(bold=True, size=14)
     ws["A1"].alignment = Alignment(horizontal="center")
     ws.append([
-        "#", "Товар", "Распознанная модель", "Категория", "Цена €",
+        "#", "Товар", "Категория", "Цена €",
         "Было просмотров", "Сейчас просмотров", "Прирост", "Просмотров/час",
         "Фактический интервал, ч", "Дата объявления", "ID", "Ссылка",
     ])
@@ -4046,16 +4004,16 @@ def build_growth_top_xlsx(
     for idx, item in enumerate(growth[:GROWTH_TOP_LIMIT], 1):
         row = item.listing
         ws.append([
-            idx, row.title, row.identity_label or "", row.category, row.price_eur,
+            idx, row.title, row.category, row.price_eur,
             item.base_views, item.current_views, item.delta, round(item.per_hour, 2),
             round(item.elapsed_hours, 2), row.posted_date_msk or row.posted_text or "",
             row.external_id, row.url,
         ])
     ws.freeze_panes = "A3"
-    ws.auto_filter.ref = f"A2:M{max(2, ws.max_row)}"
+    ws.auto_filter.ref = f"A2:L{max(2, ws.max_row)}"
     widths = {
-        "A": 6, "B": 44, "C": 34, "D": 26, "E": 11, "F": 16, "G": 17,
-        "H": 12, "I": 16, "J": 19, "K": 16, "L": 16, "M": 52,
+        "A": 6, "B": 44, "C": 26, "D": 11, "E": 16, "F": 17,
+        "G": 12, "H": 16, "I": 19, "J": 16, "K": 16, "L": 52,
     }
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
@@ -4063,10 +4021,10 @@ def build_growth_top_xlsx(
         for cell in row_cells:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
     growth_fill = PatternFill("solid", fgColor="E2F0D9")
-    for cell in ws["H"][2:]:
+    for cell in ws["G"][2:]:
         cell.fill = growth_fill
         cell.font = Font(bold=True)
-    for cell in ws["M"][2:]:
+    for cell in ws["L"][2:]:
         if cell.value:
             cell.hyperlink = str(cell.value)
             cell.style = "Hyperlink"
