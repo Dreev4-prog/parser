@@ -1,4 +1,4 @@
-# Kleinanzeigen Parser Bot v3.1.7
+# Kleinanzeigen Parser Bot v3.2.0
 
 ## v3.1.7 — Clean Live Progress
 
@@ -179,3 +179,34 @@ redeploys depending on storage configuration.
 - They are not saved into scan snapshots and therefore do not enter view refreshes, popularity or growth TOPs.
 - No extra detail-page requests are needed; the filter is applied to the category/search URL itself.
 - Set `FILTER_BUSINESS_SELLERS=0` only if commercial sellers should be included again.
+
+## v3.2.0 — Admin & Subscriptions
+
+The parser core from v3.1.8 is unchanged. v3.2.0 adds a commercial access layer around it.
+
+### Admin panel
+
+Open `/admin` from a Telegram account whose ID is listed in `ADMIN_IDS`.
+
+The panel shows user/activity/scan/payment statistics and lets an admin:
+- find users by Telegram ID, username or name;
+- grant 1/3/7/30 days manually, revoke access, ban/unban;
+- edit subscription prices and enable/disable plans;
+- view recent invoices/payments;
+- switch access mode between `admin_only`, `subscription`, and `open`.
+
+### Subscription payments
+
+Two invoice providers are supported:
+- CryptoBot / Crypto Pay: set `CRYPTO_PAY_TOKEN`;
+- xRocket Pay: set `XROCKET_API_KEY`.
+
+Invoices are created in USDT. The bot polls pending invoices every `PAYMENT_POLL_SECONDS` seconds, so a separate webhook web server is not required for this first commercial build. When a provider confirms `paid`, access is extended from the later of now or the user's current subscription end, and the user receives a Telegram notification.
+
+The default plans are 1, 3, 7 and 30 days. Environment prices are only used when plans are created for the first time; afterwards change prices from `/admin` and they persist in the database.
+
+### Safe rollout
+
+Keep `ACCESS_MODE=admin_only` while testing. After both payment tokens are configured and a real test invoice has been checked, switch to `subscription` from `/admin`.
+
+SQLite remains fine for development/testing. Before opening the paid service to many users, use Railway PostgreSQL so user access, payments and background jobs survive redeploys reliably.

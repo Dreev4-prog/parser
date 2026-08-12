@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -216,3 +216,65 @@ class ScanObservation(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     item_count: Mapped[int] = mapped_column(Integer, default=0)
     error_text: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+
+class BotUser(Base):
+    """Commercial-service user profile and access state."""
+
+    __tablename__ = "bot_users"
+
+    user_id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    first_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    joined_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    access_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    is_banned: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    payments_count: Mapped[int] = mapped_column(Integer, default=0)
+    paid_total_usdt: Mapped[float] = mapped_column(Float, default=0.0)
+
+
+class SubscriptionPlan(Base):
+    """Admin-editable subscription plans priced in USDT."""
+
+    __tablename__ = "subscription_plans"
+
+    key: Mapped[str] = mapped_column(String(32), primary_key=True)
+    title: Mapped[str] = mapped_column(String(80))
+    days: Mapped[int] = mapped_column(Integer)
+    price_usdt: Mapped[float] = mapped_column(Float)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class SubscriptionPayment(Base):
+    """Invoice/payment record for Crypto Pay or xRocket."""
+
+    __tablename__ = "subscription_payments"
+    __table_args__ = (
+        UniqueConstraint("provider", "external_invoice_id", name="uq_subscription_payment_provider_invoice"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(index=True)
+    plan_key: Mapped[str] = mapped_column(String(32), index=True)
+    provider: Mapped[str] = mapped_column(String(24), index=True)
+    external_invoice_id: Mapped[str] = mapped_column(String(128), index=True)
+    amount_usdt: Mapped[float] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    pay_url: Mapped[str] = mapped_column(String(1200), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    raw_status: Mapped[str] = mapped_column(String(100), default="")
+
+
+class AppSetting(Base):
+    """Small persistent runtime settings controlled from the admin panel."""
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)

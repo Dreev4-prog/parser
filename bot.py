@@ -17,9 +17,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -39,9 +39,18 @@ from filters import (
     sort_rows,
     unique_rows,
 )
-from models import CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing, ScanObservation, ScanViewHistory, SelectedCategory, UserScan, UserSettings, ViewHistory
+from models import BotUser, CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing, ScanObservation, ScanViewHistory, SelectedCategory, SubscriptionPayment, SubscriptionPlan, UserScan, UserSettings, ViewHistory
 from product_identity import TYPE_DISPLAY, ProductIdentity, recognize_product
 from traffic import TRAFFIC
+from commerce import (
+    PAYMENT_POLL_SECONDS, PaymentProviderError, admin_stats, cached_access_until,
+    create_subscription_payment, current_access_mode, find_users, get_payment,
+    get_plan, get_plans, get_user as get_commerce_user, grant_access_days,
+    has_access, initialize_commerce, is_banned_cached, pending_payments,
+    provider_enabled, providers_status, recent_payments, recent_users,
+    refresh_payment, revoke_access, set_access_mode, set_banned, toggle_plan,
+    touch_user, update_plan_price,
+)
 from parser import (
     MAX_PAGES_PER_CATEGORY,
     PAGE_DELAY_SECONDS,
@@ -175,8 +184,13 @@ class ScanInput(StatesGroup):
     target_date = State()
 
 
+class AdminInput(StatesGroup):
+    user_search = State()
+    plan_price = State()
+
+
 def allowed(user_id: int) -> bool:
-    return not ADMIN_IDS or user_id in ADMIN_IDS
+    return has_access(int(user_id), ADMIN_IDS)
 
 
 def main_keyboard(selected_count: int = 0) -> InlineKeyboardMarkup:
@@ -187,6 +201,7 @@ def main_keyboard(selected_count: int = 0) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
         [InlineKeyboardButton(text=f"🗂 Категории ({selected_count})", callback_data="groups"),
          InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
+        [InlineKeyboardButton(text="💎 Подписка", callback_data="subscription")],
         [InlineKeyboardButton(text="📦 Текущий результат", callback_data="export_smart")],
     ])
 
@@ -3266,18 +3281,806 @@ async def enqueue_user_scan(message: Message, user_id: int, category_keys: list[
 
 
 
+
+def _utc_to_msk_text(value: datetime | None) -> str:
+    if value is None:
+        return "—"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(MOSCOW).strftime("%d.%m.%Y %H:%M")
+
+
+def _access_mode_label(mode: str | None = None) -> str:
+    mode = mode or current_access_mode()
+    return {
+        "admin_only": "🔒 Только админы",
+        "subscription": "💎 По подписке",
+        "open": "🌍 Открытый доступ",
+    }.get(mode, mode)
+
+
+def _provider_label(provider: str) -> str:
+    return {"cryptobot": "🤖 CryptoBot", "xrocket": "🚀 xRocket"}.get(provider, provider)
+
+
+def _payment_status_label(status: str) -> str:
+    return {
+        "pending": "⏳ ожидает",
+        "paid": "✅ оплачено",
+        "expired": "⌛ истекло",
+        "failed": "❌ ошибка",
+        "cancelled": "❌ отменено",
+    }.get(status, status)
+
+
+async def subscription_text(user_id: int) -> str:
+    mode = current_access_mode()
+    user = await get_commerce_user(user_id)
+    until = user.access_until if user else cached_access_until(user_id)
+    if user_id in ADMIN_IDS:
+        status = "👑 <b>Администратор — доступ без ограничений</b>"
+    elif is_banned_cached(user_id):
+        status = "⛔ <b>Доступ заблокирован администратором</b>"
+    elif mode == "open":
+        status = "🌍 <b>Сервис сейчас открыт для всех</b>"
+    elif until and until > datetime.utcnow():
+        left = until - datetime.utcnow()
+        hours = max(0, int(left.total_seconds() // 3600))
+        days = hours // 24
+        rem_hours = hours % 24
+        status = (
+            f"✅ <b>Подписка активна до {_utc_to_msk_text(until)} МСК</b>\n"
+            f"Осталось: <b>{days} дн. {rem_hours} ч.</b>"
+        )
+    elif mode == "admin_only":
+        status = "🔒 <b>Сервис пока работает в закрытом тестовом режиме.</b>"
+    else:
+        status = "❌ <b>Подписка не активна</b>"
+
+    providers = providers_status()
+    providers_line = (
+        f"{_provider_label('cryptobot')}: {'✅' if providers['cryptobot'] else '▫️'}   "
+        f"{_provider_label('xrocket')}: {'✅' if providers['xrocket'] else '▫️'}"
+    )
+    return (
+        "<b>💎 Подписка</b>\n\n"
+        f"{status}\n\n"
+        f"Режим доступа: <b>{_access_mode_label(mode)}</b>\n"
+        f"Оплата: {providers_line}\n\n"
+        "Выбери срок — доступ после подтверждённой оплаты включится автоматически."
+    )
+
+
+async def subscription_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    plans = await get_plans(active_only=True)
+    rows: list[list[InlineKeyboardButton]] = []
+    if current_access_mode() == "subscription" and not is_banned_cached(user_id):
+        for plan in plans:
+            rows.append([InlineKeyboardButton(
+                text=f"{plan.title} · {plan.price_usdt:g} USDT",
+                callback_data=f"buyplan:{plan.key}",
+            )])
+    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def payment_provider_keyboard(plan_key: str) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if provider_enabled("cryptobot"):
+        rows.append([InlineKeyboardButton(text="🤖 Оплатить через CryptoBot", callback_data=f"payprovider:cryptobot:{plan_key}")])
+    if provider_enabled("xrocket"):
+        rows.append([InlineKeyboardButton(text="🚀 Оплатить через xRocket", callback_data=f"payprovider:xrocket:{plan_key}")])
+    rows.append([InlineKeyboardButton(text="⬅️ К подписке", callback_data="subscription")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def payment_invoice_keyboard(payment: SubscriptionPayment) -> InlineKeyboardMarkup:
+    rows = []
+    if payment.pay_url:
+        rows.append([InlineKeyboardButton(text="💳 Открыть оплату", url=payment.pay_url)])
+    rows.append([InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"paycheck:{payment.id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Подписка", callback_data="subscription")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="adminstats")],
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="adminusers"),
+         InlineKeyboardButton(text="💳 Платежи", callback_data="adminpayments")],
+        [InlineKeyboardButton(text="🎟 Тарифы", callback_data="adminplans"),
+         InlineKeyboardButton(text="🔐 Режим доступа", callback_data="adminmode")],
+        [InlineKeyboardButton(text="🔎 Найти пользователя", callback_data="adminusersearch")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")],
+    ])
+
+
+def admin_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")]
+    ])
+
+
+def admin_mode_keyboard() -> InlineKeyboardMarkup:
+    current = current_access_mode()
+    def b(mode: str, label: str) -> InlineKeyboardButton:
+        prefix = "✅ " if current == mode else ""
+        return InlineKeyboardButton(text=prefix + label, callback_data=f"adminsetmode:{mode}")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [b("admin_only", "🔒 Только админы")],
+        [b("subscription", "💎 По подписке")],
+        [b("open", "🌍 Открытый доступ")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
+    ])
+
+
+def admin_users_keyboard(users: list[BotUser]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    now = datetime.utcnow()
+    for user in users[:20]:
+        if user.is_banned:
+            icon = "⛔"
+        elif user.access_until and user.access_until > now:
+            icon = "✅"
+        else:
+            icon = "▫️"
+        name = f"@{user.username}" if user.username else (user.first_name or str(user.user_id))
+        rows.append([InlineKeyboardButton(text=f"{icon} {name[:28]} · {user.user_id}", callback_data=f"adminuser:{user.user_id}")])
+    rows.append([InlineKeyboardButton(text="🔎 Поиск", callback_data="adminusersearch")])
+    rows.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_user_keyboard(user: BotUser) -> InlineKeyboardMarkup:
+    ban_label = "✅ Разблокировать" if user.is_banned else "⛔ Заблокировать"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="+1 день", callback_data=f"admingrant:{user.user_id}:1"),
+         InlineKeyboardButton(text="+3 дня", callback_data=f"admingrant:{user.user_id}:3")],
+        [InlineKeyboardButton(text="+7 дней", callback_data=f"admingrant:{user.user_id}:7"),
+         InlineKeyboardButton(text="+30 дней", callback_data=f"admingrant:{user.user_id}:30")],
+        [InlineKeyboardButton(text="🗑 Забрать доступ", callback_data=f"adminrevoke:{user.user_id}"),
+         InlineKeyboardButton(text=ban_label, callback_data=f"adminban:{user.user_id}")],
+        [InlineKeyboardButton(text="⬅️ Пользователи", callback_data="adminusers")],
+    ])
+
+
+def admin_plans_keyboard(plans: list[SubscriptionPlan]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for plan in plans:
+        icon = "✅" if plan.is_active else "▫️"
+        rows.append([InlineKeyboardButton(
+            text=f"{icon} {plan.title} · {plan.price_usdt:g} USDT",
+            callback_data=f"adminplan:{plan.key}",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_plan_keyboard(plan: SubscriptionPlan) -> InlineKeyboardMarkup:
+    toggle_label = "⏸ Выключить тариф" if plan.is_active else "▶️ Включить тариф"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Изменить цену", callback_data=f"adminplanprice:{plan.key}")],
+        [InlineKeyboardButton(text=toggle_label, callback_data=f"adminplantoggle:{plan.key}")],
+        [InlineKeyboardButton(text="⬅️ Тарифы", callback_data="adminplans")],
+    ])
+
+
+async def render_admin_user(user_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    user = await get_commerce_user(user_id)
+    if user is None:
+        return None
+    now = datetime.utcnow()
+    active = bool(user.access_until and user.access_until > now and not user.is_banned)
+    async with SessionLocal() as session:
+        scans = (await session.execute(select(func.count(UserScan.id)).where(UserScan.user_id == user.user_id))).scalar_one()
+        paid = (await session.execute(select(func.count(SubscriptionPayment.id)).where(
+            SubscriptionPayment.user_id == user.user_id, SubscriptionPayment.status == "paid"
+        ))).scalar_one()
+    name = f"@{html.escape(user.username)}" if user.username else html.escape(user.first_name or "без username")
+    text = (
+        f"<b>👤 Пользователь</b>\n\n"
+        f"{name}\n"
+        f"ID: <code>{user.user_id}</code>\n"
+        f"Статус: <b>{'⛔ заблокирован' if user.is_banned else ('✅ активен' if active else '▫️ без доступа')}</b>\n"
+        f"Доступ до: <b>{_utc_to_msk_text(user.access_until)} МСК</b>\n"
+        f"Первый вход: <b>{_utc_to_msk_text(user.joined_at)} МСК</b>\n"
+        f"Последняя активность: <b>{_utc_to_msk_text(user.last_seen_at)} МСК</b>\n\n"
+        f"📊 Сканов: <b>{int(scans or 0)}</b>\n"
+        f"💳 Оплат: <b>{int(paid or 0)}</b>\n"
+        f"💰 Оплачено всего: <b>{float(user.paid_total_usdt or 0):g} USDT</b>"
+    )
+    return text, admin_user_keyboard(user)
+
+
+async def send_access_screen(message: Message, user_id: int) -> None:
+    if is_banned_cached(user_id):
+        await message.answer("⛔ <b>Доступ к сервису заблокирован.</b>", parse_mode=ParseMode.HTML)
+        return
+    await message.answer(
+        await subscription_text(user_id),
+        parse_mode=ParseMode.HTML,
+        reply_markup=await subscription_keyboard(user_id),
+    )
+
+
+class ActivityAccessMiddleware(BaseMiddleware):
+    """Track users and keep commercial access checks outside parser handlers."""
+
+    async def __call__(self, handler, event, data):
+        tg_user = getattr(event, "from_user", None)
+        if tg_user is None:
+            return await handler(event, data)
+        try:
+            await touch_user(tg_user)
+        except Exception:
+            log.exception("Could not update user activity user=%s", tg_user.id)
+
+        uid = int(tg_user.id)
+        if uid in ADMIN_IDS or allowed(uid):
+            return await handler(event, data)
+
+        # /start and subscription/payment callbacks must stay reachable without access.
+        if isinstance(event, Message):
+            text = (event.text or "").strip()
+            if text.startswith("/start"):
+                return await handler(event, data)
+            if text.startswith("/admin"):
+                return await handler(event, data)
+            await send_access_screen(event, uid)
+            return None
+
+        if isinstance(event, CallbackQuery):
+            callback_data = event.data or ""
+            public_prefixes = ("buyplan:", "payprovider:", "paycheck:")
+            if callback_data == "subscription" or callback_data.startswith(public_prefixes):
+                return await handler(event, data)
+            if is_banned_cached(uid):
+                await event.answer("Доступ заблокирован", show_alert=True)
+                return None
+            await event.answer("Нужна активная подписка", show_alert=True)
+            if event.message:
+                await send_access_screen(event.message, uid)
+            return None
+        return None
+
+
 dp = Dispatcher()
+
+# Commercial access/user tracking runs before regular handlers. It never performs
+# parser work, so Telegram navigation stays responsive while scans run in background.
+_access_middleware = ActivityAccessMiddleware()
+dp.message.outer_middleware(_access_middleware)
+dp.callback_query.outer_middleware(_access_middleware)
+
+
+def _is_admin(user_id: int) -> bool:
+    return int(user_id) in ADMIN_IDS
+
+
+async def _admin_dashboard_text() -> str:
+    stats = await admin_stats()
+    providers = providers_status()
+    traffic = await TRAFFIC.snapshot()
+    return (
+        "<b>🛠 Админ-панель</b>\n\n"
+        f"Доступ: <b>{_access_mode_label()}</b>\n"
+        f"Оплата: CryptoBot {'✅' if providers['cryptobot'] else '▫️'} · "
+        f"xRocket {'✅' if providers['xrocket'] else '▫️'}\n\n"
+        "<b>👥 Пользователи</b>\n"
+        f"Всего: <b>{stats['total_users']}</b> · за 24ч активны: <b>{stats['active_24h']}</b>\n"
+        f"Новых за 24ч: <b>{stats['new_24h']}</b> · активных подписок: <b>{stats['active_users']}</b>\n\n"
+        "<b>📊 Использование</b>\n"
+        f"Сканов: <b>{stats['total_scans']}</b> · за 24ч: <b>{stats['scans_24h']}</b>\n"
+        f"Активные сетевые лимиты: scan <b>{traffic.scan_limit}</b> · views <b>{traffic.view_limit}</b> · "
+        f"global <b>{traffic.global_limit}</b>\n\n"
+        "<b>💳 Платежи</b>\n"
+        f"Успешных: <b>{stats['paid_count']}</b> · ожидают: <b>{stats['pending_payments']}</b>\n"
+        f"За 24ч: <b>{stats['paid_24h']:g} USDT</b> · всего: <b>{stats['paid_total']:g} USDT</b>"
+    )
+
+
+async def _edit_or_answer(target: Message, text: str, *, reply_markup=None) -> None:
+    """Prefer editing inline-menu messages, but gracefully fall back to a new one."""
+    try:
+        await target.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+    except Exception:
+        await target.answer(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+
+
+@dp.callback_query(F.data == "subscription")
+async def subscription_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message,
+        await subscription_text(callback.from_user.id),
+        reply_markup=await subscription_keyboard(callback.from_user.id),
+    )
+
+
+@dp.callback_query(F.data.startswith("buyplan:"))
+async def buy_plan_handler(callback: CallbackQuery) -> None:
+    if is_banned_cached(callback.from_user.id):
+        await callback.answer("Доступ заблокирован", show_alert=True)
+        return
+    if current_access_mode() != "subscription":
+        await callback.answer("Продажа подписок сейчас выключена", show_alert=True)
+        return
+    key = callback.data.split(":", 1)[1]
+    plan = await get_plan(key)
+    if plan is None or not plan.is_active:
+        await callback.answer("Этот тариф сейчас недоступен", show_alert=True)
+        return
+    providers = providers_status()
+    if not any(providers.values()):
+        await callback.answer("Оплата пока не настроена", show_alert=True)
+        return
+    await callback.answer()
+    text = (
+        "<b>💎 Оформление подписки</b>\n\n"
+        f"Тариф: <b>{html.escape(plan.title)}</b>\n"
+        f"Срок: <b>{plan.days} дн.</b>\n"
+        f"Стоимость: <b>{plan.price_usdt:g} USDT</b>\n\n"
+        "Выбери способ оплаты. Сумма и срок задаются ботом автоматически."
+    )
+    await _edit_or_answer(callback.message, text, reply_markup=payment_provider_keyboard(plan.key))
+
+
+@dp.callback_query(F.data.startswith("payprovider:"))
+async def create_payment_handler(callback: CallbackQuery) -> None:
+    if is_banned_cached(callback.from_user.id):
+        await callback.answer("Доступ заблокирован", show_alert=True)
+        return
+    try:
+        _, provider, plan_key = callback.data.split(":", 2)
+    except ValueError:
+        await callback.answer("Некорректный способ оплаты", show_alert=True)
+        return
+    await callback.answer("Создаю счёт…")
+    try:
+        payment = await create_subscription_payment(callback.from_user.id, plan_key, provider)
+    except PaymentProviderError as exc:
+        await callback.message.answer(
+            f"⚠️ <b>Не удалось создать счёт</b>\n{html.escape(str(exc))}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Подписка", callback_data="subscription")]
+            ]),
+        )
+        return
+    except Exception:
+        log.exception("Could not create payment invoice")
+        await callback.message.answer("⚠️ Не удалось создать счёт. Попробуй чуть позже.")
+        return
+
+    plan = await get_plan(payment.plan_key)
+    title = plan.title if plan else payment.plan_key
+    text = (
+        "<b>💳 Счёт создан</b>\n\n"
+        f"Способ: <b>{_provider_label(payment.provider)}</b>\n"
+        f"Тариф: <b>{html.escape(title)}</b>\n"
+        f"Сумма: <b>{payment.amount_usdt:g} USDT</b>\n"
+        f"Действует до: <b>{_utc_to_msk_text(payment.expires_at)} МСК</b>\n\n"
+        "Нажми «Открыть оплату». После оплаты бот проверит счёт автоматически; "
+        "кнопка «Проверить оплату» нужна только если хочешь проверить сразу."
+    )
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=payment_invoice_keyboard(payment))
+
+
+@dp.callback_query(F.data.startswith("paycheck:"))
+async def check_payment_handler(callback: CallbackQuery) -> None:
+    try:
+        payment_id = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("Некорректный счёт", show_alert=True)
+        return
+    payment = await get_payment(payment_id)
+    if payment is None or (payment.user_id != callback.from_user.id and not _is_admin(callback.from_user.id)):
+        await callback.answer("Счёт не найден", show_alert=True)
+        return
+    await callback.answer("Проверяю…")
+    refreshed, just_activated = await refresh_payment(payment_id)
+    if refreshed is None:
+        await callback.message.answer("⚠️ Счёт не найден.")
+        return
+    if refreshed.status == "paid":
+        user = await get_commerce_user(refreshed.user_id)
+        text = (
+            "✅ <b>Оплата подтверждена</b>\n\n"
+            f"Подписка активна до <b>{_utc_to_msk_text(user.access_until if user else None)} МСК</b>."
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 Перейти в сервис", callback_data="home")],
+            [InlineKeyboardButton(text="💎 Подписка", callback_data="subscription")],
+        ])
+        await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+    if refreshed.status == "expired":
+        await callback.message.answer(
+            "⌛ <b>Срок счёта истёк.</b> Создай новый счёт в разделе подписки.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Подписка", callback_data="subscription")]
+            ]),
+        )
+        return
+    await callback.message.answer(
+        "⏳ <b>Оплата пока не подтверждена.</b>\nЕсли ты только что оплатил, подожди несколько секунд — бот проверяет счета автоматически.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.message(Command("admin"))
+async def admin_command(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if not _is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        return
+    await message.answer(await _admin_dashboard_text(), parse_mode=ParseMode.HTML, reply_markup=admin_keyboard())
+
+
+@dp.callback_query(F.data == "adminhome")
+async def admin_home_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=admin_keyboard())
+
+
+@dp.callback_query(F.data == "adminstats")
+async def admin_stats_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=admin_keyboard())
+
+
+@dp.callback_query(F.data == "adminusers")
+async def admin_users_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    users = await recent_users(20)
+    await callback.answer()
+    text = "<b>👥 Пользователи</b>\n\nПоследние по активности. Нажми на пользователя для управления доступом."
+    if not users:
+        text += "\n\nПока никого нет."
+    await _edit_or_answer(callback.message, text, reply_markup=admin_users_keyboard(users))
+
+
+@dp.callback_query(F.data == "adminusersearch")
+async def admin_user_search_begin(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminInput.user_search)
+    await callback.answer()
+    await callback.message.answer(
+        "🔎 Отправь <b>Telegram ID</b>, <b>@username</b> или имя пользователя.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_back_keyboard(),
+    )
+
+
+@dp.message(AdminInput.user_search)
+async def admin_user_search_message(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message.from_user.id):
+        await state.clear()
+        return
+    query = (message.text or "").strip()
+    users = await find_users(query, 20)
+    await state.clear()
+    text = f"<b>🔎 Результаты поиска</b>\n\nЗапрос: <code>{html.escape(query)}</code>"
+    if not users:
+        text += "\n\nНичего не найдено. Пользователь должен хотя бы раз открыть бота."
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=admin_users_keyboard(users))
+
+
+@dp.callback_query(F.data.startswith("adminuser:"))
+async def admin_user_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        uid = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+    rendered = await render_admin_user(uid)
+    if rendered is None:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_or_answer(callback.message, rendered[0], reply_markup=rendered[1])
+
+
+@dp.callback_query(F.data.startswith("admingrant:"))
+async def admin_grant_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, uid_raw, days_raw = callback.data.split(":", 2)
+        uid, days = int(uid_raw), int(days_raw)
+    except Exception:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+    until = await grant_access_days(uid, days)
+    await callback.answer(f"Добавлено {days} дн.")
+    try:
+        await callback.bot.send_message(
+            uid,
+            f"✅ <b>Доступ продлён на {days} дн.</b>\nАктивен до <b>{_utc_to_msk_text(until)} МСК</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+    rendered = await render_admin_user(uid)
+    if rendered:
+        await _edit_or_answer(callback.message, rendered[0], reply_markup=rendered[1])
+
+
+@dp.callback_query(F.data.startswith("adminrevoke:"))
+async def admin_revoke_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        uid = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+    await revoke_access(uid)
+    await callback.answer("Доступ отозван")
+    rendered = await render_admin_user(uid)
+    if rendered:
+        await _edit_or_answer(callback.message, rendered[0], reply_markup=rendered[1])
+
+
+@dp.callback_query(F.data.startswith("adminban:"))
+async def admin_ban_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        uid = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+    user = await get_commerce_user(uid)
+    new_value = not bool(user and user.is_banned)
+    await set_banned(uid, new_value)
+    await callback.answer("Заблокирован" if new_value else "Разблокирован")
+    rendered = await render_admin_user(uid)
+    if rendered:
+        await _edit_or_answer(callback.message, rendered[0], reply_markup=rendered[1])
+
+
+@dp.callback_query(F.data == "adminpayments")
+async def admin_payments_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    payments = await recent_payments(20)
+    providers = providers_status()
+    lines = [
+        "<b>💳 Платежи</b>",
+        "",
+        f"CryptoBot: <b>{'✅ настроен' if providers['cryptobot'] else '▫️ нет токена'}</b>",
+        f"xRocket: <b>{'✅ настроен' if providers['xrocket'] else '▫️ нет API key'}</b>",
+    ]
+    if payments:
+        lines.extend(["", "<b>Последние счета</b>"])
+        for p in payments[:15]:
+            user = await get_commerce_user(p.user_id)
+            who = f"@{user.username}" if user and user.username else str(p.user_id)
+            lines.append(
+                f"{_payment_status_label(p.status)} · <b>{p.amount_usdt:g} USDT</b> · "
+                f"{html.escape(who)} · {_provider_label(p.provider)} · {_utc_to_msk_text(p.created_at)}"
+            )
+    else:
+        lines.extend(["", "Платежей пока нет."])
+    await callback.answer()
+    await _edit_or_answer(callback.message, "\n".join(lines), reply_markup=admin_back_keyboard())
+
+
+@dp.callback_query(F.data == "adminplans")
+async def admin_plans_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    plans = await get_plans()
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message,
+        "<b>🎟 Тарифы</b>\n\nЦена меняется здесь и сразу применяется к новым счетам.",
+        reply_markup=admin_plans_keyboard(plans),
+    )
+
+
+@dp.callback_query(F.data.startswith("adminplan:"))
+async def admin_plan_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    key = callback.data.split(":", 1)[1]
+    plan = await get_plan(key)
+    if not plan:
+        await callback.answer("Тариф не найден", show_alert=True)
+        return
+    text = (
+        f"<b>🎟 {html.escape(plan.title)}</b>\n\n"
+        f"Срок: <b>{plan.days} дн.</b>\n"
+        f"Цена: <b>{plan.price_usdt:g} USDT</b>\n"
+        f"Статус: <b>{'✅ включён' if plan.is_active else '⏸ выключен'}</b>"
+    )
+    await callback.answer()
+    await _edit_or_answer(callback.message, text, reply_markup=admin_plan_keyboard(plan))
+
+
+@dp.callback_query(F.data.startswith("adminplanprice:"))
+async def admin_plan_price_begin(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    key = callback.data.split(":", 1)[1]
+    plan = await get_plan(key)
+    if not plan:
+        await callback.answer("Тариф не найден", show_alert=True)
+        return
+    await state.set_state(AdminInput.plan_price)
+    await state.update_data(admin_plan_key=key)
+    await callback.answer()
+    await callback.message.answer(
+        f"💰 Новая цена для <b>{html.escape(plan.title)}</b> в USDT.\nНапример: <code>9.99</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_back_keyboard(),
+    )
+
+
+@dp.message(AdminInput.plan_price)
+async def admin_plan_price_message(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    key = data.get("admin_plan_key")
+    raw = (message.text or "").strip().replace(",", ".")
+    try:
+        price = float(raw)
+        plan = await update_plan_price(str(key), price)
+    except Exception:
+        await message.answer("⚠️ Нужна положительная цена, например <code>9.99</code>.", parse_mode=ParseMode.HTML)
+        return
+    await state.clear()
+    if not plan:
+        await message.answer("Тариф не найден.", reply_markup=admin_back_keyboard())
+        return
+    await message.answer(
+        f"✅ Цена <b>{html.escape(plan.title)}</b> изменена на <b>{plan.price_usdt:g} USDT</b>.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_plan_keyboard(plan),
+    )
+
+
+@dp.callback_query(F.data.startswith("adminplantoggle:"))
+async def admin_plan_toggle_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    key = callback.data.split(":", 1)[1]
+    plan = await toggle_plan(key)
+    if not plan:
+        await callback.answer("Тариф не найден", show_alert=True)
+        return
+    await callback.answer("Включён" if plan.is_active else "Выключен")
+    text = (
+        f"<b>🎟 {html.escape(plan.title)}</b>\n\n"
+        f"Срок: <b>{plan.days} дн.</b>\n"
+        f"Цена: <b>{plan.price_usdt:g} USDT</b>\n"
+        f"Статус: <b>{'✅ включён' if plan.is_active else '⏸ выключен'}</b>"
+    )
+    await _edit_or_answer(callback.message, text, reply_markup=admin_plan_keyboard(plan))
+
+
+@dp.callback_query(F.data == "adminmode")
+async def admin_mode_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    text = (
+        "<b>🔐 Режим доступа</b>\n\n"
+        "🔒 <b>Только админы</b> — безопасный режим для тестов.\n"
+        "💎 <b>По подписке</b> — без активной подписки доступна только оплата.\n"
+        "🌍 <b>Открытый доступ</b> — бот доступен всем без оплаты.\n\n"
+        f"Сейчас: <b>{_access_mode_label()}</b>"
+    )
+    await callback.answer()
+    await _edit_or_answer(callback.message, text, reply_markup=admin_mode_keyboard())
+
+
+@dp.callback_query(F.data.startswith("adminsetmode:"))
+async def admin_set_mode_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    mode = callback.data.split(":", 1)[1]
+    try:
+        await set_access_mode(mode)
+    except ValueError:
+        await callback.answer("Некорректный режим", show_alert=True)
+        return
+    await callback.answer("Режим изменён")
+    await _edit_or_answer(
+        callback.message,
+        f"<b>🔐 Режим доступа</b>\n\nСейчас: <b>{_access_mode_label(mode)}</b>",
+        reply_markup=admin_mode_keyboard(),
+    )
+
+
+async def payment_scheduler(bot: Bot) -> None:
+    """Poll pending invoices. No webhook service is required for the first commercial build."""
+    while True:
+        try:
+            payments = await pending_payments(100)
+            for payment in payments:
+                try:
+                    refreshed, just_paid = await refresh_payment(payment.id)
+                    if not refreshed or not just_paid:
+                        continue
+                    user = await get_commerce_user(refreshed.user_id)
+                    plan = await get_plan(refreshed.plan_key)
+                    until = user.access_until if user else None
+                    try:
+                        await bot.send_message(
+                            refreshed.user_id,
+                            "✅ <b>Оплата подтверждена</b>\n\n"
+                            f"{html.escape(plan.title) if plan else 'Подписка'} активна до "
+                            f"<b>{_utc_to_msk_text(until)} МСК</b>.\nТеперь сервис доступен.",
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="🏠 Открыть сервис", callback_data="home")]
+                            ]),
+                        )
+                    except Exception:
+                        log.exception("Could not notify paid user %s", refreshed.user_id)
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            await bot.send_message(
+                                admin_id,
+                                "💳 <b>Новая оплата</b>\n"
+                                f"User: <code>{refreshed.user_id}</code>\n"
+                                f"Тариф: <b>{html.escape(plan.title) if plan else refreshed.plan_key}</b>\n"
+                                f"Сумма: <b>{refreshed.amount_usdt:g} USDT</b>\n"
+                                f"Способ: <b>{_provider_label(refreshed.provider)}</b>",
+                                parse_mode=ParseMode.HTML,
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    log.exception("Payment polling failed for payment=%s", payment.id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Payment scheduler loop failed")
+        await asyncio.sleep(PAYMENT_POLL_SECONDS)
 
 
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
+    await touch_user(message.from_user, force=True)
     if not allowed(message.from_user.id):
-        await message.answer("Нет доступа.")
+        await send_access_screen(message, message.from_user.id)
         return
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>🔍 Kleinanzeigen Parser v3.1.7</b>\n\n"
+        "<b>🔍 Kleinanzeigen Parser v3.2.0</b>\n\n"
         "Здесь всё строится вокруг сохранённых сканов:\n"
         "🔥 <b>Популярное сейчас</b> — лидеры по просмотрам\n"
         "🔎 <b>Новый скан</b> — собрать свежие объявления\n"
@@ -3295,7 +4098,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v3.1.7</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("<b>🔍 Kleinanzeigen Parser v3.2.0</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == "post_settings")
@@ -3316,7 +4119,7 @@ async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
     await callback.message.answer(
-        "<b>🔍 Kleinanzeigen Parser v3.1.7</b>\n\nЧто хочешь посмотреть?",
+        "<b>🔍 Kleinanzeigen Parser v3.2.0</b>\n\nЧто хочешь посмотреть?",
         reply_markup=main_keyboard(len(selected)),
         parse_mode=ParseMode.HTML,
     )
@@ -4483,6 +5286,7 @@ async def start_scan_with_pages(callback: CallbackQuery, state: FSMContext) -> N
 async def main() -> None:
     if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN is not set")
     await init_db()
+    await initialize_commerce()
     backfilled = await backfill_product_identities()
     if backfilled:
         log.info("v3.0 product identity backfill: %s listings", backfilled)
@@ -4509,6 +5313,7 @@ async def main() -> None:
         for i in range(1, MAX_CONCURRENT_JOBS + 1)
     ]
     ticker_task = asyncio.create_task(progress_ticker(bot), name="user-progress-ticker")
+    payment_task = asyncio.create_task(payment_scheduler(bot), name="payment-scheduler")
     observation_tasks = [
         asyncio.create_task(observation_scheduler(bot, i), name=f"view-observation-worker-{i}")
         for i in range(1, OBSERVATION_CONCURRENCY + 1)
@@ -4517,11 +5322,12 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         ticker_task.cancel()
+        payment_task.cancel()
         for task in observation_tasks:
             task.cancel()
         for task in worker_tasks:
             task.cancel()
-        await asyncio.gather(ticker_task, *observation_tasks, *worker_tasks, return_exceptions=True)
+        await asyncio.gather(ticker_task, payment_task, *observation_tasks, *worker_tasks, return_exceptions=True)
         async with category_inflight_guard:
             inflight = list(category_inflight.values())
         for task in inflight:
