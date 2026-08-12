@@ -170,6 +170,49 @@ def _allowed_url(url: str) -> bool:
     return parsed.scheme == "https" and (host == "kleinanzeigen.de" or host.endswith(".kleinanzeigen.de"))
 
 
+FILTER_BUSINESS_SELLERS = os.getenv("FILTER_BUSINESS_SELLERS", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+
+
+def private_provider_url(base_url: str) -> str:
+    """Return the same Kleinanzeigen feed restricted to private sellers.
+
+    Kleinanzeigen exposes an official ``Anbieter -> Privat`` search filter as the
+    path segment ``anbieter%3Aprivat``. Applying it at the feed level is much
+    cheaper and more reliable than opening every ad detail page to inspect the
+    seller. It also means commercial listings never consume the requested
+    25/50/100-page depth or enter view/top analytics.
+    """
+    if not FILTER_BUSINESS_SELLERS:
+        return base_url
+
+    parts = urlsplit(base_url)
+    path = parts.path
+    decoded = unquote(path).lower()
+    if "/anbieter:privat/" in decoded:
+        return base_url
+
+    # If some caller supplied a different provider filter, replace it rather than
+    # stacking two mutually exclusive Anbieter segments.
+    path = re.sub(
+        r"/anbieter(?:%3A|:)(?:privat|gewerblich)(?=/)",
+        "/anbieter%3Aprivat",
+        path,
+        flags=re.IGNORECASE,
+    )
+    if "/anbieter%3aprivat/" not in path.lower():
+        path2 = re.sub(
+            r"/(c\d+(?:l\d+)?)$",
+            r"/anbieter%3Aprivat/\1",
+            path,
+        )
+        if path2 == path:
+            raise ValueError(f"Unsupported category URL for private-provider filter: {base_url}")
+        path = path2
+    return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
+
+
 def page_url(base_url: str, page: int) -> str:
     if page <= 1:
         return base_url

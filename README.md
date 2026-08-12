@@ -171,3 +171,11 @@ redeploys depending on storage configuration.
 - If zero fresh values are available, no new observation point is created.
 - Completion replaces the progress message with a clear summary: fresh values, direct requests, simultaneous reuse, missing counters, listings that grew, maximum and total growth.
 - Chromium/browser fallback remains disabled for mass measurement jobs.
+
+## v3.1.8 — Private sellers only
+
+- Commercial/store listings are excluded through Kleinanzeigen's official `Anbieter: Privat` search filter.
+- Store ads no longer consume the selected 25/50/100-page depth.
+- They are not saved into scan snapshots and therefore do not enter view refreshes, popularity or growth TOPs.
+- No extra detail-page requests are needed; the filter is applied to the category/search URL itself.
+- Set `FILTER_BUSINESS_SELLERS=0` only if commercial sellers should be included again.

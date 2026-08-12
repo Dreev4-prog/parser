@@ -54,6 +54,7 @@ from parser import (
     posted_date_moscow,
     profile_page_dates,
     page_url,
+    private_provider_url,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -2238,6 +2239,10 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         return len(target_items)
 
     async def locate_feed(base_url: str, feed_name: str):
+        # v3.1.8: use Kleinanzeigen's official Anbieter=Privat filter at the
+        # search-feed level. Commercial/store listings therefore never consume
+        # scan depth and never enter snapshots, views or TOP analytics.
+        base_url = private_provider_url(base_url)
         """Locate the first target-date page inside one verified <=50-page feed."""
         nonlocal network_requests, cards_seen, listings_parsed, missing_date_count
         nonlocal missing_price_count, promoted_filtered, duplicate_count, invalid_pages
