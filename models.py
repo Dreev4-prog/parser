@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -180,6 +180,14 @@ class UserScan(Base):
     # only the My Scans inbox is kept compact.
     archived_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
 
+    # v3.3.0 production recovery metadata. Telegram chat/message references let a
+    # Railway restart rebuild an unfinished queue entry instead of silently losing it.
+    chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    status_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    resumed_count: Mapped[int] = mapped_column(Integer, default=0)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
 
 class ScanListing(Base):
     """Snapshot membership + view count at the moment a user scan completed."""
@@ -239,6 +247,11 @@ class BotUser(Base):
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     payments_count: Mapped[int] = mapped_column(Integer, default=0)
     paid_total_usdt: Mapped[float] = mapped_column(Float, default=0.0)
+
+    # v3.3.0 product onboarding + subscription lifecycle notifications.
+    onboarding_completed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    expiry_warning_sent_for: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expiry_expired_sent_for: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class SubscriptionPlan(Base):

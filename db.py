@@ -20,11 +20,11 @@ _IS_RAILWAY = bool(
     or os.getenv("RAILWAY_SERVICE_ID")
 )
 
-# v3.2.8: PostgreSQL is mandatory on Railway. Local SQLite remains available only
+# v3.3.0: PostgreSQL is mandatory on Railway. Local SQLite remains available only
 # as a zero-setup development/test fallback so the included unit tests still run.
 if _IS_RAILWAY and not RAW_DATABASE_URL:
     raise RuntimeError(
-        "DATABASE_URL is required on Railway in v3.2.8. Add a PostgreSQL service "
+        "DATABASE_URL is required on Railway in v3.3.0. Add a PostgreSQL service "
         "and set DATABASE_URL=${{Postgres.DATABASE_URL}} in the parser service Variables."
     )
 
@@ -36,7 +36,7 @@ _IS_POSTGRES = DATABASE_URL.startswith("postgresql+asyncpg://")
 
 if _IS_RAILWAY and not _IS_POSTGRES:
     raise RuntimeError(
-        "v3.2.8 requires PostgreSQL on Railway. DATABASE_URL must point to the Railway PostgreSQL service."
+        "v3.3.0 requires PostgreSQL on Railway. DATABASE_URL must point to the Railway PostgreSQL service."
     )
 if not _IS_SQLITE and not _IS_POSTGRES:
     raise RuntimeError("Unsupported DATABASE_URL. Use PostgreSQL (postgresql://...) or local SQLite for development.")
@@ -200,5 +200,26 @@ async def init_db() -> None:
             await conn.execute(text("ALTER TABLE user_scans ADD COLUMN quality_note VARCHAR(500) DEFAULT ''"))
         if user_scan_columns and "archived_at" not in user_scan_columns:
             await conn.execute(text("ALTER TABLE user_scans ADD COLUMN archived_at TIMESTAMP"))
+        if user_scan_columns and "chat_id" not in user_scan_columns:
+            await conn.execute(text("ALTER TABLE user_scans ADD COLUMN chat_id BIGINT"))
+        if user_scan_columns and "status_message_id" not in user_scan_columns:
+            await conn.execute(text("ALTER TABLE user_scans ADD COLUMN status_message_id BIGINT"))
+        if user_scan_columns and "resumed_count" not in user_scan_columns:
+            await conn.execute(text("ALTER TABLE user_scans ADD COLUMN resumed_count INTEGER DEFAULT 0"))
+        if user_scan_columns and "retry_count" not in user_scan_columns:
+            await conn.execute(text("ALTER TABLE user_scans ADD COLUMN retry_count INTEGER DEFAULT 0"))
+        if user_scan_columns and "last_error" not in user_scan_columns:
+            await conn.execute(text("ALTER TABLE user_scans ADD COLUMN last_error VARCHAR(1000)"))
+
+        bot_user_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "bot_users"))
+        if bot_user_columns and "onboarding_completed" not in bot_user_columns:
+            await conn.execute(text("ALTER TABLE bot_users ADD COLUMN onboarding_completed BOOLEAN DEFAULT FALSE"))
+            # Existing v3.2.x users already know the product; onboarding is only for
+            # new users. They can still replay it from /help.
+            await conn.execute(text("UPDATE bot_users SET onboarding_completed = TRUE"))
+        if bot_user_columns and "expiry_warning_sent_for" not in bot_user_columns:
+            await conn.execute(text("ALTER TABLE bot_users ADD COLUMN expiry_warning_sent_for TIMESTAMP"))
+        if bot_user_columns and "expiry_expired_sent_for" not in bot_user_columns:
+            await conn.execute(text("ALTER TABLE bot_users ADD COLUMN expiry_expired_sent_for TIMESTAMP"))
 
     log.info("Database initialized: %s", DATABASE_BACKEND)

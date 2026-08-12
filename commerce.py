@@ -186,6 +186,87 @@ async def get_user(user_id: int) -> BotUser | None:
         return await session.get(BotUser, int(user_id))
 
 
+async def set_onboarding_completed(user_id: int, completed: bool = True) -> None:
+    """Persist first-run onboarding state so /start stays compact afterwards."""
+    async with SessionLocal() as session:
+        row = await session.get(BotUser, int(user_id))
+        if row is None:
+            now = datetime.utcnow()
+            row = BotUser(user_id=int(user_id), joined_at=now, last_seen_at=now)
+            session.add(row)
+        row.onboarding_completed = bool(completed)
+        await session.commit()
+
+
+async def user_payments(user_id: int, limit: int = 20) -> list[SubscriptionPayment]:
+    async with SessionLocal() as session:
+        return list((await session.execute(
+            select(SubscriptionPayment)
+            .where(SubscriptionPayment.user_id == int(user_id))
+            .order_by(SubscriptionPayment.created_at.desc())
+            .limit(max(1, int(limit)))
+        )).scalars().all())
+
+
+async def subscription_notice_candidates(limit: int = 100) -> tuple[list[BotUser], list[BotUser]]:
+    """Return users who need a 24h warning or a just-expired notification.
+
+    Old historical expirations are intentionally ignored to avoid sending a burst
+    after deploying v3.3.0 to an existing database.
+    """
+    now = datetime.utcnow()
+    warning_until = now + timedelta(hours=24)
+    recent_expiry_cutoff = now - timedelta(hours=24)
+    async with SessionLocal() as session:
+        warning_stmt = (
+            select(BotUser)
+            .where(
+                BotUser.is_banned.is_(False),
+                BotUser.access_until.is_not(None),
+                BotUser.access_until > now,
+                BotUser.access_until <= warning_until,
+                or_(
+                    BotUser.expiry_warning_sent_for.is_(None),
+                    BotUser.expiry_warning_sent_for != BotUser.access_until,
+                ),
+            )
+            .order_by(BotUser.access_until.asc())
+            .limit(limit)
+        )
+        expired_stmt = (
+            select(BotUser)
+            .where(
+                BotUser.is_banned.is_(False),
+                BotUser.access_until.is_not(None),
+                BotUser.access_until <= now,
+                BotUser.access_until >= recent_expiry_cutoff,
+                or_(
+                    BotUser.expiry_expired_sent_for.is_(None),
+                    BotUser.expiry_expired_sent_for != BotUser.access_until,
+                ),
+            )
+            .order_by(BotUser.access_until.asc())
+            .limit(limit)
+        )
+        warnings = list((await session.execute(warning_stmt)).scalars().all())
+        expired = list((await session.execute(expired_stmt)).scalars().all())
+        return warnings, expired
+
+
+async def mark_subscription_notice(user_id: int, access_until: datetime, kind: str) -> None:
+    if kind not in {"warning", "expired"}:
+        raise ValueError("invalid notice kind")
+    async with SessionLocal() as session:
+        row = await session.get(BotUser, int(user_id))
+        if row is None or row.access_until != access_until:
+            return
+        if kind == "warning":
+            row.expiry_warning_sent_for = access_until
+        else:
+            row.expiry_expired_sent_for = access_until
+        await session.commit()
+
+
 async def find_users(query: str, limit: int = 20) -> list[BotUser]:
     query = (query or "").strip().lstrip("@")
     async with SessionLocal() as session:
@@ -217,6 +298,8 @@ async def grant_access_days(user_id: int, days: int) -> datetime:
         base = row.access_until if row.access_until and row.access_until > now else now
         row.access_until = base + timedelta(days=days)
         row.is_banned = False
+        row.expiry_warning_sent_for = None
+        row.expiry_expired_sent_for = None
         await session.commit()
         until = row.access_until
     _banned_users.discard(int(user_id))
@@ -229,6 +312,8 @@ async def revoke_access(user_id: int) -> None:
         row = await session.get(BotUser, int(user_id))
         if row is not None:
             row.access_until = None
+            row.expiry_warning_sent_for = None
+            row.expiry_expired_sent_for = None
             await session.commit()
     _access_cache.pop(int(user_id), None)
 
@@ -543,6 +628,8 @@ async def _refresh_payment_locked(payment_id: int) -> tuple[SubscriptionPayment 
         base = user.access_until if user.access_until and user.access_until > now else now
         user.access_until = base + timedelta(days=plan.days)
         user.is_banned = False
+        user.expiry_warning_sent_for = None
+        user.expiry_expired_sent_for = None
         user.payments_count = int(user.payments_count or 0) + 1
         user.paid_total_usdt = float(user.paid_total_usdt or 0) + float(row.amount_usdt or 0)
         row.status = "paid"

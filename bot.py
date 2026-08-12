@@ -54,7 +54,8 @@ from commerce import (
     has_access, initialize_commerce, is_banned_cached, pending_payments,
     provider_enabled, providers_status, recent_payments, recent_users,
     refresh_payment, revoke_access, set_access_mode, set_banned, toggle_plan,
-    touch_user, update_plan_price,
+    touch_user, update_plan_price, set_onboarding_completed, user_payments,
+    subscription_notice_candidates, mark_subscription_notice,
 )
 from parser import (
     MAX_PAGES_PER_CATEGORY,
@@ -76,7 +77,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "3.2.8"
+APP_VERSION = "3.3.0"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
@@ -88,6 +89,12 @@ MAX_CONCURRENT_JOBS = max(1, min(12, int(os.getenv("MAX_CONCURRENT_JOBS", "4")))
 MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
 CATEGORY_CACHE_TTL_SECONDS = max(0, int(os.getenv("CATEGORY_CACHE_TTL_SECONDS", "300")))
 STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVAL_SECONDS", "1.5")))
+# v3.3.0 job-level resilience on top of parser HTTP retries. A category that
+# throws an unexpected transient exception gets one controlled retry before the
+# user receives a partial result.
+SCAN_CATEGORY_ATTEMPTS = max(1, min(3, int(os.getenv("SCAN_CATEGORY_ATTEMPTS", "2"))))
+SCAN_CATEGORY_RETRY_SECONDS = max(1.0, min(30.0, float(os.getenv("SCAN_CATEGORY_RETRY_SECONDS", "4"))))
+SUBSCRIPTION_NOTICE_POLL_SECONDS = max(60, int(os.getenv("SUBSCRIPTION_NOTICE_POLL_SECONDS", "300")))
 
 # Public view counts are collected inline while category pages are scanned.
 # Recent values are cached so shared/multi-user scans do not reopen the same ad.
@@ -201,6 +208,7 @@ class ScanInput(StatesGroup):
 class AdminInput(StatesGroup):
     user_search = State()
     plan_price = State()
+    custom_days = State()
 
 
 def allowed(user_id: int) -> bool:
@@ -276,6 +284,8 @@ def growth_period_keyboard(scan_id: int, active_hours: int = 3, category_key: st
 
 def popular_categories_keyboard(items: list[tuple[str, UserScan]]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
+    if not items:
+        rows.append([InlineKeyboardButton(text="▶️ Сделать первый скан", callback_data="start_scan")])
     for key, scan in items[:30]:
         cat = CATEGORIES.get(key)
         if cat is None:
@@ -351,6 +361,7 @@ def category_keyboard(group_key: str, selected_keys: set[str]) -> InlineKeyboard
         text=("☑️ Убрать все подкатегории" if children_all else "☑️ Выбрать все подкатегории"),
         callback_data=f"grpall:{group_key}",
     )])
+    rows.append([InlineKeyboardButton(text="▶️ Запустить парсер", callback_data="start_scan")])
     rows.append([InlineKeyboardButton(text="⬅️ К разделам", callback_data="groups")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -376,6 +387,7 @@ def settings_keyboard(s: UserSettings) -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="🚫 Исключить слова", callback_data="set_exclude")],
         [InlineKeyboardButton(text="ℹ️ Как работают режимы", callback_data="mode_help")],
         [InlineKeyboardButton(text="♻️ Сбросить настройки", callback_data="reset_settings")],
+        [InlineKeyboardButton(text="▶️ Запустить с этими настройками", callback_data="start_scan")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="home")],
     ])
 
@@ -385,7 +397,8 @@ def page_limit_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="25 страниц", callback_data="scanpages:25"),
          InlineKeyboardButton(text="50 страниц", callback_data="scanpages:50")],
         [InlineKeyboardButton(text="100 страниц", callback_data="scanpages:100")],
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="home")],
+        [InlineKeyboardButton(text="⬅️ Выбрать другую дату", callback_data="start_scan")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")],
     ])
 
 
@@ -486,6 +499,28 @@ async def create_user_scan(user_id: int, job_uid: str, category_keys: list[str],
         await session.commit()
         await session.refresh(scan)
         return scan
+
+
+async def attach_user_scan_message(scan_id: int, chat_id: int, status_message_id: int) -> None:
+    async with SessionLocal() as session:
+        scan = await session.get(UserScan, int(scan_id))
+        if scan is None:
+            return
+        scan.chat_id = int(chat_id)
+        scan.status_message_id = int(status_message_id)
+        await session.commit()
+
+
+async def record_user_scan_retry(scan_id: int | None, error_text: str) -> None:
+    if scan_id is None:
+        return
+    async with SessionLocal() as session:
+        scan = await session.get(UserScan, int(scan_id))
+        if scan is None:
+            return
+        scan.retry_count = int(scan.retry_count or 0) + 1
+        scan.last_error = (error_text or "")[:1000] or None
+        await session.commit()
 
 
 async def get_user_scan(user_id: int, scan_id: int) -> UserScan | None:
@@ -769,6 +804,8 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
             quality_scores = [int(x) for x in (job.quality_scores or []) if x is not None]
             scan.quality_score = round(sum(quality_scores) / len(quality_scores)) if quality_scores else 0
             scan.quality_note = " | ".join((job.quality_notes or [])[:4])[:500]
+            if not cancelled and job.incomplete_categories == 0:
+                scan.last_error = None
             if cancelled:
                 await session.commit()
                 return
@@ -1107,6 +1144,8 @@ def _scan_list_button(scan: UserScan) -> InlineKeyboardButton:
         "✅" if scan.status == "done"
         else "⚠️" if scan.status == "partial"
         else "⏳" if scan.status in {"queued", "running"}
+        else "⏹" if scan.status in {"cancelling", "cancelled"}
+        else "❌" if scan.status == "failed"
         else "⚪️"
     )
     target_label = _date_label(scan.target_date) if scan.target_date else _moscow_text(scan.finished_at or scan.created_at)[:10]
@@ -2251,6 +2290,8 @@ class ScanJob:
     matched_ids: set[str] | None = None
     quality_scores: list[int] | None = None
     quality_notes: list[str] | None = None
+    retry_note: str = ""
+    recovered: bool = False
     stop_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False, compare=False)
 
 
@@ -3072,6 +3113,15 @@ def stopped_job_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def failed_job_keyboard(scan_id: int | None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if scan_id is not None:
+        rows.append([InlineKeyboardButton(text="🔄 Повторить этот скан", callback_data=f"scanrepeat:{scan_id}")])
+    rows.append([InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")])
+    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def fresh_category_cache_age(category_key: str, page_limit: int, target_date: str) -> int | None:
     """Legacy DB cache hook. Exact-depth scans use the in-memory ScanResult cache.
 
@@ -3245,11 +3295,20 @@ def render_user_job_status(job: ScanJob) -> str:
 
     if job.state == "queued":
         waited = max(0, int((datetime.utcnow() - job.created_at).total_seconds()))
+        headline = "♻️ <b>Восстанавливаю скан после перезапуска…</b>\n\n" if job.recovered else "⏳ <b>Готовлю скан…</b>\n\n"
         return (
-            "⏳ <b>Готовлю скан…</b>\n\n"
-            f"📂 Категорий: <b>{total}</b>\n"
-            f"📅 <b>{_date_label(job.target_date)}</b> · 📄 <b>{depth} стр.</b>\n"
-            f"⏱ <b>{_human_duration(waited)}</b>"
+            headline
+            + f"📂 Категорий: <b>{total}</b>\n"
+            + f"📅 <b>{_date_label(job.target_date)}</b> · 📄 <b>{depth} стр.</b>\n"
+            + f"⏱ <b>{_human_duration(waited)}</b>"
+        )
+
+    if job.retry_note:
+        return (
+            "♻️ <b>Временный сбой — повторяю категорию</b>\n\n"
+            f"📂 <b>{html.escape(job.current_category or 'Категория')}</b>\n"
+            f"{html.escape(job.retry_note)}\n"
+            "Уже собранные данные сохранены."
         )
 
     live = category_live_progress.get(job.current_progress_key) if job.current_progress_key else None
@@ -3428,6 +3487,41 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
             log.exception("Could not send warnings for job=%s", job.job_id)
 
 
+async def dispatch_category_with_retry(bot: Bot, job: ScanJob, cat) -> CategoryDispatchResult:
+    """Run one category with a small job-level retry safety net.
+
+    The parser itself already retries HTTP/403/429/5xx responses. This outer layer
+    protects the user from a one-off transport/runtime failure and keeps a partial
+    scan recoverable instead of immediately turning the category into an error.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, SCAN_CATEGORY_ATTEMPTS + 1):
+        try:
+            job.retry_note = ""
+            return await dispatch_category(
+                cat, job.user_id, job.page_limit, job.target_date, stop_event=job.stop_event
+            )
+        except ScanStopRequested:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            await record_user_scan_retry(job.scan_id, f"{cat.name}: {type(exc).__name__}: {exc}")
+            if attempt >= SCAN_CATEGORY_ATTEMPTS:
+                raise
+            job.retry_note = (
+                f"Попытка {attempt + 1}/{SCAN_CATEGORY_ATTEMPTS} через "
+                f"{int(SCAN_CATEGORY_RETRY_SECONDS * attempt)} сек."
+            )
+            await edit_job_status(bot, job, render_user_job_status(job), force=True)
+            await asyncio.sleep(SCAN_CATEGORY_RETRY_SECONDS * attempt)
+            if job.stop_event.is_set() or job.cancel_requested:
+                raise ScanStopRequested()
+    assert last_exc is not None
+    raise last_exc
+
+
 async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
     job.state = "running"
     if job.scan_id is not None:
@@ -3470,9 +3564,7 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
         )
         try:
             await edit_job_status(bot, job, render_user_job_status(job), force=True)
-            dispatched = await dispatch_category(
-                cat, job.user_id, job.page_limit, job.target_date, stop_event=job.stop_event
-            )
+            dispatched = await dispatch_category_with_retry(bot, job, cat)
             if job.cancel_requested or job.stop_event.is_set():
                 raise ScanStopRequested()
             result = dispatched.result
@@ -3603,11 +3695,21 @@ async def scan_worker(bot: Bot, worker_id: int) -> None:
                         if scan is not None:
                             scan.status = "failed"
                             scan.finished_at = datetime.utcnow()
+                            scan.last_error = "Необработанная ошибка воркера; см. Railway logs"
                             await session.commit()
                 except Exception:
                     log.exception("Could not mark user scan failed scan_id=%s", job.scan_id)
             try:
-                await edit_job_status(bot, job, "❌ <b>Ошибка задания парсинга</b>\nПопробуй запустить ещё раз.", force=True)
+                await bot.edit_message_text(
+                    chat_id=job.chat_id,
+                    message_id=job.status_message_id,
+                    text=(
+                        "❌ <b>Парсер не смог завершить этот запуск</b>\n\n"
+                        "Уже собранные данные в PostgreSQL не потеряны. Можно повторить этот же скан одной кнопкой."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=failed_job_keyboard(job.scan_id),
+                )
             except Exception:
                 pass
         finally:
@@ -3625,6 +3727,7 @@ async def enqueue_user_scan(message: Message, user_id: int, category_keys: list[
     job_uid = uuid.uuid4().hex[:12]
     scan = await create_user_scan(user_id, job_uid, category_keys, page_limit, target_date)
     status = await message.answer("⏳ <b>Подготавливаю скан…</b>", parse_mode=ParseMode.HTML)
+    await attach_user_scan_message(scan.id, message.chat.id, status.message_id)
     job = ScanJob(
         job_id=job_uid,
         user_id=user_id,
@@ -3647,6 +3750,95 @@ async def enqueue_user_scan(message: Message, user_id: int, category_keys: list[
         reply_markup=job_keyboard(job.job_id),
     )
     return job
+
+
+
+async def recover_interrupted_user_scans(bot: Bot) -> int:
+    """Requeue unfinished scans after a Railway/process restart.
+
+    The already collected Listing/ParserRun rows stay in PostgreSQL. Re-running
+    unfinished categories is idempotent at listing level, so a restart cannot turn
+    a 70-page crawl into lost data even though live in-memory progress resets.
+    """
+    now = datetime.utcnow()
+    recovered_jobs: list[ScanJob] = []
+    seen_users: set[int] = set()
+    async with SessionLocal() as session:
+        # A user may have pressed Stop milliseconds before a process crash. Persisted
+        # 'cancelling' jobs must remain cancelled rather than resurrecting.
+        cancelling = list((await session.execute(
+            select(UserScan).where(UserScan.status == "cancelling", UserScan.finished_at.is_(None))
+        )).scalars().all())
+        for scan in cancelling:
+            scan.status = "cancelled"
+            scan.finished_at = now
+            scan.last_error = "Остановлен пользователем перед перезапуском сервиса"
+
+        unfinished = list((await session.execute(
+            select(UserScan)
+            .where(UserScan.status.in_(["queued", "running"]), UserScan.finished_at.is_(None))
+            .order_by(UserScan.created_at.desc())
+        )).scalars().all())
+
+        for scan in unfinished:
+            uid = int(scan.user_id)
+            if uid in seen_users:
+                scan.status = "failed"
+                scan.finished_at = now
+                scan.last_error = "Найден дублирующий незавершённый запуск после перезапуска"
+                continue
+            seen_users.add(uid)
+            keys = [k for k in _scan_category_keys(scan) if k in CATEGORIES]
+            if not keys or not scan.chat_id:
+                scan.status = "failed"
+                scan.finished_at = now
+                scan.last_error = "Не удалось восстановить запуск: нет категории или Telegram chat_id"
+                continue
+
+            status_message_id = int(scan.status_message_id or 0)
+            try:
+                msg = await bot.send_message(
+                    int(scan.chat_id),
+                    "♻️ <b>Сервис перезапустился — восстанавливаю незавершённый скан.</b>\n\n"
+                    "Уже сохранённые объявления не потеряны. Продолжаю безопасным повторным запуском.",
+                    parse_mode=ParseMode.HTML,
+                )
+                status_message_id = msg.message_id
+            except Exception:
+                log.exception("Could not create recovery status message scan=%s", scan.id)
+                if not status_message_id:
+                    scan.status = "failed"
+                    scan.finished_at = now
+                    scan.last_error = "Не удалось восстановить Telegram-контекст после перезапуска"
+                    continue
+
+            scan.status = "queued"
+            scan.status_message_id = status_message_id
+            scan.resumed_count = int(scan.resumed_count or 0) + 1
+            scan.last_error = "Автоматически восстановлен после перезапуска Railway"
+            job = ScanJob(
+                job_id=scan.job_uid,
+                user_id=uid,
+                chat_id=int(scan.chat_id),
+                status_message_id=status_message_id,
+                category_keys=keys,
+                created_at=scan.created_at or now,
+                warnings=["Скан автоматически восстановлен после перезапуска сервиса."],
+                page_limit=int(scan.page_limit or 25),
+                scan_id=scan.id,
+                target_date=scan.target_date or _moscow_today_iso(),
+                recovered=True,
+            )
+            recovered_jobs.append(job)
+        await session.commit()
+
+    async with job_guard:
+        for job in recovered_jobs:
+            active_jobs[job.user_id] = job
+            queued_job_ids.append(job.job_id)
+            scan_queue.put_nowait(job)
+    return len(recovered_jobs)
+
 
 
 
@@ -3686,6 +3878,9 @@ async def subscription_text(user_id: int) -> str:
     mode = current_access_mode()
     user = await get_commerce_user(user_id)
     until = user.access_until if user else cached_access_until(user_id)
+    payments = await user_payments(user_id, 10)
+    pending_count = sum(1 for p in payments if p.status == "pending")
+
     if user_id in ADMIN_IDS:
         status = "👑 <b>Администратор — доступ без ограничений</b>"
     elif is_banned_cached(user_id):
@@ -3699,38 +3894,58 @@ async def subscription_text(user_id: int) -> str:
         rem_hours = hours % 24
         status = (
             f"✅ <b>Подписка активна до {_utc_to_msk_text(until)} МСК</b>\n"
-            f"Осталось: <b>{days} дн. {rem_hours} ч.</b>"
+            f"Осталось: <b>{days} дн. {rem_hours} ч.</b>\n"
+            "Можно продлить заранее — новые дни прибавятся к текущему сроку."
         )
     elif mode == "admin_only":
         status = "🔒 <b>Сервис пока работает в закрытом тестовом режиме.</b>"
     else:
-        status = "❌ <b>Подписка не активна</b>"
+        status = "❌ <b>Подписка не активна</b>\nВыбери тариф ниже, чтобы открыть доступ."
 
     providers = providers_status()
-    providers_line = (
-        f"{_provider_label('cryptobot')}: {'✅' if providers['cryptobot'] else '▫️'}   "
-        f"{_provider_label('xrocket')}: {'✅' if providers['xrocket'] else '▫️'}"
-    )
+    methods = []
+    if providers["cryptobot"]:
+        methods.append("CryptoBot")
+    if providers["xrocket"]:
+        methods.append("xRocket")
+    methods_text = " · ".join(methods) if methods else "временно недоступна"
+    pending_text = f"\n⏳ Ожидающих счетов: <b>{pending_count}</b>" if pending_count else ""
+    admin_mode = f"\nРежим: <b>{_access_mode_label(mode)}</b>" if user_id in ADMIN_IDS else ""
     return (
         "<b>💎 Подписка</b>\n\n"
         f"{status}\n\n"
-        f"Режим доступа: <b>{_access_mode_label(mode)}</b>\n"
-        f"Оплата: {providers_line}\n\n"
-        "Выбери срок — доступ после подтверждённой оплаты включится автоматически."
+        f"Оплата: <b>{methods_text}</b>{pending_text}{admin_mode}"
     )
 
 
 async def subscription_keyboard(user_id: int) -> InlineKeyboardMarkup:
     plans = await get_plans(active_only=True)
+    user = await get_commerce_user(user_id)
+    active = bool(user and user.access_until and user.access_until > datetime.utcnow())
     rows: list[list[InlineKeyboardButton]] = []
     if current_access_mode() == "subscription" and not is_banned_cached(user_id):
         for plan in plans:
+            prefix = "🔄 Продлить · " if active else ""
             rows.append([InlineKeyboardButton(
-                text=f"{plan.title} · {plan.price_usdt:g} USDT",
+                text=f"{prefix}{plan.title} · {plan.price_usdt:g} USDT",
                 callback_data=f"buyplan:{plan.key}",
             )])
-    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
+    rows.append([InlineKeyboardButton(text="💳 Мои платежи", callback_data="mypayments")])
+    if allowed(user_id):
+        rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def user_payments_keyboard(payments: list[SubscriptionPayment]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for p in payments[:5]:
+        if p.status == "pending":
+            if p.pay_url:
+                rows.append([InlineKeyboardButton(text=f"💳 Открыть счёт #{p.id}", url=p.pay_url)])
+            rows.append([InlineKeyboardButton(text=f"✅ Проверить счёт #{p.id}", callback_data=f"paycheck:{p.id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Подписка", callback_data="subscription")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 
 def payment_provider_keyboard(plan_key: str) -> InlineKeyboardMarkup:
@@ -3807,10 +4022,22 @@ def admin_user_keyboard(user: BotUser) -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="+3 дня", callback_data=f"admingrant:{user.user_id}:3")],
         [InlineKeyboardButton(text="+7 дней", callback_data=f"admingrant:{user.user_id}:7"),
          InlineKeyboardButton(text="+30 дней", callback_data=f"admingrant:{user.user_id}:30")],
+        [InlineKeyboardButton(text="➕ Свой срок", callback_data=f"admincustom:{user.user_id}")],
+        [InlineKeyboardButton(text="💳 Платежи", callback_data=f"adminuserpayments:{user.user_id}"),
+         InlineKeyboardButton(text="📊 Сканы", callback_data=f"adminuserscans:{user.user_id}")],
+        [InlineKeyboardButton(text="⚠️ Ошибки", callback_data=f"adminusererrors:{user.user_id}")],
         [InlineKeyboardButton(text="🗑 Забрать доступ", callback_data=f"adminrevoke:{user.user_id}"),
          InlineKeyboardButton(text=ban_label, callback_data=f"adminban:{user.user_id}")],
         [InlineKeyboardButton(text="⬅️ Пользователи", callback_data="adminusers")],
     ])
+
+
+def admin_user_back_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К пользователю", callback_data=f"adminuser:{user_id}")],
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="adminusers")],
+    ])
+
 
 
 def admin_plans_keyboard(plans: list[SubscriptionPlan]) -> InlineKeyboardMarkup:
@@ -3845,7 +4072,19 @@ async def render_admin_user(user_id: int) -> tuple[str, InlineKeyboardMarkup] | 
         paid = (await session.execute(select(func.count(SubscriptionPayment.id)).where(
             SubscriptionPayment.user_id == user.user_id, SubscriptionPayment.status == "paid"
         ))).scalar_one()
+        pending = (await session.execute(select(func.count(SubscriptionPayment.id)).where(
+            SubscriptionPayment.user_id == user.user_id, SubscriptionPayment.status == "pending"
+        ))).scalar_one()
+        errors = (await session.execute(select(func.count(ParserRun.id)).where(
+            ParserRun.user_id == user.user_id, ParserRun.success.is_(False)
+        ))).scalar_one()
+        last_scan = (await session.execute(
+            select(UserScan).where(UserScan.user_id == user.user_id).order_by(UserScan.created_at.desc()).limit(1)
+        )).scalar_one_or_none()
     name = f"@{html.escape(user.username)}" if user.username else html.escape(user.first_name or "без username")
+    scan_line = "—"
+    if last_scan is not None:
+        scan_line = f"{_date_label(last_scan.target_date)} · {last_scan.status} · {last_scan.result_count} результатов"
     text = (
         f"<b>👤 Пользователь</b>\n\n"
         f"{name}\n"
@@ -3855,7 +4094,9 @@ async def render_admin_user(user_id: int) -> tuple[str, InlineKeyboardMarkup] | 
         f"Первый вход: <b>{_utc_to_msk_text(user.joined_at)} МСК</b>\n"
         f"Последняя активность: <b>{_utc_to_msk_text(user.last_seen_at)} МСК</b>\n\n"
         f"📊 Сканов: <b>{int(scans or 0)}</b>\n"
-        f"💳 Оплат: <b>{int(paid or 0)}</b>\n"
+        f"Последний: <b>{html.escape(scan_line)}</b>\n"
+        f"⚠️ Ошибок парсера: <b>{int(errors or 0)}</b>\n"
+        f"💳 Оплат: <b>{int(paid or 0)}</b> · ожидают: <b>{int(pending or 0)}</b>\n"
         f"💰 Оплачено всего: <b>{float(user.paid_total_usdt or 0):g} USDT</b>"
     )
     return text, admin_user_keyboard(user)
@@ -3904,7 +4145,7 @@ class ActivityAccessMiddleware(BaseMiddleware):
 
         if isinstance(event, CallbackQuery):
             callback_data = event.data or ""
-            public_prefixes = ("buyplan:", "payprovider:", "paycheck:")
+            public_prefixes = ("buyplan:", "payprovider:", "paycheck:", "mypayments")
             if callback_data == "subscription" or callback_data.startswith(public_prefixes):
                 return await handler(event, data)
             if is_banned_cached(uid):
@@ -3969,6 +4210,27 @@ async def subscription_handler(callback: CallbackQuery, state: FSMContext) -> No
         await subscription_text(callback.from_user.id),
         reply_markup=await subscription_keyboard(callback.from_user.id),
     )
+
+
+@dp.callback_query(F.data == "mypayments")
+async def my_payments_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    payments = await user_payments(callback.from_user.id, 15)
+    lines = ["<b>💳 Мои платежи</b>", ""]
+    if not payments:
+        lines.append("Платежей пока нет.")
+    else:
+        for p in payments[:10]:
+            plan = await get_plan(p.plan_key)
+            title = plan.title if plan else p.plan_key
+            date_text = _utc_to_msk_text(p.paid_at or p.created_at)
+            lines.append(
+                f"{_payment_status_label(p.status)} · <b>{html.escape(title)}</b> · "
+                f"{p.amount_usdt:g} USDT · {_provider_label(p.provider)}\n"
+                f"#{p.id} · {date_text} МСК"
+            )
+    await callback.answer()
+    await _edit_or_answer(callback.message, "\n\n".join(lines), reply_markup=user_payments_keyboard(payments))
 
 
 @dp.callback_query(F.data.startswith("buyplan:"))
@@ -4068,11 +4330,14 @@ async def check_payment_handler(callback: CallbackQuery) -> None:
         ])
         await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=markup)
         return
-    if refreshed.status == "expired":
+    if refreshed.status in {"expired", "failed", "cancelled"}:
+        title = "⌛ <b>Срок счёта истёк.</b>" if refreshed.status == "expired" else "❌ <b>Этот счёт нельзя подтвердить.</b>"
         await callback.message.answer(
-            "⌛ <b>Срок счёта истёк.</b> Создай новый счёт в разделе подписки.",
+            title + " Создай новый счёт — старый повторно использовать не нужно.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Создать новый счёт", callback_data=f"buyplan:{refreshed.plan_key}")],
+                [InlineKeyboardButton(text="💳 Мои платежи", callback_data="mypayments")],
                 [InlineKeyboardButton(text="💎 Подписка", callback_data="subscription")]
             ]),
         )
@@ -4080,6 +4345,10 @@ async def check_payment_handler(callback: CallbackQuery) -> None:
     await callback.message.answer(
         "⏳ <b>Оплата пока не подтверждена.</b>\nЕсли ты только что оплатил, подожди несколько секунд — бот проверяет счета автоматически.",
         parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Проверить ещё раз", callback_data=f"paycheck:{refreshed.id}")],
+            [InlineKeyboardButton(text="💳 Мои платежи", callback_data="mypayments")],
+        ]),
     )
 
 
@@ -4169,6 +4438,136 @@ async def admin_user_handler(callback: CallbackQuery) -> None:
         return
     await callback.answer()
     await _edit_or_answer(callback.message, rendered[0], reply_markup=rendered[1])
+
+
+@dp.callback_query(F.data.startswith("admincustom:"))
+async def admin_custom_days_begin(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        uid = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+    await state.set_state(AdminInput.custom_days)
+    await state.update_data(admin_target_user=uid)
+    await callback.answer()
+    await callback.message.answer(
+        f"➕ Сколько дней добавить пользователю <code>{uid}</code>?\n\nОтправь число от <b>1</b> до <b>3650</b>.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_user_back_keyboard(uid),
+    )
+
+
+@dp.message(AdminInput.custom_days)
+async def admin_custom_days_message(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    uid = int(data.get("admin_target_user") or 0)
+    try:
+        days = int((message.text or "").strip())
+        if days < 1 or days > 3650:
+            raise ValueError
+    except Exception:
+        await message.answer("⚠️ Отправь целое число от 1 до 3650.")
+        return
+    until = await grant_access_days(uid, days)
+    await state.clear()
+    try:
+        await message.bot.send_message(
+            uid,
+            f"✅ <b>Доступ продлён на {days} дн.</b>\nАктивен до <b>{_utc_to_msk_text(until)} МСК</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+    rendered = await render_admin_user(uid)
+    if rendered:
+        await message.answer(rendered[0], parse_mode=ParseMode.HTML, reply_markup=rendered[1])
+
+
+@dp.callback_query(F.data.startswith("adminuserpayments:"))
+async def admin_user_payments_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    payments = await user_payments(uid, 20)
+    lines = [f"<b>💳 Платежи пользователя</b>", f"ID: <code>{uid}</code>", ""]
+    if not payments:
+        lines.append("Платежей нет.")
+    else:
+        for p in payments[:15]:
+            plan = await get_plan(p.plan_key)
+            title = plan.title if plan else p.plan_key
+            when = _utc_to_msk_text(p.paid_at or p.created_at)
+            lines.append(
+                f"{_payment_status_label(p.status)} · <b>{html.escape(title)}</b> · "
+                f"{p.amount_usdt:g} USDT · {_provider_label(p.provider)} · {when}"
+            )
+    await callback.answer()
+    await _edit_or_answer(callback.message, "\n".join(lines), reply_markup=admin_user_back_keyboard(uid))
+
+
+@dp.callback_query(F.data.startswith("adminuserscans:"))
+async def admin_user_scans_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    async with SessionLocal() as session:
+        scans = list((await session.execute(
+            select(UserScan).where(UserScan.user_id == uid).order_by(UserScan.created_at.desc()).limit(12)
+        )).scalars().all())
+    lines = ["<b>📊 Последние сканы пользователя</b>", f"ID: <code>{uid}</code>", ""]
+    if not scans:
+        lines.append("Сканов нет.")
+    else:
+        for scan in scans:
+            icon = {"done": "✅", "partial": "⚠️", "failed": "❌", "cancelled": "⏹", "running": "🔄", "queued": "⏳"}.get(scan.status, "▫️")
+            recovered = f" · ♻️{scan.resumed_count}" if int(scan.resumed_count or 0) else ""
+            lines.append(
+                f"{icon} <b>#{scan.id}</b> · {_date_label(scan.target_date)} · {html.escape(scan.title[:45])}\n"
+                f"результат: {scan.result_count} · качество: {scan.quality_score}/100{recovered}"
+            )
+    await callback.answer()
+    await _edit_or_answer(callback.message, "\n\n".join(lines), reply_markup=admin_user_back_keyboard(uid))
+
+
+@dp.callback_query(F.data.startswith("adminusererrors:"))
+async def admin_user_errors_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    async with SessionLocal() as session:
+        runs = list((await session.execute(
+            select(ParserRun)
+            .where(ParserRun.user_id == uid, ParserRun.success.is_(False))
+            .order_by(ParserRun.started_at.desc())
+            .limit(8)
+        )).scalars().all())
+        scan_errors = list((await session.execute(
+            select(UserScan)
+            .where(UserScan.user_id == uid, UserScan.last_error.is_not(None))
+            .order_by(UserScan.created_at.desc())
+            .limit(5)
+        )).scalars().all())
+    lines = ["<b>⚠️ Последние ошибки</b>", f"ID: <code>{uid}</code>", ""]
+    if not runs and not scan_errors:
+        lines.append("Ошибок не зафиксировано.")
+    for scan in scan_errors:
+        lines.append(f"Скан #{scan.id}: <code>{html.escape((scan.last_error or '')[:220])}</code>")
+    for run in runs:
+        lines.append(
+            f"{_utc_to_msk_text(run.started_at)} · {html.escape(run.category_name[:40])}\n"
+            f"<code>{html.escape((run.error_text or run.stop_reason or 'ошибка')[:220])}</code>"
+        )
+    await callback.answer()
+    await _edit_or_answer(callback.message, "\n\n".join(lines), reply_markup=admin_user_back_keyboard(uid))
 
 
 @dp.callback_query(F.data.startswith("admingrant:"))
@@ -4444,6 +4843,55 @@ async def payment_scheduler(bot: Bot) -> None:
         await asyncio.sleep(PAYMENT_POLL_SECONDS)
 
 
+async def subscription_lifecycle_scheduler(bot: Bot) -> None:
+    """Notify users once 24h before expiry and once right after expiry."""
+    while True:
+        try:
+            warnings, expired = await subscription_notice_candidates(100)
+            for user in warnings:
+                until = user.access_until
+                if until is None:
+                    continue
+                try:
+                    await bot.send_message(
+                        user.user_id,
+                        "⏳ <b>Подписка закончится меньше чем через 24 часа.</b>\n\n"
+                        f"Доступ до <b>{_utc_to_msk_text(until)} МСК</b>. Продлить можно заранее — дни прибавятся к текущему сроку.",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🔄 Продлить подписку", callback_data="subscription")]
+                        ]),
+                    )
+                    await mark_subscription_notice(user.user_id, until, "warning")
+                except Exception:
+                    log.debug("Could not send subscription warning user=%s", user.user_id, exc_info=True)
+
+            for user in expired:
+                until = user.access_until
+                if until is None:
+                    continue
+                try:
+                    await bot.send_message(
+                        user.user_id,
+                        "⌛ <b>Подписка закончилась.</b>\n\n"
+                        "Сохранённые сканы и история не удалены. Продли доступ, чтобы снова запускать парсер и обновлять данные.",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="💎 Продлить доступ", callback_data="subscription")]
+                        ]),
+                    )
+                    await mark_subscription_notice(user.user_id, until, "expired")
+                except Exception:
+                    log.debug("Could not send subscription expiry user=%s", user.user_id, exc_info=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Subscription lifecycle scheduler failed")
+        await asyncio.sleep(SUBSCRIPTION_NOTICE_POLL_SECONDS)
+
+
+
+
 
 async def setup_bot_commands(bot: Bot) -> None:
     """Configure Telegram's bottom-left Menu button and command list."""
@@ -4475,6 +4923,61 @@ async def setup_bot_commands(bot: Bot) -> None:
     # Force Telegram to render the standard Commands menu button instead of
     # requiring users to type slash commands manually.
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+
+
+def onboarding_keyboard(step: int) -> InlineKeyboardMarkup:
+    if step == 1:
+        rows = [
+            [InlineKeyboardButton(text="➡️ Как пользоваться", callback_data="onboard:2")],
+            [InlineKeyboardButton(text="Пропустить", callback_data="onboard:skip")],
+        ]
+    elif step == 2:
+        rows = [
+            [InlineKeyboardButton(text="➡️ Что будет после скана", callback_data="onboard:3")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="onboard:1")],
+        ]
+    else:
+        rows = [
+            [InlineKeyboardButton(text="🗂 Выбрать категории", callback_data="onboard:categories")],
+            [InlineKeyboardButton(text="🏠 Открыть главное меню", callback_data="onboard:finish")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="onboard:2")],
+        ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def onboarding_text(step: int) -> str:
+    if step == 1:
+        return (
+            f"<b>👋 Kleinanzeigen Parser v{APP_VERSION}</b>\n\n"
+            "Бот помогает найти товары, которые реально привлекают внимание на Kleinanzeigen, "
+            "и затем автоматически измеряет рост просмотров.\n\n"
+            "Настройка первого запуска занимает меньше минуты."
+        )
+    if step == 2:
+        return (
+            "<b>1/2 · Как запустить первый скан</b>\n\n"
+            "1. 🗂 Выбери одну или несколько категорий.\n"
+            "2. ⚙️ При необходимости задай цену, уникальность и слова-фильтры.\n"
+            "3. ▶️ Нажми «Запустить парсер», выбери дату и глубину 25 / 50 / 100 страниц.\n\n"
+            "Во время работы парсер можно полностью остановить кнопкой ⏹."
+        )
+    return (
+        "<b>2/2 · Что будет после скана</b>\n\n"
+        "📊 Скан сохранится в «Мои сканы».\n"
+        "👁 Бот сделает автозамеры через 3 / 6 / 12 часов.\n"
+        "🔥 В «Популярное сейчас» появятся лидеры по просмотрам и росту.\n"
+        "📦 Через 24 часа карточка уйдёт в Архив, но данные не удалятся.\n\n"
+        "Готово — можно выбирать категории."
+    )
+
+
+async def _show_onboarding(message: Message, user_id: int, step: int = 1) -> None:
+    step = max(1, min(3, int(step)))
+    await message.answer(
+        onboarding_text(step),
+        parse_mode=ParseMode.HTML,
+        reply_markup=onboarding_keyboard(step),
+    )
 
 
 async def _send_home_message(message: Message, user_id: int, *, intro: bool = False) -> None:
@@ -4564,12 +5067,50 @@ async def _begin_scan_from_message(message: Message, state: FSMContext) -> None:
     )
 
 
+@dp.callback_query(F.data.startswith("onboard:"))
+async def onboarding_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not allowed(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    action = callback.data.split(":", 1)[1]
+    if action in {"1", "2", "3"}:
+        await callback.answer()
+        await _edit_or_answer(callback.message, onboarding_text(int(action)), reply_markup=onboarding_keyboard(int(action)))
+        return
+    if action in {"finish", "skip"}:
+        await set_onboarding_completed(callback.from_user.id, True)
+        await callback.answer("Готово")
+        selected = await get_selected(callback.from_user.id)
+        await _edit_or_answer(
+            callback.message,
+            f"<b>🔍 Kleinanzeigen Parser v{APP_VERSION}</b>\n\nВсё готово. Что хочешь сделать?",
+            reply_markup=main_keyboard(len(selected)),
+        )
+        return
+    if action == "categories":
+        await set_onboarding_completed(callback.from_user.id, True)
+        selected = await get_selected(callback.from_user.id)
+        await callback.answer()
+        await _edit_or_answer(
+            callback.message,
+            "<b>🗂 Выбери категории</b>\n\nОтметь товары, которые хочешь анализировать. Потом вернись и запускай первый скан.",
+            reply_markup=groups_keyboard(selected),
+        )
+        return
+    await callback.answer("Неизвестное действие", show_alert=True)
+
+
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await touch_user(message.from_user, force=True)
     if not allowed(message.from_user.id):
         await send_access_screen(message, message.from_user.id)
+        return
+    user = await get_commerce_user(message.from_user.id)
+    if user is not None and not bool(user.onboarding_completed):
+        await _show_onboarding(message, message.from_user.id, 1)
         return
     await _send_home_message(message, message.from_user.id, intro=True)
 
@@ -4648,7 +5189,10 @@ async def help_command(message: Message, state: FSMContext) -> None:
         "💎 Подписка — статус и тарифы\n"
         "📦 Текущий результат — скачать текущую выборку",
         parse_mode=ParseMode.HTML,
-        reply_markup=main_keyboard(len(selected)),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎓 Показать обучение", callback_data="onboard:1")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")],
+        ]),
     )
 
 
@@ -4657,8 +5201,12 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     if not allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
-    selected = await get_selected(callback.from_user.id)
+    user = await get_commerce_user(callback.from_user.id)
     await callback.answer()
+    if user is not None and not bool(user.onboarding_completed):
+        await _edit_or_answer(callback.message, onboarding_text(1), reply_markup=onboarding_keyboard(1))
+        return
+    selected = await get_selected(callback.from_user.id)
     await callback.message.edit_text(f"<b>🔍 Kleinanzeigen Parser v{APP_VERSION}</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
 
 
@@ -5225,7 +5773,8 @@ async def render_scan_detail(scan: UserScan) -> str:
         "partial": "⚠️ Частичный результат",
         "running": "🔄 Выполняется",
         "queued": "⏳ Ожидает",
-        "cancelled": "❌ Отменён",
+        "cancelling": "⏹ Останавливается",
+        "cancelled": "⏹ Остановлен",
         "failed": "❌ Ошибка",
     }.get(scan.status, scan.status)
 
@@ -5851,18 +6400,31 @@ async def queue_status(callback: CallbackQuery) -> None:
 
 
 async def request_user_scan_stop(user_id: int, job_id: str | None = None) -> tuple[ScanJob | None, str]:
-    """Set the hard-stop signal used by both the button and /stop command."""
+    """Set and persist the hard-stop signal used by both the button and /stop."""
+    scan_id: int | None = None
     async with job_guard:
         job = active_jobs.get(user_id)
         if job is None or (job_id is not None and job.job_id != job_id):
             return None, "missing"
         if job.state not in {"queued", "running"}:
             return None, "finished"
+        previous = job.state
         job.cancel_requested = True
         job.stop_event.set()
+        scan_id = job.scan_id
         if job.job_id in queued_job_ids:
             queued_job_ids.remove(job.job_id)
-        return job, job.state
+
+    # Persist intent immediately. If Railway restarts before finish_job(), startup
+    # recovery sees 'cancelling' and finalizes it as cancelled instead of resuming.
+    if scan_id is not None:
+        async with SessionLocal() as session:
+            scan = await session.get(UserScan, int(scan_id))
+            if scan is not None and scan.status in {"queued", "running"}:
+                scan.status = "cancelling"
+                scan.last_error = "Остановка запрошена пользователем"
+                await session.commit()
+    return job, previous
 
 
 @dp.message(Command("stop"))
@@ -6061,29 +6623,36 @@ async def start_scan_with_pages(callback: CallbackQuery, state: FSMContext) -> N
 
 
 async def main() -> None:
-    if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN is not set")
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set")
     await init_db()
     await initialize_commerce()
     backfilled = await backfill_product_identities()
     if backfilled:
         log.info("v3.0 product identity backfill: %s listings", backfilled)
     obsolete_observations = await cleanup_obsolete_observation_plans()
-    recovered = await recover_running_observations()
+    recovered_observations = await recover_running_observations()
     planned = await backfill_recent_observation_plans()
     archived = await archive_expired_scans()
-    if recovered or planned or obsolete_observations:
+    if recovered_observations or planned or obsolete_observations:
         log.info(
-            "v3.2.8 observations: removed_old=%s recovered=%s recent_scans_planned=%s",
-            obsolete_observations, recovered, planned,
+            "v3.3.0 observations: removed_old=%s recovered=%s recent_scans_planned=%s",
+            obsolete_observations, recovered_observations, planned,
         )
     if archived:
-        log.info("v3.2.8 initial scan archive: %s moved", archived)
+        log.info("v3.3.0 initial scan archive: %s moved", archived)
+
     bot = Bot(BOT_TOKEN)
     try:
         await setup_bot_commands(bot)
     except Exception:
         # A Telegram menu configuration error must never keep the parser offline.
         log.exception("Could not configure Telegram command menu")
+
+    recovered_scans = await recover_interrupted_user_scans(bot)
+    if recovered_scans:
+        log.warning("v3.3.0 recovered %s unfinished user scan(s) after restart", recovered_scans)
+
     me = await bot.get_me()
     traffic = await TRAFFIC.snapshot()
     log.info(
@@ -6099,6 +6668,9 @@ async def main() -> None:
     ]
     ticker_task = asyncio.create_task(progress_ticker(bot), name="user-progress-ticker")
     payment_task = asyncio.create_task(payment_scheduler(bot), name="payment-scheduler")
+    subscription_task = asyncio.create_task(
+        subscription_lifecycle_scheduler(bot), name="subscription-lifecycle-scheduler"
+    )
     archive_task = asyncio.create_task(scan_archive_scheduler(), name="scan-archive-scheduler")
     observation_tasks = [
         asyncio.create_task(observation_scheduler(bot, i), name=f"view-observation-worker-{i}")
@@ -6109,12 +6681,16 @@ async def main() -> None:
     finally:
         ticker_task.cancel()
         payment_task.cancel()
+        subscription_task.cancel()
         archive_task.cancel()
         for task in observation_tasks:
             task.cancel()
         for task in worker_tasks:
             task.cancel()
-        await asyncio.gather(ticker_task, payment_task, archive_task, *observation_tasks, *worker_tasks, return_exceptions=True)
+        await asyncio.gather(
+            ticker_task, payment_task, subscription_task, archive_task,
+            *observation_tasks, *worker_tasks, return_exceptions=True,
+        )
         async with category_inflight_guard:
             inflight = list(category_inflight.values())
         for task in inflight:
