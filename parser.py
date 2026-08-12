@@ -1720,7 +1720,7 @@ class KleinanzeigenParser:
         listings. Browser fallback remains available for explicit one-off diagnostics
         by passing ``browser_fallback=True`` and ``direct_http_only=False``.
 
-        Requests are processed in small batches so background 1/3/6/12/24-hour
+        Requests are processed in small batches so background 3/6/12-hour
         checkpoints do not create a burst that competes with interactive scans.
         """
         if not urls:

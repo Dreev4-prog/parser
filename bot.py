@@ -26,7 +26,7 @@ from aiogram.types import (
     BotCommand, BotCommandScopeChat, BotCommandScopeDefault, CallbackQuery, FSInputFile,
     InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, Message,
 )
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -76,7 +76,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "3.2.7"
+APP_VERSION = "3.2.8"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
@@ -95,16 +95,25 @@ VIEW_COUNT_CACHE_TTL_SECONDS = max(60, int(os.getenv("VIEW_COUNT_CACHE_TTL_SECON
 VIEW_COUNT_CONCURRENCY = max(1, min(10, int(os.getenv("VIEW_COUNT_CONCURRENCY", "3"))))
 # A control measurement must be fresh. This tiny window is only for coalescing
 # truly simultaneous checks of the same IDs across users/scans; it is not a
-# normal cache and cannot replace a 1/3/6/12/24h measurement.
+# normal cache and cannot replace a 3/6/12h measurement.
 VIEW_MEASUREMENT_REUSE_SECONDS = max(0, min(60, int(os.getenv("VIEW_MEASUREMENT_REUSE_SECONDS", "20"))))
 VIEW_COUNT_EXPORT_MODES = {"newest", "all", "unique", "below_market"}
 
 # v3.1 keeps the v3.0.7 Popularity Tracker. Every completed scan gets automatic public-view
 # checkpoints. They are persisted, so a Railway restart does not lose the plan.
-OBSERVATION_HOURS = (1, 3, 6, 12, 24)
+OBSERVATION_HOURS = (3, 6, 12)
 OBSERVATION_POLL_SECONDS = max(15, int(os.getenv("OBSERVATION_POLL_SECONDS", "30")))
 OBSERVATION_CONCURRENCY = max(1, min(4, int(os.getenv("OBSERVATION_CONCURRENCY", "1"))))
 OBSERVATION_LATE_GRACE_MINUTES = max(5, int(os.getenv("OBSERVATION_LATE_GRACE_MINUTES", "45")))
+
+# v3.2.8 My Scans inbox. Completed scans stay in the main list for 24 hours,
+# then only their UI card is archived. Underlying scan/listing/history data remains
+# intact for Popular Now, exports and future analytics.
+SCAN_ARCHIVE_AFTER_HOURS = 24
+SCAN_ARCHIVE_PAGE_SIZE = 8
+SCAN_ARCHIVE_SWEEP_SECONDS = 15 * 60
+ARCHIVABLE_SCAN_STATUSES = ("done", "partial", "cancelled", "failed")
+
 GROWTH_TOP_LIMIT = 50
 GROWTH_TELEGRAM_LIMIT = 10
 
@@ -219,7 +228,7 @@ def post_scan_keyboard(scan_id: int | None = None) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="👁 Обновить просмотры", callback_data=f"scanviews:{scan_id}")])
         rows.append([
             InlineKeyboardButton(text="🔥 Топ просмотров", callback_data=f"scantop:{scan_id}"),
-            InlineKeyboardButton(text="🚀 Топ роста", callback_data=f"scangrowth:{scan_id}:1"),
+            InlineKeyboardButton(text="🚀 Топ роста", callback_data=f"scangrowth:{scan_id}:3"),
         ])
         rows.append([InlineKeyboardButton(text="🔄 Повторить скан", callback_data=f"scanrepeat:{scan_id}")])
     else:
@@ -228,21 +237,23 @@ def post_scan_keyboard(scan_id: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def scan_detail_keyboard(scan_id: int) -> InlineKeyboardMarkup:
-    """User-facing scan actions: only the actions that matter for everyday use."""
+def scan_detail_keyboard(scan_id: int, *, archived: bool = False) -> InlineKeyboardMarkup:
+    """User-facing scan actions with context-aware back navigation."""
+    back_text = "⬅️ Архив" if archived else "⬅️ Мои сканы"
+    back_callback = "scan_archive:0" if archived else "my_scans"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👁 Обновить просмотры", callback_data=f"scanviews:{scan_id}")],
         [InlineKeyboardButton(text="🔥 Топ просмотров", callback_data=f"scantop:{scan_id}"),
-         InlineKeyboardButton(text="🚀 Топ роста", callback_data=f"scangrowth:{scan_id}:1")],
+         InlineKeyboardButton(text="🚀 Топ роста", callback_data=f"scangrowth:{scan_id}:3")],
         [InlineKeyboardButton(text="🔄 Повторить скан", callback_data=f"scanrepeat:{scan_id}"),
          InlineKeyboardButton(text="🕘 История", callback_data=f"scanhistory:{scan_id}")],
         [InlineKeyboardButton(text="📄 Скачать результат", callback_data=f"scanexport:{scan_id}")],
-        [InlineKeyboardButton(text="⬅️ Мои сканы", callback_data="my_scans"),
+        [InlineKeyboardButton(text=back_text, callback_data=back_callback),
          InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
     ])
 
 
-def growth_period_keyboard(scan_id: int, active_hours: int = 1, category_key: str | None = None) -> InlineKeyboardMarkup:
+def growth_period_keyboard(scan_id: int, active_hours: int = 3, category_key: str | None = None) -> InlineKeyboardMarkup:
     prefix = f"pcg:{scan_id}:{category_key}:" if category_key else f"scangrowth:{scan_id}:"
     export_prefix = f"pce:{scan_id}:{category_key}:" if category_key else f"scangrowthexport:{scan_id}:"
     def b(hours: int) -> InlineKeyboardButton:
@@ -253,8 +264,7 @@ def growth_period_keyboard(scan_id: int, active_hours: int = 1, category_key: st
 
     back_callback = f"popularcat:{category_key}" if category_key else f"scan:{scan_id}"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [b(1), b(3), b(6)],
-        [b(12), b(24)],
+        [b(3), b(6), b(12)],
         [InlineKeyboardButton(text="📊 Скачать TOP-50", callback_data=f"{export_prefix}{active_hours}")],
         [InlineKeyboardButton(
             text="👁 Обновить последний скан" if category_key else "👁 Обновить сейчас",
@@ -279,11 +289,9 @@ def popular_categories_keyboard(items: list[tuple[str, UserScan]]) -> InlineKeyb
 def popular_category_keyboard(scan_id: int, category_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👁 Самые просматриваемые · все сканы", callback_data=f"pcv:{scan_id}:{category_key}")],
-        [InlineKeyboardButton(text="🚀 TOP 1ч", callback_data=f"pcg:{scan_id}:{category_key}:1"),
-         InlineKeyboardButton(text="🚀 TOP 3ч", callback_data=f"pcg:{scan_id}:{category_key}:3")],
-        [InlineKeyboardButton(text="🔥 TOP 6ч", callback_data=f"pcg:{scan_id}:{category_key}:6"),
-         InlineKeyboardButton(text="🔥 TOP 12ч", callback_data=f"pcg:{scan_id}:{category_key}:12")],
-        [InlineKeyboardButton(text="📈 TOP 24ч", callback_data=f"pcg:{scan_id}:{category_key}:24")],
+        [InlineKeyboardButton(text="🚀 TOP 3ч", callback_data=f"pcg:{scan_id}:{category_key}:3"),
+         InlineKeyboardButton(text="🔥 TOP 6ч", callback_data=f"pcg:{scan_id}:{category_key}:6")],
+        [InlineKeyboardButton(text="🔥 TOP 12ч", callback_data=f"pcg:{scan_id}:{category_key}:12")],
         [InlineKeyboardButton(text="⬅️ Категории", callback_data="popular_now"),
          InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
     ])
@@ -486,12 +494,83 @@ async def get_user_scan(user_id: int, scan_id: int) -> UserScan | None:
         return result.scalar_one_or_none()
 
 
+async def archive_expired_scans(user_id: int | None = None) -> int:
+    """Archive completed scan cards 24h after completion without deleting data."""
+    now = datetime.utcnow()
+    cutoff = now - timedelta(hours=SCAN_ARCHIVE_AFTER_HOURS)
+    conditions = [
+        UserScan.archived_at.is_(None),
+        UserScan.status.in_(ARCHIVABLE_SCAN_STATUSES),
+        func.coalesce(UserScan.finished_at, UserScan.created_at) <= cutoff,
+    ]
+    if user_id is not None:
+        conditions.append(UserScan.user_id == user_id)
+    async with db_write_lock:
+        async with SessionLocal() as session:
+            result = await session.execute(
+                update(UserScan).where(*conditions).values(archived_at=now)
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
+
+
+async def archive_active_finished_scans(user_id: int) -> int:
+    """Manual inbox cleanup: archive every finished visible scan immediately."""
+    now = datetime.utcnow()
+    async with db_write_lock:
+        async with SessionLocal() as session:
+            result = await session.execute(
+                update(UserScan)
+                .where(
+                    UserScan.user_id == user_id,
+                    UserScan.archived_at.is_(None),
+                    UserScan.status.in_(ARCHIVABLE_SCAN_STATUSES),
+                )
+                .values(archived_at=now)
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
+
+
 async def get_user_scans(user_id: int, limit: int = 10) -> list[UserScan]:
+    await archive_expired_scans(user_id)
     async with SessionLocal() as session:
         result = await session.execute(
-            select(UserScan).where(UserScan.user_id == user_id).order_by(UserScan.created_at.desc()).limit(limit)
+            select(UserScan)
+            .where(UserScan.user_id == user_id, UserScan.archived_at.is_(None))
+            .order_by(UserScan.created_at.desc())
+            .limit(limit)
         )
         return list(result.scalars().all())
+
+
+async def get_user_archive(user_id: int, page: int = 0, page_size: int = SCAN_ARCHIVE_PAGE_SIZE) -> tuple[list[UserScan], int]:
+    await archive_expired_scans(user_id)
+    page = max(0, int(page))
+    async with SessionLocal() as session:
+        total = int((await session.execute(
+            select(func.count(UserScan.id)).where(
+                UserScan.user_id == user_id, UserScan.archived_at.is_not(None)
+            )
+        )).scalar_one())
+        result = await session.execute(
+            select(UserScan)
+            .where(UserScan.user_id == user_id, UserScan.archived_at.is_not(None))
+            .order_by(UserScan.archived_at.desc(), UserScan.created_at.desc())
+            .offset(page * page_size)
+            .limit(page_size)
+        )
+        return list(result.scalars().all()), total
+
+
+async def get_archive_count(user_id: int) -> int:
+    await archive_expired_scans(user_id)
+    async with SessionLocal() as session:
+        return int((await session.execute(
+            select(func.count(UserScan.id)).where(
+                UserScan.user_id == user_id, UserScan.archived_at.is_not(None)
+            )
+        )).scalar_one())
 
 
 async def get_user_popular_categories(user_id: int, limit_scans: int = 100) -> list[tuple[str, UserScan]]:
@@ -594,15 +673,27 @@ async def get_scan_rows(scan_id: int) -> list[tuple[Listing, ScanListing]]:
 
 
 async def ensure_scan_observation_plan(scan_id: int, finished_at: datetime | None = None) -> None:
-    """Create the +1/+3/+6/+12/+24h plan once; safe to call after restarts."""
+    """Create the +3/+6/+12h plan once; safe to call after restarts."""
     async with db_write_lock:
         async with SessionLocal() as session:
             scan = await session.get(UserScan, scan_id)
             if scan is None or scan.status not in {"done", "partial"}:
                 return
             base = finished_at or scan.finished_at or scan.created_at
+            # Drop obsolete unfinished +1h/+24h checkpoints left by older versions.
+            # Completed history remains available, but it is no longer scheduled or shown.
+            await session.execute(
+                delete(ScanObservation).where(
+                    ScanObservation.scan_id == scan_id,
+                    ScanObservation.target_hours.notin_(OBSERVATION_HOURS),
+                    ScanObservation.status.in_(["pending", "error", "missed"]),
+                )
+            )
             existing = await session.execute(
-                select(ScanObservation.target_hours).where(ScanObservation.scan_id == scan_id)
+                select(ScanObservation.target_hours).where(
+                    ScanObservation.scan_id == scan_id,
+                    ScanObservation.target_hours.in_(OBSERVATION_HOURS),
+                )
             )
             have = {int(x) for x in existing.scalars().all()}
             for hours in OBSERVATION_HOURS:
@@ -625,6 +716,20 @@ async def get_scan_observation_statuses(scan_id: int) -> dict[int, str]:
             .order_by(ScanObservation.target_hours)
         )
         return {int(hours): status for hours, status in result.all()}
+
+
+async def cleanup_obsolete_observation_plans() -> int:
+    """Remove unfinished +1h/+24h jobs created by pre-v3.2.8 versions."""
+    async with db_write_lock:
+        async with SessionLocal() as session:
+            result = await session.execute(
+                delete(ScanObservation).where(
+                    ScanObservation.target_hours.notin_(OBSERVATION_HOURS),
+                    ScanObservation.status != "done",
+                )
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
 
 
 async def backfill_recent_observation_plans() -> int:
@@ -867,7 +972,7 @@ async def get_scan_growth_rows(
     the initial scan snapshot. Otherwise fall back to the closest manual history
     so old scans remain useful.
     """
-    period_hours = period_hours if period_hours in set(OBSERVATION_HOURS) else 1
+    period_hours = period_hours if period_hours in set(OBSERVATION_HOURS) else 3
     pairs = await get_scan_rows(scan_id)
     if category_key:
         pairs = [p for p in pairs if p[0].category_key == category_key]
@@ -997,19 +1102,44 @@ async def get_category_growth_rows(
     return values[:GROWTH_TOP_LIMIT], len(scans), total_rounds
 
 
-def my_scans_keyboard(scans: list[UserScan]) -> InlineKeyboardMarkup:
-    rows = []
-    for scan in scans[:8]:
-        icon = (
-            "✅" if scan.status == "done"
-            else "⚠️" if scan.status == "partial"
-            else "⏳" if scan.status in {"queued", "running"}
-            else "⚪️"
-        )
-        target_label = _date_label(scan.target_date) if scan.target_date else _moscow_text(scan.finished_at or scan.created_at)[:10]
-        label = f"{icon} {scan.title[:22]} · {target_label[:5]}"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"scan:{scan.id}")])
+def _scan_list_button(scan: UserScan) -> InlineKeyboardButton:
+    icon = (
+        "✅" if scan.status == "done"
+        else "⚠️" if scan.status == "partial"
+        else "⏳" if scan.status in {"queued", "running"}
+        else "⚪️"
+    )
+    target_label = _date_label(scan.target_date) if scan.target_date else _moscow_text(scan.finished_at or scan.created_at)[:10]
+    label = f"{icon} {scan.title[:22]} · {target_label[:5]}"
+    return InlineKeyboardButton(text=label, callback_data=f"scan:{scan.id}")
+
+
+def my_scans_keyboard(scans: list[UserScan], archive_count: int = 0) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for scan in scans[:SCAN_ARCHIVE_PAGE_SIZE]:
+        rows.append([_scan_list_button(scan)])
+    if any(scan.status in ARCHIVABLE_SCAN_STATUSES for scan in scans):
+        rows.append([InlineKeyboardButton(
+            text="🧹 Очистить и переместить в архив", callback_data="archive_my_scans"
+        )])
+    rows.append([InlineKeyboardButton(text=f"📦 Архив · {archive_count}", callback_data="scan_archive:0")])
     rows.append([InlineKeyboardButton(text="▶️ Запустить парсер", callback_data="start_scan")])
+    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def scan_archive_keyboard(scans: list[UserScan], page: int, total: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [[_scan_list_button(scan)] for scan in scans]
+    max_page = max(0, (max(0, total - 1)) // SCAN_ARCHIVE_PAGE_SIZE)
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"scan_archive:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{max_page + 1}", callback_data="archive_noop"))
+    if page < max_page:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"scan_archive:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⬅️ Мои сканы", callback_data="my_scans")])
     rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1651,6 +1781,7 @@ async def claim_due_observation() -> ScanObservation | None:
                     select(ScanObservation)
                     .where(
                         ScanObservation.status == "pending",
+                        ScanObservation.target_hours.in_(OBSERVATION_HOURS),
                         ScanObservation.due_at <= now,
                     )
                     .order_by(ScanObservation.due_at.asc())
@@ -1771,7 +1902,7 @@ async def process_observation(bot: Bot, obs: ScanObservation) -> None:
 
 
 async def observation_scheduler(bot: Bot, worker_id: int = 1) -> None:
-    """Persistent +1/+3/+6/+12/+24h view-checkpoint worker."""
+    """Persistent +3/+6/+12h view-checkpoint worker."""
     while True:
         try:
             obs = await claim_due_observation()
@@ -1784,6 +1915,21 @@ async def observation_scheduler(bot: Bot, worker_id: int = 1) -> None:
         except Exception:
             log.exception("Observation scheduler loop error")
             await asyncio.sleep(OBSERVATION_POLL_SECONDS)
+
+
+async def scan_archive_scheduler() -> None:
+    """Keep the My Scans inbox compact even when the user does not open it."""
+    while True:
+        try:
+            moved = await archive_expired_scans()
+            if moved:
+                log.info("Auto-archived %s completed scan cards", moved)
+            await asyncio.sleep(SCAN_ARCHIVE_SWEEP_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Scan archive scheduler loop error")
+            await asyncio.sleep(SCAN_ARCHIVE_SWEEP_SECONDS)
 
 
 async def send_smart_export(
@@ -4359,7 +4505,7 @@ async def _send_popular_message(message: Message, user_id: int) -> None:
         text = (
             "🔥 <b>Популярное сейчас</b>\n\n"
             "Выбери категорию. Рейтинги разных категорий больше не смешиваются.\n\n"
-            "🚀 TOP 1/3/6/12/24ч — по <b>реальному приросту просмотров</b>.\n"
+            "🚀 TOP 3/6/12ч — по <b>реальному приросту просмотров</b>.\n"
             "👁 Самые просматриваемые — отдельный рейтинг по общему числу просмотров."
         )
     await message.answer(
@@ -4372,17 +4518,23 @@ async def _send_popular_message(message: Message, user_id: int) -> None:
 
 async def _send_my_scans_message(message: Message, user_id: int) -> None:
     scans = await get_user_scans(user_id, 10)
+    archive_count = await get_archive_count(user_id)
     if not scans:
         text = (
-            "<b>📊 Мои сканы</b>\n\nПока пусто. Сделай первый скан — он сохранится здесь, "
-            "и к нему можно будет вернуться позже."
+            "<b>📊 Мои сканы</b>\n\nСвежих сканов пока нет. Завершённые сканы через <b>24 часа</b> "
+            "автоматически уходят в 📦 Архив и не засоряют этот список."
         )
     else:
         text = (
-            "<b>📊 Мои сканы</b>\n\nОткрой нужный запуск. Внутри можно обновить просмотры, "
-            "посмотреть рост, топ и повторить скан."
+            "<b>📊 Мои сканы</b>\n\nЗдесь только текущие и свежие сканы за последние <b>24 часа</b>. "
+            "Старые автоматически уходят в 📦 Архив.\n\n"
+            "Если список уже не нужен — нажми <b>🧹 Очистить и переместить в архив</b>. "
+            "Данные при этом не удаляются."
         )
-    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=my_scans_keyboard(scans))
+    await message.answer(
+        text, parse_mode=ParseMode.HTML,
+        reply_markup=my_scans_keyboard(scans, archive_count),
+    )
 
 
 async def _begin_scan_from_message(message: Message, state: FSMContext) -> None:
@@ -4808,7 +4960,7 @@ async def popular_now(callback: CallbackQuery) -> None:
         text = (
             "🔥 <b>Популярное сейчас</b>\n\n"
             "Выбери категорию. Рейтинги разных категорий больше не смешиваются.\n\n"
-            "🚀 TOP 1/3/6/12/24ч — по <b>реальному приросту просмотров</b>.\n"
+            "🚀 TOP 3/6/12ч — по <b>реальному приросту просмотров</b>.\n"
             "👁 Самые просматриваемые — отдельный рейтинг по общему числу просмотров."
         )
     try:
@@ -4907,7 +5059,7 @@ async def popular_category_growth(callback: CallbackQuery) -> None:
     except Exception:
         await callback.answer("Некорректный запрос", show_alert=True); return
     if period_hours not in OBSERVATION_HOURS:
-        period_hours = 1
+        period_hours = 3
     scans = await get_user_category_scans(callback.from_user.id, category_key)
     cat = CATEGORIES.get(category_key)
     if not scans or cat is None:
@@ -4929,7 +5081,7 @@ async def popular_category_growth(callback: CallbackQuery) -> None:
             f"🚀 <b>TOP роста · {html.escape(cat.name)} · {period_label}</b>\n\n"
             f"Проверены все сохранённые сканы категории: <b>{scan_count}</b>. "
             "Контрольные замеры для этого периода ещё не готовы или прироста пока нет. "
-            "Автоматические замеры выполняются через 1 / 3 / 6 / 12 / 24 часа после каждого скана."
+            "Автоматические замеры выполняются через 3 / 6 / 12 часов после каждого скана."
         )
     else:
         lines = [
@@ -4960,19 +5112,71 @@ async def my_scans(callback: CallbackQuery) -> None:
     if not allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
     scans = await get_user_scans(callback.from_user.id, 10)
+    archive_count = await get_archive_count(callback.from_user.id)
     await callback.answer()
     if not scans:
-        await callback.message.edit_text(
-            "<b>📊 Мои сканы</b>\n\nПока пусто. Сделай первый скан — он сохранится здесь, и к нему можно будет вернуться позже.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=my_scans_keyboard([]),
+        text = (
+            "<b>📊 Мои сканы</b>\n\nСвежих сканов пока нет. Завершённые сканы через <b>24 часа</b> "
+            "автоматически уходят в 📦 Архив."
         )
-        return
+    else:
+        text = (
+            "<b>📊 Мои сканы</b>\n\nЗдесь только текущие и свежие сканы за последние <b>24 часа</b>. "
+            "Старые автоматически уходят в 📦 Архив.\n\n"
+            "🧹 Можно убрать завершённые сканы раньше — данные не удалятся."
+        )
     await callback.message.edit_text(
-        "<b>📊 Мои сканы</b>\n\nОткрой нужный запуск. Внутри можно обновить просмотры, посмотреть рост, топ и повторить скан.",
+        text,
         parse_mode=ParseMode.HTML,
-        reply_markup=my_scans_keyboard(scans),
+        reply_markup=my_scans_keyboard(scans, archive_count),
     )
+
+
+@dp.callback_query(F.data == "archive_my_scans")
+async def archive_my_scans(callback: CallbackQuery) -> None:
+    if not allowed(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True); return
+    moved = await archive_active_finished_scans(callback.from_user.id)
+    scans = await get_user_scans(callback.from_user.id, 10)
+    archive_count = await get_archive_count(callback.from_user.id)
+    await callback.answer(f"В архив перемещено: {moved}")
+    await callback.message.edit_text(
+        "<b>📊 Мои сканы</b>\n\n"
+        f"📦 Перемещено в архив: <b>{moved}</b>.\n"
+        "Активный/ожидающий парсинг остаётся здесь. Данные сканов не удаляются.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=my_scans_keyboard(scans, archive_count),
+    )
+
+
+@dp.callback_query(F.data.startswith("scan_archive:"))
+async def scan_archive(callback: CallbackQuery) -> None:
+    if not allowed(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True); return
+    try:
+        page = max(0, int(callback.data.split(":", 1)[1]))
+    except Exception:
+        page = 0
+    scans, total = await get_user_archive(callback.from_user.id, page)
+    if total and not scans and page > 0:
+        page = max(0, (total - 1) // SCAN_ARCHIVE_PAGE_SIZE)
+        scans, total = await get_user_archive(callback.from_user.id, page)
+    await callback.answer()
+    text = (
+        "<b>📦 Архив сканов</b>\n\n"
+        f"Всего: <b>{total}</b>. Здесь хранятся сканы старше 24 часов и те, "
+        "которые ты убрал вручную.\n\n"
+        "Архив <b>не удаляет данные</b>: история просмотров и аналитика «Популярное сейчас» сохраняются."
+    )
+    await callback.message.edit_text(
+        text, parse_mode=ParseMode.HTML,
+        reply_markup=scan_archive_keyboard(scans, page, total),
+    )
+
+
+@dp.callback_query(F.data == "archive_noop")
+async def archive_noop(callback: CallbackQuery) -> None:
+    await callback.answer()
 
 
 async def render_scan_detail(scan: UserScan) -> str:
@@ -5094,11 +5298,11 @@ async def scan_detail(callback: CallbackQuery) -> None:
     # Telegram cannot edit a document into text, so open a fresh card for document callbacks.
     if callback.message.text:
         await callback.message.edit_text(
-            text, parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan.id), disable_web_page_preview=True
+            text, parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan.id, archived=scan.archived_at is not None), disable_web_page_preview=True
         )
     else:
         await callback.message.answer(
-            text, parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan.id), disable_web_page_preview=True
+            text, parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan.id, archived=scan.archived_at is not None), disable_web_page_preview=True
         )
 
 
@@ -5116,7 +5320,7 @@ async def scan_products(callback: CallbackQuery) -> None:
     await callback.message.answer(
         await render_scan_detail(scan),
         parse_mode=ParseMode.HTML,
-        reply_markup=scan_detail_keyboard(scan_id),
+        reply_markup=scan_detail_keyboard(scan_id, archived=scan.archived_at is not None),
         disable_web_page_preview=True,
     )
 
@@ -5149,7 +5353,7 @@ async def scan_top(callback: CallbackQuery) -> None:
                 f"<a href=\"{html.escape(row.url)}\">Открыть</a>"
             )
         text = "\n\n".join(lines)
-    await callback.message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=scan_detail_keyboard(scan_id))
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=scan_detail_keyboard(scan_id, archived=scan.archived_at is not None))
 
 
 @dp.callback_query(F.data.startswith("scangrowth:"))
@@ -5157,11 +5361,11 @@ async def scan_growth(callback: CallbackQuery) -> None:
     parts = callback.data.split(":")
     try:
         scan_id = int(parts[1])
-        period_hours = int(parts[2]) if len(parts) > 2 else 1
+        period_hours = int(parts[2]) if len(parts) > 2 else 3
     except Exception:
         await callback.answer("Скан не найден", show_alert=True); return
     if period_hours not in OBSERVATION_HOURS:
-        period_hours = 1
+        period_hours = 3
     scan = await get_user_scan(callback.from_user.id, scan_id)
     if scan is None:
         await callback.answer("Скан не найден", show_alert=True); return
@@ -5179,7 +5383,7 @@ async def scan_growth(callback: CallbackQuery) -> None:
         text = (
             f"🚀 <b>TOP роста за {period_label}</b>\n\n"
             "Контрольный замер для этого периода ещё не готов или прироста пока нет. "
-            "Бот автоматически делает замеры через 1 / 3 / 6 / 12 / 24 часа после первого скана."
+            "Бот автоматически делает замеры через 3 / 6 / 12 часов после первого скана."
         )
     else:
         lines = [
@@ -5387,7 +5591,7 @@ async def scan_history(callback: CallbackQuery) -> None:
             )
         lines += ["", "Каждое ручное «Обновить просмотры» добавляет новую точку для сравнения."]
         text = "\n".join(lines)
-    await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan_id))
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan_id, archived=scan.archived_at is not None))
 
 
 async def _manual_view_refresh_job(
@@ -5424,7 +5628,7 @@ async def _manual_view_refresh_job(
             )
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🚀 Открыть динамику", callback_data=f"scangrowth:{scan_id}:1"),
+            [InlineKeyboardButton(text="🚀 Открыть динамику", callback_data=f"scangrowth:{scan_id}:3"),
              InlineKeyboardButton(text="🔥 Топ", callback_data=f"scantop:{scan_id}")],
             [InlineKeyboardButton(text="📊 Открыть этот скан", callback_data=f"scan:{scan_id}")],
         ])
@@ -5863,10 +6067,17 @@ async def main() -> None:
     backfilled = await backfill_product_identities()
     if backfilled:
         log.info("v3.0 product identity backfill: %s listings", backfilled)
+    obsolete_observations = await cleanup_obsolete_observation_plans()
     recovered = await recover_running_observations()
     planned = await backfill_recent_observation_plans()
-    if recovered or planned:
-        log.info("v3.1 observations: recovered=%s recent_scans_planned=%s", recovered, planned)
+    archived = await archive_expired_scans()
+    if recovered or planned or obsolete_observations:
+        log.info(
+            "v3.2.8 observations: removed_old=%s recovered=%s recent_scans_planned=%s",
+            obsolete_observations, recovered, planned,
+        )
+    if archived:
+        log.info("v3.2.8 initial scan archive: %s moved", archived)
     bot = Bot(BOT_TOKEN)
     try:
         await setup_bot_commands(bot)
@@ -5888,6 +6099,7 @@ async def main() -> None:
     ]
     ticker_task = asyncio.create_task(progress_ticker(bot), name="user-progress-ticker")
     payment_task = asyncio.create_task(payment_scheduler(bot), name="payment-scheduler")
+    archive_task = asyncio.create_task(scan_archive_scheduler(), name="scan-archive-scheduler")
     observation_tasks = [
         asyncio.create_task(observation_scheduler(bot, i), name=f"view-observation-worker-{i}")
         for i in range(1, OBSERVATION_CONCURRENCY + 1)
@@ -5897,11 +6109,12 @@ async def main() -> None:
     finally:
         ticker_task.cancel()
         payment_task.cancel()
+        archive_task.cancel()
         for task in observation_tasks:
             task.cancel()
         for task in worker_tasks:
             task.cancel()
-        await asyncio.gather(ticker_task, payment_task, *observation_tasks, *worker_tasks, return_exceptions=True)
+        await asyncio.gather(ticker_task, payment_task, archive_task, *observation_tasks, *worker_tasks, return_exceptions=True)
         async with category_inflight_guard:
             inflight = list(category_inflight.values())
         for task in inflight:

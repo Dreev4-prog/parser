@@ -176,6 +176,9 @@ class UserScan(Base):
     scan_note: Mapped[str] = mapped_column(String(500), default="")
     quality_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
     quality_note: Mapped[str] = mapped_column(String(500), default="")
+    # v3.2.8: UI archive marker. Scan data/listings/history are preserved;
+    # only the My Scans inbox is kept compact.
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
 
 
 class ScanListing(Base):
@@ -201,7 +204,7 @@ class ScanViewHistory(Base):
     external_id: Mapped[str] = mapped_column(String(64), index=True)
     view_count: Mapped[int] = mapped_column(Integer)
     recorded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
-    # None = manual refresh/baseline-compatible point. 1/3/6/12/24 = automatic checkpoint.
+    # None = manual refresh/baseline-compatible point. 3/6/12 = automatic checkpoint.
     target_hours: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 

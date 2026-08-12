@@ -1,4 +1,14 @@
-# Kleinanzeigen Parser Bot v3.2.7
+# Kleinanzeigen Parser Bot v3.2.8
+
+## v3.2.8 — автозамеры 3/6/12ч + архив сканов
+
+- Автоматические контрольные замеры просмотров теперь выполняются только через **+3 / +6 / +12 часов**. +1ч и +24ч удалены из планировщика, интерфейса TOP роста и новых задач.
+- При обновлении незавершённые старые +1ч/+24ч задачи очищаются автоматически; уже сохранённая история не удаляется.
+- «📊 Мои сканы» работает как входящие: завершённый скан остаётся там 24 часа после завершения, затем автоматически перемещается в персональный «📦 Архив».
+- Архивирование не удаляет `UserScan`, `ScanListing` или историю просмотров: архивные сканы продолжают участвовать в «🔥 Популярное сейчас», TOP и выгрузках.
+- Добавлена кнопка **«🧹 Очистить и переместить в архив»** — она мгновенно убирает завершённые сканы из основного списка; queued/running задачи не трогает.
+- «📦 Архив» пагинируется по 8 сканов на страницу, поэтому даже большая история не превращается в тысячи кнопок.
+- Фоновая уборка выполняется каждые 15 минут, а также при открытии «Моих сканов»/архива.
 
 ## v3.2.7 — дата только при запуске
 
@@ -87,7 +97,7 @@ traffic controller for commercial multi-user operation.
 
 - **4 user scan workers by default.** Different users can genuinely scan in parallel.
 - **Separate request pools:** category pages, direct view counters, and Chromium fallback.
-- **Interactive capacity reservation.** Automatic +1/+3/+6/+12/+24h checkpoints keep working,
+- **Interactive capacity reservation.** Automatic +3/+6/+12h checkpoints keep working,
   but while scans are active their direct-view concurrency is reduced so they cannot starve a new scan.
 - **Global burst smoothing.** Page/view/browser requests from all parser instances are spaced,
   instead of every worker releasing a burst at the same instant.
@@ -114,7 +124,7 @@ Recommended starting values are included in `.env.example`; v3.1.6 uses real dir
 ## Parser Quality & Stability
 
 v3.1.1 is a reliability release built on v3.0.7. Popularity Tracker, automatic
-1/3/6/12/24-hour view checkpoints, product recognition, My Scans and the
+3/6/12-hour view checkpoints, product recognition, My Scans and the
 25/50/100 depth workflow are preserved.
 
 ### What changed
@@ -163,7 +173,7 @@ verified with reliable publication-date data. Otherwise the result is explicitly
 ### Automatic popularity measurements
 
 Unchanged from v3.0.7: completed scans get public-view checkpoints at
-`+1 / +3 / +6 / +12 / +24` hours. Category-separated growth TOPs show TOP-10 in
+`+3 / +6 / +12` hours. Category-separated growth TOPs show TOP-10 in
 Telegram and can export TOP-50 XLSX.
 
 ### Parser-quality self tests
@@ -218,7 +228,7 @@ development/testing outside Railway.
 
 - Manual `👁 Обновить просмотры` runs as a true background task and immediately shows a separate live percentage/progress message.
 - The Telegram UI remains usable while the measurement runs; progress edits are throttled to roughly once every 1.5 seconds / batch.
-- Manual and scheduled 1/3/6/12/24h checkpoints require genuinely fresh Direct View values. The normal multi-minute cache can no longer create a fake observation point.
+- Manual and scheduled 3/6/12h checkpoints require genuinely fresh Direct View values. The normal multi-minute cache can no longer create a fake observation point.
 - A tiny `VIEW_MEASUREMENT_REUSE_SECONDS` window (20s default) only coalesces truly simultaneous measurements across users.
 - If zero fresh values are available, no new observation point is created.
 - Completion replaces the progress message with a clear summary: fresh values, direct requests, simultaneous reuse, missing counters, listings that grew, maximum and total growth.

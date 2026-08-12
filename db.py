@@ -20,11 +20,11 @@ _IS_RAILWAY = bool(
     or os.getenv("RAILWAY_SERVICE_ID")
 )
 
-# v3.2.3: PostgreSQL is mandatory on Railway. Local SQLite remains available only
+# v3.2.8: PostgreSQL is mandatory on Railway. Local SQLite remains available only
 # as a zero-setup development/test fallback so the included unit tests still run.
 if _IS_RAILWAY and not RAW_DATABASE_URL:
     raise RuntimeError(
-        "DATABASE_URL is required on Railway in v3.2.3. Add a PostgreSQL service "
+        "DATABASE_URL is required on Railway in v3.2.8. Add a PostgreSQL service "
         "and set DATABASE_URL=${{Postgres.DATABASE_URL}} in the parser service Variables."
     )
 
@@ -36,7 +36,7 @@ _IS_POSTGRES = DATABASE_URL.startswith("postgresql+asyncpg://")
 
 if _IS_RAILWAY and not _IS_POSTGRES:
     raise RuntimeError(
-        "v3.2.3 requires PostgreSQL on Railway. DATABASE_URL must point to the Railway PostgreSQL service."
+        "v3.2.8 requires PostgreSQL on Railway. DATABASE_URL must point to the Railway PostgreSQL service."
     )
 if not _IS_SQLITE and not _IS_POSTGRES:
     raise RuntimeError("Unsupported DATABASE_URL. Use PostgreSQL (postgresql://...) or local SQLite for development.")
@@ -198,5 +198,7 @@ async def init_db() -> None:
             await conn.execute(text("ALTER TABLE user_scans ADD COLUMN quality_score INTEGER DEFAULT 0"))
         if user_scan_columns and "quality_note" not in user_scan_columns:
             await conn.execute(text("ALTER TABLE user_scans ADD COLUMN quality_note VARCHAR(500) DEFAULT ''"))
+        if user_scan_columns and "archived_at" not in user_scan_columns:
+            await conn.execute(text("ALTER TABLE user_scans ADD COLUMN archived_at TIMESTAMP"))
 
     log.info("Database initialized: %s", DATABASE_BACKEND)
