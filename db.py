@@ -210,6 +210,8 @@ async def init_db() -> None:
             await conn.execute(text("ALTER TABLE user_scans ADD COLUMN retry_count INTEGER DEFAULT 0"))
         if user_scan_columns and "last_error" not in user_scan_columns:
             await conn.execute(text("ALTER TABLE user_scans ADD COLUMN last_error VARCHAR(1000)"))
+        if user_scan_columns and "incomplete_category_keys" not in user_scan_columns:
+            await conn.execute(text("ALTER TABLE user_scans ADD COLUMN incomplete_category_keys TEXT DEFAULT ''"))
 
         bot_user_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "bot_users"))
         if bot_user_columns and "onboarding_completed" not in bot_user_columns:

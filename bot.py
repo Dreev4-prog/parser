@@ -47,6 +47,7 @@ from models import BotUser, CategoryScanState, Listing, ParserRun, PriceHistory,
 from product_identity import TYPE_DISPLAY, ProductIdentity, recognize_product
 from traffic import TRAFFIC
 from scan_control import ScanStopRequested, wait_for_task_or_stop
+from scan_selection import MAX_SELECTED_CATEGORIES, bulk_group_selection, toggle_selection, validate_scan_category_keys
 from commerce import (
     PAYMENT_POLL_SECONDS, PaymentProviderError, admin_stats, cached_access_until,
     create_subscription_payment, current_access_mode, find_users, get_payment,
@@ -77,7 +78,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.3.1"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
@@ -228,11 +229,13 @@ def main_keyboard(selected_count: int = 0) -> InlineKeyboardMarkup:
     ])
 
 
-def post_scan_keyboard(scan_id: int | None = None) -> InlineKeyboardMarkup:
+def post_scan_keyboard(scan_id: int | None = None, *, recheck: bool = False) -> InlineKeyboardMarkup:
     """Compact actions shown under the automatic result file."""
     rows = []
     if scan_id is not None:
         rows.append([InlineKeyboardButton(text="📊 Открыть скан", callback_data=f"scan:{scan_id}")])
+        if recheck:
+            rows.append([InlineKeyboardButton(text="🔄 Допроверить проблемные категории", callback_data=f"scanrecheck:{scan_id}")])
         rows.append([InlineKeyboardButton(text="👁 Обновить просмотры", callback_data=f"scanviews:{scan_id}")])
         rows.append([
             InlineKeyboardButton(text="🔥 Топ просмотров", callback_data=f"scantop:{scan_id}"),
@@ -245,20 +248,32 @@ def post_scan_keyboard(scan_id: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def scan_detail_keyboard(scan_id: int, *, archived: bool = False) -> InlineKeyboardMarkup:
+def partial_recheck_keyboard(scan_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Допроверить проблемные категории", callback_data=f"scanrecheck:{scan_id}")],
+        [InlineKeyboardButton(text="📊 Открыть сохранённый скан", callback_data=f"scan:{scan_id}")],
+    ])
+
+
+def scan_detail_keyboard(scan_id: int, *, archived: bool = False, recheck: bool = False) -> InlineKeyboardMarkup:
     """User-facing scan actions with context-aware back navigation."""
     back_text = "⬅️ Архив" if archived else "⬅️ Мои сканы"
     back_callback = "scan_archive:0" if archived else "my_scans"
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text="👁 Обновить просмотры", callback_data=f"scanviews:{scan_id}")],
         [InlineKeyboardButton(text="🔥 Топ просмотров", callback_data=f"scantop:{scan_id}"),
          InlineKeyboardButton(text="🚀 Топ роста", callback_data=f"scangrowth:{scan_id}:3")],
+    ]
+    if recheck:
+        rows.append([InlineKeyboardButton(text="🔄 Допроверить проблемные категории", callback_data=f"scanrecheck:{scan_id}")])
+    rows += [
         [InlineKeyboardButton(text="🔄 Повторить скан", callback_data=f"scanrepeat:{scan_id}"),
          InlineKeyboardButton(text="🕘 История", callback_data=f"scanhistory:{scan_id}")],
         [InlineKeyboardButton(text="📄 Скачать результат", callback_data=f"scanexport:{scan_id}")],
         [InlineKeyboardButton(text=back_text, callback_data=back_callback),
          InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
-    ])
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def growth_period_keyboard(scan_id: int, active_hours: int = 3, category_key: str | None = None) -> InlineKeyboardMarkup:
@@ -344,6 +359,11 @@ def groups_keyboard(selected_keys: set[str]) -> InlineKeyboardMarkup:
             suffix = f" · {count}" if count else ""
             row.append(InlineKeyboardButton(text=f"{group.icon} {group.name}{suffix}", callback_data=f"grp:{group.key}"))
         rows.append(row)
+    counter_icon = "⚠️" if len(selected_keys) > MAX_SELECTED_CATEGORIES else "✅"
+    rows.append([InlineKeyboardButton(
+        text=f"{counter_icon} Выбрано: {len(selected_keys)}/{MAX_SELECTED_CATEGORIES}",
+        callback_data="selected",
+    )])
     rows.append([InlineKeyboardButton(text="🧹 Очистить выбор", callback_data="clear_all")])
     rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -351,16 +371,18 @@ def groups_keyboard(selected_keys: set[str]) -> InlineKeyboardMarkup:
 
 def category_keyboard(group_key: str, selected_keys: set[str]) -> InlineKeyboardMarkup:
     cats = categories_for_group(group_key)
-    rows = []
+    rows = [[InlineKeyboardButton(
+        text=("⚠️" if len(selected_keys) > MAX_SELECTED_CATEGORIES else "✅")
+             + f" Выбрано: {len(selected_keys)}/{MAX_SELECTED_CATEGORIES}",
+        callback_data="selected",
+    )]]
     for cat in cats:
         marker = "✅" if cat.key in selected_keys else "▫️"
         rows.append([InlineKeyboardButton(text=f"{marker} {cat.name}", callback_data=f"cat:{cat.key}")])
     child_keys = [c.key for c in cats if not c.is_group]
-    children_all = bool(child_keys) and all(k in selected_keys for k in child_keys)
-    rows.append([InlineKeyboardButton(
-        text=("☑️ Убрать все подкатегории" if children_all else "☑️ Выбрать все подкатегории"),
-        callback_data=f"grpall:{group_key}",
-    )])
+    selected_children = [k for k in child_keys if k in selected_keys]
+    bulk_label = "🧹 Убрать выбранные в разделе" if selected_children else f"☑️ Выбрать до {MAX_SELECTED_CATEGORIES}"
+    rows.append([InlineKeyboardButton(text=bulk_label, callback_data=f"grpall:{group_key}")])
     rows.append([InlineKeyboardButton(text="▶️ Запустить парсер", callback_data="start_scan")])
     rows.append([InlineKeyboardButton(text="⬅️ К разделам", callback_data="groups")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -483,7 +505,12 @@ class GrowthMetric:
     observed_at: datetime
 
 
+def _validate_scan_category_count(category_keys: list[str]) -> list[str]:
+    return validate_scan_category_keys(category_keys, set(CATEGORIES))
+
+
 async def create_user_scan(user_id: int, job_uid: str, category_keys: list[str], page_limit: int, target_date: str) -> UserScan:
+    category_keys = _validate_scan_category_count(category_keys)
     scan = UserScan(
         job_uid=job_uid,
         user_id=user_id,
@@ -801,6 +828,9 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
             scan.new_count = job.total_new
             scan.target_complete = bool(not cancelled and job.incomplete_categories == 0)
             scan.scan_note = " | ".join((job.scan_notes or [])[:4])[:500]
+            scan.incomplete_category_keys = ",".join(
+                key for key in job.category_keys if key in (job.incomplete_category_keys or set())
+            )
             quality_scores = [int(x) for x in (job.quality_scores or []) if x is not None]
             scan.quality_score = round(sum(quality_scores) / len(quality_scores)) if quality_scores else 0
             scan.quality_note = " | ".join((job.quality_notes or [])[:4])[:500]
@@ -1183,49 +1213,44 @@ def scan_archive_keyboard(scans: list[UserScan], page: int, total: int) -> Inlin
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def toggle_category(user_id: int, key: str) -> set[str]:
-    cat = CATEGORIES[key]
-    root_key = group_root_key(cat.group)
+async def _replace_selected_categories(user_id: int, keys: set[str]) -> set[str]:
+    clean = [key for key in CATEGORIES if key in keys][:MAX_SELECTED_CATEGORIES]
     async with SessionLocal() as session:
-        result = await session.execute(select(SelectedCategory).where(
-            SelectedCategory.user_id == user_id, SelectedCategory.category_key == key,
-        ))
-        existing = result.scalar_one_or_none()
-        if existing:
-            await session.delete(existing)
-        else:
-            if cat.is_group:
-                child_keys = [c.key for c in categories_for_group(cat.group) if not c.is_group]
-                if child_keys:
-                    await session.execute(delete(SelectedCategory).where(
-                        SelectedCategory.user_id == user_id, SelectedCategory.category_key.in_(child_keys),
-                    ))
-            else:
-                await session.execute(delete(SelectedCategory).where(
-                    SelectedCategory.user_id == user_id, SelectedCategory.category_key == root_key,
-                ))
-            session.add(SelectedCategory(user_id=user_id, category_key=key))
+        await session.execute(delete(SelectedCategory).where(SelectedCategory.user_id == user_id))
+        session.add_all([SelectedCategory(user_id=user_id, category_key=key) for key in clean])
         await session.commit()
-    return await get_selected(user_id)
+    return set(clean)
 
 
-async def toggle_group_children(user_id: int, group_key: str) -> set[str]:
+async def toggle_category(user_id: int, key: str) -> tuple[set[str], bool]:
+    """Toggle one category without ever allowing a new selection above 5.
+
+    Returns (selected, limit_reached). Removing a category is always allowed.
+    Choosing a group-root replaces its child selections; choosing a child replaces
+    the root, so those operations do not consume an extra slot unnecessarily.
+    """
+    cat = CATEGORIES[key]
+    selected = await get_selected(user_id)
+    updated, limit_reached = toggle_selection(
+        selected,
+        key,
+        is_group=bool(cat.is_group),
+        root_key=group_root_key(cat.group),
+        child_keys={c.key for c in categories_for_group(cat.group) if not c.is_group},
+    )
+    if limit_reached:
+        return selected, True
+    return await _replace_selected_categories(user_id, updated), False
+
+
+async def toggle_group_children(user_id: int, group_key: str) -> tuple[set[str], bool]:
+    """Bulk-select only the remaining free slots, or clear this group's children."""
     child_keys = [c.key for c in categories_for_group(group_key) if not c.is_group]
     selected = await get_selected(user_id)
-    all_selected = bool(child_keys) and all(k in selected for k in child_keys)
-    async with SessionLocal() as session:
-        await session.execute(delete(SelectedCategory).where(
-            SelectedCategory.user_id == user_id, SelectedCategory.category_key == group_root_key(group_key),
-        ))
-        if all_selected:
-            await session.execute(delete(SelectedCategory).where(
-                SelectedCategory.user_id == user_id, SelectedCategory.category_key.in_(child_keys),
-            ))
-        else:
-            missing = [k for k in child_keys if k not in selected]
-            session.add_all([SelectedCategory(user_id=user_id, category_key=k) for k in missing])
-        await session.commit()
-    return await get_selected(user_id)
+    updated, limit_reached = bulk_group_selection(
+        selected, child_keys, root_key=group_root_key(group_key)
+    )
+    return await _replace_selected_categories(user_id, updated), limit_reached
 
 
 async def clear_selected(user_id: int) -> None:
@@ -2290,6 +2315,7 @@ class ScanJob:
     matched_ids: set[str] | None = None
     quality_scores: list[int] | None = None
     quality_notes: list[str] | None = None
+    incomplete_category_keys: set[str] | None = None
     retry_note: str = ""
     recovered: bool = False
     stop_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False, compare=False)
@@ -2824,8 +2850,12 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         if remaining_virtual_pages <= 0:
             return True, False
 
-        start_count = today_seen
-        goal = start_count + remaining_virtual_pages * 25
+        # v3.3.1: hidden/regional fallback measures depth by real verified result
+        # pages, not by how many listings survive seller/promotion/dedupe filters.
+        # A Kleinanzeigen page can contain far fewer than 25 usable private ads;
+        # treating 25 surviving rows as one page caused false "partial" warnings.
+        hidden_pages_collected = 0
+        goal_pages = max(0, int(remaining_virtual_pages))
         unresolved = False
         visited: set[str] = set()
         max_hidden_feeds = 180
@@ -2865,7 +2895,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     break
             return added > 0
 
-        while queue and today_seen < goal and feeds_processed < max_hidden_feeds:
+        while queue and hidden_pages_collected < goal_pages and feeds_processed < max_hidden_feeds:
             state_name, feed_url, level = queue.pop(0)
             if feed_url in visited:
                 continue
@@ -2905,7 +2935,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             fetch = loc["fetch"]
             page = candidate
             state_exhausted = False
-            while page <= feed_limit and today_seen < goal:
+            while page <= feed_limit and hidden_pages_collected < goal_pages:
                 try:
                     items, relation, pairs, days = await fetch(page, "collecting")
                 except TemporaryAccessError:
@@ -2920,23 +2950,29 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 if relation == "older" or (relation == "mixed" and not any(d == target_day for d in days)):
                     state_exhausted = True
                     break
-                remaining_items = max(0, goal - today_seen)
-                await process_target_items(items, pairs, limit=remaining_items)
-                virtual_hidden = max(0, (today_seen - start_count + 24) // 25)
-                update_live(page, days, "collecting", direct_pages_collected + virtual_hidden)
+                # Count the actual verified page even when business/promoted cards
+                # were filtered out and only a handful of usable listings remain.
+                target_on_page = any(d == target_day for d in days)
+                if target_on_page:
+                    await process_target_items(items, pairs)
+                    hidden_pages_collected += 1
+                    update_live(
+                        page, days, "collecting",
+                        direct_pages_collected + hidden_pages_collected,
+                    )
                 page += 1
                 if PAGE_DELAY_SECONDS:
                     await asyncio.sleep(min(PAGE_DELAY_SECONDS, 0.15))
 
-            if page > feed_limit and not state_exhausted and today_seen < goal:
+            if page > feed_limit and not state_exhausted and hidden_pages_collected < goal_pages:
                 # The target day continues beyond this feed's visible window. Drill
                 # down again instead of declaring the category empty/skipped.
                 if not add_children(state_name, loc, level):
                     unresolved = True
 
-        if today_seen >= goal:
+        if hidden_pages_collected >= goal_pages:
             request_complete = True
-            reason = f"собрана глубина {depth} страниц выбранной даты"
+            reason = f"проверено {depth} реальных страниц выбранной даты"
             return True, unresolved
 
         if queue and feeds_processed >= max_hidden_feeds:
@@ -3404,7 +3440,8 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
     else:
         headline = "⚠️ <b>Парсинг завершён частично</b>" if job.incomplete_categories else "✅ <b>Парсинг завершён</b>"
         completeness_line = (
-            f"⚠️ Не удалось надёжно начать/закончить выбранную глубину в категориях: <b>{job.incomplete_categories}</b>\n"
+            f"⚠️ Требуют допроверки: <b>{job.incomplete_categories}/{len(job.category_keys)}</b>. "
+            "Найденные объявления сохранены.\n"
             if job.incomplete_categories else ""
         )
         quality_values = [int(x) for x in (job.quality_scores or []) if x is not None]
@@ -3452,7 +3489,7 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
                 bot,
                 job.chat_id,
                 prefix=result_prefix,
-                reply_markup=post_scan_keyboard(job.scan_id),
+                reply_markup=post_scan_keyboard(job.scan_id, recheck=bool(job.incomplete_categories)),
             )
             snapshot_rows = []
             if job.scan_id is not None:
@@ -3471,20 +3508,27 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
                     job.chat_id,
                     "⚠️ Парсинг завершён, но автоматическую выгрузку сформировать не удалось. "
                     "Нажми «📦 Получить результат» — данные уже сохранены.",
-                    reply_markup=post_scan_keyboard(job.scan_id),
+                    reply_markup=post_scan_keyboard(job.scan_id, recheck=bool(job.incomplete_categories)),
                 )
             except Exception:
                 pass
 
-    if job.warnings:
+    if job.incomplete_categories:
         try:
             await bot.send_message(
                 job.chat_id,
-                "<b>⚠️ Предупреждения</b>\n\n" + "\n".join(f"• {html.escape(x)}" for x in job.warnings[:20]),
+                "<b>⚠️ Нужна дополнительная проверка</b>\n\n"
+                f"{job.incomplete_categories} из {len(job.category_keys)} категорий проверены не полностью. "
+                "Найденные объявления уже сохранены и не потеряются.\n\n"
+                "Можно повторно проверить только эти категории — остальные заново запускаться не будут.",
                 parse_mode=ParseMode.HTML,
+                reply_markup=partial_recheck_keyboard(job.scan_id) if job.scan_id is not None else None,
             )
         except Exception:
-            log.exception("Could not send warnings for job=%s", job.job_id)
+            log.exception("Could not send partial-scan notice for job=%s", job.job_id)
+    elif job.warnings:
+        # Keep non-actionable diagnostics in logs instead of flooding the user.
+        log.info("scan job=%s warnings=%s", job.job_id, job.warnings[:20])
 
 
 async def dispatch_category_with_retry(bot: Bot, job: ScanJob, cat) -> CategoryDispatchResult:
@@ -3537,6 +3581,7 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
     job.matched_ids = job.matched_ids or set()
     job.quality_scores = job.quality_scores or []
     job.quality_notes = job.quality_notes or []
+    job.incomplete_category_keys = job.incomplete_category_keys or set()
     await edit_job_status(bot, job, render_user_job_status(job), force=True)
 
     for idx, key in enumerate(job.category_keys, start=1):
@@ -3546,6 +3591,8 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
         if cat is None:
             job.warnings.append(f"Неизвестная категория: {key}")
             job.incomplete_categories += 1
+            job.incomplete_category_keys = job.incomplete_category_keys or set()
+            job.incomplete_category_keys.add(key)
             job.completed_categories += 1
             job.quality_scores = job.quality_scores or []
             job.quality_scores.append(0)
@@ -3598,6 +3645,8 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
                         job.full_categories += 1
                 if not result.date_complete:
                     job.incomplete_categories += 1
+                    job.incomplete_category_keys = job.incomplete_category_keys or set()
+                    job.incomplete_category_keys.add(cat.key)
                     reached = _date_label(result.oldest_date_seen) if result.oldest_date_seen else "не определена"
                     note = (
                         f"{cat.name}: охват {_date_label(job.target_date)} не подтверждён полностью; "
@@ -3637,6 +3686,8 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
                     job.scan_notes = job.scan_notes or []
                     job.scan_notes.append(note)
                     job.incomplete_categories += remaining_categories
+                    job.incomplete_category_keys = job.incomplete_category_keys or set()
+                    job.incomplete_category_keys.update(job.category_keys[idx:])
                     job.completed_categories += remaining_categories
                 break
             # User sees only useful progress; cache/shared/worker details stay internal.
@@ -3656,6 +3707,8 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
             job.quality_scores.append(0)
             job.quality_notes.append(f"{cat.name}: 0/100 — ошибка скана")
             job.incomplete_categories += 1
+            job.incomplete_category_keys = job.incomplete_category_keys or set()
+            job.incomplete_category_keys.add(cat.key)
             job.completed_categories += 1
 
     await finish_job(bot, job, cancelled=job.cancel_requested)
@@ -3724,6 +3777,7 @@ async def scan_worker(bot: Bot, worker_id: int) -> None:
 
 async def enqueue_user_scan(message: Message, user_id: int, category_keys: list[str], page_limit: int, target_date: str) -> ScanJob:
     """Create a persistent scan card and queue the network job."""
+    category_keys = _validate_scan_category_count(category_keys)
     job_uid = uuid.uuid4().hex[:12]
     scan = await create_user_scan(user_id, job_uid, category_keys, page_limit, target_date)
     status = await message.answer("⏳ <b>Подготавливаю скан…</b>", parse_mode=ParseMode.HTML)
@@ -5820,8 +5874,19 @@ async def render_scan_detail(scan: UserScan) -> str:
         lines.append(f"🕒 Обновлено: <b>{_moscow_text(scan.last_view_refresh_at)} МСК</b>")
 
     # Diagnostics should only appear when they actually need the user's attention.
-    if scan.status == "partial" and getattr(scan, "scan_note", ""):
-        lines += ["", f"⚠️ <b>Что не удалось:</b> {html.escape(scan.scan_note)}"]
+    if scan.status == "partial":
+        incomplete_keys = [
+            key for key in (getattr(scan, "incomplete_category_keys", "") or "").split(",") if key in CATEGORIES
+        ]
+        if incomplete_keys:
+            names = ", ".join(CATEGORIES[key].name for key in incomplete_keys[:5])
+            lines += [
+                "",
+                f"⚠️ <b>Допроверка:</b> {len(incomplete_keys)} кат. — {html.escape(names)}",
+                "Найденные объявления сохранены; можно допроверить только эти категории.",
+            ]
+        elif getattr(scan, "scan_note", ""):
+            lines += ["", "⚠️ <b>Часть категории проверена не полностью.</b> Найденные объявления сохранены."]
     elif quality_value and quality_value < 90 and getattr(scan, "quality_note", ""):
         lines += ["", f"⚠️ <b>Проверка качества:</b> {html.escape(scan.quality_note)}"]
 
@@ -5847,11 +5912,11 @@ async def scan_detail(callback: CallbackQuery) -> None:
     # Telegram cannot edit a document into text, so open a fresh card for document callbacks.
     if callback.message.text:
         await callback.message.edit_text(
-            text, parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan.id, archived=scan.archived_at is not None), disable_web_page_preview=True
+            text, parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan.id, archived=scan.archived_at is not None, recheck=bool(getattr(scan, "incomplete_category_keys", ""))), disable_web_page_preview=True
         )
     else:
         await callback.message.answer(
-            text, parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan.id, archived=scan.archived_at is not None), disable_web_page_preview=True
+            text, parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan.id, archived=scan.archived_at is not None, recheck=bool(getattr(scan, "incomplete_category_keys", ""))), disable_web_page_preview=True
         )
 
 
@@ -5869,7 +5934,7 @@ async def scan_products(callback: CallbackQuery) -> None:
     await callback.message.answer(
         await render_scan_detail(scan),
         parse_mode=ParseMode.HTML,
-        reply_markup=scan_detail_keyboard(scan_id, archived=scan.archived_at is not None),
+        reply_markup=scan_detail_keyboard(scan_id, archived=scan.archived_at is not None, recheck=bool(getattr(scan, "incomplete_category_keys", ""))),
         disable_web_page_preview=True,
     )
 
@@ -5902,7 +5967,7 @@ async def scan_top(callback: CallbackQuery) -> None:
                 f"<a href=\"{html.escape(row.url)}\">Открыть</a>"
             )
         text = "\n\n".join(lines)
-    await callback.message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=scan_detail_keyboard(scan_id, archived=scan.archived_at is not None))
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=scan_detail_keyboard(scan_id, archived=scan.archived_at is not None, recheck=bool(getattr(scan, "incomplete_category_keys", ""))))
 
 
 @dp.callback_query(F.data.startswith("scangrowth:"))
@@ -6140,7 +6205,7 @@ async def scan_history(callback: CallbackQuery) -> None:
             )
         lines += ["", "Каждое ручное «Обновить просмотры» добавляет новую точку для сравнения."]
         text = "\n".join(lines)
-    await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan_id, archived=scan.archived_at is not None))
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=scan_detail_keyboard(scan_id, archived=scan.archived_at is not None, recheck=bool(getattr(scan, "incomplete_category_keys", ""))))
 
 
 async def _manual_view_refresh_job(
@@ -6302,9 +6367,58 @@ async def scan_repeat(callback: CallbackQuery) -> None:
     keys = [k for k in _scan_category_keys(scan) if k in CATEGORIES]
     if not keys:
         await callback.answer("Категории этого скана больше недоступны", show_alert=True); return
+    if len(keys) > MAX_SELECTED_CATEGORIES:
+        await callback.answer(
+            f"Этот старый скан содержит {len(keys)} категорий. Сейчас лимит — {MAX_SELECTED_CATEGORIES}; выбери нужные категории для нового запуска.",
+            show_alert=True,
+        )
+        return
     repeat_depth = scan.page_limit if scan.page_limit in PAGE_LIMIT_CHOICES else 50
     await callback.answer("Повторяю скан")
     await enqueue_user_scan(callback.message, callback.from_user.id, keys, repeat_depth, scan.target_date or _moscow_today_iso())
+
+
+@dp.callback_query(F.data.startswith("scanrecheck:"))
+async def scan_recheck_partial(callback: CallbackQuery) -> None:
+    """Re-run only categories that were not fully verified in a partial scan."""
+    try:
+        scan_id = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("Скан не найден", show_alert=True)
+        return
+    scan = await get_user_scan(callback.from_user.id, scan_id)
+    if scan is None:
+        await callback.answer("Скан не найден", show_alert=True)
+        return
+
+    keys = [
+        key for key in (getattr(scan, "incomplete_category_keys", "") or "").split(",")
+        if key in CATEGORIES
+    ]
+    keys = list(dict.fromkeys(keys))
+    if not keys:
+        await callback.answer("У этого скана нет категорий, требующих допроверки", show_alert=True)
+        return
+    if len(keys) > MAX_SELECTED_CATEGORIES:
+        keys = keys[:MAX_SELECTED_CATEGORIES]
+
+    async with job_guard:
+        existing = active_jobs.get(callback.from_user.id)
+        if existing and existing.state in {"queued", "running"} and not existing.cancel_requested:
+            await callback.answer("У тебя уже идёт парсинг", show_alert=True)
+            return
+        if len(queued_job_ids) >= MAX_QUEUE_SIZE:
+            await callback.answer("Сервис сейчас сильно загружен. Попробуй чуть позже.", show_alert=True)
+            return
+
+    depth = scan.page_limit if scan.page_limit in PAGE_LIMIT_CHOICES else 50
+    target_date = scan.target_date or _moscow_today_iso()
+    # Do not immediately reuse the partial 5-minute category result cache.
+    for key in keys:
+        category_result_cache.pop(_progress_key(key, target_date, depth), None)
+
+    await callback.answer(f"Допроверяю категорий: {len(keys)}")
+    await enqueue_user_scan(callback.message, callback.from_user.id, keys, depth, target_date)
 
 
 @dp.callback_query(F.data == "groups")
@@ -6312,7 +6426,12 @@ async def groups(callback: CallbackQuery) -> None:
     if not allowed(callback.from_user.id): await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text("<b>🗂 Категории Kleinanzeigen</b>\n\nОткрой раздел и отметь, что нужно парсить.", reply_markup=groups_keyboard(selected), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text(
+        f"<b>🗂 Категории Kleinanzeigen</b>\n\nВыбери до <b>{MAX_SELECTED_CATEGORIES}</b> категорий на один запуск. "
+        "Так скан быстрее, стабильнее и проще допроверять при сетевых ограничениях.",
+        reply_markup=groups_keyboard(selected),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @dp.callback_query(F.data.startswith("grp:"))
@@ -6322,15 +6441,26 @@ async def open_group(callback: CallbackQuery) -> None:
     selected = await get_selected(callback.from_user.id)
     group = GROUPS[group_key]
     await callback.answer()
-    await callback.message.edit_text(f"<b>{group.icon} {html.escape(group.name)}</b>\n\nВыбери весь раздел или отдельные подкатегории.", reply_markup=category_keyboard(group_key, selected), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text(
+        f"<b>{group.icon} {html.escape(group.name)}</b>\n\n"
+        f"Отметь нужные подкатегории. Максимум за один запуск: <b>{MAX_SELECTED_CATEGORIES}</b>.",
+        reply_markup=category_keyboard(group_key, selected),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @dp.callback_query(F.data.startswith("cat:"))
 async def toggle_cat(callback: CallbackQuery) -> None:
     key = callback.data.split(":", 1)[1]
     if key not in CATEGORIES: await callback.answer("Категория не найдена", show_alert=True); return
-    selected = await toggle_category(callback.from_user.id, key)
-    await callback.answer("Выбор обновлён")
+    selected, limit_reached = await toggle_category(callback.from_user.id, key)
+    if limit_reached:
+        await callback.answer(
+            f"Можно выбрать максимум {MAX_SELECTED_CATEGORIES} категорий за один запуск. Сними одну галочку и выбери другую.",
+            show_alert=True,
+        )
+    else:
+        await callback.answer(f"Выбрано: {len(selected)}/{MAX_SELECTED_CATEGORIES}")
     await callback.message.edit_reply_markup(reply_markup=category_keyboard(CATEGORIES[key].group, selected))
 
 
@@ -6338,8 +6468,14 @@ async def toggle_cat(callback: CallbackQuery) -> None:
 async def toggle_all_children(callback: CallbackQuery) -> None:
     group_key = callback.data.split(":", 1)[1]
     if group_key not in GROUPS: return
-    selected = await toggle_group_children(callback.from_user.id, group_key)
-    await callback.answer("Выбор обновлён")
+    selected, limit_reached = await toggle_group_children(callback.from_user.id, group_key)
+    if limit_reached:
+        await callback.answer(
+            f"Выбраны свободные места до лимита {MAX_SELECTED_CATEGORIES}. Для одного скана больше нельзя.",
+            show_alert=True,
+        )
+    else:
+        await callback.answer(f"Выбрано: {len(selected)}/{MAX_SELECTED_CATEGORIES}")
     await callback.message.edit_reply_markup(reply_markup=category_keyboard(group_key, selected))
 
 
@@ -6357,7 +6493,10 @@ async def selected(callback: CallbackQuery) -> None:
     if not cats:
         text = "<b>Категории пока не выбраны.</b>"
     else:
-        lines = [f"<b>Выбрано категорий: {len(cats)}</b>", ""]
+        counter = f"{len(cats)}/{MAX_SELECTED_CATEGORIES}"
+        lines = [f"<b>Выбрано категорий: {counter}</b>", ""]
+        if len(cats) > MAX_SELECTED_CATEGORIES:
+            lines += [f"⚠️ Для нового запуска оставь максимум {MAX_SELECTED_CATEGORIES} категорий.", ""]
         for cat in cats[:70]: lines.append(f"• {html.escape(cat.name)}")
         if len(cats) > 70: lines.append(f"…и ещё {len(cats)-70}")
         text = "\n".join(lines)
@@ -6491,6 +6630,12 @@ async def start_scan(callback: CallbackQuery, state: FSMContext) -> None:
     if not selected_cats:
         await callback.answer("Сначала выбери хотя бы одну категорию", show_alert=True)
         return
+    if len(selected_cats) > MAX_SELECTED_CATEGORIES:
+        await callback.answer(
+            f"Сейчас выбрано {len(selected_cats)} категорий. В новой версии максимум {MAX_SELECTED_CATEGORIES} за один запуск — убери лишние или очисти выбор.",
+            show_alert=True,
+        )
+        return
 
     async with job_guard:
         existing = active_jobs.get(callback.from_user.id)
@@ -6515,6 +6660,15 @@ async def _show_scan_depth_choice(message: Message, state: FSMContext, user_id: 
     if not selected_cats:
         await state.clear()
         await message.answer("Сначала выбери хотя бы одну категорию.")
+        return
+    if len(selected_cats) > MAX_SELECTED_CATEGORIES:
+        await state.clear()
+        await message.answer(
+            f"⚠️ Сейчас выбрано <b>{len(selected_cats)}</b> категорий, а максимум для одного запуска — "
+            f"<b>{MAX_SELECTED_CATEGORIES}</b>. Убери лишние категории и запусти снова.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=groups_keyboard(selected),
+        )
         return
 
     scan_settings = await get_settings(user_id)
@@ -6603,6 +6757,12 @@ async def start_scan_with_pages(callback: CallbackQuery, state: FSMContext) -> N
     selected_cats = [CATEGORIES[k] for k in CATEGORIES if k in selected_keys]
     if not selected_cats:
         await callback.answer("Сначала выбери хотя бы одну категорию", show_alert=True)
+        return
+    if len(selected_cats) > MAX_SELECTED_CATEGORIES:
+        await callback.answer(
+            f"Сейчас выбрано {len(selected_cats)} категорий. В новой версии максимум {MAX_SELECTED_CATEGORIES} за один запуск — убери лишние или очисти выбор.",
+            show_alert=True,
+        )
         return
 
     async with job_guard:

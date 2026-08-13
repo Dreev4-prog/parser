@@ -18,4 +18,5 @@ def test_scan_schema_has_restart_recovery_state():
         "resumed_count",
         "retry_count",
         "last_error",
+        "incomplete_category_keys",
     } <= columns

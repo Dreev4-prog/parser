@@ -187,6 +187,8 @@ class UserScan(Base):
     resumed_count: Mapped[int] = mapped_column(Integer, default=0)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    # v3.3.1: exact category keys that need a targeted recheck after a partial run.
+    incomplete_category_keys: Mapped[str] = mapped_column(Text, default="")
 
 
 class ScanListing(Base):
