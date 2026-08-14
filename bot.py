@@ -78,7 +78,8 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "3.4.0"
+APP_VERSION = "3.4.1"
+MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
@@ -217,16 +218,19 @@ def allowed(user_id: int) -> bool:
     return has_access(int(user_id), ADMIN_IDS)
 
 
-def main_keyboard(selected_count: int = 0) -> InlineKeyboardMarkup:
+def main_keyboard(selected_count: int = 0, *, admin: bool = False) -> InlineKeyboardMarkup:
     """Product-style home screen with one clear primary action."""
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text="▶️ Новый скан", callback_data="start_scan")],
         [InlineKeyboardButton(text="🔥 Популярное", callback_data="popular_now"),
          InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
         [InlineKeyboardButton(text=f"🗂 Категории · {selected_count}/{MAX_SELECTED_CATEGORIES}", callback_data="groups"),
          InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
         [InlineKeyboardButton(text="💎 Подписка", callback_data="subscription")],
-    ])
+    ]
+    if admin:
+        rows.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="adminhome")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def post_scan_keyboard(scan_id: int | None = None, *, recheck: bool = False) -> InlineKeyboardMarkup:
@@ -4941,7 +4945,7 @@ async def subscription_lifecycle_scheduler(bot: Bot) -> None:
 async def setup_bot_commands(bot: Bot) -> None:
     """Configure Telegram's bottom-left Menu button and command list."""
     user_commands = [
-        BotCommand(command="start", description="🏠 Главное меню"),
+        BotCommand(command="menu", description="🏠 Главное меню"),
         BotCommand(command="new_scan", description="▶️ Новый скан"),
         BotCommand(command="stop", description="⏹ Остановить парсер"),
         BotCommand(command="my_scans", description="📊 Мои сканы"),
@@ -5038,12 +5042,23 @@ def home_text(selected_count: int) -> str:
 
 
 async def _send_home_message(message: Message, user_id: int, *, intro: bool = False) -> None:
+    """Send the branded DT PARSER home card with navigation buttons below it."""
     selected = await get_selected(user_id)
-    await message.answer(
-        home_text(len(selected)),
-        reply_markup=main_keyboard(len(selected)),
-        parse_mode=ParseMode.HTML,
-    )
+    markup = main_keyboard(len(selected), admin=_is_admin(user_id))
+    caption = home_text(len(selected))
+
+    if MENU_IMAGE_PATH.exists():
+        await message.answer_photo(
+            photo=FSInputFile(MENU_IMAGE_PATH),
+            caption=caption,
+            reply_markup=markup,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Safe fallback if the asset was accidentally omitted from a deployment.
+    log.error("Main menu image is missing: %s", MENU_IMAGE_PATH)
+    await message.answer(caption, reply_markup=markup, parse_mode=ParseMode.HTML)
 
 
 async def _send_popular_message(message: Message, user_id: int) -> None:
@@ -5126,12 +5141,7 @@ async def onboarding_handler(callback: CallbackQuery, state: FSMContext) -> None
     if action in {"finish", "skip"}:
         await set_onboarding_completed(callback.from_user.id, True)
         await callback.answer("Готово")
-        selected = await get_selected(callback.from_user.id)
-        await _edit_or_answer(
-            callback.message,
-            home_text(len(selected)),
-            reply_markup=main_keyboard(len(selected)),
-        )
+        await _send_home_message(callback.message, callback.from_user.id)
         return
     if action == "categories":
         await set_onboarding_completed(callback.from_user.id, True)
@@ -5250,12 +5260,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
     if user is not None and not bool(user.onboarding_completed):
         await _edit_or_answer(callback.message, onboarding_text(1), reply_markup=onboarding_keyboard(1))
         return
-    selected = await get_selected(callback.from_user.id)
-    await _edit_or_answer(
-        callback.message,
-        home_text(len(selected)),
-        reply_markup=main_keyboard(len(selected)),
-    )
+    await _send_home_message(callback.message, callback.from_user.id)
 
 
 @dp.callback_query(F.data == "post_settings")
@@ -5273,13 +5278,8 @@ async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     if not allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
-    selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.answer(
-        home_text(len(selected)),
-        reply_markup=main_keyboard(len(selected)),
-        parse_mode=ParseMode.HTML,
-    )
+    await _send_home_message(callback.message, callback.from_user.id)
 
 
 @dp.callback_query(F.data == "settings")
