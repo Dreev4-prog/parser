@@ -78,7 +78,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "3.3.2"
+APP_VERSION = "3.4.0"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
@@ -218,34 +218,31 @@ def allowed(user_id: int) -> bool:
 
 
 def main_keyboard(selected_count: int = 0) -> InlineKeyboardMarkup:
-    """Simple user-facing home screen. Technical/debug actions stay out of the way."""
+    """Product-style home screen with one clear primary action."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔥 Популярное сейчас", callback_data="popular_now")],
-        [InlineKeyboardButton(text="▶️ Запустить парсер", callback_data="start_scan")],
-        [InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
-        [InlineKeyboardButton(text=f"🗂 Категории ({selected_count})", callback_data="groups"),
+        [InlineKeyboardButton(text="▶️ Новый скан", callback_data="start_scan")],
+        [InlineKeyboardButton(text="🔥 Популярное", callback_data="popular_now"),
+         InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
+        [InlineKeyboardButton(text=f"🗂 Категории · {selected_count}/{MAX_SELECTED_CATEGORIES}", callback_data="groups"),
          InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
         [InlineKeyboardButton(text="💎 Подписка", callback_data="subscription")],
-        [InlineKeyboardButton(text="📦 Текущий результат", callback_data="export_smart")],
     ])
 
 
 def post_scan_keyboard(scan_id: int | None = None, *, recheck: bool = False) -> InlineKeyboardMarkup:
-    """Compact actions shown under the automatic result file."""
+    """Short result actions: analytics first, secondary actions inside scan details."""
     rows = []
     if scan_id is not None:
-        rows.append([InlineKeyboardButton(text="📊 Открыть скан", callback_data=f"scan:{scan_id}")])
-        if recheck:
-            rows.append([InlineKeyboardButton(text="🔄 Допроверить проблемные категории", callback_data=f"scanrecheck:{scan_id}")])
-        rows.append([InlineKeyboardButton(text="👁 Обновить просмотры", callback_data=f"scanviews:{scan_id}")])
         rows.append([
-            InlineKeyboardButton(text="🔥 Топ просмотров", callback_data=f"scantop:{scan_id}"),
-            InlineKeyboardButton(text="🚀 Топ роста", callback_data=f"scangrowth:{scan_id}:3"),
+            InlineKeyboardButton(text="🔥 Открыть TOP", callback_data=f"scantop:{scan_id}"),
+            InlineKeyboardButton(text="📊 Открыть скан", callback_data=f"scan:{scan_id}"),
         ])
+        if recheck:
+            rows.append([InlineKeyboardButton(text="🔄 Допроверить категории", callback_data=f"scanrecheck:{scan_id}")])
         rows.append([InlineKeyboardButton(text="🔄 Повторить скан", callback_data=f"scanrepeat:{scan_id}")])
     else:
-        rows.append([InlineKeyboardButton(text="🔄 Запустить снова", callback_data="start_scan")])
-    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="post_home")])
+        rows.append([InlineKeyboardButton(text="▶️ Новый скан", callback_data="start_scan")])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="post_home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -257,20 +254,20 @@ def partial_recheck_keyboard(scan_id: int) -> InlineKeyboardMarkup:
 
 
 def scan_detail_keyboard(scan_id: int, *, archived: bool = False, recheck: bool = False) -> InlineKeyboardMarkup:
-    """User-facing scan actions with context-aware back navigation."""
+    """Compact scan actions with analytics grouped together."""
     back_text = "⬅️ Архив" if archived else "⬅️ Мои сканы"
     back_callback = "scan_archive:0" if archived else "my_scans"
     rows = [
-        [InlineKeyboardButton(text="👁 Обновить просмотры", callback_data=f"scanviews:{scan_id}")],
         [InlineKeyboardButton(text="🔥 Топ просмотров", callback_data=f"scantop:{scan_id}"),
          InlineKeyboardButton(text="🚀 Топ роста", callback_data=f"scangrowth:{scan_id}:3")],
+        [InlineKeyboardButton(text="👁 Обновить", callback_data=f"scanviews:{scan_id}"),
+         InlineKeyboardButton(text="📄 CSV", callback_data=f"scanexport:{scan_id}")],
     ]
     if recheck:
-        rows.append([InlineKeyboardButton(text="🔄 Допроверить проблемные категории", callback_data=f"scanrecheck:{scan_id}")])
+        rows.append([InlineKeyboardButton(text="🔄 Допроверить категории", callback_data=f"scanrecheck:{scan_id}")])
     rows += [
-        [InlineKeyboardButton(text="🔄 Повторить скан", callback_data=f"scanrepeat:{scan_id}"),
+        [InlineKeyboardButton(text="🔄 Повторить", callback_data=f"scanrepeat:{scan_id}"),
          InlineKeyboardButton(text="🕘 История", callback_data=f"scanhistory:{scan_id}")],
-        [InlineKeyboardButton(text="📄 Скачать результат", callback_data=f"scanexport:{scan_id}")],
         [InlineKeyboardButton(text=back_text, callback_data=back_callback),
          InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
     ]
@@ -308,16 +305,16 @@ def popular_categories_keyboard(items: list[tuple[str, UserScan]]) -> InlineKeyb
             continue
         icon = GROUPS.get(cat.group).icon if cat.group in GROUPS else "📂"
         rows.append([InlineKeyboardButton(text=f"{icon} {cat.name[:38]}", callback_data=f"popularcat:{key}")])
-    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def popular_category_keyboard(scan_id: int, category_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👁 Самые просматриваемые · последний скан", callback_data=f"pcv:{scan_id}:{category_key}")],
-        [InlineKeyboardButton(text="🚀 TOP 3ч", callback_data=f"pcg:{scan_id}:{category_key}:3"),
-         InlineKeyboardButton(text="🔥 TOP 6ч", callback_data=f"pcg:{scan_id}:{category_key}:6")],
-        [InlineKeyboardButton(text="🔥 TOP 12ч", callback_data=f"pcg:{scan_id}:{category_key}:12")],
+        [InlineKeyboardButton(text="👁 По просмотрам", callback_data=f"pcv:{scan_id}:{category_key}")],
+        [InlineKeyboardButton(text="🚀 3ч", callback_data=f"pcg:{scan_id}:{category_key}:3"),
+         InlineKeyboardButton(text="🚀 6ч", callback_data=f"pcg:{scan_id}:{category_key}:6"),
+         InlineKeyboardButton(text="🚀 12ч", callback_data=f"pcg:{scan_id}:{category_key}:12")],
         [InlineKeyboardButton(text="⬅️ Категории", callback_data="popular_now"),
          InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
     ])
@@ -366,7 +363,7 @@ def groups_keyboard(selected_keys: set[str]) -> InlineKeyboardMarkup:
         callback_data="selected",
     )])
     rows.append([InlineKeyboardButton(text="🧹 Очистить выбор", callback_data="clear_all")])
-    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="home")])
+    rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -384,7 +381,7 @@ def category_keyboard(group_key: str, selected_keys: set[str]) -> InlineKeyboard
     selected_children = [k for k in child_keys if k in selected_keys]
     bulk_label = "🧹 Убрать выбранные в разделе" if selected_children else f"☑️ Выбрать до {MAX_SELECTED_CATEGORIES}"
     rows.append([InlineKeyboardButton(text=bulk_label, callback_data=f"grpall:{group_key}")])
-    rows.append([InlineKeyboardButton(text="▶️ Запустить парсер", callback_data="start_scan")])
+    rows.append([InlineKeyboardButton(text="▶️ Новый скан", callback_data="start_scan")])
     rows.append([InlineKeyboardButton(text="⬅️ К разделам", callback_data="groups")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -402,32 +399,30 @@ def min_views_label(value: int | None) -> str:
 
 
 def settings_keyboard(s: UserSettings) -> InlineKeyboardMarkup:
+    mode_label = MODE_LABELS.get(s.output_mode, s.output_mode)
     return InlineKeyboardMarkup(inline_keyboard=[
-        [_mode_button(s, "newest"), _mode_button(s, "all")],
-        [_mode_button(s, "unique"), _mode_button(s, "frequent")],
-        [_mode_button(s, "fast_disappearing"), _mode_button(s, "below_market")],
-        [_mode_button(s, "price_drop")],
-        [InlineKeyboardButton(text=f"🚫 Умные дубли: {'ВКЛ' if s.smart_dedupe else 'ВЫКЛ'}", callback_data="toggle_dedupe")],
-        [InlineKeyboardButton(text=f"🧹 Чистить услуги/поиск: {'ВКЛ' if s.clean_noise else 'ВЫКЛ'}", callback_data="toggle_noise")],
-        [InlineKeyboardButton(text=f"💶 Цена: {PRICE_LABELS.get(s.price_filter, s.price_filter)}", callback_data="set_price")],
-        [InlineKeyboardButton(text=f"👁 От просмотров: {min_views_label(getattr(s, 'min_views', 0))}", callback_data="set_min_views")],
-        [InlineKeyboardButton(text=f"↕️ Сортировка: {SORT_LABELS.get(s.sort_mode, s.sort_mode)}", callback_data="set_sort")],
-        [InlineKeyboardButton(text="✅ Ключевые слова", callback_data="set_include"),
-         InlineKeyboardButton(text="🚫 Исключить слова", callback_data="set_exclude")],
-        [InlineKeyboardButton(text="ℹ️ Как работают режимы", callback_data="mode_help")],
-        [InlineKeyboardButton(text="♻️ Сбросить настройки", callback_data="reset_settings")],
-        [InlineKeyboardButton(text="▶️ Запустить с этими настройками", callback_data="start_scan")],
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="home")],
+        [InlineKeyboardButton(text=f"Режим: {mode_label}", callback_data="set_mode")],
+        [InlineKeyboardButton(text=f"💶 {PRICE_LABELS.get(s.price_filter, s.price_filter)}", callback_data="set_price"),
+         InlineKeyboardButton(text=f"👁 {min_views_label(getattr(s, 'min_views', 0))}", callback_data="set_min_views")],
+        [InlineKeyboardButton(text=f"🧠 Дубли · {'Вкл' if s.smart_dedupe else 'Выкл'}", callback_data="toggle_dedupe"),
+         InlineKeyboardButton(text=f"🧹 Шум · {'Вкл' if s.clean_noise else 'Выкл'}", callback_data="toggle_noise")],
+        [InlineKeyboardButton(text=f"↕️ {SORT_LABELS.get(s.sort_mode, s.sort_mode)}", callback_data="set_sort")],
+        [InlineKeyboardButton(text="🔎 Ключевые слова", callback_data="set_include"),
+         InlineKeyboardButton(text="🚫 Исключения", callback_data="set_exclude")],
+        [InlineKeyboardButton(text="▶️ Новый скан", callback_data="start_scan")],
+        [InlineKeyboardButton(text="ℹ️ О режимах", callback_data="mode_help"),
+         InlineKeyboardButton(text="♻️ Сбросить", callback_data="reset_settings")],
+        [InlineKeyboardButton(text="⬅️ Меню", callback_data="home")],
     ])
 
 
 def page_limit_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="25 страниц", callback_data="scanpages:25"),
-         InlineKeyboardButton(text="50 страниц", callback_data="scanpages:50")],
-        [InlineKeyboardButton(text="100 страниц", callback_data="scanpages:100")],
-        [InlineKeyboardButton(text="⬅️ Выбрать другую дату", callback_data="start_scan")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")],
+        [InlineKeyboardButton(text="25 стр.", callback_data="scanpages:25"),
+         InlineKeyboardButton(text="50 стр.", callback_data="scanpages:50"),
+         InlineKeyboardButton(text="100 стр.", callback_data="scanpages:100")],
+        [InlineKeyboardButton(text="⬅️ Другая дата", callback_data="start_scan"),
+         InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
     ])
 
 
@@ -438,7 +433,7 @@ def scan_date_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"📅 Сегодня · {today:%d.%m}", callback_data="scan_date:today"),
          InlineKeyboardButton(text=f"↩️ Вчера · {yesterday:%d.%m}", callback_data="scan_date:yesterday")],
         [InlineKeyboardButton(text="🗓 Выбрать дату", callback_data="scan_date:custom")],
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="home")],
+        [InlineKeyboardButton(text="⬅️ Меню", callback_data="home")],
     ])
 
 
@@ -1182,8 +1177,8 @@ def my_scans_keyboard(scans: list[UserScan], archive_count: int = 0) -> InlineKe
             text="🧹 Очистить и переместить в архив", callback_data="archive_my_scans"
         )])
     rows.append([InlineKeyboardButton(text=f"📦 Архив · {archive_count}", callback_data="scan_archive:0")])
-    rows.append([InlineKeyboardButton(text="▶️ Запустить парсер", callback_data="start_scan")])
-    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
+    rows.append([InlineKeyboardButton(text="▶️ Новый скан", callback_data="start_scan")])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1199,7 +1194,7 @@ def scan_archive_keyboard(scans: list[UserScan], page: int, total: int) -> Inlin
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="⬅️ Мои сканы", callback_data="my_scans")])
-    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -2094,17 +2089,16 @@ def settings_text(s: UserSettings) -> str:
     include = html.escape(s.include_words) if s.include_words else "—"
     exclude = html.escape(s.exclude_words) if s.exclude_words else "—"
     return (
-        "<b>⚙️ Настройки парсинга</b>\n\n"
-        "Эти правила применяются к результату независимо от даты запуска. Дата выбирается отдельно при старте парсера.\n\n"
+        "<b>⚙️ Настройки</b>\n\n"
         f"Режим: <b>{MODE_LABELS.get(s.output_mode, s.output_mode)}</b>\n"
-        f"Умные дубли: <b>{'ВКЛ' if s.smart_dedupe else 'ВЫКЛ'}</b>\n"
-        f"Чистить услуги/поиск: <b>{'ВКЛ' if s.clean_noise else 'ВЫКЛ'}</b>\n"
-        f"Цена: <b>{PRICE_LABELS.get(s.price_filter, s.price_filter)}</b>\n"
-        f"От просмотров: <b>{min_views_label(getattr(s, 'min_views', 0))}</b>\n"
-        f"Сортировка: <b>{SORT_LABELS.get(s.sort_mode, s.sort_mode)}</b>\n"
-        f"Ключевые слова: <b>{include}</b>\n"
-        f"Исключить: <b>{exclude}</b>\n\n"
-        "<i>При запуске выбери «Сегодня», «Вчера» или «Выбрать дату». После этого все настройки выше применятся к выбранному дню.</i>"
+        f"💶 Цена: <b>{PRICE_LABELS.get(s.price_filter, s.price_filter)}</b>\n"
+        f"👁 Просмотры: <b>{min_views_label(getattr(s, 'min_views', 0))}</b>\n"
+        f"🧠 Умные дубли: <b>{'Вкл' if s.smart_dedupe else 'Выкл'}</b>\n"
+        f"🧹 Очистка шума: <b>{'Вкл' if s.clean_noise else 'Выкл'}</b>\n"
+        f"↕️ Сортировка: <b>{SORT_LABELS.get(s.sort_mode, s.sort_mode)}</b>\n"
+        f"🔎 Ключевые слова: <b>{include}</b>\n"
+        f"🚫 Исключения: <b>{exclude}</b>\n\n"
+        "<i>Дата выбирается отдельно при запуске нового скана.</i>"
     )
 
 
@@ -3135,8 +3129,8 @@ def job_keyboard(job_id: str) -> InlineKeyboardMarkup:
 def stopped_job_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗂 Выбрать категории", callback_data="groups")],
-        [InlineKeyboardButton(text="▶️ Запустить парсер", callback_data="start_scan")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")],
+        [InlineKeyboardButton(text="▶️ Новый скан", callback_data="start_scan")],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
     ])
 
 
@@ -3145,7 +3139,7 @@ def failed_job_keyboard(scan_id: int | None) -> InlineKeyboardMarkup:
     if scan_id is not None:
         rows.append([InlineKeyboardButton(text="🔄 Повторить этот скан", callback_data=f"scanrepeat:{scan_id}")])
     rows.append([InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")])
-    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -3322,10 +3316,10 @@ def render_user_job_status(job: ScanJob) -> str:
 
     if job.state == "queued":
         waited = max(0, int((datetime.utcnow() - job.created_at).total_seconds()))
-        headline = "♻️ <b>Восстанавливаю скан после перезапуска…</b>\n\n" if job.recovered else "⏳ <b>Готовлю скан…</b>\n\n"
+        headline = "♻️ <b>Восстанавливаю скан…</b>\n\n" if job.recovered else "⏳ <b>Подготавливаю скан</b>\n\n"
         return (
             headline
-            + f"📂 Категорий: <b>{total}</b>\n"
+            + f"🗂 Категорий: <b>{total}</b>\n"
             + f"📅 <b>{_date_label(job.target_date)}</b> · 📄 <b>{depth} стр.</b>\n"
             + f"⏱ <b>{_human_duration(waited)}</b>"
         )
@@ -3360,9 +3354,9 @@ def render_user_job_status(job: ScanJob) -> str:
     # quality telemetry are intentionally hidden from the everyday UI.
     if live is None or live.phase != "collecting":
         return (
-            "🔄 <b>Парсинг</b>\n\n"
-            f"📂 <b>{category_line}</b> · {category_index}/{total}\n"
-            f"⚡ Ищу объявления за <b>{_date_label(job.target_date)}</b>…\n"
+            "🔎 <b>Ищу объявления</b>\n\n"
+            f"🗂 <b>{category_line}</b> · {category_index}/{total}\n"
+            f"📅 За <b>{_date_label(job.target_date)}</b>\n"
             f"⏱ <b>{_human_duration(elapsed)}</b>"
         )
 
@@ -3372,9 +3366,9 @@ def render_user_job_status(job: ScanJob) -> str:
         views_text = f" · 👁 <b>{min(live_views_ready, current_today)}</b>"
 
     return (
-        f"🔄 <b>Парсинг · {percent}%</b>\n"
+        f"🔎 <b>Сканирование · {percent}%</b>\n"
         f"{_progress_bar(percent)}\n\n"
-        f"📂 <b>{category_line}</b> · {category_index}/{total}\n"
+        f"🗂 <b>{category_line}</b> · {category_index}/{total}\n"
         f"📄 <b>{pages_done}/{depth}</b> страниц\n"
         f"📦 <b>{current_today}</b> объявлений{views_text}\n"
         f"⏱ <b>{_human_duration(elapsed)}</b>"
@@ -3423,33 +3417,12 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
     job.state = "cancelled" if cancelled else ("partial" if job.incomplete_categories else "done")
     if cancelled:
         text = (
-            "⏹ <b>Парсинг остановлен</b>\n\n"
-            f"Категорий обработано: <b>{job.completed_categories}/{len(job.category_keys)}</b>\n"
-            f"Новых найдено: <b>{job.total_new}</b>\n"
+            "⏹ <b>Скан остановлен</b>\n\n"
+            f"🗂 Обработано: <b>{job.completed_categories}/{len(job.category_keys)}</b> категорий\n"
+            f"📦 Найдено до остановки: <b>{job.total_new}</b>\n"
             f"⏱ Время: <b>{elapsed_text}</b>"
         )
-    else:
-        headline = "⚠️ <b>Парсинг завершён частично</b>" if job.incomplete_categories else "✅ <b>Парсинг завершён</b>"
-        completeness_line = (
-            f"⚠️ Требуют допроверки: <b>{job.incomplete_categories}/{len(job.category_keys)}</b>. "
-            "Найденные объявления сохранены.\n"
-            if job.incomplete_categories else ""
-        )
-        quality_values = [int(x) for x in (job.quality_scores or []) if x is not None]
-        quality_avg = round(sum(quality_values) / len(quality_values)) if quality_values else 0
-        text = (
-            f"{headline}\n\n"
-            f"🗂 Категорий обработано: <b>{job.completed_categories}/{len(job.category_keys)}</b>\n"
-            f"🛡 Качество данных: <b>{quality_avg}/100</b>\n"
-            f"📅 Дата объявлений: <b>{_date_label(job.target_date)} (МСК)</b>\n"
-            f"📄 Глубина: <b>{job.page_limit} страниц от начала даты</b>\n"
-            f"{completeness_line}"
-            f"🆕 Новых объявлений: <b>{job.total_new}</b>\n"
-            f"⏱ Время: <b>{elapsed_text}</b>\n\n"
-            "📄 Формирую файл с результатом…"
-        )
-    await edit_job_status(bot, job, text, force=True)
-    if cancelled:
+        await edit_job_status(bot, job, text, force=True)
         try:
             await bot.edit_message_reply_markup(
                 chat_id=job.chat_id,
@@ -3458,68 +3431,94 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
             )
         except Exception:
             log.debug("Could not attach stopped-job actions job=%s", job.job_id, exc_info=True)
+        return
 
-    if not cancelled:
+    # Keep the live card clean while the CSV is being built, then replace it with
+    # the final product-style summary after export returns the actual result count.
+    await edit_job_status(
+        bot,
+        job,
+        "✅ <b>Сканирование завершено</b>\n\n📄 Готовлю результат…",
+        force=True,
+    )
+
+    result_count: int | None = None
+    export_ok = False
+    snapshot_rows: list[Listing] = []
+    if job.scan_id is not None:
         try:
-            settings = await get_settings(job.user_id)
-            result_prefix = (
-                ("⚠️ <b>Частичный результат</b>\n" if job.incomplete_categories else "✅ <b>Готовый результат</b>\n")
-                +
-                f"🗂 Категорий: <b>{job.completed_categories}/{len(job.category_keys)}</b>\n"
-                f"📅 Дата: <b>{_date_label(job.target_date)} (МСК)</b>\n"
-                f"📄 Глубина: <b>{job.page_limit} страниц от начала даты</b>\n"
-                f"⚡ Поиск даты: <b>быстрый переход к старту</b>\n"
-                f"🆕 Новых найдено: <b>{job.total_new}</b>\n"
-                f"🛡 Качество: <b>{round(sum(job.quality_scores or [0]) / max(1, len(job.quality_scores or [])))}/100</b>\n"
-                f"⏱ Время: <b>{elapsed_text}</b>\n"
-                f"Режим: <b>{MODE_LABELS.get(settings.output_mode, settings.output_mode)}</b>\n"
-                f"Дата поиска: <b>{_date_label(job.target_date)} (МСК)</b>\n"
-                f"Цена: <b>{PRICE_LABELS.get(settings.price_filter, settings.price_filter)}</b>\n"
-                f"От просмотров: <b>{min_views_label(getattr(settings, 'min_views', 0))}</b>"
-            )
-            adapter = BotChatAdapter(
-                bot,
+            snapshot_rows = [row for row, _ in await get_scan_rows(job.scan_id)]
+        except Exception:
+            log.exception("Could not load snapshot rows for job=%s", job.job_id)
+
+    try:
+        result_prefix = (
+            "📄 <b>Результат скана</b>\n"
+            f"📅 {_date_label(job.target_date)} · 🗂 {job.completed_categories}/{len(job.category_keys)} категорий"
+        )
+        adapter = BotChatAdapter(
+            bot,
+            job.chat_id,
+            prefix=result_prefix,
+            reply_markup=post_scan_keyboard(job.scan_id, recheck=bool(job.incomplete_categories)),
+        )
+        result_count = await send_smart_export(
+            adapter,
+            job.user_id,
+            len(job.category_keys),
+            category_keys_override=set(job.category_keys),
+            rows_override=snapshot_rows,
+        )
+        export_ok = True
+    except Exception:
+        log.exception("Could not auto-export result for job=%s", job.job_id)
+        try:
+            await bot.send_message(
                 job.chat_id,
-                prefix=result_prefix,
+                "⚠️ <b>Результат сохранён, но CSV не отправился.</b>\n\n"
+                "Открой скан — файл можно скачать повторно.",
+                parse_mode=ParseMode.HTML,
                 reply_markup=post_scan_keyboard(job.scan_id, recheck=bool(job.incomplete_categories)),
             )
-            snapshot_rows = []
-            if job.scan_id is not None:
-                snapshot_rows = [row for row, _ in await get_scan_rows(job.scan_id)]
-            await send_smart_export(
-                adapter,
-                job.user_id,
-                len(job.category_keys),
-                category_keys_override=set(job.category_keys),
-                rows_override=snapshot_rows,
-            )
-        except Exception as exc:
-            log.exception("Could not auto-export result for job=%s", job.job_id)
-            try:
-                await bot.send_message(
-                    job.chat_id,
-                    "⚠️ Парсинг завершён, но автоматическую выгрузку сформировать не удалось. "
-                    "Нажми «📦 Получить результат» — данные уже сохранены.",
-                    reply_markup=post_scan_keyboard(job.scan_id, recheck=bool(job.incomplete_categories)),
-                )
-            except Exception:
-                pass
+        except Exception:
+            pass
+
+    quality_values = [int(x) for x in (job.quality_scores or []) if x is not None]
+    quality_avg = round(sum(quality_values) / len(quality_values)) if quality_values else 0
+    headline = "⚠️ <b>Скан завершён частично</b>" if job.incomplete_categories else "✅ <b>Скан завершён</b>"
+    lines = [
+        headline,
+        "",
+        f"📅 Дата: <b>{_date_label(job.target_date)}</b>",
+        f"🗂 Категории: <b>{job.completed_categories}/{len(job.category_keys)}</b>",
+    ]
+    if result_count is not None:
+        lines.append(f"📦 В результате: <b>{result_count}</b>")
+    if job.incomplete_categories:
+        lines.append(f"⚠️ Допроверка: <b>{job.incomplete_categories}</b> категорий")
+    elif quality_avg and quality_avg < 90:
+        lines.append(f"🛡 Качество: <b>{quality_avg}/100</b>")
+    lines.append(f"⏱ Время: <b>{elapsed_text}</b>")
+    if not job.incomplete_categories:
+        lines.append("🔔 Автозамеры: <b>3 · 6 · 12 ч</b>")
+    lines += ["", "📄 CSV отправлен ниже." if export_ok and result_count else (
+        "По текущим фильтрам подходящих объявлений нет." if export_ok else "Данные сохранены в скане."
+    )]
+    await edit_job_status(bot, job, "\n".join(lines), force=True)
 
     if job.incomplete_categories:
         try:
             await bot.send_message(
                 job.chat_id,
-                "<b>⚠️ Нужна дополнительная проверка</b>\n\n"
+                "<b>⚠️ Нужна допроверка</b>\n\n"
                 f"{job.incomplete_categories} из {len(job.category_keys)} категорий проверены не полностью. "
-                "Найденные объявления уже сохранены и не потеряются.\n\n"
-                "Можно повторно проверить только эти категории — остальные заново запускаться не будут.",
+                "Найденные данные сохранены.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=partial_recheck_keyboard(job.scan_id) if job.scan_id is not None else None,
             )
         except Exception:
             log.exception("Could not send partial-scan notice for job=%s", job.job_id)
     elif job.warnings:
-        # Keep non-actionable diagnostics in logs instead of flooding the user.
         log.info("scan job=%s warnings=%s", job.job_id, job.warnings[:20])
 
 
@@ -3978,7 +3977,7 @@ async def subscription_keyboard(user_id: int) -> InlineKeyboardMarkup:
             )])
     rows.append([InlineKeyboardButton(text="💳 Мои платежи", callback_data="mypayments")])
     if allowed(user_id):
-        rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
+        rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -4021,7 +4020,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🎟 Тарифы", callback_data="adminplans"),
          InlineKeyboardButton(text="🔐 Режим доступа", callback_data="adminmode")],
         [InlineKeyboardButton(text="🔎 Найти пользователя", callback_data="adminusersearch")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
     ])
 
 
@@ -4943,14 +4942,13 @@ async def setup_bot_commands(bot: Bot) -> None:
     """Configure Telegram's bottom-left Menu button and command list."""
     user_commands = [
         BotCommand(command="start", description="🏠 Главное меню"),
-        BotCommand(command="new_scan", description="▶️ Запустить парсер"),
+        BotCommand(command="new_scan", description="▶️ Новый скан"),
         BotCommand(command="stop", description="⏹ Остановить парсер"),
         BotCommand(command="my_scans", description="📊 Мои сканы"),
-        BotCommand(command="popular", description="🔥 Популярное сейчас"),
+        BotCommand(command="popular", description="🔥 Популярное"),
         BotCommand(command="categories", description="🗂 Категории"),
         BotCommand(command="settings", description="⚙️ Настройки"),
         BotCommand(command="subscription", description="💎 Подписка"),
-        BotCommand(command="result", description="📦 Текущий результат"),
         BotCommand(command="help", description="ℹ️ Помощь"),
     ]
     admin_commands = user_commands + [
@@ -4994,7 +4992,7 @@ def onboarding_keyboard(step: int) -> InlineKeyboardMarkup:
 def onboarding_text(step: int) -> str:
     if step == 1:
         return (
-            f"<b>👋 Kleinanzeigen Parser v{APP_VERSION}</b>\n\n"
+            f"<b>👋 Kleinanzeigen Analytics</b>\n\n"
             "Бот помогает найти товары, которые реально привлекают внимание на Kleinanzeigen, "
             "и затем автоматически измеряет рост просмотров.\n\n"
             "Настройка первого запуска занимает меньше минуты."
@@ -5004,14 +5002,14 @@ def onboarding_text(step: int) -> str:
             "<b>1/2 · Как запустить первый скан</b>\n\n"
             "1. 🗂 Выбери одну или несколько категорий.\n"
             "2. ⚙️ При необходимости задай цену, уникальность и слова-фильтры.\n"
-            "3. ▶️ Нажми «Запустить парсер», выбери дату и глубину 25 / 50 / 100 страниц.\n\n"
+            "3. ▶️ Нажми «Новый скан», выбери дату и глубину 25 / 50 / 100 страниц.\n\n"
             "Во время работы парсер можно полностью остановить кнопкой ⏹."
         )
     return (
         "<b>2/2 · Что будет после скана</b>\n\n"
         "📊 Скан сохранится в «Мои сканы».\n"
         "👁 Бот сделает автозамеры через 3 / 6 / 12 часов.\n"
-        "🔥 В «Популярное сейчас» появятся лидеры по просмотрам и росту.\n"
+        "🔥 В «Популярное» появятся лидеры по просмотрам и росту.\n"
         "📦 Через 24 часа карточка уйдёт в Архив, но данные не удалятся.\n\n"
         "Готово — можно выбирать категории."
     )
@@ -5026,36 +5024,40 @@ async def _show_onboarding(message: Message, user_id: int, step: int = 1) -> Non
     )
 
 
+def home_text(selected_count: int) -> str:
+    if selected_count:
+        state_line = f"🗂 Категории: <b>{selected_count}/{MAX_SELECTED_CATEGORIES}</b> · можно запускать скан"
+    else:
+        state_line = "🗂 Категории: <b>не выбраны</b>"
+    return (
+        "<b>🔎 Kleinanzeigen Analytics</b>\n\n"
+        "Находи объявления, которые быстрее остальных набирают просмотры.\n\n"
+        f"{state_line}\n\n"
+        "Выбери действие ниже."
+    )
+
+
 async def _send_home_message(message: Message, user_id: int, *, intro: bool = False) -> None:
     selected = await get_selected(user_id)
-    if intro:
-        text = (
-            f"<b>🔍 Kleinanzeigen Parser v{APP_VERSION}</b>\n\n"
-            "Здесь всё строится вокруг сохранённых сканов:\n"
-            "🔥 <b>Популярное сейчас</b> — лидеры по просмотрам\n"
-            "▶️ <b>Запустить парсер</b> — собрать свежие объявления\n"
-            "📊 <b>Мои сканы</b> — вернуться к любому запуску, обновить просмотры и увидеть рост\n\n"
-            "После скана результат не теряется: его карточка остаётся в «Мои сканы»."
-        )
-    else:
-        text = f"<b>🔍 Kleinanzeigen Parser v{APP_VERSION}</b>\n\nЧто хочешь посмотреть?"
-    await message.answer(text, reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await message.answer(
+        home_text(len(selected)),
+        reply_markup=main_keyboard(len(selected)),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def _send_popular_message(message: Message, user_id: int) -> None:
     items = await get_user_popular_categories(user_id)
     if not items:
         text = (
-            "🔥 <b>Популярное сейчас</b>\n\n"
-            "Здесь появятся только категории, которые ты уже сканировал. "
-            "Сначала сделай хотя бы один скан с просмотрами."
+            "🔥 <b>Популярное</b>\n\n"
+            "После первого успешного скана здесь появится актуальный TOP по категории."
         )
     else:
         text = (
-            "🔥 <b>Популярное сейчас</b>\n\n"
-            "Выбери категорию. Для неё используется только <b>последний успешно завершённый скан</b>.\n\n"
-            "🚀 TOP 3/6/12ч — по <b>реальному приросту просмотров</b>.\n"
-            "👁 Самые просматриваемые — отдельный рейтинг по общему числу просмотров."
+            "🔥 <b>Популярное</b>\n\n"
+            "Выбери категорию — показываем только её <b>последний успешный скан</b>.\n"
+            "TOP роста доступен по замерам 3 / 6 / 12 часов."
         )
     await message.answer(
         text,
@@ -5070,15 +5072,11 @@ async def _send_my_scans_message(message: Message, user_id: int) -> None:
     archive_count = await get_archive_count(user_id)
     if not scans:
         text = (
-            "<b>📊 Мои сканы</b>\n\nСвежих сканов пока нет. Завершённые сканы через <b>24 часа</b> "
-            "автоматически уходят в 📦 Архив и не засоряют этот список."
+            "<b>📊 Мои сканы</b>\n\nСвежих сканов пока нет. После завершения они будут храниться здесь 24 часа, затем уйдут в Архив."
         )
     else:
         text = (
-            "<b>📊 Мои сканы</b>\n\nЗдесь только текущие и свежие сканы за последние <b>24 часа</b>. "
-            "Старые автоматически уходят в 📦 Архив.\n\n"
-            "Если список уже не нужен — нажми <b>🧹 Очистить и переместить в архив</b>. "
-            "Данные при этом не удаляются."
+            "<b>📊 Мои сканы</b>\n\nТекущие и свежие запуски за последние <b>24 часа</b>. Старые автоматически уходят в Архив; данные не удаляются."
         )
     await message.answer(
         text, parse_mode=ParseMode.HTML,
@@ -5106,8 +5104,9 @@ async def _begin_scan_from_message(message: Message, state: FSMContext) -> None:
 
     await state.set_state(ScanInput.target_date)
     await message.answer(
-        "<b>📅 За какой день запустить парсер?</b>\n\n"
-        "Выбери дату отдельно от настроек. Всё считаем по <b>московскому времени (МСК)</b>.",
+        "<b>▶️ Новый скан</b>\n\n"
+        "<b>1/2 · Дата объявлений</b>\n"
+        "Выбери день. Время считаем по Москве.",
         parse_mode=ParseMode.HTML,
         reply_markup=scan_date_keyboard(),
     )
@@ -5130,7 +5129,7 @@ async def onboarding_handler(callback: CallbackQuery, state: FSMContext) -> None
         selected = await get_selected(callback.from_user.id)
         await _edit_or_answer(
             callback.message,
-            f"<b>🔍 Kleinanzeigen Parser v{APP_VERSION}</b>\n\nВсё готово. Что хочешь сделать?",
+            home_text(len(selected)),
             reply_markup=main_keyboard(len(selected)),
         )
         return
@@ -5190,7 +5189,7 @@ async def categories_command(message: Message, state: FSMContext) -> None:
     await state.clear()
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>🗂 Категории Kleinanzeigen</b>\n\nОткрой раздел и отметь, что нужно парсить.",
+        f"<b>🗂 Категории</b>\n\nВыбери до <b>{MAX_SELECTED_CATEGORIES}</b> категорий на один скан.",
         reply_markup=groups_keyboard(selected),
         parse_mode=ParseMode.HTML,
     )
@@ -5225,19 +5224,18 @@ async def help_command(message: Message, state: FSMContext) -> None:
     await state.clear()
     selected = await get_selected(message.from_user.id)
     await message.answer(
-        "<b>ℹ️ Быстрое меню</b>\n\n"
-        "Нажми кнопку <b>Menu</b> рядом со строкой ввода — там собраны основные разделы бота.\n\n"
-        "▶️ Запустить парсер — начать сбор\n"
-        "📊 Мои сканы — история запусков\n"
-        "🔥 Популярное — рейтинги просмотров и роста\n"
-        "🗂 Категории — выбрать, что сканировать\n"
-        "⚙️ Настройки — фильтры и параметры\n"
-        "💎 Подписка — статус и тарифы\n"
-        "📦 Текущий результат — скачать текущую выборку",
+        "<b>ℹ️ Помощь</b>\n\n"
+        "Основные разделы всегда доступны через кнопку <b>Menu</b>.\n\n"
+        "▶️ Новый скан — выбрать дату и запустить сбор\n"
+        "🔥 Популярное — актуальный TOP последнего успешного скана\n"
+        "📊 Мои сканы — свежие запуски и архив\n"
+        "🗂 Категории — что анализировать\n"
+        "⚙️ Настройки — фильтры результата\n"
+        "💎 Подписка — доступ и платежи",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🎓 Показать обучение", callback_data="onboard:1")],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")],
+            [InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
         ]),
     )
 
@@ -5255,7 +5253,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
     selected = await get_selected(callback.from_user.id)
     await _edit_or_answer(
         callback.message,
-        f"<b>🔍 Kleinanzeigen Parser v{APP_VERSION}</b>\n\nЧто хочешь посмотреть?",
+        home_text(len(selected)),
         reply_markup=main_keyboard(len(selected)),
     )
 
@@ -5278,7 +5276,7 @@ async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
     await callback.message.answer(
-        f"<b>🔍 Kleinanzeigen Parser v{APP_VERSION}</b>\n\nЧто хочешь посмотреть?",
+        home_text(len(selected)),
         reply_markup=main_keyboard(len(selected)),
         parse_mode=ParseMode.HTML,
     )
@@ -5606,16 +5604,14 @@ async def popular_now(callback: CallbackQuery) -> None:
     await callback.answer()
     if not items:
         text = (
-            "🔥 <b>Популярное сейчас</b>\n\n"
-            "Здесь появятся только категории, которые ты уже сканировал. "
-            "Сначала сделай хотя бы один скан с просмотрами."
+            "🔥 <b>Популярное</b>\n\n"
+            "После первого успешного скана здесь появится актуальный TOP по категории."
         )
     else:
         text = (
-            "🔥 <b>Популярное сейчас</b>\n\n"
-            "Выбери категорию. Для неё используется только <b>последний успешно завершённый скан</b>.\n\n"
-            "🚀 TOP 3/6/12ч — по <b>реальному приросту просмотров</b>.\n"
-            "👁 Самые просматриваемые — отдельный рейтинг по общему числу просмотров."
+            "🔥 <b>Популярное</b>\n\n"
+            "Выбери категорию — показываем только её <b>последний успешный скан</b>.\n"
+            "TOP роста доступен по замерам 3 / 6 / 12 часов."
         )
     try:
         await callback.message.edit_text(
@@ -5645,13 +5641,11 @@ async def popular_category(callback: CallbackQuery) -> None:
     await callback.answer()
     finished_label = _moscow_text(scan.finished_at or scan.created_at)
     text = (
-        f"🔥 <b>Популярное · {html.escape(cat.name)}</b>\n\n"
-        f"📅 Дата объявлений: <b>{html.escape(_date_label(scan.target_date))}</b>\n"
-        f"🕒 Последний успешный запуск: <b>{html.escape(finished_label)}</b>\n"
-        f"📦 Объявлений после фильтров: <b>{len(rows)}</b>\n"
-        f"👁 С просмотрами: <b>{viewed}</b>\n\n"
-        "Здесь используется <b>только последний успешно завершённый скан</b> этой категории. "
-        "Предыдущие запуски остаются в «Моих сканах» и «Архиве»."
+        f"🔥 <b>{html.escape(cat.name)}</b>\n\n"
+        f"📅 <b>{html.escape(_date_label(scan.target_date))}</b>\n"
+        f"🕒 Последний скан: <b>{html.escape(finished_label)}</b>\n"
+        f"📦 Объявлений: <b>{len(rows)}</b> · 👁 С просмотрами: <b>{viewed}</b>\n\n"
+        "Актуальный TOP по последнему успешному скану."
     )
     await callback.message.answer(
         text, parse_mode=ParseMode.HTML,
@@ -5770,14 +5764,11 @@ async def my_scans(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     if not scans:
         text = (
-            "<b>📊 Мои сканы</b>\n\nСвежих сканов пока нет. Завершённые сканы через <b>24 часа</b> "
-            "автоматически уходят в 📦 Архив."
+            "<b>📊 Мои сканы</b>\n\nСвежих сканов пока нет. После завершения они будут храниться здесь 24 часа, затем уйдут в Архив."
         )
     else:
         text = (
-            "<b>📊 Мои сканы</b>\n\nЗдесь только текущие и свежие сканы за последние <b>24 часа</b>. "
-            "Старые автоматически уходят в 📦 Архив.\n\n"
-            "🧹 Можно убрать завершённые сканы раньше — данные не удалятся."
+            "<b>📊 Мои сканы</b>\n\nТекущие и свежие запуски за последние <b>24 часа</b>. Старые автоматически уходят в Архив; данные не удаляются."
         )
     await _edit_or_answer(
         callback.message,
@@ -5834,7 +5825,7 @@ async def archive_noop(callback: CallbackQuery) -> None:
 
 
 async def render_scan_detail(scan: UserScan) -> str:
-    """Compact scan card for non-technical users."""
+    """Compact product-style scan card. Show diagnostics only when actionable."""
     pairs = await get_scan_rows(scan.id)
     scan_settings = await get_settings(scan.user_id)
     allowed_rows = apply_listing_settings(
@@ -5855,15 +5846,6 @@ async def render_scan_detail(scan: UserScan) -> str:
                 growers += 1
                 total_growth += delta
 
-    new_since = 0
-    if scan.finished_at is not None:
-        keys = _scan_category_keys(scan)
-        if keys:
-            async with SessionLocal() as session:
-                new_since = (await session.execute(select(func.count(Listing.id)).where(
-                    Listing.category_key.in_(keys), Listing.first_seen_at > scan.finished_at
-                ))).scalar_one()
-
     history_rounds = await get_scan_history_rounds(scan.id, limit=50)
     observation_statuses = await get_scan_observation_statuses(scan.id)
     status_icons = {"done": "✅", "pending": "⏳", "running": "🔄", "missed": "▫️", "error": "⚠️"}
@@ -5873,7 +5855,6 @@ async def render_scan_detail(scan: UserScan) -> str:
     )
 
     quality_value = int(getattr(scan, "quality_score", 0) or 0)
-    quality_label = f"{quality_value}/100" if quality_value > 0 else "—"
     status_label = {
         "done": "✅ Завершён",
         "partial": "⚠️ Частичный результат",
@@ -5883,69 +5864,44 @@ async def render_scan_detail(scan: UserScan) -> str:
         "cancelled": "⏹ Остановлен",
         "failed": "❌ Ошибка",
     }.get(scan.status, scan.status)
-
     depth = scan.page_limit if scan.page_limit in PAGE_LIMIT_CHOICES else 50
+
     lines = [
         f"<b>📊 {html.escape(scan.title)}</b>",
-        f"{status_label}",
+        status_label,
         "",
-        f"📅 Объявления за: <b>{_date_label(scan.target_date)}</b>",
-        f"📄 Глубина: <b>{depth} стр.</b>",
-        f"🛡 Качество: <b>{quality_label}</b>",
+        f"📅 <b>{_date_label(scan.target_date)}</b> · 📄 <b>{depth} стр.</b>",
+        f"📦 Объявлений: <b>{len(rows)}</b> · 👁 С просмотрами: <b>{viewed}</b>",
     ]
     if scan.total_categories > 1:
         lines.append(f"🗂 Категории: <b>{scan.completed_categories}/{scan.total_categories}</b>")
 
-    lines += [
-        "",
-        "<b>Результат</b>",
-        f"📦 Объявлений: <b>{len(rows)}</b>",
-        f"👁 С просмотрами: <b>{viewed}/{len(rows)}</b>",
-    ]
-
-    if len(history_rounds) >= 2 or growers > 0:
-        growth_text = f"🚀 Набрали просмотры: <b>{growers}</b>"
-        if total_growth > 0:
-            growth_text += f" · всего <b>+{total_growth}</b>"
-        lines.append(growth_text)
-    else:
-        lines.append("🚀 Рост: <b>появится после повторного замера</b>")
-
-    if new_since > 0:
-        lines.append(f"🆕 Новых найдено позже: <b>{new_since}</b>")
+    if growers > 0:
+        lines.append(f"🚀 Набирают просмотры: <b>{growers}</b> · всего <b>+{total_growth}</b>")
+    elif len(history_rounds) < 2:
+        lines.append("🚀 Рост появится после первого контрольного замера")
     if disappeared > 0:
-        lines.append(f"❌ Исчезли: <b>{disappeared}</b>")
+        lines.append(f"▫️ Исчезли: <b>{disappeared}</b>")
 
     lines += [
         "",
-        "<b>Наблюдение</b>",
-        f"📈 Замеров просмотров: <b>{len(history_rounds)}</b>",
-        f"🔔 Авто: <b>{observation_line}</b>",
+        f"🔔 Автозамеры: <b>{observation_line}</b>",
     ]
     if scan.last_view_refresh_at:
         lines.append(f"🕒 Обновлено: <b>{_moscow_text(scan.last_view_refresh_at)} МСК</b>")
 
-    # Diagnostics should only appear when they actually need the user's attention.
     if scan.status == "partial":
         incomplete_keys = [
             key for key in (getattr(scan, "incomplete_category_keys", "") or "").split(",") if key in CATEGORIES
         ]
         if incomplete_keys:
             names = ", ".join(CATEGORIES[key].name for key in incomplete_keys[:5])
-            lines += [
-                "",
-                f"⚠️ <b>Допроверка:</b> {len(incomplete_keys)} кат. — {html.escape(names)}",
-                "Найденные объявления сохранены; можно допроверить только эти категории.",
-            ]
-        elif getattr(scan, "scan_note", ""):
-            lines += ["", "⚠️ <b>Часть категории проверена не полностью.</b> Найденные объявления сохранены."]
+            lines += ["", f"⚠️ Допроверка: <b>{len(incomplete_keys)}</b> · {html.escape(names)}"]
+        else:
+            lines += ["", "⚠️ Часть скана требует допроверки."]
     elif quality_value and quality_value < 90 and getattr(scan, "quality_note", ""):
-        lines += ["", f"⚠️ <b>Проверка качества:</b> {html.escape(scan.quality_note)}"]
+        lines += ["", f"⚠️ Проверка качества: {html.escape(scan.quality_note)}"]
 
-    lines += [
-        "",
-        "💡 <b>Топ просмотров</b> — что уже популярно. <b>Топ роста</b> — что быстрее всего набирает просмотры.",
-    ]
     return "\n".join(lines)
 
 
@@ -6481,8 +6437,7 @@ async def groups(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await _edit_or_answer(
         callback.message,
-        f"<b>🗂 Категории Kleinanzeigen</b>\n\nВыбери до <b>{MAX_SELECTED_CATEGORIES}</b> категорий на один запуск. "
-        "Так скан быстрее, стабильнее и проще допроверять при сетевых ограничениях.",
+        f"<b>🗂 Категории</b>\n\nВыбери до <b>{MAX_SELECTED_CATEGORIES}</b> категорий на один скан.",
         reply_markup=groups_keyboard(selected),
     )
 
@@ -6699,8 +6654,9 @@ async def start_scan(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(ScanInput.target_date)
     await callback.answer()
     await callback.message.answer(
-        "<b>📅 За какой день запустить парсер?</b>\n\n"
-        "Выбери дату отдельно от настроек. Всё считаем по <b>московскому времени (МСК)</b>.",
+        "<b>▶️ Новый скан</b>\n\n"
+        "<b>1/2 · Дата объявлений</b>\n"
+        "Выбери день. Время считаем по Москве.",
         parse_mode=ParseMode.HTML,
         reply_markup=scan_date_keyboard(),
     )
@@ -6725,20 +6681,26 @@ async def _show_scan_depth_choice(message: Message, state: FSMContext, user_id: 
         return
 
     scan_settings = await get_settings(user_id)
-    include = html.escape(scan_settings.include_words) if scan_settings.include_words else "—"
-    exclude = html.escape(scan_settings.exclude_words) if scan_settings.exclude_words else "—"
+    include = html.escape(scan_settings.include_words) if scan_settings.include_words else ""
+    exclude = html.escape(scan_settings.exclude_words) if scan_settings.exclude_words else ""
+    extra_lines = []
+    if include:
+        extra_lines.append(f"🔎 Ключевые: <b>{include}</b>")
+    if exclude:
+        extra_lines.append(f"🚫 Исключения: <b>{exclude}</b>")
+    extras = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
     await message.answer(
-        f"<b>📅 Дата: {_date_label(target_date)} (МСК)</b>\n\n"
-        "<b>⚙️ Активные настройки результата</b>\n"
+        "<b>▶️ Новый скан</b>\n\n"
+        "<b>2/2 · Проверка запуска</b>\n"
+        f"📅 Дата: <b>{_date_label(target_date)}</b>\n"
+        f"🗂 Категорий: <b>{len(selected_cats)}/{MAX_SELECTED_CATEGORIES}</b>\n"
         f"Режим: <b>{MODE_LABELS.get(scan_settings.output_mode, scan_settings.output_mode)}</b>\n"
-        f"Умные дубли: <b>{'ВКЛ' if scan_settings.smart_dedupe else 'ВЫКЛ'}</b>\n"
-        f"Чистить услуги/поиск: <b>{'ВКЛ' if scan_settings.clean_noise else 'ВЫКЛ'}</b>\n"
-        f"Цена: <b>{PRICE_LABELS.get(scan_settings.price_filter, scan_settings.price_filter)}</b>\n"
-        f"От просмотров: <b>{min_views_label(getattr(scan_settings, 'min_views', 0))}</b>\n"
-        f"Сортировка: <b>{SORT_LABELS.get(scan_settings.sort_mode, scan_settings.sort_mode)}</b>\n"
-        f"Ключевые слова: <b>{include}</b>\n"
-        f"Исключить: <b>{exclude}</b>\n\n"
-        "Теперь выбери глубину <b>25 / 50 / 100 страниц</b>. Все настройки выше применятся именно к выбранной дате.",
+        f"💶 Цена: <b>{PRICE_LABELS.get(scan_settings.price_filter, scan_settings.price_filter)}</b> · "
+        f"👁 <b>{min_views_label(getattr(scan_settings, 'min_views', 0))}</b>\n"
+        f"🧠 Дубли: <b>{'Вкл' if scan_settings.smart_dedupe else 'Выкл'}</b> · "
+        f"🧹 Шум: <b>{'Вкл' if scan_settings.clean_noise else 'Выкл'}</b>"
+        f"{extras}\n\n"
+        "Выбери глубину сканирования.",
         parse_mode=ParseMode.HTML,
         reply_markup=page_limit_keyboard(),
     )
@@ -6760,8 +6722,8 @@ async def choose_scan_date(callback: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(ScanInput.target_date)
         await callback.answer()
         await callback.message.answer(
-            "<b>🗓 Отправь нужную дату</b>\n\n"
-            "Например: <code>10.08.2026</code>, <code>10.08</code> или просто <code>10</code> для текущего месяца.",
+            "<b>🗓 Своя дата</b>\n\n"
+            "Отправь <code>10.08.2026</code>, <code>10.08</code> или просто <code>10</code>.",
             parse_mode=ParseMode.HTML,
         )
         return
