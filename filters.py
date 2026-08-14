@@ -401,6 +401,14 @@ def apply_listing_settings(
         include_words=settings.include_words or "",
         exclude_words=settings.exclude_words or "",
     )
+    min_views = max(0, int(getattr(settings, "min_views", 0) or 0))
+    if min_views > 0:
+        # A non-zero threshold means only listings with a successfully fetched
+        # public view counter can enter the user's result.
+        filtered = [
+            row for row in filtered
+            if row.view_count is not None and int(row.view_count) >= min_views
+        ]
     if apply_output_mode and settings.output_mode == "unique":
         filtered = unique_rows(filtered)
     elif settings.smart_dedupe and settings.output_mode != "frequent":

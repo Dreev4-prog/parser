@@ -78,7 +78,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "3.3.1"
+APP_VERSION = "3.3.2"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
@@ -199,6 +199,7 @@ def _regional_category_url(base_url: str, slug: str, location_id: int) -> str:
 class SettingsInput(StatesGroup):
     include_words = State()
     exclude_words = State()
+    min_views = State()
     view_test_url = State()
 
 
@@ -313,7 +314,7 @@ def popular_categories_keyboard(items: list[tuple[str, UserScan]]) -> InlineKeyb
 
 def popular_category_keyboard(scan_id: int, category_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👁 Самые просматриваемые · все сканы", callback_data=f"pcv:{scan_id}:{category_key}")],
+        [InlineKeyboardButton(text="👁 Самые просматриваемые · последний скан", callback_data=f"pcv:{scan_id}:{category_key}")],
         [InlineKeyboardButton(text="🚀 TOP 3ч", callback_data=f"pcg:{scan_id}:{category_key}:3"),
          InlineKeyboardButton(text="🔥 TOP 6ч", callback_data=f"pcg:{scan_id}:{category_key}:6")],
         [InlineKeyboardButton(text="🔥 TOP 12ч", callback_data=f"pcg:{scan_id}:{category_key}:12")],
@@ -395,6 +396,11 @@ def _mode_button(s: UserSettings, mode: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=label, callback_data=f"quickmode:{mode}")
 
 
+def min_views_label(value: int | None) -> str:
+    threshold = max(0, int(value or 0))
+    return "Без порога" if threshold == 0 else f"{threshold}+"
+
+
 def settings_keyboard(s: UserSettings) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [_mode_button(s, "newest"), _mode_button(s, "all")],
@@ -404,6 +410,7 @@ def settings_keyboard(s: UserSettings) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"🚫 Умные дубли: {'ВКЛ' if s.smart_dedupe else 'ВЫКЛ'}", callback_data="toggle_dedupe")],
         [InlineKeyboardButton(text=f"🧹 Чистить услуги/поиск: {'ВКЛ' if s.clean_noise else 'ВЫКЛ'}", callback_data="toggle_noise")],
         [InlineKeyboardButton(text=f"💶 Цена: {PRICE_LABELS.get(s.price_filter, s.price_filter)}", callback_data="set_price")],
+        [InlineKeyboardButton(text=f"👁 От просмотров: {min_views_label(getattr(s, 'min_views', 0))}", callback_data="set_min_views")],
         [InlineKeyboardButton(text=f"↕️ Сортировка: {SORT_LABELS.get(s.sort_mode, s.sort_mode)}", callback_data="set_sort")],
         [InlineKeyboardButton(text="✅ Ключевые слова", callback_data="set_include"),
          InlineKeyboardButton(text="🚫 Исключить слова", callback_data="set_exclude")],
@@ -437,6 +444,25 @@ def scan_date_keyboard() -> InlineKeyboardMarkup:
 
 def choice_keyboard(prefix: str, options: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=label, callback_data=f"{prefix}:{value}")] for value, label in options]
+    rows.append([InlineKeyboardButton(text="⬅️ К настройкам", callback_data="settings")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def min_views_keyboard(current: int = 0) -> InlineKeyboardMarkup:
+    presets = (0, 10, 25, 50, 100)
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for value in presets:
+        label = "Без порога" if value == 0 else f"{value}+"
+        if int(current or 0) == value:
+            label = "✅ " + label
+        row.append(InlineKeyboardButton(text=label, callback_data=f"minviews:{value}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="✏️ Своё значение", callback_data="minviews:custom")])
     rows.append([InlineKeyboardButton(text="⬅️ К настройкам", callback_data="settings")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -636,18 +662,13 @@ async def get_archive_count(user_id: int) -> int:
 
 
 async def get_user_popular_categories(user_id: int, limit_scans: int = 100) -> list[tuple[str, UserScan]]:
-    """Return category menu entries, newest representative scan first.
-
-    The representative scan is used only to build compact Telegram callbacks.
-    Category analytics themselves aggregate every completed scan for that
-    category (see ``get_user_category_scans`` / ``get_category_scan_rows``).
-    """
+    """Return one menu entry per category using its latest successful scan only."""
     async with SessionLocal() as session:
         result = await session.execute(
             select(UserScan)
             .where(
                 UserScan.user_id == user_id,
-                UserScan.status.in_(["done", "partial"]),
+                UserScan.status == "done",
             )
             .order_by(UserScan.finished_at.desc(), UserScan.created_at.desc())
             .limit(limit_scans)
@@ -662,11 +683,10 @@ async def get_user_popular_categories(user_id: int, limit_scans: int = 100) -> l
 
 
 async def get_user_category_scans(user_id: int, category_key: str) -> list[UserScan]:
-    """Return every completed user scan that contains ``category_key``.
+    """Return successful scans containing category_key, newest first.
 
-    Exact key matching is intentionally done in Python instead of SQL ``LIKE``
-    because ``category_keys`` is a comma-separated legacy field and category
-    names may share prefixes. Newest scans are returned first.
+    This remains available for history/admin features. «Популярное сейчас» uses
+    only the first item (the latest successful scan).
     """
     if category_key not in CATEGORIES:
         return []
@@ -675,7 +695,7 @@ async def get_user_category_scans(user_id: int, category_key: str) -> list[UserS
             select(UserScan)
             .where(
                 UserScan.user_id == user_id,
-                UserScan.status.in_(["done", "partial"]),
+                UserScan.status == "done",
             )
             .order_by(UserScan.finished_at.desc(), UserScan.created_at.desc())
         )
@@ -683,30 +703,28 @@ async def get_user_category_scans(user_id: int, category_key: str) -> list[UserS
     return [scan for scan in scans if category_key in _scan_category_keys(scan)]
 
 
-async def get_category_scan_rows(user_id: int, category_key: str) -> tuple[list[Listing], list[UserScan]]:
-    """Union all saved listings from all completed scans of one category.
-
-    One Kleinanzeigen listing may be present in several repeated scans. The SQL
-    ``DISTINCT`` keeps it only once. The current listing view counter is used,
-    while paid/promoted rows are excluded from Popular just like global output.
-    """
+async def get_latest_scan_for_category(user_id: int, category_key: str) -> UserScan | None:
     scans = await get_user_category_scans(user_id, category_key)
-    if not scans:
+    return scans[0] if scans else None
+
+
+async def get_category_scan_rows(user_id: int, category_key: str) -> tuple[list[Listing], list[UserScan]]:
+    """Return listings from the latest successful scan of a category only."""
+    scan = await get_latest_scan_for_category(user_id, category_key)
+    if scan is None:
         return [], []
-    scan_ids = [scan.id for scan in scans]
     async with SessionLocal() as session:
         result = await session.execute(
             select(Listing)
             .join(ScanListing, Listing.external_id == ScanListing.external_id)
             .where(
-                ScanListing.scan_id.in_(scan_ids),
+                ScanListing.scan_id == scan.id,
                 Listing.category_key == category_key,
                 Listing.is_promoted.is_(False),
             )
-            .distinct()
         )
         rows = list(result.scalars().all())
-    return rows, scans
+    return rows, [scan]
 
 
 def _category_scan_dates(scans: list[UserScan], max_items: int = 8) -> str:
@@ -717,11 +735,6 @@ def _category_scan_dates(scans: list[UserScan], max_items: int = 8) -> str:
     if len(dates) > max_items:
         shown.append(f"+ ещё {len(dates) - max_items}")
     return ", ".join(shown)
-
-
-async def get_latest_scan_for_category(user_id: int, category_key: str) -> UserScan | None:
-    scans = await get_user_category_scans(user_id, category_key)
-    return scans[0] if scans else None
 
 
 async def get_scan_rows(scan_id: int) -> list[tuple[Listing, ScanListing]]:
@@ -1136,37 +1149,14 @@ async def get_scan_growth_rows(
 async def get_category_growth_rows(
     user_id: int, category_key: str, period_hours: int
 ) -> tuple[list[GrowthMetric], int, int]:
-    """Aggregate growth metrics from every completed scan of one category.
-
-    Repeated scans can contain the same Kleinanzeigen ad. In that case the most
-    recent observation wins, so the category TOP never shows duplicate rows.
-    Returns ``(growth, scan_count, observation_round_count)``.
-    """
-    scans = await get_user_category_scans(user_id, category_key)
-    if not scans:
+    """Return growth metrics for the latest successful scan of a category only."""
+    scan = await get_latest_scan_for_category(user_id, category_key)
+    if scan is None:
         return [], 0, 0
-
-    merged: dict[str, GrowthMetric] = {}
-    total_rounds = 0
-    for scan in scans:
-        growth, rounds = await get_scan_growth_rows(
-            scan.id, period_hours, category_key=category_key
-        )
-        total_rounds += rounds
-        for item in growth:
-            external_id = item.listing.external_id
-            previous = merged.get(external_id)
-            if previous is None:
-                merged[external_id] = item
-                continue
-            # Prefer the newest real observation. On an identical timestamp,
-            # keep the larger delta as a deterministic tie breaker.
-            if (item.observed_at, item.delta) > (previous.observed_at, previous.delta):
-                merged[external_id] = item
-
-    values = list(merged.values())
-    values.sort(key=lambda item: (item.delta, item.per_hour, item.current_views), reverse=True)
-    return values[:GROWTH_TOP_LIMIT], len(scans), total_rounds
+    growth, rounds = await get_scan_growth_rows(
+        scan.id, period_hours, category_key=category_key
+    )
+    return growth[:GROWTH_TOP_LIMIT], 1, rounds
 
 
 def _scan_list_button(scan: UserScan) -> InlineKeyboardButton:
@@ -2110,6 +2100,7 @@ def settings_text(s: UserSettings) -> str:
         f"Умные дубли: <b>{'ВКЛ' if s.smart_dedupe else 'ВЫКЛ'}</b>\n"
         f"Чистить услуги/поиск: <b>{'ВКЛ' if s.clean_noise else 'ВЫКЛ'}</b>\n"
         f"Цена: <b>{PRICE_LABELS.get(s.price_filter, s.price_filter)}</b>\n"
+        f"От просмотров: <b>{min_views_label(getattr(s, 'min_views', 0))}</b>\n"
         f"Сортировка: <b>{SORT_LABELS.get(s.sort_mode, s.sort_mode)}</b>\n"
         f"Ключевые слова: <b>{include}</b>\n"
         f"Исключить: <b>{exclude}</b>\n\n"
@@ -3483,7 +3474,8 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
                 f"⏱ Время: <b>{elapsed_text}</b>\n"
                 f"Режим: <b>{MODE_LABELS.get(settings.output_mode, settings.output_mode)}</b>\n"
                 f"Дата поиска: <b>{_date_label(job.target_date)} (МСК)</b>\n"
-                f"Цена: <b>{PRICE_LABELS.get(settings.price_filter, settings.price_filter)}</b>"
+                f"Цена: <b>{PRICE_LABELS.get(settings.price_filter, settings.price_filter)}</b>\n"
+                f"От просмотров: <b>{min_views_label(getattr(settings, 'min_views', 0))}</b>"
             )
             adapter = BotChatAdapter(
                 bot,
@@ -5061,7 +5053,7 @@ async def _send_popular_message(message: Message, user_id: int) -> None:
     else:
         text = (
             "🔥 <b>Популярное сейчас</b>\n\n"
-            "Выбери категорию. Рейтинги разных категорий больше не смешиваются.\n\n"
+            "Выбери категорию. Для неё используется только <b>последний успешно завершённый скан</b>.\n\n"
             "🚀 TOP 3/6/12ч — по <b>реальному приросту просмотров</b>.\n"
             "👁 Самые просматриваемые — отдельный рейтинг по общему числу просмотров."
         )
@@ -5394,6 +5386,62 @@ async def choose_price(callback: CallbackQuery) -> None:
     await callback.message.edit_text(settings_text(s), reply_markup=settings_keyboard(s), parse_mode=ParseMode.HTML)
 
 
+@dp.callback_query(F.data == "set_min_views")
+async def set_min_views(callback: CallbackQuery) -> None:
+    s = await get_settings(callback.from_user.id)
+    await callback.answer()
+    await callback.message.edit_text(
+        "<b>👁 Минимум просмотров</b>\n\n"
+        "В результат попадут только объявления, у которых текущее число просмотров не ниже выбранного порога.\n\n"
+        "<i>Важно: бот всё равно должен сначала получить счётчик просмотров у объявления, поэтому эта настройка фильтрует результат, а не уменьшает число запросов к Kleinanzeigen.</i>",
+        reply_markup=min_views_keyboard(int(getattr(s, "min_views", 0) or 0)),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.callback_query(F.data.startswith("minviews:"))
+async def choose_min_views(callback: CallbackQuery, state: FSMContext) -> None:
+    value = callback.data.split(":", 1)[1]
+    if value == "custom":
+        await state.set_state(SettingsInput.min_views)
+        await callback.answer()
+        await callback.message.answer(
+            "👁 Пришли минимальное количество просмотров числом.\n\n"
+            "Например: <code>75</code>\n"
+            "Чтобы отключить порог — отправь <code>0</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        threshold = max(0, min(10_000_000, int(value)))
+    except ValueError:
+        await callback.answer("Некорректное значение", show_alert=True)
+        return
+    s = await update_setting(callback.from_user.id, "min_views", threshold)
+    await callback.answer("Порог просмотров сохранён")
+    await callback.message.edit_text(settings_text(s), reply_markup=settings_keyboard(s), parse_mode=ParseMode.HTML)
+
+
+@dp.message(SettingsInput.min_views)
+async def save_custom_min_views(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip().replace(" ", "")
+    try:
+        threshold = int(raw)
+    except ValueError:
+        await message.answer("Пришли целое число, например <code>75</code>.", parse_mode=ParseMode.HTML)
+        return
+    if threshold < 0 or threshold > 10_000_000:
+        await message.answer("Укажи значение от 0 до 10 000 000.")
+        return
+    s = await update_setting(message.from_user.id, "min_views", threshold)
+    await state.clear()
+    await message.answer(
+        "✅ Порог просмотров сохранён.\n\n" + settings_text(s),
+        reply_markup=settings_keyboard(s),
+        parse_mode=ParseMode.HTML,
+    )
+
+
 @dp.callback_query(F.data == "set_sort")
 async def set_sort(callback: CallbackQuery) -> None:
     await callback.answer()
@@ -5561,7 +5609,7 @@ async def popular_now(callback: CallbackQuery) -> None:
     else:
         text = (
             "🔥 <b>Популярное сейчас</b>\n\n"
-            "Выбери категорию. Рейтинги разных категорий больше не смешиваются.\n\n"
+            "Выбери категорию. Для неё используется только <b>последний успешно завершённый скан</b>.\n\n"
             "🚀 TOP 3/6/12ч — по <b>реальному приросту просмотров</b>.\n"
             "👁 Самые просматриваемые — отдельный рейтинг по общему числу просмотров."
         )
@@ -5588,19 +5636,18 @@ async def popular_category(callback: CallbackQuery) -> None:
         await callback.answer("Категория или сканы не найдены", show_alert=True); return
     scan_settings = await get_settings(callback.from_user.id)
     rows = apply_listing_settings(rows, scan_settings, exact_date_scan=True, apply_output_mode=True)
-    scan = scans[0]  # newest representative scan; analytics below use all scans
+    scan = scans[0]
     viewed = sum(1 for row in rows if row.view_count is not None)
-    unique_dates = {item.target_date for item in scans if item.target_date}
     await callback.answer()
+    finished_label = _moscow_text(scan.finished_at or scan.created_at)
     text = (
         f"🔥 <b>Популярное · {html.escape(cat.name)}</b>\n\n"
-        f"🧩 Объединено запусков: <b>{len(scans)}</b>\n"
-        f"📅 Даты парсинга объявлений: <b>{html.escape(_category_scan_dates(scans))}</b>\n"
-        f"📦 Уникальных объявлений: <b>{len(rows)}</b>\n"
+        f"📅 Дата объявлений: <b>{html.escape(_date_label(scan.target_date))}</b>\n"
+        f"🕒 Последний успешный запуск: <b>{html.escape(finished_label)}</b>\n"
+        f"📦 Объявлений после фильтров: <b>{len(rows)}</b>\n"
         f"👁 С просмотрами: <b>{viewed}</b>\n\n"
-        "Теперь рейтинг собирается <b>по всем сохранённым сканам этой категории</b>, "
-        "а повторно встретившееся объявление показывается только один раз. "
-        f"Всего разных дат в выборке: <b>{len(unique_dates)}</b>."
+        "Здесь используется <b>только последний успешно завершённый скан</b> этой категории. "
+        "Предыдущие запуски остаются в «Моих сканах» и «Архиве»."
     )
     await callback.message.answer(
         text, parse_mode=ParseMode.HTML,
@@ -5630,11 +5677,11 @@ async def popular_category_views(callback: CallbackQuery) -> None:
     rows.sort(key=lambda row: (row.view_count or 0, row.first_seen_at), reverse=True)
     await callback.answer()
     if not rows:
-        text = f"👁 <b>{html.escape(cat.name)}</b>\n\nПока нет данных просмотров ни в одном сохранённом скане."
+        text = f"👁 <b>{html.escape(cat.name)}</b>\n\nВ последнем успешном скане пока нет объявлений с подходящими данными просмотров."
     else:
         lines = [
             f"👁 <b>Самые просматриваемые · {html.escape(cat.name)}</b>",
-            f"Сводно по <b>{len(scans)}</b> запускам · даты: <b>{html.escape(_category_scan_dates(scans))}</b>",
+            f"Последний успешный скан · дата объявлений: <b>{html.escape(_date_label(scans[0].target_date))}</b>",
             "",
         ]
         for i, row in enumerate(rows[:GROWTH_TELEGRAM_LIMIT], 1):
@@ -5681,14 +5728,14 @@ async def popular_category_growth(callback: CallbackQuery) -> None:
     if not growth:
         text = (
             f"🚀 <b>TOP роста · {html.escape(cat.name)} · {period_label}</b>\n\n"
-            f"Проверены все сохранённые сканы категории: <b>{scan_count}</b>. "
+            "Проверен последний успешный скан категории. "
             "Контрольные замеры для этого периода ещё не готовы или прироста пока нет. "
             "Автоматические замеры выполняются через 3 / 6 / 12 часов после каждого скана."
         )
     else:
         lines = [
             f"🚀 <b>TOP роста · {html.escape(cat.name)} · {period_label}</b>",
-            f"Сводно по <b>{scan_count}</b> запускам · без дублей объявлений.",
+            "Последний успешный скан категории.",
             "Сортировка: <b>кто набрал больше всего новых просмотров</b>.",
             "",
         ]
@@ -6141,7 +6188,7 @@ async def send_category_growth_xlsx(
             FSInputFile(path),
             caption=(
                 f"📊 TOP-{min(GROWTH_TOP_LIMIT, len(growth))} роста за {period_hours}ч{suffix} "
-                f"· сводно по {scan_count} запускам"
+                "· последний успешный скан"
             ),
         )
     finally:
@@ -6176,7 +6223,7 @@ async def popular_growth_export(callback: CallbackQuery) -> None:
     scans = await get_user_category_scans(callback.from_user.id, category_key)
     if not scans:
         await callback.answer("Сканы категории не найдены", show_alert=True); return
-    await callback.answer("Формирую сводный TOP-50")
+    await callback.answer("Формирую TOP-50 последнего скана")
     await send_category_growth_xlsx(
         callback.message, callback.from_user.id, category_key, period_hours
     )
@@ -6681,6 +6728,7 @@ async def _show_scan_depth_choice(message: Message, state: FSMContext, user_id: 
         f"Умные дубли: <b>{'ВКЛ' if scan_settings.smart_dedupe else 'ВЫКЛ'}</b>\n"
         f"Чистить услуги/поиск: <b>{'ВКЛ' if scan_settings.clean_noise else 'ВЫКЛ'}</b>\n"
         f"Цена: <b>{PRICE_LABELS.get(scan_settings.price_filter, scan_settings.price_filter)}</b>\n"
+        f"От просмотров: <b>{min_views_label(getattr(scan_settings, 'min_views', 0))}</b>\n"
         f"Сортировка: <b>{SORT_LABELS.get(scan_settings.sort_mode, scan_settings.sort_mode)}</b>\n"
         f"Ключевые слова: <b>{include}</b>\n"
         f"Исключить: <b>{exclude}</b>\n\n"

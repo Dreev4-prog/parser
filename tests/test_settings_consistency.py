@@ -30,6 +30,7 @@ def settings(**overrides) -> UserSettings:
         clean_noise=True,
         period="today",
         price_filter="200_500",
+        min_views=0,
         sort_mode="newest",
         include_words="",
         exclude_words="",
@@ -83,3 +84,21 @@ def test_legacy_period_field_is_ignored_for_all_listing_settings():
         apply_output_mode=True,
     )
     assert [r.external_id for r in result] == ["legacy"]
+
+
+def test_min_views_threshold_filters_result_after_view_collection():
+    low = row("low", "Apple TV 4K 128GB", 300)
+    low.view_count = 49
+    high = row("high", "PlayStation Portal", 200)
+    high.view_count = 50
+    missing = row("missing", "Nintendo Switch OLED", 250)
+    missing.view_count = None
+
+    result = apply_listing_settings(
+        [low, high, missing],
+        settings(output_mode="all", smart_dedupe=False, price_filter="any", min_views=50),
+        exact_date_scan=True,
+        apply_output_mode=True,
+    )
+
+    assert [r.external_id for r in result] == ["high"]

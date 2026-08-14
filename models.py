@@ -83,6 +83,7 @@ class UserSettings(Base):
     # Legacy v3.2.6 field kept for schema compatibility; ignored since v3.2.7.
     period: Mapped[str] = mapped_column(String(16), default="today")
     price_filter: Mapped[str] = mapped_column(String(32), default="any")
+    min_views: Mapped[int] = mapped_column(Integer, default=0)
     sort_mode: Mapped[str] = mapped_column(String(32), default="newest")
     include_words: Mapped[str] = mapped_column(String(1000), default="")
     exclude_words: Mapped[str] = mapped_column(String(1000), default="")
