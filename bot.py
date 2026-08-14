@@ -5253,7 +5253,11 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
         await _edit_or_answer(callback.message, onboarding_text(1), reply_markup=onboarding_keyboard(1))
         return
     selected = await get_selected(callback.from_user.id)
-    await callback.message.edit_text(f"<b>🔍 Kleinanzeigen Parser v{APP_VERSION}</b>\n\nЧто хочешь посмотреть?", reply_markup=main_keyboard(len(selected)), parse_mode=ParseMode.HTML)
+    await _edit_or_answer(
+        callback.message,
+        f"<b>🔍 Kleinanzeigen Parser v{APP_VERSION}</b>\n\nЧто хочешь посмотреть?",
+        reply_markup=main_keyboard(len(selected)),
+    )
 
 
 @dp.callback_query(F.data == "post_settings")
@@ -5287,7 +5291,7 @@ async def settings(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     s = await get_settings(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text(settings_text(s), reply_markup=settings_keyboard(s), parse_mode=ParseMode.HTML)
+    await _edit_or_answer(callback.message, settings_text(s), reply_markup=settings_keyboard(s))
 
 
 @dp.callback_query(F.data == "mode_help")
@@ -5757,7 +5761,8 @@ async def popular_category_growth(callback: CallbackQuery) -> None:
 
 
 @dp.callback_query(F.data == "my_scans")
-async def my_scans(callback: CallbackQuery) -> None:
+async def my_scans(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     if not allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
     scans = await get_user_scans(callback.from_user.id, 10)
@@ -5774,9 +5779,9 @@ async def my_scans(callback: CallbackQuery) -> None:
             "Старые автоматически уходят в 📦 Архив.\n\n"
             "🧹 Можно убрать завершённые сканы раньше — данные не удалятся."
         )
-    await callback.message.edit_text(
+    await _edit_or_answer(
+        callback.message,
         text,
-        parse_mode=ParseMode.HTML,
         reply_markup=my_scans_keyboard(scans, archive_count),
     )
 
@@ -6469,15 +6474,16 @@ async def scan_recheck_partial(callback: CallbackQuery) -> None:
 
 
 @dp.callback_query(F.data == "groups")
-async def groups(callback: CallbackQuery) -> None:
+async def groups(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     if not allowed(callback.from_user.id): await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text(
+    await _edit_or_answer(
+        callback.message,
         f"<b>🗂 Категории Kleinanzeigen</b>\n\nВыбери до <b>{MAX_SELECTED_CATEGORIES}</b> категорий на один запуск. "
         "Так скан быстрее, стабильнее и проще допроверять при сетевых ограничениях.",
         reply_markup=groups_keyboard(selected),
-        parse_mode=ParseMode.HTML,
     )
 
 

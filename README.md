@@ -1,7 +1,7 @@
-# Kleinanzeigen Parser Bot v3.3.2
+# Kleinanzeigen Parser Bot v3.3.3
 
 
-## v3.3.2 — минимум просмотров + актуальное «Популярно сейчас»
+## v3.3.3 — минимум просмотров + актуальное «Популярно сейчас»
 
 - В **⚙️ Настройки** добавлен фильтр **«👁 От просмотров»**: без порога / 10+ / 25+ / 50+ / 100+ / своё значение.
 - При ненулевом пороге в пользовательский результат попадают только объявления с успешно полученным публичным счётчиком просмотров не ниже порога. Фильтр применяется к сохранённому скану, выгрузкам, TOP и «Популярно сейчас».
@@ -372,3 +372,11 @@ v3.2.2+ requires Railway PostgreSQL in production so user access, payments, scan
 - A stop detaches the user job immediately; if no other user shares that category scan, the underlying network/parser task is cancelled too.
 - Cancelled scans are marked `cancelled` and do not create a result snapshot or automatic view-observation plan.
 - After stopping, the bot offers **Выбрать категории** and **Запустить парсер** so a new run can start immediately.
+
+
+## v3.3.3 — исправление навигации после CSV
+
+- Исправлены кнопки главного меню, прикреплённые к документу результата.
+- «Мои сканы», «Категории», «Настройки» и «Главное меню» теперь безопасно открываются и из CSV-сообщения.
+- Если Telegram не позволяет редактировать документ через `edit_text`, бот автоматически отправляет новый текстовый экран.
+- Основные переходы также очищают незавершённое FSM-состояние пользователя.
