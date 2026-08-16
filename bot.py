@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 from collections import Counter
+from contextvars import ContextVar
 import html
 import logging
 import os
@@ -63,6 +64,7 @@ from parser import (
     MAX_PAGES_PER_CATEGORY,
     PAGE_DELAY_SECONDS,
     STOP_AFTER_EMPTY_TODAY_PAGES,
+    SCAN_TRANSPORT,
     KleinanzeigenParser,
     ParsedListing,
     ViewCountResult,
@@ -79,7 +81,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "3.5.0"
+APP_VERSION = "3.6.0"
 MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -92,6 +94,10 @@ MAX_CONCURRENT_JOBS = max(1, min(12, int(os.getenv("MAX_CONCURRENT_JOBS", "5")))
 MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
 PARSER_WORKER_CONCURRENCY = max(1, min(8, int(os.getenv("PARSER_WORKER_CONCURRENCY", "1"))))
 CATEGORY_CACHE_TTL_SECONDS = max(0, int(os.getenv("CATEGORY_CACHE_TTL_SECONDS", "300")))
+SHARE_ACTIVE_CATEGORY_SCANS = os.getenv(
+    "SHARE_ACTIVE_CATEGORY_SCANS", "0" if SCAN_TRANSPORT == "browser" else "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+JOB_PARSER: ContextVar[KleinanzeigenParser | None] = ContextVar("dtparser_job_parser", default=None)
 STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVAL_SECONDS", "1.5")))
 # v3.3.0 job-level resilience on top of parser HTTP retries. A category that
 # throws an unexpected transient exception gets one controlled retry before the
@@ -3303,11 +3309,19 @@ async def fresh_category_cache_age(category_key: str, page_limit: int, target_da
 
 
 async def _scan_category_task(cat, user_id: int, page_limit: int, target_date: str) -> ScanResult:
-    parser = KleinanzeigenParser()
+    # A browser worker binds one parser/browser session to the whole user job.
+    # asyncio tasks inherit ContextVar values, so every sequential category in the
+    # job reuses the same independent Chromium context instead of launching a new
+    # browser for every category. Local/legacy calls still get an owned parser.
+    parser = JOB_PARSER.get()
+    owned = parser is None
+    if parser is None:
+        parser = KleinanzeigenParser()
     try:
         return await scan_one_category(parser, cat, user_id, page_limit, target_date)
     finally:
-        await parser.close()
+        if owned:
+            await parser.close()
 
 
 async def _publish_distributed_category_progress(inflight_key: str, lock_token: str) -> None:
@@ -3437,6 +3451,31 @@ async def dispatch_category(
                 return CategoryDispatchResult(source="cache", result=result, cache_age_seconds=0)
         except Exception:
             log.exception("Redis category cache read failed key=%s", inflight_key)
+
+    # Browser-isolated mode intentionally does not subscribe a second active user
+    # to another user's in-flight category. Each user keeps moving in their own
+    # Chromium session. Completed-result caching is still kept above.
+    if not SHARE_ACTIVE_CATEGORY_SCANS:
+        task = asyncio.create_task(
+            _scan_category_task(cat, user_id, page_limit, target_date),
+            name=f"category-scan-isolated:{user_id}:{inflight_key}",
+        )
+        try:
+            result = await wait_for_task_or_stop(task, stop_event)
+        except ScanStopRequested:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        if CATEGORY_CACHE_TTL_SECONDS > 0:
+            category_result_cache[inflight_key] = (time.monotonic(), result)
+        if DISTRIBUTED_WORKERS:
+            try:
+                await COORDINATOR.set_category_result(
+                    inflight_key, result, max(60, CATEGORY_CACHE_TTL_SECONDS or 60)
+                )
+            except Exception:
+                log.debug("Could not publish isolated category cache key=%s", inflight_key, exc_info=True)
+        return CategoryDispatchResult(source="scan", result=result)
 
     async with category_inflight_guard:
         task = category_inflight.get(inflight_key)
@@ -3654,8 +3693,9 @@ def render_user_job_status(job: ScanJob) -> str:
             f"🗂 <b>{category_line}</b> · {category_index}/{total}\n"
             f"📅 За <b>{_date_label(job.target_date)}</b>"
             f"{requests_text}\n"
-            f"⏱ <b>{_human_duration(elapsed)}</b>\n\n"
-            "Запросы распределяются между активными сканами — статус обновляется автоматически."
+            f"⏱ <b>{_human_duration(elapsed)}</b>\n"
+            + ("🌐 <b>Отдельная Chromium-сессия</b>\n" if SCAN_TRANSPORT == "browser" else "")
+            + "\nСтатус обновляется автоматически."
         )
 
     if live.phase == "views":
@@ -4033,9 +4073,13 @@ async def scan_worker(bot: Bot, worker_id: int) -> None:
                 await finish_job(bot, job, cancelled=True)
             else:
                 await TRAFFIC.scan_job_started()
+                parser = KleinanzeigenParser()
+                parser_token = JOB_PARSER.set(parser)
                 try:
                     await process_scan_job(bot, job, worker_id)
                 finally:
+                    JOB_PARSER.reset(parser_token)
+                    await parser.close()
                     await TRAFFIC.scan_job_finished()
         except asyncio.CancelledError:
             raise
@@ -4203,9 +4247,13 @@ async def distributed_scan_worker(bot: Bot, worker_id: str) -> None:
                 _distributed_cancel_watcher(job), name=f"cancel-watch:{job.job_id}"
             )
             await TRAFFIC.scan_job_started()
+            parser = KleinanzeigenParser()
+            parser_token = JOB_PARSER.set(parser)
             try:
                 await process_scan_job(bot, job, 1)
             finally:
+                JOB_PARSER.reset(parser_token)
+                await parser.close()
                 await TRAFFIC.scan_job_finished()
                 cancel_watcher.cancel()
                 await asyncio.gather(cancel_watcher, return_exceptions=True)

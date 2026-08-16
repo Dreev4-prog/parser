@@ -8,7 +8,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
-from distributed import COORDINATOR, DISTRIBUTED_WORKERS
+from distributed import COORDINATOR, DISTRIBUTED_WORKERS, DIST_TRAFFIC_SHARED_COOLDOWN
 
 log = logging.getLogger("dtparser-traffic")
 
@@ -161,7 +161,7 @@ class AdaptiveTrafficManager:
                 cooldown = min(self.max_cooldown, cooldown * 1.5)
             self._cooldown_until = max(self._cooldown_until, now + cooldown)
             self._condition.notify_all()
-        if DISTRIBUTED_WORKERS:
+        if DISTRIBUTED_WORKERS and DIST_TRAFFIC_SHARED_COOLDOWN:
             try:
                 await COORDINATOR.report_traffic_refusal(int(status_code))
             except Exception:

@@ -50,6 +50,17 @@ DIRECT_VIEW_CONCURRENCY = max(1, min(16, int(os.getenv("DIRECT_VIEW_CONCURRENCY"
 VIEW_DIRECT_BATCH_SIZE = max(5, min(200, int(os.getenv("VIEW_DIRECT_BATCH_SIZE", "40"))))
 VIEW_DIRECT_BATCH_PAUSE_SECONDS = max(0.0, min(5.0, float(os.getenv("VIEW_DIRECT_BATCH_PAUSE_SECONDS", "0.35"))))
 
+# v3.6.0 Browser-Isolated Workers. Foreground category pages can be loaded through
+# a real Chromium navigation instead of the process-wide HTTP client. Each parser
+# worker/job owns one browser context and one lightweight page; selected categories
+# reuse that session sequentially for the lifetime of the user scan.
+SCAN_TRANSPORT = os.getenv("SCAN_TRANSPORT", "http").strip().lower()
+if SCAN_TRANSPORT not in {"http", "browser"}:
+    SCAN_TRANSPORT = "http"
+BROWSER_SCAN_NAV_TIMEOUT_MS = max(10_000, min(90_000, int(os.getenv("BROWSER_SCAN_NAV_TIMEOUT_MS", "35000"))))
+BROWSER_SCAN_ACCESS_MAX_WAIT_SECONDS = max(10.0, min(180.0, float(os.getenv("BROWSER_SCAN_ACCESS_MAX_WAIT_SECONDS", "45"))))
+BROWSER_SCAN_RETRY_MIN_SECONDS = max(2.0, min(30.0, float(os.getenv("BROWSER_SCAN_RETRY_MIN_SECONDS", "6"))))
+
 log = logging.getLogger("kleinanzeigen-parser")
 
 
@@ -938,11 +949,20 @@ class KleinanzeigenParser:
         self._browser = None
         self._browser_context = None
         self._browser_lock = asyncio.Lock()
+        self._scan_page = None
+        self._scan_page_lock = asyncio.Lock()
         self._direct_mode_lock = asyncio.Lock()
+        self.scan_transport = SCAN_TRANSPORT
         self._direct_view_mode: str = "unknown"  # unknown|http|context|browser
         self._context_session_seeded = False
 
     async def close(self) -> None:
+        try:
+            if self._scan_page is not None:
+                await self._scan_page.close()
+        except Exception:
+            pass
+        self._scan_page = None
         try:
             if self._browser_context is not None:
                 await self._browser_context.close()
@@ -1039,15 +1059,119 @@ class KleinanzeigenParser:
 
         raise RuntimeError(str(last_error))
 
+    async def _reset_scan_page(self) -> None:
+        page = self._scan_page
+        self._scan_page = None
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+    async def _ensure_scan_page(self):
+        if self._scan_page is not None and not self._scan_page.is_closed():
+            return self._scan_page
+        context = await self._ensure_view_browser()
+        page = await context.new_page()
+        await self._install_lightweight_route(page)
+        self._scan_page = page
+        return page
+
+    async def _fetch_scan_browser_document(self, url: str) -> tuple[str, str]:
+        """Load one public category page in the worker's dedicated Chromium session.
+
+        The browser worker is isolation, not an anti-bot bypass: it uses a normal
+        public browser navigation, honors 403/429 responses, and backs off locally.
+        A refusal in one isolated browser does not require freezing every other
+        browser worker.
+        """
+        if not _allowed_url(url):
+            raise ValueError("Only public kleinanzeigen.de HTTPS URLs are allowed")
+        try:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        except Exception as exc:
+            raise RuntimeError(f"Playwright unavailable: {exc}") from exc
+
+        started = time.monotonic()
+        refusal_attempt = 0
+        transient_attempt = 0
+        while True:
+            try:
+                async with self._scan_page_lock:
+                    page = await self._ensure_scan_page()
+                    async with TRAFFIC.lease("scan", "high"):
+                        response = await page.goto(
+                            url, wait_until="domcontentloaded", timeout=BROWSER_SCAN_NAV_TIMEOUT_MS
+                        )
+                    if response is None:
+                        raise RuntimeError("Chromium navigation returned no main response")
+                    status = int(response.status)
+                    final_url = page.url
+
+                    if status in {403, 429}:
+                        refusal_attempt += 1
+                        await TRAFFIC.report_refusal(status, "scan")
+                        elapsed = time.monotonic() - started
+                        if elapsed < BROWSER_SCAN_ACCESS_MAX_WAIT_SECONDS:
+                            delay = min(20.0, BROWSER_SCAN_RETRY_MIN_SECONDS * min(refusal_attempt, 3))
+                            delay += random.uniform(0.0, min(1.5, CATEGORY_RETRY_JITTER_SECONDS))
+                            remaining = max(0.0, BROWSER_SCAN_ACCESS_MAX_WAIT_SECONDS - elapsed)
+                            if remaining:
+                                await asyncio.sleep(min(delay, remaining))
+                            await self._reset_scan_page()
+                            continue
+                        raise TemporaryAccessError(status, url)
+
+                    if status >= 500:
+                        transient_attempt += 1
+                        if transient_attempt >= CATEGORY_HTTP_RETRIES:
+                            raise RuntimeError(f"Chromium category HTTP {status}")
+                        await asyncio.sleep(1.2 * transient_attempt + random.uniform(0.0, 0.6))
+                        await self._reset_scan_page()
+                        continue
+                    if status >= 400:
+                        raise RuntimeError(f"Chromium category HTTP {status}")
+
+                    await TRAFFIC.report_success("scan")
+                    try:
+                        text = await response.text()
+                    except Exception:
+                        text = await page.content()
+                    if not text:
+                        text = await page.content()
+                    return text, final_url
+            except TemporaryAccessError:
+                raise
+            except (asyncio.TimeoutError, PlaywrightTimeoutError):
+                transient_attempt += 1
+                await self._reset_scan_page()
+                if transient_attempt >= CATEGORY_HTTP_RETRIES:
+                    raise
+                await asyncio.sleep(1.2 * transient_attempt + random.uniform(0.0, 0.6))
+            except Exception:
+                transient_attempt += 1
+                await self._reset_scan_page()
+                if transient_attempt >= CATEGORY_HTTP_RETRIES:
+                    raise
+                await asyncio.sleep(1.2 * transient_attempt + random.uniform(0.0, 0.6))
+
     async def fetch_html(
         self, url: str, *, traffic_kind: str = "scan", traffic_priority: str = "high"
     ) -> str:
+        if traffic_kind == "scan" and self.scan_transport == "browser":
+            text, _ = await self._fetch_scan_browser_document(url)
+            return text
         return (await self._fetch_response(url, traffic_kind=traffic_kind, traffic_priority=traffic_priority)).text
 
     async def parse_category_page(self, url: str) -> list[ParsedListing]:
         return parse_category_html(await self.fetch_html(url))
 
     async def parse_category_page_info(self, url: str, requested_page: int) -> CategoryPageInfo:
+        if self.scan_transport == "browser":
+            text, final_url = await self._fetch_scan_browser_document(url)
+            return category_page_info_from_html(
+                text, requested_page=requested_page, final_url=final_url
+            )
         response = await self._fetch_response(url)
         return category_page_info_from_html(
             response.text,

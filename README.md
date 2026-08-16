@@ -1,4 +1,44 @@
-# Kleinanzeigen Parser Bot v3.5.0
+# Kleinanzeigen Parser Bot v3.6.0
+
+## v3.6.0 — Browser-Isolated Workers
+
+Релиз для реального multi-user browser execution. В v3.5.0 Redis уже разделил очередь и worker-процессы, но foreground category/date search всё ещё выполнялся обычным `httpx`. Поэтому пять worker replicas могли логически быть разными, но сетевой путь поиска даты оставался одинаковым.
+
+### Что изменилось
+
+- Добавлен `browser_worker.py`: отдельный Railway worker запускает foreground category pages через **реальный headless Chromium / Playwright**.
+- Один активный UserScan получает один `KleinanzeigenParser` + один browser context, который переиспользуется для всех выбранных категорий этого запуска. После завершения браузер полностью закрывается.
+- При 5 browser-worker replicas одновременно могут существовать **5 независимых Chromium-процессов/контекстов** — по одному на активный пользовательский scan.
+- Browser transport используется именно для поиска даты и чтения category pages; HTML дальше разбирается тем же проверенным parser-quality кодом.
+- Изображения, шрифты, media и CSS в Chromium блокируются, чтобы category navigation не тратила лишний трафик/RAM.
+- Активные одинаковые сканы больше не принудительно объединяются (`SHARE_ACTIVE_CATEGORY_SCANS=0` по умолчанию у browser worker). Каждый пользователь действительно продолжает собственный browser scan. Завершённый короткий cache сохраняется.
+- 403/429 в одном browser worker больше не публикует общий Redis freeze для всех browser workers (`DIST_TRAFFIC_SHARED_COOLDOWN=0`). Локальный worker аккуратно замедляется/останавливает проблемную категорию, остальные продолжают работу.
+- Глобальный Redis concurrency governor сохранён: независимые браузеры не получают право бесконтрольно создавать burst-запросы.
+- Парсер теперь переиспользуется на уровне всего UserScan через `ContextVar`, поэтому Chromium не перезапускается между каждой из 1–5 категорий пользователя.
+- Старый `parser_worker.py` оставлен как HTTP fallback; можно переключаться без миграции PostgreSQL.
+
+### Рекомендуемая схема
+
+```text
+Telegram bot ×1
+      │
+      ├── PostgreSQL
+      └── Redis Streams
+             │
+       ┌─────┼─────┬─────┬─────┐
+       ▼     ▼     ▼     ▼     ▼
+   Browser Browser Browser Browser Browser
+   Worker1 Worker2 Worker3 Worker4 Worker5
+   Chromium Chromium Chromium Chromium Chromium
+
+      + views-worker ×1
+```
+
+Для Railway подробная инструкция: **`DEPLOY_V3_6_BROWSER_WORKERS.md`**.
+
+> Важно: разные Chromium-сессии дают независимые процессы/cookies/event loops, но сами по себе не гарантируют разные публичные egress IP. Если внешний сайт ограничивает именно общий IP/ASN, это отдельное сетевое ограничение, а не проблема очереди или браузерной изоляции.
+
+---
 
 ## v3.5.0 — Multi-User Core / Redis Workers
 

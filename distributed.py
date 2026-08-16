@@ -49,6 +49,7 @@ DIST_TRAFFIC_VIEW_LIMIT = _env_int("DIST_TRAFFIC_VIEW_LIMIT", 3, 1, 30)
 DIST_TRAFFIC_BROWSER_LIMIT = _env_int("DIST_TRAFFIC_BROWSER_LIMIT", 1, 1, 8)
 DIST_TRAFFIC_GLOBAL_LIMIT = _env_int("DIST_TRAFFIC_GLOBAL_LIMIT", 8, 2, 40)
 DIST_TRAFFIC_TOKEN_SECONDS = _env_int("DIST_TRAFFIC_TOKEN_SECONDS", 90, 10, 180)
+DIST_TRAFFIC_SHARED_COOLDOWN = _env_bool("DIST_TRAFFIC_SHARED_COOLDOWN", True)
 
 
 class DistributedUnavailable(RuntimeError):
@@ -278,7 +279,12 @@ class DistributedCoordinator:
         return f"{REDIS_PREFIX}:traffic:next:{kind}"
 
     def _traffic_cooldown_key(self) -> str:
-        return f"{REDIS_PREFIX}:traffic:cooldown_until_ms"
+        if DIST_TRAFFIC_SHARED_COOLDOWN:
+            return f"{REDIS_PREFIX}:traffic:cooldown_until_ms"
+        # Browser-isolated workers should not all freeze because one independent
+        # browser session received a temporary refusal. Keep the cooldown key local
+        # to this worker process while still sharing the global concurrency tokens.
+        return f"{REDIS_PREFIX}:traffic:cooldown:{socket.gethostname()}:{os.getpid()}"
 
     async def acquire_traffic(self, kind: str, *, interval_seconds: float = 0.0) -> str:
         """Acquire a short Redis lease shared by every parser-worker replica.

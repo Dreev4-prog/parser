@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from aiogram import Bot
 
@@ -14,6 +15,7 @@ from bot import (
     recover_distributed_unfinished_scans,
 )
 from db import DATABASE_BACKEND, init_db
+from parser import SCAN_TRANSPORT
 from distributed import COORDINATOR, DISTRIBUTED_WORKERS, default_worker_id
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -47,9 +49,11 @@ async def main() -> None:
         for idx in range(1, PARSER_WORKER_CONCURRENCY + 1)
     ]
     log.info(
-        "DT PARSER worker online | id=%s | local_concurrency=%s | db=%s",
+        "DT PARSER worker online | id=%s | replica=%s | local_concurrency=%s | transport=%s | db=%s",
         base_worker_id,
+        os.getenv("RAILWAY_REPLICA_ID", "local"),
         PARSER_WORKER_CONCURRENCY,
+        SCAN_TRANSPORT,
         DATABASE_BACKEND,
     )
     try:
