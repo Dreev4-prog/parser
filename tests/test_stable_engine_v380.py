@@ -9,8 +9,8 @@ ENV = (ROOT / ".env.example").read_text(encoding="utf-8")
 
 
 def test_v380_version_and_stable_worker():
-    assert (ROOT / "VERSION").read_text().strip() == "4.1.5"
-    assert 'APP_VERSION = "4.1.5"' in BOT
+    assert (ROOT / "VERSION").read_text().strip() == "4.1.6"
+    assert 'APP_VERSION = "4.1.6"' in BOT
     assert 'os.environ["STABLE_SCAN_ENGINE"] = "1"' in WORKER
     assert 'os.environ["SHARE_ACTIVE_CATEGORY_SCANS"] = "1"' in WORKER
     assert 'os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "0"' in WORKER
@@ -47,7 +47,7 @@ def test_verified_pages_use_postgres_checkpoint_before_network():
 
 def test_view_work_is_removed_from_default_foreground_scan():
     assert 'PRIMARY_SCAN_INLINE_VIEWS = os.getenv("PRIMARY_SCAN_INLINE_VIEWS", "0")' in BOT
-    assert 'if inline_view_counts:' in BOT
+    assert 'need_view_counts = PRIMARY_SCAN_INLINE_VIEWS' in BOT
     assert 'OBSERVATION_SCHEDULE_HOURS = (0, 3, 6, 12)' in BOT
     assert 'target_hours == 0 and membership.initial_view_count is None' in BOT
 

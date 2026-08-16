@@ -14,8 +14,8 @@ def _item(i: int, posted: str | None):
 
 
 def test_v401_version():
-    assert (ROOT / "VERSION").read_text().strip() == "4.1.5"
-    assert 'APP_VERSION = "4.1.5"' in BOT
+    assert (ROOT / "VERSION").read_text().strip() == "4.1.6"
+    assert 'APP_VERSION = "4.1.6"' in BOT
 
 
 def test_sparse_direction_uses_absolute_date_evidence():

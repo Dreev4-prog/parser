@@ -1,3 +1,9 @@
+# v4.1.6 — Queue Visibility + Deferred Views
+
+- Queued Redis jobs show queue position instead of appearing frozen.
+- Stale queued test jobs older than 10 minutes are retired at startup.
+- View-threshold scans collect pages first, then fetch view counts in one concurrent phase.
+
 # v4.1.5 — Self-Bootstrap Fleet
 
 - With `REDIS_URL` present, the main `parser` service automatically starts one embedded browser-backed Redis consumer if no external `fleet-worker` heartbeat exists.

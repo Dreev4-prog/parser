@@ -88,7 +88,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.1.5"
+APP_VERSION = "4.1.6"
 MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -115,7 +115,7 @@ if DISTRIBUTED_WORKERS:
 MAX_CONCURRENT_JOBS = max(1, min(12, int(os.getenv("MAX_CONCURRENT_JOBS", "5"))))
 MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
 PARSER_WORKER_CONCURRENCY = max(1, min(8, int(os.getenv("PARSER_WORKER_CONCURRENCY", "1"))))
-# v4.1.5: bootstrap one in-process browser consumer when Redis is configured but
+# v4.1.6: bootstrap one in-process browser consumer when Redis is configured but
 # no external parser/fleet worker is online yet. This keeps a fresh Railway
 # install functional with only the main parser service; external fleet replicas
 # can be added later for horizontal scaling.
@@ -123,6 +123,8 @@ EMBEDDED_FLEET_FALLBACK = os.getenv("EMBEDDED_FLEET_FALLBACK", "1").strip().lowe
     "0", "false", "no", "off",
 }
 EMBEDDED_FLEET_READY_WAIT_SECONDS = max(0, min(15, int(os.getenv("EMBEDDED_FLEET_READY_WAIT_SECONDS", "3"))))
+DISTRIBUTED_STALE_QUEUE_SECONDS = max(60, min(3600, int(os.getenv("DISTRIBUTED_STALE_QUEUE_SECONDS", "600"))))
+DISTRIBUTED_QUEUE_UI_SECONDS = max(2.0, min(15.0, float(os.getenv("DISTRIBUTED_QUEUE_UI_SECONDS", "3"))))
 CATEGORY_CACHE_TTL_SECONDS = max(0, int(os.getenv("CATEGORY_CACHE_TTL_SECONDS", "300")))
 SHARE_ACTIVE_CATEGORY_SCANS = os.getenv(
     "SHARE_ACTIVE_CATEGORY_SCANS",
@@ -2735,7 +2737,12 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     progress_key = _progress_key(cat.key, target_date, depth)
     mode = "stable-date" if STABLE_SCAN_ENGINE else "date"
     scan_settings = await get_settings(user_id)
-    inline_view_counts = PRIMARY_SCAN_INLINE_VIEWS or int(getattr(scan_settings, "min_views", 0) or 0) > 0
+    # v4.1.6: view-threshold scans still need fresh counters before final filtering,
+    # but fetching 20-30 counters after *every* page made a 25-page crawl look
+    # frozen.  Collect the category pages first, then run one concurrent views
+    # phase for all matched target-day listings.
+    need_view_counts = PRIMARY_SCAN_INLINE_VIEWS or int(getattr(scan_settings, "min_views", 0) or 0) > 0
+    deferred_view_items: dict[str, ParsedListing] = {}
     if STABLE_SCAN_ENGINE:
         try:
             await mark_category_job(cat.key, target_date, depth, status="running")
@@ -2849,9 +2856,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         async with db_write_lock:
             new_items, known_count, enriched_count = await upsert_page_items(cat.key, cat.name, target_items)
         live = category_live_progress.get(progress_key)
-        if inline_view_counts:
-            _, _, failed_views = await enrich_page_view_counts(parser, target_items, live)
-            view_failures += failed_views
+        if need_view_counts:
+            for item in target_items:
+                deferred_view_items[item.external_id] = item
         new_count += len(new_items)
         known_total += known_count
         enriched_total += enriched_count
@@ -3530,6 +3537,31 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
 
         if not reason:
             reason = "завершено"
+
+        # v4.1.6: the category crawl is complete before public view counters are
+        # collected.  This keeps page traversal fast and gives Telegram a distinct
+        # "Собираю просмотры" phase instead of spending 10-15 seconds on every page.
+        if need_view_counts and deferred_view_items:
+            live = category_live_progress.get(progress_key)
+            if live is not None:
+                live.phase = "views"
+                live.today_seen = today_seen
+                live.page_limit = depth
+            try:
+                _, _, failed_views = await enrich_page_view_counts(
+                    parser, list(deferred_view_items.values()), live
+                )
+                view_failures += failed_views
+            except Exception:
+                # A view-threshold result will naturally exclude rows without a
+                # counter.  Do not convert a successfully crawled date into a
+                # partial category merely because the optional counter endpoint
+                # had a transient problem.
+                view_failures += len(deferred_view_items)
+                log.exception(
+                    "Deferred view-count phase failed category=%s target=%s",
+                    cat.name, target_date,
+                )
 
         quality_score, quality_note = _calculate_scan_quality(
             listings_parsed=listings_parsed,
@@ -4707,6 +4739,88 @@ async def scan_worker(bot: Bot, worker_id: int) -> None:
 
 
 
+async def cleanup_stale_distributed_queue_rows() -> int:
+    """Retire abandoned queued DB cards from pre-fleet test deployments.
+
+    Redis messages for these rows are harmless: when a worker encounters them it
+    sees the finished DB row and ACKs them immediately.  This prevents a newly
+    bootstrapped single worker from spending minutes on ancient user jobs before
+    it reaches the scan the user just launched.
+    """
+    if not DISTRIBUTED_WORKERS:
+        return 0
+    now = datetime.utcnow()
+    cutoff = now - timedelta(seconds=DISTRIBUTED_STALE_QUEUE_SECONDS)
+    async with SessionLocal() as session:
+        rows = list((await session.execute(
+            select(UserScan).where(
+                UserScan.status == "queued",
+                UserScan.finished_at.is_(None),
+                UserScan.created_at < cutoff,
+            )
+        )).scalars().all())
+        for scan in rows:
+            scan.status = "failed"
+            scan.finished_at = now
+            scan.last_error = "Старая очередь очищена после запуска Browser Fleet; повтори скан"
+        if rows:
+            await session.commit()
+    if rows:
+        log.warning("Retired stale distributed queued scans: %s", len(rows))
+    return len(rows)
+
+
+async def distributed_queue_ui_ticker(bot: Bot) -> None:
+    """Keep queued distributed cards alive while all worker lanes are busy.
+
+    Previously a job waiting behind another Redis job stayed forever at
+    `Подготавливаю скан · 0 сек`, making a healthy queue look broken.
+    """
+    while True:
+        await asyncio.sleep(DISTRIBUTED_QUEUE_UI_SECONDS)
+        try:
+            async with SessionLocal() as session:
+                rows = list((await session.execute(
+                    select(UserScan)
+                    .where(UserScan.status == "queued", UserScan.finished_at.is_(None))
+                    .order_by(UserScan.created_at.asc(), UserScan.id.asc())
+                )).scalars().all())
+            if not rows:
+                continue
+            try:
+                workers = await COORDINATOR.worker_count(prefix="parser")
+            except Exception:
+                workers = 0
+            total_waiting = len(rows)
+            for position, scan in enumerate(rows, start=1):
+                if not scan.chat_id or not scan.status_message_id:
+                    continue
+                waited = max(0, int((datetime.utcnow() - scan.created_at).total_seconds()))
+                text = (
+                    "⏳ <b>Ожидание Browser Fleet</b>\n\n"
+                    f"📍 Позиция в очереди: <b>{position}/{total_waiting}</b>\n"
+                    f"🧩 Активных worker: <b>{workers}</b>\n"
+                    f"📅 <b>{_date_label(scan.target_date)}</b> · 📄 <b>{scan.page_limit} стр.</b>\n"
+                    f"⏱ <b>{_human_duration(waited)}</b>\n\n"
+                    "Как только освободится worker, карточка автоматически перейдёт к сканированию."
+                )
+                try:
+                    await bot.edit_message_text(
+                        chat_id=int(scan.chat_id),
+                        message_id=int(scan.status_message_id),
+                        text=text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=job_keyboard(str(scan.job_uid)),
+                    )
+                except Exception:
+                    # Identical edits / deleted messages are non-fatal.
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("Distributed queue UI ticker failed", exc_info=True)
+
+
 async def recover_distributed_unfinished_scans() -> int:
     """Ensure PostgreSQL unfinished scans have a Redis Stream item.
 
@@ -4790,6 +4904,11 @@ async def distributed_scan_worker(bot: Bot, worker_id: str) -> None:
             )
 
             job = await load_scan_job_by_uid(job_uid)
+            if job is not None:
+                log.info(
+                    "Distributed job claimed job=%s consumer=%s scan_id=%s user=%s chat=%s message=%s",
+                    job_uid, consumer, job.scan_id, job.user_id, job.chat_id, job.status_message_id,
+                )
             if job is None:
                 await COORDINATOR.ack_scan(message_id)
                 await COORDINATOR.mark_job_complete(job_uid)
@@ -8120,6 +8239,9 @@ async def main() -> None:
             "disabled on Railway so production cannot silently run in mode=local."
         )
     await init_db()
+    stale_distributed = await cleanup_stale_distributed_queue_rows()
+    if stale_distributed:
+        log.info("v4.1.6 stale distributed queue cleanup: %s", stale_distributed)
     await initialize_commerce()
     backfilled = await backfill_product_identities()
     if backfilled:
@@ -8187,6 +8309,9 @@ async def main() -> None:
     ticker_task = None if DISTRIBUTED_WORKERS else asyncio.create_task(
         progress_ticker(bot), name="user-progress-ticker"
     )
+    distributed_queue_ticker_task = asyncio.create_task(
+        distributed_queue_ui_ticker(bot), name="distributed-queue-ui-ticker"
+    ) if DISTRIBUTED_WORKERS else None
     payment_task = asyncio.create_task(payment_scheduler(bot), name="payment-scheduler")
     subscription_task = asyncio.create_task(
         subscription_lifecycle_scheduler(bot), name="subscription-lifecycle-scheduler"
@@ -8201,6 +8326,8 @@ async def main() -> None:
     finally:
         if ticker_task is not None:
             ticker_task.cancel()
+        if distributed_queue_ticker_task is not None:
+            distributed_queue_ticker_task.cancel()
         payment_task.cancel()
         subscription_task.cancel()
         archive_task.cancel()
@@ -8209,6 +8336,8 @@ async def main() -> None:
         for task in worker_tasks:
             task.cancel()
         shutdown_tasks = [payment_task, subscription_task, archive_task, *observation_tasks, *worker_tasks]
+        if distributed_queue_ticker_task is not None:
+            shutdown_tasks.insert(0, distributed_queue_ticker_task)
         if ticker_task is not None:
             shutdown_tasks.insert(0, ticker_task)
         await asyncio.gather(*shutdown_tasks, return_exceptions=True)
