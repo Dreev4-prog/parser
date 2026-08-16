@@ -85,7 +85,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.0.3"
+APP_VERSION = "4.0.4"
 MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -2699,7 +2699,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     """
     depth = page_limit if page_limit in PAGE_LIMIT_CHOICES else 50
     target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
-    # v4.0.3: recent dates (today / yesterday / day before yesterday) never need
+    # v4.0.4: recent dates (today / yesterday / day before yesterday) never need
     # a separate date-locator. Kleinanzeigen's nationwide feed is newest-sorted,
     # so page 1 is the deterministic starting point: skip newer pages, collect the
     # requested day, and stop once the feed becomes older. This avoids the most
@@ -2724,7 +2724,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         estimated_pages=depth,
         started_monotonic=time.monotonic(),
         page_limit=depth,
-        phase="jumping",
+        phase="collecting" if recent_fast_path else "jumping",
     )
 
     new_count = 0
@@ -2855,8 +2855,15 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         invalid_note = ""
 
         def locator_result(status: str, reason_text: str = "", candidate_page: int | None = None):
+            # v4.0.4: the Stable Engine must actually use its per-page retry wrapper
+            # during collection. Older builds returned raw `fetch` here, so a single
+            # weak/invalid page bypassed STABLE_PAGE_RETRIES and could make the whole
+            # category partial even though stable_fetch() existed. Name resolution is
+            # intentionally late: locator_result is called only after stable_fetch has
+            # been defined.
+            page_fetch = stable_fetch if STABLE_SCAN_ENGINE else fetch
             return {
-                "status": status, "reason": reason_text, "fetch": fetch,
+                "status": status, "reason": reason_text, "fetch": page_fetch,
                 "limit": effective_limit, "site_max_page": site_max_page,
                 "candidate": candidate_page, "shards": list(discovered_shards),
             }
@@ -3029,7 +3036,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             return last
 
         if STABLE_SCAN_ENGINE:
-            # v4.0.3 recent-date stream path: today / yesterday / day-before-yesterday
+            # v4.0.4 recent-date stream path: today / yesterday / day-before-yesterday
             # all start deterministically from page 1. The collector itself skips
             # newer pages until the requested day appears. No separate date search.
             if recent_fast_path and feed_name == "nationwide":
@@ -3252,11 +3259,27 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     direct_pages_collected += 1
                     update_live(page, days, "collecting", direct_pages_collected)
 
-                # v4.0.3: for recent dates an otherwise valid page with sparse
+                # v4.0.4: for recent dates an otherwise valid page with sparse
                 # timestamp metadata is not a reason to fail the whole category. The
                 # feed is newest-sorted and exact timestamps are still filtered per
                 # listing. True invalid/challenge pages remain strict failures.
                 if recent_fast_path and relation == "unknown" and items:
+                    # A valid newest-sorted page with sparse/hidden timestamps is still
+                    # part of the recent stream. Once we are inside the requested-day
+                    # window (or scanning today from page 1), count the traversed page
+                    # toward the requested 25/50/100 depth even though only listings
+                    # with an exact parsed target date are inserted. This prevents a
+                    # few A/B-template cards from forcing a fake deep/regional scan.
+                    if not target_on_page and (target_seen_any or today_fast_path):
+                        direct_pages_collected += 1
+                        update_live(page, days, "collecting", direct_pages_collected)
+                        if direct_pages_collected >= depth:
+                            request_complete = True
+                            reason = (
+                                f"обработано {depth} последовательных страниц свежей даты; "
+                                f"часть карточек скрывала метку времени"
+                            )
+                            return "done", direct_pages_collected
                     page += 1
                     continue
 
@@ -3477,7 +3500,18 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 outcome, direct_pages_collected = await collect_direct(nationwide)
                 if outcome == "needs_hidden" and not request_complete:
                     remaining = max(0, depth - direct_pages_collected)
-                    await hidden_fill(remaining)
+                    if recent_fast_path and target_seen_any:
+                        # Recent dates are a single deterministic newest-sorted stream.
+                        # Once the target day was observed, exhausting the public window
+                        # is not evidence that we should explode into 16-180 regional
+                        # feeds merely to compensate for sparse timestamp templates.
+                        request_complete = True
+                        reason = (
+                            f"свежая дата обработана до публичного лимита; "
+                            f"подтверждено {direct_pages_collected} страниц"
+                        )
+                    else:
+                        await hidden_fill(remaining)
                 elif outcome == "weak_stop" and not request_complete:
                     # Do not fan a chronology-template problem out into up to 180
                     # regional feeds. Keep the direct evidence and let the bounded

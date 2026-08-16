@@ -5,8 +5,8 @@ BOT = (ROOT / "bot.py").read_text()
 
 
 def test_v402_version():
-    assert (ROOT / "VERSION").read_text().strip() == "4.0.3"
-    assert 'APP_VERSION = "4.0.3"' in BOT
+    assert (ROOT / "VERSION").read_text().strip() == "4.0.4"
+    assert 'APP_VERSION = "4.0.4"' in BOT
 
 
 def test_today_skips_date_locator():

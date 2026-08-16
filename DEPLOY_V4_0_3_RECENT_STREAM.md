@@ -1,4 +1,4 @@
-# DT PARSER v4.0.3 — Recent Date Stream Fix
+# DT PARSER v4.0.4 — Recent Date Stream Fix
 
 ## Что исправлено
 
@@ -24,7 +24,7 @@
 - Redis ×1
 - PostgreSQL ×1
 
-Все сервисы должны использовать один и тот же commit v4.0.3.
+Все сервисы должны использовать один и тот же commit v4.0.4.
 
 Start Command fleet-worker:
 

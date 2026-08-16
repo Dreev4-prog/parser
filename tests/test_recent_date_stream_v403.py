@@ -5,8 +5,8 @@ BOT = (ROOT / "bot.py").read_text(encoding="utf-8")
 
 
 def test_v403_version():
-    assert (ROOT / "VERSION").read_text().strip() == "4.0.3"
-    assert 'APP_VERSION = "4.0.3"' in BOT
+    assert (ROOT / "VERSION").read_text().strip() == "4.0.4"
+    assert 'APP_VERSION = "4.0.4"' in BOT
 
 
 def test_recent_dates_use_stream_fast_path():
