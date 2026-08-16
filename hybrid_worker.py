@@ -21,6 +21,13 @@ os.environ.setdefault("DIST_TRAFFIC_SHARED_COOLDOWN", "0")
 os.environ.setdefault("TRAFFIC_SCAN_CONCURRENCY", "1")
 os.environ.setdefault("TRAFFIC_BROWSER_CONCURRENCY", "1")
 
+# v3.7.1: hybrid replicas must have independent foreground network lanes.
+# Older Railway Variables could leave DIST_TRAFFIC_SCAN_LIMIT at 2/3 and make
+# some replicas look frozen. A dedicated hybrid profile deliberately wins over
+# those generic legacy values while remaining tunable through HYBRID_* vars.
+os.environ["DIST_TRAFFIC_SCAN_LIMIT"] = os.getenv("HYBRID_SCAN_LANES", "5")
+os.environ["DIST_TRAFFIC_GLOBAL_LIMIT"] = os.getenv("HYBRID_GLOBAL_LANES", "8")
+
 from parser_worker import main  # noqa: E402
 
 

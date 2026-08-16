@@ -1,4 +1,12 @@
-# Kleinanzeigen Parser Bot v3.7.0
+# Kleinanzeigen Parser Bot v3.7.1
+
+## v3.7.1 — Fair Network Lanes
+
+- 5 hybrid Railway replicas now pace foreground requests independently instead of competing for one shared Redis next-request timestamp.
+- Global Redis concurrency caps remain shared, so independent lanes do not remove the safety ceiling.
+- `HYBRID_SCAN_LANES=5` and `HYBRID_GLOBAL_LANES=8` form the hybrid-worker production profile and override stale generic limits inside that worker process.
+- Fix targets the symptom where one scan advances while other active scans remain on date search.
+
 
 ## v3.7.0 — Browser → HTTP Hybrid Transport
 

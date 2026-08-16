@@ -275,8 +275,17 @@ class DistributedCoordinator:
     def _traffic_global_key(self) -> str:
         return f"{REDIS_PREFIX}:traffic:active:global"
 
+    def _traffic_lane_id(self) -> str:
+        # Each Railway replica/process owns its pacing lane. Concurrency counters
+        # remain global in Redis, but request-spacing is intentionally NOT global:
+        # one fast worker must never starve another worker waiting on date search.
+        replica = (os.getenv("RAILWAY_REPLICA_ID") or "").strip()
+        if replica:
+            return replica
+        return f"{socket.gethostname()}:{os.getpid()}"
+
     def _traffic_next_key(self, kind: str) -> str:
-        return f"{REDIS_PREFIX}:traffic:next:{kind}"
+        return f"{REDIS_PREFIX}:traffic:next:{kind}:{self._traffic_lane_id()}"
 
     def _traffic_cooldown_key(self) -> str:
         if DIST_TRAFFIC_SHARED_COOLDOWN:
@@ -289,9 +298,10 @@ class DistributedCoordinator:
     async def acquire_traffic(self, kind: str, *, interval_seconds: float = 0.0) -> str:
         """Acquire a short Redis lease shared by every parser-worker replica.
 
-        Sorted-set leases self-heal after worker crashes. The atomic Lua script also
-        enforces a small cross-replica spacing window so five replicas do not all
-        burst at Kleinanzeigen in the same millisecond.
+        Sorted-set leases self-heal after worker crashes. Global active-request
+        caps are shared by every replica, while pacing is per replica. This prevents
+        one fast worker from repeatedly winning a single shared next-request clock
+        and starving other users during date search.
         """
         if kind not in {"scan", "view", "browser"}:
             raise ValueError(f"unknown traffic kind: {kind}")

@@ -1,8 +1,8 @@
-# DT PARSER v3.7.0 — Browser → HTTP Hybrid на Railway
+# DT PARSER v3.7.1 — Browser → HTTP Hybrid на Railway
 
 ## Зачем этот режим
 
-`browser-worker ×5` из v3.6.0 даёт независимые Chromium-сессии, но Chromium остаётся тяжёлым по RAM/CPU и каждая category navigation рендерит браузерную страницу. В v3.7.0 браузер используется коротко: первый нормальный navigation создаёт сессию, затем storage state передаётся в Playwright APIRequestContext и основная работа идёт как HTTP без рендера.
+`browser-worker ×5` из v3.6.0 даёт независимые Chromium-сессии, но Chromium остаётся тяжёлым по RAM/CPU и каждая category navigation рендерит браузерную страницу. В v3.7.1 браузер используется коротко: первый нормальный navigation создаёт сессию, затем storage state передаётся в Playwright APIRequestContext и основная работа идёт как HTTP без рендера.
 
 Это не режим обхода ограничений. Если сайт явно отвечает 403/429 или возвращает challenge, hybrid worker не меняет транспорт, чтобы проигнорировать отказ — он применяет cooldown/ошибку как и обычный production parser.
 
@@ -22,7 +22,7 @@ hybrid-worker   ×5 replicas
 
 ## 1. Код
 
-Залей содержимое v3.7.0 в тот же GitHub repository и дождись deploy основного `bot`.
+Залей содержимое v3.7.1 в тот же GitHub repository и дождись deploy основного `bot`.
 
 ## 2. Hybrid worker
 
@@ -65,10 +65,9 @@ TRAFFIC_BROWSER_CONCURRENCY=1
 На всех сервисах, которые участвуют в distributed parsing, используй одинаковые значения:
 
 ```env
-DIST_TRAFFIC_SCAN_LIMIT=5
+HYBRID_SCAN_LANES=5
+HYBRID_GLOBAL_LANES=8
 DIST_TRAFFIC_VIEW_LIMIT=3
-DIST_TRAFFIC_BROWSER_LIMIT=2
-DIST_TRAFFIC_GLOBAL_LIMIT=8
 DIST_TRAFFIC_SHARED_COOLDOWN=0
 ```
 
@@ -138,3 +137,10 @@ Hybrid HTTP compatibility fallback to Chromium ...
 - 403/429 не растут лавинообразно.
 
 Только после стабильного теста 5×25 переходи к 5×50 и затем 5×100.
+
+
+## v3.7.1: что изменилось при одновременном старте
+
+Раньше Redis держал один общий `traffic:next:scan` timestamp для всех replicas. Это ограничивало всплески, но не гарантировало справедливость: быстрый worker мог снова первым получить следующий момент старта. Теперь у каждой Railway replica свой pacing key, а глобальные active-request counters по-прежнему общие. Поэтому 5 workers получают 5 независимых foreground lanes, но суммарный потолок остаётся контролируемым.
+
+Если в Railway остались старые `DIST_TRAFFIC_SCAN_LIMIT=2/3`, hybrid worker больше не наследует их как foreground cap. Для hybrid регулируй `HYBRID_SCAN_LANES` и `HYBRID_GLOBAL_LANES`.
