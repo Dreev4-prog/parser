@@ -7,8 +7,8 @@ WORKER = (ROOT / "hybrid_worker.py").read_text(encoding="utf-8")
 
 
 def test_v372_version():
-    assert (ROOT / "VERSION").read_text().strip() == "3.7.2"
-    assert 'APP_VERSION = "3.7.2"' in BOT
+    assert (ROOT / "VERSION").read_text().strip() == "3.8.0"
+    assert 'APP_VERSION = "3.8.0"' in BOT
 
 
 def test_hybrid_is_http_first_with_hard_watchdog():
@@ -51,5 +51,5 @@ def test_user_can_see_live_wait_and_recovery_status():
 def test_hybrid_worker_uses_stability_profile():
     assert 'HYBRID_HTTP_FIRST", "1"' in WORKER
     assert 'HYBRID_WATCHDOG_SECONDS", "15"' in WORKER
-    assert 'SCAN_AUTO_RECOVERY_PASSES", "2"' in WORKER
+    assert 'SCAN_AUTO_RECOVERY_PASSES", "3"' in WORKER
     assert 'SCAN_PAGE_CHECKPOINT_TTL_SECONDS", "900"' in WORKER

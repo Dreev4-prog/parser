@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""HTTP-first stability worker for Railway.
+"""v3.8 stable shared category/date worker for Railway.
 
 Each replica processes one user scan at a time. Normal category pages are requested
 through lightweight persistent HTTP first. Chromium starts only for compatibility/JS
@@ -13,8 +13,13 @@ import os
 
 # Configure before parser/bot imports because production settings are read at import.
 os.environ.setdefault("SCAN_TRANSPORT", "hybrid")
+os.environ["STABLE_SCAN_ENGINE"] = "1"
+os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "0"
+os.environ.setdefault("STABLE_PAGE_RETRIES", "3")
+os.environ.setdefault("STABLE_PAGE_CHECKPOINT_TTL_SECONDS", "300")
+os.environ.setdefault("STABLE_DATE_INDEX_TTL_SECONDS", "900")
 os.environ.setdefault("PARSER_WORKER_CONCURRENCY", "1")
-os.environ.setdefault("SHARE_ACTIVE_CATEGORY_SCANS", "0")
+os.environ["SHARE_ACTIVE_CATEGORY_SCANS"] = "1"
 # Keep refusal cooldown local to the affected replica so one session cannot freeze
 # every user's progress. Cross-replica scan/global concurrency is still governed by Redis.
 os.environ.setdefault("DIST_TRAFFIC_SHARED_COOLDOWN", "0")
@@ -23,7 +28,7 @@ os.environ.setdefault("TRAFFIC_BROWSER_CONCURRENCY", "1")
 os.environ.setdefault("HYBRID_HTTP_FIRST", "1")
 os.environ.setdefault("HYBRID_WATCHDOG_SECONDS", "15")
 os.environ.setdefault("HYBRID_DIRECT_HTTP_RETRIES", "1")
-os.environ.setdefault("SCAN_AUTO_RECOVERY_PASSES", "2")
+os.environ.setdefault("SCAN_AUTO_RECOVERY_PASSES", "3")
 os.environ.setdefault("SCAN_AUTO_RECOVERY_DELAY_SECONDS", "2")
 os.environ.setdefault("SCAN_PAGE_CHECKPOINT_TTL_SECONDS", "900")
 

@@ -1,3 +1,23 @@
+# DT PARSER v3.8.0 — Stable Scan Engine
+
+## v3.8.0
+
+- Новый Stable Scan Engine: общая category/date/depth работа между пользователями.
+- Последовательный поиск даты вместо jump/binary как основного алгоритма.
+- PostgreSQL checkpoints подтверждённых страниц и persistent date index.
+- Повторяется только слабая страница; recovery не начинает категорию с нуля.
+- Одинаковые активные сканы снова объединяются и зеркалят общий прогресс через Redis.
+- Разные depth jobs переиспользуют общие page checkpoints.
+- Просмотры вынесены из обычного foreground scan в immediate baseline `views-worker` + 3/6/12h.
+- `Min Views > 0` автоматически оставляет foreground view collection для корректного фильтра.
+- Stable Engine скрывает ручную «Допроверку» из нормального пользовательского flow.
+- Новые DB-таблицы создаются автоматически; существующие данные сохраняются.
+- Новый Railway entry point: `python stable_worker.py`.
+
+Подробная установка: `DEPLOY_V3_8_STABLE.md`.
+
+---
+
 # Kleinanzeigen Parser Bot v3.7.2
 
 ## v3.7.2 — Stability Core

@@ -44,7 +44,7 @@ from filters import (
     sort_rows,
     unique_rows,
 )
-from models import BotUser, CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing, ScanObservation, ScanViewHistory, SelectedCategory, SubscriptionPayment, SubscriptionPlan, UserScan, UserSettings, ViewHistory
+from models import BotUser, CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing, ScanObservation, ScanViewHistory, SelectedCategory, StableCategoryJob, StablePageCheckpoint, SubscriptionPayment, SubscriptionPlan, UserScan, UserSettings, ViewHistory
 from product_identity import TYPE_DISPLAY, ProductIdentity, recognize_product
 from traffic import TRAFFIC
 from distributed import COORDINATOR, DISTRIBUTED_WORKERS
@@ -75,18 +75,30 @@ from parser import (
     page_url,
     private_provider_url,
 )
+from stable_engine import (
+    load_date_index, load_page_checkpoint, mark_category_job, record_page_failure,
+    save_date_index, save_page_checkpoint,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "3.7.2"
+APP_VERSION = "3.8.0"
 MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
 AVAILABILITY_CONCURRENCY = max(1, min(8, int(os.getenv("AVAILABILITY_CONCURRENCY", "4"))))
+
+# v3.8 Stable Scan Engine. Category/date work is shared across users and
+# verified page/date boundaries are checkpointed in PostgreSQL, so a worker
+# restart or recovery pass never has to rediscover healthy pages from scratch.
+STABLE_SCAN_ENGINE = os.getenv("STABLE_SCAN_ENGINE", "1").strip().lower() not in {"0", "false", "no", "off"}
+STABLE_PAGE_RETRIES = max(1, min(5, int(os.getenv("STABLE_PAGE_RETRIES", "3"))))
+STABLE_PAGE_RETRY_SECONDS = max(0.2, min(10.0, float(os.getenv("STABLE_PAGE_RETRY_SECONDS", "1.2"))))
+PRIMARY_SCAN_INLINE_VIEWS = os.getenv("PRIMARY_SCAN_INLINE_VIEWS", "0").strip().lower() not in {"0", "false", "no", "off"}
 
 # v2.6 Multi-User Core. User launches go into a queue. Only a limited number
 # of jobs are processed at once, while category scans are shared globally.
@@ -95,7 +107,8 @@ MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
 PARSER_WORKER_CONCURRENCY = max(1, min(8, int(os.getenv("PARSER_WORKER_CONCURRENCY", "1"))))
 CATEGORY_CACHE_TTL_SECONDS = max(0, int(os.getenv("CATEGORY_CACHE_TTL_SECONDS", "300")))
 SHARE_ACTIVE_CATEGORY_SCANS = os.getenv(
-    "SHARE_ACTIVE_CATEGORY_SCANS", "0" if SCAN_TRANSPORT in {"browser", "hybrid"} else "1"
+    "SHARE_ACTIVE_CATEGORY_SCANS",
+    "1" if STABLE_SCAN_ENGINE else ("0" if SCAN_TRANSPORT in {"browser", "hybrid"} else "1")
 ).strip().lower() not in {"0", "false", "no", "off"}
 JOB_PARSER: ContextVar[KleinanzeigenParser | None] = ContextVar("dtparser_job_parser", default=None)
 STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVAL_SECONDS", "1.5")))
@@ -107,7 +120,7 @@ SCAN_CATEGORY_RETRY_SECONDS = max(1.0, min(30.0, float(os.getenv("SCAN_CATEGORY_
 # v3.7.2: a parser result that is structurally partial is automatically retried
 # inside the same per-user parser session. Verified page checkpoints are reused,
 # so recovery refetches weak/missing areas instead of making the user press a button.
-SCAN_AUTO_RECOVERY_PASSES = max(0, min(3, int(os.getenv("SCAN_AUTO_RECOVERY_PASSES", "2"))))
+SCAN_AUTO_RECOVERY_PASSES = max(0, min(3, int(os.getenv("SCAN_AUTO_RECOVERY_PASSES", "3"))))
 SCAN_AUTO_RECOVERY_DELAY_SECONDS = max(0.5, min(15.0, float(os.getenv("SCAN_AUTO_RECOVERY_DELAY_SECONDS", "2"))))
 SUBSCRIPTION_NOTICE_POLL_SECONDS = max(60, int(os.getenv("SUBSCRIPTION_NOTICE_POLL_SECONDS", "300")))
 
@@ -124,6 +137,7 @@ VIEW_COUNT_EXPORT_MODES = {"newest", "all", "unique", "below_market"}
 # v3.1 keeps the v3.0.7 Popularity Tracker. Every completed scan gets automatic public-view
 # checkpoints. They are persisted, so a Railway restart does not lose the plan.
 OBSERVATION_HOURS = (3, 6, 12)
+OBSERVATION_SCHEDULE_HOURS = (0, 3, 6, 12) if not PRIMARY_SCAN_INLINE_VIEWS else OBSERVATION_HOURS
 OBSERVATION_POLL_SECONDS = max(15, int(os.getenv("OBSERVATION_POLL_SECONDS", "30")))
 OBSERVATION_CONCURRENCY = max(1, min(4, int(os.getenv("OBSERVATION_CONCURRENCY", "1"))))
 OBSERVATION_LATE_GRACE_MINUTES = max(5, int(os.getenv("OBSERVATION_LATE_GRACE_MINUTES", "45")))
@@ -254,7 +268,7 @@ def post_scan_keyboard(scan_id: int | None = None, *, recheck: bool = False) -> 
             InlineKeyboardButton(text="🔥 Открыть TOP", callback_data=f"scantop:{scan_id}"),
             InlineKeyboardButton(text="📊 Открыть скан", callback_data=f"scan:{scan_id}"),
         ])
-        if recheck:
+        if recheck and not STABLE_SCAN_ENGINE:
             rows.append([InlineKeyboardButton(text="🔄 Допроверить категории", callback_data=f"scanrecheck:{scan_id}")])
         rows.append([InlineKeyboardButton(text="🔄 Повторить скан", callback_data=f"scanrepeat:{scan_id}")])
     else:
@@ -280,7 +294,7 @@ def scan_detail_keyboard(scan_id: int, *, archived: bool = False, recheck: bool 
         [InlineKeyboardButton(text="👁 Обновить", callback_data=f"scanviews:{scan_id}"),
          InlineKeyboardButton(text="📄 CSV", callback_data=f"scanexport:{scan_id}")],
     ]
-    if recheck:
+    if recheck and not STABLE_SCAN_ENGINE:
         rows.append([InlineKeyboardButton(text="🔄 Допроверить категории", callback_data=f"scanrecheck:{scan_id}")])
     rows += [
         [InlineKeyboardButton(text="🔄 Повторить", callback_data=f"scanrepeat:{scan_id}"),
@@ -808,8 +822,10 @@ async def get_scan_rows(scan_id: int) -> list[tuple[Listing, ScanListing]]:
         return list(result.all())
 
 
-async def ensure_scan_observation_plan(scan_id: int, finished_at: datetime | None = None) -> None:
-    """Create the +3/+6/+12h plan once; safe to call after restarts."""
+async def ensure_scan_observation_plan(
+    scan_id: int, finished_at: datetime | None = None, *, include_baseline: bool = True
+) -> None:
+    """Create the immediate baseline (new scans) and +3/+6/+12h plan once."""
     async with db_write_lock:
         async with SessionLocal() as session:
             scan = await session.get(UserScan, scan_id)
@@ -821,18 +837,19 @@ async def ensure_scan_observation_plan(scan_id: int, finished_at: datetime | Non
             await session.execute(
                 delete(ScanObservation).where(
                     ScanObservation.scan_id == scan_id,
-                    ScanObservation.target_hours.notin_(OBSERVATION_HOURS),
+                    ScanObservation.target_hours.notin_(OBSERVATION_SCHEDULE_HOURS),
                     ScanObservation.status.in_(["pending", "error", "missed"]),
                 )
             )
+            schedule_hours = OBSERVATION_SCHEDULE_HOURS if include_baseline else OBSERVATION_HOURS
             existing = await session.execute(
                 select(ScanObservation.target_hours).where(
                     ScanObservation.scan_id == scan_id,
-                    ScanObservation.target_hours.in_(OBSERVATION_HOURS),
+                    ScanObservation.target_hours.in_(schedule_hours),
                 )
             )
             have = {int(x) for x in existing.scalars().all()}
-            for hours in OBSERVATION_HOURS:
+            for hours in schedule_hours:
                 if hours in have:
                     continue
                 session.add(ScanObservation(
@@ -860,7 +877,7 @@ async def cleanup_obsolete_observation_plans() -> int:
         async with SessionLocal() as session:
             result = await session.execute(
                 delete(ScanObservation).where(
-                    ScanObservation.target_hours.notin_(OBSERVATION_HOURS),
+                    ScanObservation.target_hours.notin_(OBSERVATION_SCHEDULE_HOURS),
                     ScanObservation.status != "done",
                 )
             )
@@ -882,7 +899,7 @@ async def backfill_recent_observation_plans() -> int:
         )
         rows = list(result.all())
     for scan_id, finished_at in rows:
-        await ensure_scan_observation_plan(int(scan_id), finished_at)
+        await ensure_scan_observation_plan(int(scan_id), finished_at, include_baseline=False)
     return len(rows)
 
 
@@ -936,23 +953,33 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
             )
 
             scan.result_count = len(rows)
-            scan.viewed_count = sum(1 for row in rows if row.view_count is not None)
+            fresh_view_cutoff = now - timedelta(minutes=2)
+            fresh_views = {
+                row.external_id: int(row.view_count)
+                for row in rows
+                if row.view_count is not None
+                and row.views_checked_at is not None
+                and row.views_checked_at >= fresh_view_cutoff
+            }
+            scan.viewed_count = len(fresh_views)
             scan.last_view_refresh_at = now if scan.viewed_count else None
 
             await session.execute(delete(ScanListing).where(ScanListing.scan_id == scan.id))
             for row in rows:
+                initial_view = fresh_views.get(row.external_id)
                 session.add(ScanListing(
                     scan_id=scan.id,
                     external_id=row.external_id,
-                    initial_view_count=row.view_count,
+                    initial_view_count=initial_view,
                     captured_at=now,
                 ))
-                if row.view_count is not None:
+                if initial_view is not None:
                     session.add(ScanViewHistory(
                         scan_id=scan.id,
                         external_id=row.external_id,
-                        view_count=int(row.view_count),
+                        view_count=int(initial_view),
                         recorded_at=now,
+                        target_hours=0,
                     ))
             await session.commit()
 
@@ -976,7 +1003,7 @@ async def update_scan_view_refresh(
             if scan is None:
                 return 0
             query = (
-                select(Listing.external_id, Listing.view_count)
+                select(Listing.external_id, Listing.view_count, ScanListing)
                 .join(ScanListing, Listing.external_id == ScanListing.external_id)
                 .where(ScanListing.scan_id == scan_id)
             )
@@ -994,9 +1021,12 @@ async def update_scan_view_refresh(
             result = await session.execute(query)
             values = list(result.all())
             recorded = 0
-            for external_id, view_count in values:
+            for external_id, view_count, membership in values:
                 if view_count is None:
                     continue
+                if target_hours == 0 and membership.initial_view_count is None:
+                    membership.initial_view_count = int(view_count)
+                    membership.captured_at = now
                 session.add(ScanViewHistory(
                     scan_id=scan_id,
                     external_id=external_id,
@@ -1896,7 +1926,7 @@ async def claim_due_observation() -> ScanObservation | None:
                     select(ScanObservation)
                     .where(
                         ScanObservation.status == "pending",
-                        ScanObservation.target_hours.in_(OBSERVATION_HOURS),
+                        ScanObservation.target_hours.in_(OBSERVATION_SCHEDULE_HOURS),
                         ScanObservation.due_at <= now,
                     )
                     .order_by(ScanObservation.due_at.asc())
@@ -1990,23 +2020,24 @@ async def process_observation(bot: Bot, obs: ScanObservation) -> None:
             obs.id, status="done", item_count=recorded,
             error_text=(f"view failures: {failed}" if failed else None),
         )
-        try:
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔥 Открыть популярное", callback_data="popular_now")],
-                [InlineKeyboardButton(text="📊 Открыть скан", callback_data=f"scan:{scan.id}")],
-            ])
-            await bot.send_message(
-                scan.user_id,
-                f"✅ <b>Контрольный замер +{obs.target_hours}ч готов</b>\n\n"
-                f"Скан: <b>{html.escape(scan.title)}</b>\n"
-                f"📅 Дата объявлений: <b>{_date_label(scan.target_date)}</b>\n"
-                f"👁 Свежих значений сохранено: <b>{recorded}</b>\n\n"
-                "Теперь в «🔥 Популярное сейчас» доступен TOP роста по каждой категории отдельно.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=keyboard,
-            )
-        except Exception:
-            log.debug("Could not notify user about observation scan=%s +%sh", scan.id, obs.target_hours, exc_info=True)
+        if obs.target_hours > 0:
+            try:
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔥 Открыть популярное", callback_data="popular_now")],
+                    [InlineKeyboardButton(text="📊 Открыть скан", callback_data=f"scan:{scan.id}")],
+                ])
+                await bot.send_message(
+                    scan.user_id,
+                    f"✅ <b>Контрольный замер +{obs.target_hours}ч готов</b>\n\n"
+                    f"Скан: <b>{html.escape(scan.title)}</b>\n"
+                    f"📅 Дата объявлений: <b>{_date_label(scan.target_date)}</b>\n"
+                    f"👁 Свежих значений сохранено: <b>{recorded}</b>\n\n"
+                    "Теперь в «🔥 Популярное сейчас» доступен TOP роста по каждой категории отдельно.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
+            except Exception:
+                log.debug("Could not notify user about observation scan=%s +%sh", scan.id, obs.target_hours, exc_info=True)
         log.info(
             "Observation done scan=%s +%sh requested=%s updated=%s recorded=%s failed=%s",
             scan.id, obs.target_hours, requested, updated, recorded, failed,
@@ -2218,6 +2249,15 @@ async def stats_text() -> str:
         db_queued_jobs = (await session.execute(select(func.count(UserScan.id)).where(
             UserScan.status == "queued", UserScan.finished_at.is_(None),
         ))).scalar_one()
+        stable_jobs_done = (await session.execute(select(func.count(StableCategoryJob.id)).where(
+            StableCategoryJob.status == "done", StableCategoryJob.updated_at >= start_utc,
+        ))).scalar_one()
+        stable_jobs_partial = (await session.execute(select(func.count(StableCategoryJob.id)).where(
+            StableCategoryJob.status == "partial", StableCategoryJob.updated_at >= start_utc,
+        ))).scalar_one()
+        stable_checkpoints = (await session.execute(select(func.count(StablePageCheckpoint.id)).where(
+            StablePageCheckpoint.status == "verified", StablePageCheckpoint.checked_at >= start_utc,
+        ))).scalar_one()
     storage = DATABASE_BACKEND
     warning = ""
     coverage = round(priced / today * 100) if today else 0
@@ -2253,7 +2293,11 @@ async def stats_text() -> str:
         f"Всего сохранено: <b>{total}</b>\n"
         f"Записей истории цен: <b>{drops}</b>\n\n"
         f"{multiuser_text}"
-        f"<b>🛡 v3.1 качество сегодня</b>\n"
+        f"<b>🧱 Stable Scan Engine</b>\n"
+        f"Общих category/date jobs завершено: <b>{stable_jobs_done}</b>\n"
+        f"Частичных после автоповторов: <b>{stable_jobs_partial}</b>\n"
+        f"PostgreSQL checkpoints сегодня: <b>{stable_checkpoints}</b>\n\n"
+        f"<b>🛡 Качество сегодня</b>\n"
         f"Запусков категорий: <b>{runs}</b>\n"
         f"Среднее качество: <b>{round(float(avg_quality or 0))}/100</b>\n"
         f"Дат не распознано: <b>{missing_dates}</b>\n"
@@ -2587,7 +2631,7 @@ async def save_category_scan_state(
         state.last_today_seen = today_seen
         state.last_stop_reason = reason[:255]
         state.total_runs = (state.total_runs or 0) + 1
-        if mode in {"full", "date"}:
+        if mode in {"full", "date", "stable-date"}:
             # Keep the deepest seeded window for the day. A 25-page seed enables
             # later 25-page fast scans, while a later 100-page request can deepen it.
             state.day_full_pages = max(state.day_full_pages or 0, int(coverage_pages or pages_scanned))
@@ -2652,7 +2696,14 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     depth = page_limit if page_limit in PAGE_LIMIT_CHOICES else 50
     target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
     progress_key = _progress_key(cat.key, target_date, depth)
-    mode = "date"
+    mode = "stable-date" if STABLE_SCAN_ENGINE else "date"
+    scan_settings = await get_settings(user_id)
+    inline_view_counts = PRIMARY_SCAN_INLINE_VIEWS or int(getattr(scan_settings, "min_views", 0) or 0) > 0
+    if STABLE_SCAN_ENGINE:
+        try:
+            await mark_category_job(cat.key, target_date, depth, status="running")
+        except Exception:
+            log.debug("Could not persist stable category job start", exc_info=True)
 
     category_live_progress[progress_key] = CategoryLiveProgress(
         category_key=cat.key,
@@ -2761,8 +2812,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         async with db_write_lock:
             new_items, known_count, enriched_count = await upsert_page_items(cat.key, cat.name, target_items)
         live = category_live_progress.get(progress_key)
-        _, _, failed_views = await enrich_page_view_counts(parser, target_items, live)
-        view_failures += failed_views
+        if inline_view_counts:
+            _, _, failed_views = await enrich_page_view_counts(parser, target_items, live)
+            view_failures += failed_views
         new_count += len(new_items)
         known_total += known_count
         enriched_total += enriched_count
@@ -2804,39 +2856,59 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             nonlocal low_quality_pages, verified_pages
             page = max(1, min(effective_limit, int(page)))
             fresh = page not in cache
+            from_checkpoint = False
             if not fresh:
                 info = cache[page]
             else:
                 live_req = category_live_progress.get(progress_key)
-                checkpoint_before = int(getattr(parser, "scan_page_checkpoint_hits", 0) or 0)
-                req_started = time.monotonic()
-                if live_req is not None:
-                    live_req.request_started_at_ts = time.time()
-                    live_req.current_request_page = page
+                info = None
+                if STABLE_SCAN_ENGINE:
                     try:
-                        live_req.transport_stage = parser.scan_transport_status()
+                        info = await load_page_checkpoint(cat.key, target_date, base_url, page)
                     except Exception:
-                        live_req.transport_stage = getattr(parser, "scan_transport", "http")
-                try:
-                    info = await parser.parse_category_page_info(page_url(base_url, page), page)
-                except Exception as exc:
-                    if live_req is not None and (
-                        isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in str(exc).lower()
-                    ):
-                        live_req.request_timeouts += 1
-                    raise
-                finally:
+                        log.debug("Stable checkpoint read failed category=%s page=%s", cat.key, page, exc_info=True)
+                    if info is not None:
+                        from_checkpoint = True
+                        if live_req is not None:
+                            live_req.checkpoint_hits += 1
+                            live_req.transport_stage = "postgres-checkpoint"
+
+                if info is None:
+                    checkpoint_before = int(getattr(parser, "scan_page_checkpoint_hits", 0) or 0)
+                    req_started = time.monotonic()
                     if live_req is not None:
-                        live_req.last_request_ms = max(0, int((time.monotonic() - req_started) * 1000))
-                        live_req.request_started_at_ts = 0.0
+                        live_req.request_started_at_ts = time.time()
+                        live_req.current_request_page = page
                         try:
                             live_req.transport_stage = parser.scan_transport_status()
                         except Exception:
-                            pass
-                checkpoint_after = int(getattr(parser, "scan_page_checkpoint_hits", 0) or 0)
-                from_checkpoint = checkpoint_after > checkpoint_before
-                if live_req is not None and from_checkpoint:
-                    live_req.checkpoint_hits += 1
+                            live_req.transport_stage = getattr(parser, "scan_transport", "http")
+                    try:
+                        info = await parser.parse_category_page_info(page_url(base_url, page), page)
+                    except Exception as exc:
+                        if STABLE_SCAN_ENGINE:
+                            try:
+                                await record_page_failure(cat.key, target_date, base_url, page, f"{type(exc).__name__}: {exc}")
+                            except Exception:
+                                log.debug("Could not persist failed page checkpoint", exc_info=True)
+                        if live_req is not None and (
+                            isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in str(exc).lower()
+                        ):
+                            live_req.request_timeouts += 1
+                        raise
+                    finally:
+                        if live_req is not None:
+                            live_req.last_request_ms = max(0, int((time.monotonic() - req_started) * 1000))
+                            live_req.request_started_at_ts = 0.0
+                            try:
+                                live_req.transport_stage = parser.scan_transport_status()
+                            except Exception:
+                                pass
+                    checkpoint_after = int(getattr(parser, "scan_page_checkpoint_hits", 0) or 0)
+                    from_checkpoint = checkpoint_after > checkpoint_before
+                    if live_req is not None and from_checkpoint:
+                        live_req.checkpoint_hits += 1
+
                 cache[page] = info
                 promoted_ids = list(getattr(info, "promoted_ids", None) or [])
                 if promoted_ids:
@@ -2856,7 +2928,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     effective_limit = max(1, min(PUBLIC_SEARCH_PAGE_CAP, site_max_page))
                 if page == 1 and getattr(info, "location_shards", None):
                     discovered_shards = list(info.location_shards or [])
-                if phase == "jumping" and DATE_JUMP_PROBE_DELAY_SECONDS:
+                if phase == "jumping" and DATE_JUMP_PROBE_DELAY_SECONDS and not STABLE_SCAN_ENGINE:
                     await asyncio.sleep(DATE_JUMP_PROBE_DELAY_SECONDS)
 
             items = info.items
@@ -2882,6 +2954,21 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             if not valid:
                 relation, pairs, days = "invalid", [], []
                 invalid_note = invalid_note or f"страница {page} была нормализована/не подтверждена сайтом"
+
+            strong_page = (
+                valid
+                and bool(getattr(info, "page_verified", False))
+                and relation not in {"unknown", "invalid"}
+                and (not items or float(getattr(info, "date_coverage", 0.0) or 0.0) >= 0.60)
+            )
+            if STABLE_SCAN_ENGINE and strong_page and not from_checkpoint:
+                try:
+                    await save_page_checkpoint(
+                        cat.key, target_date, base_url, page, info, relation=relation
+                    )
+                except Exception:
+                    log.debug("Stable checkpoint write failed category=%s page=%s", cat.key, page, exc_info=True)
+
             update_live(page, days, phase)
             if relation == "unknown":
                 update_quality_live(f"не хватает дат на странице {page}")
@@ -2889,14 +2976,113 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 update_quality_live(invalid_note)
             log.info(
                 "category=%s feed=%s phase=%s page=%s relation=%s actual=%s max=%s verified=%s "
-                "date_cov=%.0f%% parsed=%s missing_date=%s raw=%s promoted=%s duplicates=%s valid=%s requests=%s",
+                "date_cov=%.0f%% parsed=%s missing_date=%s raw=%s promoted=%s duplicates=%s valid=%s requests=%s checkpoint=%s",
                 cat.name, feed_name, phase, page, relation,
                 getattr(info, "actual_page", None), getattr(info, "max_page", None),
                 getattr(info, "page_verified", False), float(getattr(info, "date_coverage", 0.0) or 0.0) * 100,
                 len(items), getattr(info, "missing_date_count", 0), getattr(info, "raw_candidates", 0),
                 getattr(info, "promoted_filtered", 0), getattr(info, "duplicate_cards", 0), valid, network_requests,
+                from_checkpoint,
             )
             return items, relation, pairs, days
+
+        async def stable_fetch(page: int, phase: str):
+            """Retry only the weak page; never restart a whole category for one bad response."""
+            last = None
+            for attempt in range(1, STABLE_PAGE_RETRIES + 1):
+                try:
+                    last = await fetch(page, phase)
+                except TemporaryAccessError:
+                    raise
+                except Exception as exc:
+                    if attempt >= STABLE_PAGE_RETRIES:
+                        raise
+                    cache.pop(page, None)
+                    await asyncio.sleep(STABLE_PAGE_RETRY_SECONDS * attempt)
+                    continue
+                if last[1] not in {"unknown", "invalid"}:
+                    return last
+                if attempt < STABLE_PAGE_RETRIES:
+                    cache.pop(page, None)
+                    await asyncio.sleep(STABLE_PAGE_RETRY_SECONDS * attempt)
+            if STABLE_SCAN_ENGINE and last is not None and last[1] in {"unknown", "invalid"}:
+                try:
+                    await record_page_failure(
+                        cat.key, target_date, base_url, page,
+                        f"weak chronology after {STABLE_PAGE_RETRIES} attempts: {last[1]}",
+                    )
+                except Exception:
+                    log.debug("Could not persist weak page failure", exc_info=True)
+            return last
+
+        if STABLE_SCAN_ENGINE:
+            # v3.8 deliberately prefers deterministic sequential chronology over
+            # jump/binary probing. A single weak page is retried in place and
+            # verified pages survive process restarts in PostgreSQL.
+            indexed = None
+            try:
+                indexed = await load_date_index(cat.key, target_date, base_url)
+            except Exception:
+                log.debug("Stable date-index read failed", exc_info=True)
+            if indexed and indexed.get("status") == "found" and indexed.get("candidate_page"):
+                candidate_page = max(1, int(indexed["candidate_page"]))
+                try:
+                    _items, relation, _pairs, _days = await stable_fetch(candidate_page, "stable_scan")
+                    if relation == "target":
+                        return locator_result("found", candidate_page=candidate_page)
+                except TemporaryAccessError:
+                    raise
+                except Exception:
+                    log.debug("Stored date index could not be revalidated", exc_info=True)
+
+            saw_newer = False
+            page = 1
+            while page <= effective_limit:
+                items, relation, pairs, days = await stable_fetch(page, "stable_scan")
+                if relation == "target":
+                    try:
+                        await save_date_index(
+                            cat.key, target_date, base_url, status="found",
+                            candidate_page=page, max_page=site_max_page,
+                        )
+                    except Exception:
+                        log.debug("Stable date-index write failed", exc_info=True)
+                    return locator_result("found", candidate_page=page)
+                if relation == "newer":
+                    saw_newer = True
+                    page += 1
+                    continue
+                if relation == "empty":
+                    full_feed_visible = site_max_page is not None and site_max_page <= effective_limit
+                    status = "absent" if full_feed_visible else "ambiguous_absent"
+                    if status == "absent":
+                        try:
+                            await save_date_index(cat.key, target_date, base_url, status="absent", max_page=site_max_page)
+                        except Exception:
+                            pass
+                    return locator_result(status, "последовательный проход завершил выдачу")
+                if relation == "older":
+                    full_feed_visible = site_max_page is not None and site_max_page <= effective_limit
+                    status = "absent" if full_feed_visible else "ambiguous_absent"
+                    if status == "absent":
+                        try:
+                            await save_date_index(cat.key, target_date, base_url, status="absent", max_page=site_max_page)
+                        except Exception:
+                            pass
+                    reason_text = (
+                        "последовательный проход пересёк выбранную дату без объявлений"
+                        if saw_newer else "выдача уже старше выбранной даты"
+                    )
+                    return locator_result(status, reason_text)
+                if relation in {"unknown", "invalid"}:
+                    return locator_result("unknown", f"страница {page} не подтвердила хронологию после повторов")
+                page += 1
+
+            try:
+                await save_date_index(cat.key, target_date, base_url, status="too_deep", max_page=site_max_page)
+            except Exception:
+                pass
+            return locator_result("too_deep", "дата глубже публичного окна; перехожу к независимым регионам")
 
         low_newer = 0
         high: int | None = None
@@ -3264,6 +3450,18 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             quality_note=quality_note,
         )
         await record_parser_run(user_id, cat, result, started_at)
+        if STABLE_SCAN_ENGINE:
+            try:
+                await mark_category_job(
+                    cat.key, target_date, depth,
+                    status="done" if request_complete else "partial",
+                    verified_pages=verified_pages,
+                    network_requests=network_requests,
+                    matched_count=len(processed_target_ids),
+                    error_text="" if request_complete else reason,
+                )
+            except Exception:
+                log.debug("Could not persist stable category job summary", exc_info=True)
         log.info(
             "category=%s v3.1-quality target=%s depth=%s requests=%s matched=%s complete=%s quality=%s "
             "cards=%s parsed=%s missing_date=%s promoted=%s duplicates=%s invalid_pages=%s repeated_pages=%s low_quality=%s views_failed=%s reason=%s",
@@ -3318,6 +3516,15 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             await record_parser_run(user_id, cat, failed, started_at, success=False, error_text=str(exc))
         except Exception:
             log.exception("Could not record failed parser run")
+        if STABLE_SCAN_ENGINE:
+            try:
+                await mark_category_job(
+                    cat.key, target_date, depth, status="failed",
+                    verified_pages=verified_pages, network_requests=network_requests,
+                    matched_count=len(processed_target_ids), error_text=str(exc),
+                )
+            except Exception:
+                log.debug("Could not persist failed stable category job", exc_info=True)
         raise
 
 def job_keyboard(job_id: str) -> InlineKeyboardMarkup:
@@ -3723,6 +3930,9 @@ def render_user_job_status(job: ScanJob) -> str:
         if live.phase == "collecting" and depth > 0:
             collected = min(1.0, max(0.0, live.collection_index / depth))
             current_fraction = 0.18 + 0.77 * collected
+        elif live.phase == "stable_scan":
+            request_steps = min(50, max(int(live.page or 0), int(live.network_requests or 0)))
+            current_fraction = 0.03 + 0.15 * (request_steps / 50.0)
         elif live.phase in {"jumping", "seeking"}:
             request_steps = min(12, max(0, int(live.network_requests or 0)))
             current_fraction = 0.03 + 0.15 * (request_steps / 12.0)
@@ -3763,13 +3973,15 @@ def render_user_job_status(job: ScanJob) -> str:
                 "api-http": "HTTP после browser-сессии",
                 "browser-fallback": "Browser fallback",
                 "browser-seed": "Browser fallback",
+                "postgres-checkpoint": "PostgreSQL checkpoint",
             }
             transport_text = f"⚡ <b>{labels.get(stage, 'HTTP-first hybrid')}</b>\n"
         timeout_text = ""
         if live is not None and live.request_timeouts:
             timeout_text = f"⚠️ Автоповторов по таймауту: <b>{live.request_timeouts}</b>\n"
+        stage_title = "Стабильный проход" if live is not None and live.phase == "stable_scan" else "Поиск даты"
         return (
-            f"🔎 <b>Поиск даты · {percent}%</b>\n"
+            f"🔎 <b>{stage_title} · {percent}%</b>\n"
             f"{_progress_bar(percent)}\n\n"
             f"🗂 <b>{category_line}</b> · {category_index}/{total}\n"
             f"📅 За <b>{_date_label(job.target_date)}</b>"
@@ -3928,7 +4140,8 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
     if job.auto_recovered_categories:
         lines.append(f"🔧 Автовосстановлено: <b>{job.auto_recovered_categories}</b> категорий")
     if job.incomplete_categories:
-        lines.append(f"⚠️ Требуют ручной проверки: <b>{job.incomplete_categories}</b> категорий")
+        label = "Непроверенные участки после автоповторов" if STABLE_SCAN_ENGINE else "Требуют ручной проверки"
+        lines.append(f"⚠️ {label}: <b>{job.incomplete_categories}</b> категорий")
     elif quality_avg and quality_avg < 90:
         lines.append(f"🛡 Качество: <b>{quality_avg}/100</b>")
     lines.append(f"⏱ Время: <b>{elapsed_text}</b>")
@@ -3941,14 +4154,26 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
 
     if job.incomplete_categories:
         try:
-            await bot.send_message(
-                job.chat_id,
-                "<b>⚠️ Автовосстановление не завершило все участки</b>\n\n"
-                f"{job.incomplete_categories} из {len(job.category_keys)} категорий всё ещё проверены не полностью. "
-                "Найденные данные сохранены. Ручная допроверка доступна как резервный вариант.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=partial_recheck_keyboard(job.scan_id) if job.scan_id is not None else None,
-            )
+            if STABLE_SCAN_ENGINE:
+                text = (
+                    "<b>⚠️ Не все участки удалось подтвердить</b>\n\n"
+                    f"Сервер автоматически выполнил до {SCAN_AUTO_RECOVERY_PASSES} повторных проходов. "
+                    f"{job.incomplete_categories} из {len(job.category_keys)} категорий всё ещё имеют непроверенные участки. "
+                    "Все подтверждённые страницы сохранены в PostgreSQL и будут переиспользованы при следующем запуске — "
+                    "повторный скан не начнётся с нуля."
+                )
+                markup = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Повторить скан", callback_data=f"scanrepeat:{job.scan_id}")],
+                    [InlineKeyboardButton(text="📊 Открыть сохранённый скан", callback_data=f"scan:{job.scan_id}")],
+                ]) if job.scan_id is not None else None
+            else:
+                text = (
+                    "<b>⚠️ Автовосстановление не завершило все участки</b>\n\n"
+                    f"{job.incomplete_categories} из {len(job.category_keys)} категорий всё ещё проверены не полностью. "
+                    "Найденные данные сохранены. Ручная допроверка доступна как резервный вариант."
+                )
+                markup = partial_recheck_keyboard(job.scan_id) if job.scan_id is not None else None
+            await bot.send_message(job.chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
         except Exception:
             log.exception("Could not send partial-scan notice for job=%s", job.job_id)
     elif job.warnings:

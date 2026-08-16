@@ -9,6 +9,7 @@ from aiogram import Bot
 from bot import (
     BOT_TOKEN,
     PARSER_WORKER_CONCURRENCY,
+    STABLE_SCAN_ENGINE,
     distributed_scan_worker,
     distributed_worker_heartbeat,
     progress_ticker,
@@ -17,6 +18,7 @@ from bot import (
 from db import DATABASE_BACKEND, init_db
 from parser import SCAN_TRANSPORT
 from distributed import COORDINATOR, DISTRIBUTED_WORKERS, default_worker_id
+from stable_engine import cleanup_stable_state
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("dtparser-parser-worker")
@@ -29,6 +31,13 @@ async def main() -> None:
         raise RuntimeError("Parser worker requires REDIS_URL and DISTRIBUTED_WORKERS=1")
 
     await init_db()
+    if STABLE_SCAN_ENGINE:
+        try:
+            cleaned = await cleanup_stable_state()
+            if any(cleaned.values()):
+                log.info("Stable state cleanup: %s", cleaned)
+        except Exception:
+            log.warning("Stable state cleanup failed", exc_info=True)
     await COORDINATOR.connect()
     await COORDINATOR.ensure_group()
     recovered = await recover_distributed_unfinished_scans()

@@ -8,11 +8,11 @@ ENV = (ROOT / ".env.example").read_text(encoding="utf-8")
 
 
 def test_v370_version_and_hybrid_worker_profile():
-    assert (ROOT / "VERSION").read_text().strip() == "3.7.2"
-    assert 'APP_VERSION = "3.7.2"' in BOT
+    assert (ROOT / "VERSION").read_text().strip() == "3.8.0"
+    assert 'APP_VERSION = "3.8.0"' in BOT
     assert 'SCAN_TRANSPORT", "hybrid"' in WORKER
     assert 'PARSER_WORKER_CONCURRENCY", "1"' in WORKER
-    assert 'SHARE_ACTIVE_CATEGORY_SCANS", "0"' in WORKER
+    assert 'os.environ["SHARE_ACTIVE_CATEGORY_SCANS"] = "1"' in WORKER
     assert 'DIST_TRAFFIC_SHARED_COOLDOWN", "0"' in WORKER
 
 

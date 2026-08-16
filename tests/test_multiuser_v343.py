@@ -20,7 +20,8 @@ def test_view_lane_yields_when_four_or_more_scans_are_alive():
 
 
 def test_date_locator_has_visible_percentage_and_real_request_heartbeat():
-    assert 'Поиск даты · {percent}%' in BOT_SOURCE
+    assert 'stage_title = "Стабильный проход"' in BOT_SOURCE
+    assert 'Поиск даты' in BOT_SOURCE
     assert 'Проверено запросов' in BOT_SOURCE
     assert 'network_requests: int = 0' in BOT_SOURCE
 

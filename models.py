@@ -236,6 +236,74 @@ class ScanObservation(Base):
     error_text: Mapped[str | None] = mapped_column(String(1000), nullable=True)
 
 
+class StablePageCheckpoint(Base):
+    """Persistent verified category page used by the v3.8 stable scan engine."""
+
+    __tablename__ = "stable_page_checkpoints"
+    __table_args__ = (
+        UniqueConstraint(
+            "category_key", "target_date", "feed_key", "page_no",
+            name="uq_stable_page_checkpoint",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    category_key: Mapped[str] = mapped_column(String(80), index=True)
+    target_date: Mapped[str] = mapped_column(String(10), index=True)
+    feed_key: Mapped[str] = mapped_column(String(32), index=True)
+    page_no: Mapped[int] = mapped_column(Integer, index=True)
+    status: Mapped[str] = mapped_column(String(24), default="verified", index=True)
+    relation: Mapped[str] = mapped_column(String(24), default="")
+    payload_json: Mapped[str] = mapped_column(Text, default="")
+    checked_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    date_coverage: Mapped[int] = mapped_column(Integer, default=0)
+    fingerprint: Mapped[str] = mapped_column(String(80), default="")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error_text: Mapped[str] = mapped_column(String(500), default="")
+
+
+class StableDateIndex(Base):
+    """Remember the verified page boundary for category/date/feed combinations."""
+
+    __tablename__ = "stable_date_index"
+    __table_args__ = (
+        UniqueConstraint(
+            "category_key", "target_date", "feed_key",
+            name="uq_stable_date_index",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    category_key: Mapped[str] = mapped_column(String(80), index=True)
+    target_date: Mapped[str] = mapped_column(String(10), index=True)
+    feed_key: Mapped[str] = mapped_column(String(32), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="unknown", index=True)
+    candidate_page: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_page: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class StableCategoryJob(Base):
+    """Shared category/date/depth work record independent from any one Telegram user."""
+
+    __tablename__ = "stable_category_jobs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_key: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    category_key: Mapped[str] = mapped_column(String(80), index=True)
+    target_date: Mapped[str] = mapped_column(String(10), index=True)
+    page_limit: Mapped[int] = mapped_column(Integer, default=25)
+    status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    verified_pages: Mapped[int] = mapped_column(Integer, default=0)
+    network_requests: Mapped[int] = mapped_column(Integer, default=0)
+    matched_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_text: Mapped[str] = mapped_column(String(1000), default="")
+
+
 class BotUser(Base):
     """Commercial-service user profile and access state."""
 
