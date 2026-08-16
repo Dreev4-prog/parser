@@ -1,3 +1,12 @@
+# DT PARSER v4.1.2 — Auto-Distributed Railway Bootstrap
+
+- `REDIS_URL` now automatically enables distributed mode; stale `DISTRIBUTED_WORKERS=0` can no longer silently force Railway back to local workers.
+- Railway bot refuses to start without Redis instead of pretending to be healthy in `mode=local`.
+- Redis connection failure is fail-closed so Railway restarts the bot.
+- Inline view collection is forcibly disabled in distributed mode.
+- `fleet_worker.py`, `parser_worker.py`, and `views_worker.py` identify themselves as distributed workers before importing the shared runtime.
+- Startup log now shows `mode`, `source`, Railway detection, Redis detection, and local worker count.
+
 # v4.1.1 — Post-scan crash fix
 
 - Fixed production `NameError: berlin_date_key is not defined` after a fully successful 25-page scan.

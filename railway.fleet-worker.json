@@ -1,7 +1,7 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "deploy": {
-    "startCommand": "python fleet_worker.py",
+    "startCommand": "DISTRIBUTED_WORKERS=1 PRIMARY_SCAN_INLINE_VIEWS=0 python fleet_worker.py",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }

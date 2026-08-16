@@ -47,7 +47,10 @@ from filters import (
 from models import BotUser, CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing, ScanObservation, ScanViewHistory, SelectedCategory, StableCategoryJob, StablePageCheckpoint, SubscriptionPayment, SubscriptionPlan, UserScan, UserSettings, ViewHistory
 from product_identity import TYPE_DISPLAY, ProductIdentity, recognize_product
 from traffic import TRAFFIC
-from distributed import COORDINATOR, DISTRIBUTED_WORKERS
+from distributed import (
+    COORDINATOR, DISTRIBUTED_WORKERS, DISTRIBUTED_MODE_SOURCE,
+    DISTRIBUTED_CONFIG_ERROR, IS_RAILWAY, REDIS_URL,
+)
 from scan_control import ScanStopRequested, wait_for_task_or_stop
 from scan_selection import MAX_SELECTED_CATEGORIES, bulk_group_selection, toggle_selection, validate_scan_category_keys
 from commerce import (
@@ -85,7 +88,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.1.1"
+APP_VERSION = "4.1.2"
 MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -103,6 +106,9 @@ STABLE_PAGE_RETRY_SECONDS = max(0.2, min(10.0, float(os.getenv("STABLE_PAGE_RETR
 # nationwide scan into the 16-region hidden fallback.
 STABLE_WEAK_PAGE_GAP_LIMIT = max(1, min(8, int(os.getenv("STABLE_WEAK_PAGE_GAP_LIMIT", "3"))))
 PRIMARY_SCAN_INLINE_VIEWS = os.getenv("PRIMARY_SCAN_INLINE_VIEWS", "0").strip().lower() not in {"0", "false", "no", "off"}
+# Distributed scans must never spend the interactive scan path on view-count IO.
+if DISTRIBUTED_WORKERS:
+    PRIMARY_SCAN_INLINE_VIEWS = False
 
 # v2.6 Multi-User Core. User launches go into a queue. Only a limited number
 # of jobs are processed at once, while category scans are shared globally.
@@ -8001,6 +8007,12 @@ async def start_scan_with_pages(callback: CallbackQuery, state: FSMContext) -> N
 async def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
+    if DISTRIBUTED_CONFIG_ERROR:
+        raise RuntimeError(
+            "Railway production requires REDIS_URL. Add a Railway Redis service and "
+            "reference its REDIS_URL in the bot service. Local scan-worker fallback is "
+            "disabled on Railway so production cannot silently run in mode=local."
+        )
     await init_db()
     await initialize_commerce()
     backfilled = await backfill_product_identities()
@@ -8035,10 +8047,12 @@ async def main() -> None:
         try:
             await COORDINATOR.connect()
             await COORDINATOR.ensure_group()
-        except Exception:
-            # Menu/payments remain online; enqueue_user_scan will show a clear error
-            # instead of silently freezing if Redis is unavailable.
-            log.exception("Distributed mode enabled but Redis is unavailable")
+        except Exception as exc:
+            # Production must fail closed. An apparently healthy Telegram bot that has
+            # no queue is worse than a Railway restart because users would launch jobs
+            # that can never reach the browser fleet.
+            await bot.session.close()
+            raise RuntimeError("Distributed mode requires a healthy Redis connection") from exc
     else:
         recovered_scans = await recover_interrupted_user_scans(bot)
         if recovered_scans:
@@ -8047,8 +8061,9 @@ async def main() -> None:
     me = await bot.get_me()
     traffic = await TRAFFIC.snapshot()
     log.info(
-        "Starting @%s | mode=%s | local_workers=%s cache_ttl=%ss | traffic scan=%s view=%s browser=%s global=%s",
+        "Starting @%s | mode=%s source=%s railway=%s redis=%s | local_workers=%s cache_ttl=%ss | traffic scan=%s view=%s browser=%s global=%s",
         me.username, "distributed" if DISTRIBUTED_WORKERS else "local",
+        DISTRIBUTED_MODE_SOURCE, IS_RAILWAY, bool(REDIS_URL),
         0 if DISTRIBUTED_WORKERS else MAX_CONCURRENT_JOBS, CATEGORY_CACHE_TTL_SECONDS,
         traffic.scan_limit, traffic.view_limit, traffic.browser_limit, traffic.global_limit,
     )

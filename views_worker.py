@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+
+# v4.1.2: this executable is always a distributed worker.
+os.environ["DISTRIBUTED_WORKERS"] = "1"
 
 from aiogram import Bot
 

@@ -4,6 +4,9 @@ import asyncio
 import logging
 import os
 
+# v4.1.2: a dedicated parser executable is never a local-mode bot.
+os.environ["DISTRIBUTED_WORKERS"] = "1"
+
 from aiogram import Bot
 
 from bot import (

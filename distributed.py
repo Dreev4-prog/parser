@@ -34,7 +34,23 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 
 
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
-DISTRIBUTED_WORKERS = _env_bool("DISTRIBUTED_WORKERS", False) and bool(REDIS_URL)
+IS_RAILWAY = bool(
+    os.getenv("RAILWAY_ENVIRONMENT")
+    or os.getenv("RAILWAY_ENVIRONMENT_ID")
+    or os.getenv("RAILWAY_PROJECT_ID")
+    or os.getenv("RAILWAY_SERVICE_ID")
+)
+# v4.1.2 Auto-Distributed: REDIS_URL is the source of truth. Older Railway
+# deployments may still have DISTRIBUTED_WORKERS=0 left over from the legacy
+# single-service mode; that stale value must never silently disable the fleet.
+# FORCE_LOCAL_MODE is intentionally explicit and is meant only for local/dev use.
+FORCE_LOCAL_MODE = _env_bool("FORCE_LOCAL_MODE", False)
+DISTRIBUTED_WORKERS = bool(REDIS_URL) and not FORCE_LOCAL_MODE
+DISTRIBUTED_MODE_SOURCE = (
+    "forced-local" if FORCE_LOCAL_MODE else ("redis-auto" if REDIS_URL else "no-redis")
+)
+RAILWAY_REQUIRES_REDIS = _env_bool("RAILWAY_REQUIRES_REDIS", True)
+DISTRIBUTED_CONFIG_ERROR = bool(IS_RAILWAY and RAILWAY_REQUIRES_REDIS and not REDIS_URL)
 REDIS_PREFIX = os.getenv("REDIS_PREFIX", "dtparser").strip() or "dtparser"
 STREAM_NAME = f"{REDIS_PREFIX}:scan_jobs"
 STREAM_GROUP = f"{REDIS_PREFIX}:parser_workers"
