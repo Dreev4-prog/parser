@@ -81,7 +81,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.7.0"
 MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -95,7 +95,7 @@ MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
 PARSER_WORKER_CONCURRENCY = max(1, min(8, int(os.getenv("PARSER_WORKER_CONCURRENCY", "1"))))
 CATEGORY_CACHE_TTL_SECONDS = max(0, int(os.getenv("CATEGORY_CACHE_TTL_SECONDS", "300")))
 SHARE_ACTIVE_CATEGORY_SCANS = os.getenv(
-    "SHARE_ACTIVE_CATEGORY_SCANS", "0" if SCAN_TRANSPORT == "browser" else "1"
+    "SHARE_ACTIVE_CATEGORY_SCANS", "0" if SCAN_TRANSPORT in {"browser", "hybrid"} else "1"
 ).strip().lower() not in {"0", "false", "no", "off"}
 JOB_PARSER: ContextVar[KleinanzeigenParser | None] = ContextVar("dtparser_job_parser", default=None)
 STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVAL_SECONDS", "1.5")))
@@ -3695,6 +3695,7 @@ def render_user_job_status(job: ScanJob) -> str:
             f"{requests_text}\n"
             f"⏱ <b>{_human_duration(elapsed)}</b>\n"
             + ("🌐 <b>Отдельная Chromium-сессия</b>\n" if SCAN_TRANSPORT == "browser" else "")
+            + ("⚡ <b>Browser → HTTP hybrid</b>\n" if SCAN_TRANSPORT == "hybrid" else "")
             + "\nСтатус обновляется автоматически."
         )
 

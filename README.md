@@ -1,4 +1,49 @@
-# Kleinanzeigen Parser Bot v3.6.0
+# Kleinanzeigen Parser Bot v3.7.0
+
+## v3.7.0 — Browser → HTTP Hybrid Transport
+
+Экспериментальный production-профиль для multi-user нагрузки: Chromium больше не
+рендерит каждую страницу категории. Один user scan открывает первую страницу через
+обычный headless Chromium, переносит `BrowserContext.storage_state()` в отдельный
+Playwright `APIRequestContext`, после чего Chromium освобождается из RAM, а основной
+поиск даты и проход страниц продолжается лёгкими HTTP-запросами с той же сессией.
+
+### Что изменилось
+
+- Добавлен `hybrid_worker.py` и Railway-конфиг `railway.hybrid-worker.json`.
+- Новый `SCAN_TRANSPORT=hybrid`: browser seed → API HTTP bulk → browser compatibility fallback.
+- Chromium по умолчанию закрывается сразу после получения storage state (`HYBRID_CLOSE_BROWSER_AFTER_SEED=1`).
+- Сессионные cookies продолжают жить в standalone `APIRequestContext`; при совместимом browser fallback актуальное состояние переносится обратно.
+- Явные `403/429` и challenge-страницы **не обходятся переключением транспорта**: worker публикует backoff/cooldown и завершает проблемный шаг контролируемо.
+- HTTP transport имеет короткие retries только для сетевых/5xx сбоев; после этого разрешён ограниченный browser compatibility fallback.
+- Direct view-counter в hybrid worker тоже переиспользует лёгкий request context и не поднимает Chromium без необходимости.
+- Active scans в hybrid-режиме не объединяются в один владеющий scan, поэтому каждый пользователь получает отдельный worker lane. Завершённый DB-cache остаётся.
+- В live progress отображается `⚡ Browser → HTTP hybrid`, чтобы тестировать реальный режим, а в Railway logs есть `Hybrid session seeded` и `compatibility fallback`.
+- PostgreSQL/Redis schema не менялись.
+
+### Рекомендуемая схема
+
+```text
+Telegram bot ×1
+      │
+      ├── PostgreSQL
+      └── Redis Streams
+             │
+       ┌─────┼─────┬─────┬─────┐
+       ▼     ▼     ▼     ▼     ▼
+    Hybrid Hybrid Hybrid Hybrid Hybrid
+    Worker Worker Worker Worker Worker
+      │      │      │      │      │
+  Chromium используется коротко для seed/fallback
+      │      │      │      │      │
+      └──── bulk category work = lightweight HTTP ────┘
+
+      + views-worker ×1
+```
+
+Для Railway: **`DEPLOY_V3_7_HYBRID.md`**.
+
+---
 
 ## v3.6.0 — Browser-Isolated Workers
 

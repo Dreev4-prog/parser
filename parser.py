@@ -50,16 +50,25 @@ DIRECT_VIEW_CONCURRENCY = max(1, min(16, int(os.getenv("DIRECT_VIEW_CONCURRENCY"
 VIEW_DIRECT_BATCH_SIZE = max(5, min(200, int(os.getenv("VIEW_DIRECT_BATCH_SIZE", "40"))))
 VIEW_DIRECT_BATCH_PAUSE_SECONDS = max(0.0, min(5.0, float(os.getenv("VIEW_DIRECT_BATCH_PAUSE_SECONDS", "0.35"))))
 
-# v3.6.0 Browser-Isolated Workers. Foreground category pages can be loaded through
-# a real Chromium navigation instead of the process-wide HTTP client. Each parser
-# worker/job owns one browser context and one lightweight page; selected categories
-# reuse that session sequentially for the lifetime of the user scan.
+# v3.7.0 Hybrid Transport. A foreground scan can use one short Chromium navigation
+# to establish a normal public browser session and then switch to Playwright's
+# lightweight APIRequestContext for the bulk category-page work. The request context
+# is initialized from BrowserContext.storage_state(), so it carries the same cookies
+# without keeping Chromium/page rendering alive for hundreds of requests.
 SCAN_TRANSPORT = os.getenv("SCAN_TRANSPORT", "http").strip().lower()
-if SCAN_TRANSPORT not in {"http", "browser"}:
+if SCAN_TRANSPORT not in {"http", "browser", "hybrid"}:
     SCAN_TRANSPORT = "http"
 BROWSER_SCAN_NAV_TIMEOUT_MS = max(10_000, min(90_000, int(os.getenv("BROWSER_SCAN_NAV_TIMEOUT_MS", "35000"))))
 BROWSER_SCAN_ACCESS_MAX_WAIT_SECONDS = max(10.0, min(180.0, float(os.getenv("BROWSER_SCAN_ACCESS_MAX_WAIT_SECONDS", "45"))))
 BROWSER_SCAN_RETRY_MIN_SECONDS = max(2.0, min(30.0, float(os.getenv("BROWSER_SCAN_RETRY_MIN_SECONDS", "6"))))
+HYBRID_HTTP_TIMEOUT_MS = max(5_000, min(60_000, int(os.getenv("HYBRID_HTTP_TIMEOUT_MS", "18000"))))
+HYBRID_SESSION_TTL_SECONDS = max(60.0, min(3600.0, float(os.getenv("HYBRID_SESSION_TTL_SECONDS", "900"))))
+HYBRID_HTTP_RETRIES = max(1, min(3, int(os.getenv("HYBRID_HTTP_RETRIES", "2"))))
+HYBRID_BROWSER_FALLBACK_LIMIT = max(0, min(10, int(os.getenv("HYBRID_BROWSER_FALLBACK_LIMIT", "3"))))
+HYBRID_CLOSE_BROWSER_AFTER_SEED = os.getenv("HYBRID_CLOSE_BROWSER_AFTER_SEED", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+
 
 log = logging.getLogger("kleinanzeigen-parser")
 
@@ -952,11 +961,23 @@ class KleinanzeigenParser:
         self._scan_page = None
         self._scan_page_lock = asyncio.Lock()
         self._direct_mode_lock = asyncio.Lock()
+        self._hybrid_lock = asyncio.Lock()
         self.scan_transport = SCAN_TRANSPORT
         self._direct_view_mode: str = "unknown"  # unknown|http|context|browser
         self._context_session_seeded = False
+        self._hybrid_request_context = None
+        self._hybrid_storage_state: dict | None = None
+        self._hybrid_seeded_at = 0.0
+        self._hybrid_request_count = 0
+        self._hybrid_browser_fallbacks = 0
 
     async def close(self) -> None:
+        try:
+            if self._hybrid_request_context is not None:
+                await self._hybrid_request_context.dispose()
+        except Exception:
+            pass
+        self._hybrid_request_context = None
         try:
             if self._scan_page is not None:
                 await self._scan_page.close()
@@ -1155,11 +1176,209 @@ class KleinanzeigenParser:
                     raise
                 await asyncio.sleep(1.2 * transient_attempt + random.uniform(0.0, 0.6))
 
+    async def _close_browser_runtime(self) -> None:
+        """Release Chromium RAM while keeping the Playwright driver/API context alive."""
+        await self._reset_scan_page()
+        try:
+            if self._browser_context is not None:
+                await self._browser_context.close()
+        except Exception:
+            pass
+        self._browser_context = None
+        try:
+            if self._browser is not None:
+                await self._browser.close()
+        except Exception:
+            pass
+        self._browser = None
+
+    async def _hybrid_state_from_request_context(self) -> dict | None:
+        if self._hybrid_request_context is None:
+            return self._hybrid_storage_state
+        try:
+            self._hybrid_storage_state = await self._hybrid_request_context.storage_state()
+        except Exception:
+            pass
+        return self._hybrid_storage_state
+
+    async def _build_hybrid_request_context(self) -> None:
+        if self._playwright is None:
+            from playwright.async_api import async_playwright
+            self._playwright = await async_playwright().start()
+        if self._hybrid_request_context is not None:
+            try:
+                await self._hybrid_request_context.dispose()
+            except Exception:
+                pass
+        self._hybrid_request_context = await self._playwright.request.new_context(
+            storage_state=self._hybrid_storage_state,
+            user_agent=USER_AGENT,
+            extra_http_headers={
+                "Accept-Language": "de-DE,de;q=0.9,en;q=0.7",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            timeout=HYBRID_HTTP_TIMEOUT_MS,
+            fail_on_status_code=False,
+        )
+
+    async def _bootstrap_hybrid_session(self, url: str) -> tuple[str, str]:
+        """Use one browser navigation, transfer its storage state, then shed Chromium.
+
+        Playwright documents that BrowserContext storage state can initialize an
+        APIRequestContext. This is a resource optimization only: HTTP 403/429 is
+        honored as a refusal and is never retried through Chromium as a bypass.
+        """
+        # If an earlier lightweight request context accumulated fresher cookies,
+        # feed them into a browser fallback/refresh before navigating.
+        await self._hybrid_state_from_request_context()
+        text, final_url = await self._fetch_scan_browser_document(url)
+        if self._browser_context is not None:
+            try:
+                self._hybrid_storage_state = await self._browser_context.storage_state()
+            except Exception:
+                self._hybrid_storage_state = self._hybrid_storage_state or {"cookies": [], "origins": []}
+        await self._build_hybrid_request_context()
+        self._hybrid_seeded_at = time.monotonic()
+        self._hybrid_request_count = 0
+        if HYBRID_CLOSE_BROWSER_AFTER_SEED:
+            await self._close_browser_runtime()
+        log.info(
+            "Hybrid session seeded | chromium_released=%s | bulk_transport=api-http | url=%s",
+            HYBRID_CLOSE_BROWSER_AFTER_SEED,
+            final_url,
+        )
+        return text, final_url
+
+    @staticmethod
+    def _hybrid_html_needs_browser(text: str) -> bool:
+        """Detect a JS-only/interstitial document, but never treat access refusal as fallback."""
+        if not text or len(text) < 200:
+            return True
+        low = text.lower()[:20000]
+        # Protection/challenge pages must be honored, not worked around with another transport.
+        challenge = (
+            "captcha", "access denied", "sicherheitsüberprüfung", "sicherheitsueberpruefung",
+            "ungewöhnliche aktivität", "ungewoehnliche aktivitaet", "bot protection",
+        )
+        if any(word in low for word in challenge):
+            return False
+        js_only = (
+            "javascript ist deaktiviert", "javascript aktivieren", "enable javascript",
+        )
+        return any(word in low for word in js_only)
+
+    @staticmethod
+    def _hybrid_html_is_challenge(text: str) -> bool:
+        low = (text or "").lower()[:20000]
+        return any(word in low for word in (
+            "captcha", "access denied", "sicherheitsüberprüfung", "sicherheitsueberpruefung",
+            "ungewöhnliche aktivität", "ungewoehnliche aktivitaet", "bot protection",
+        ))
+
+    async def _fetch_scan_hybrid_document(self, url: str) -> tuple[str, str]:
+        """Browser seed -> lightweight HTTP requests -> controlled browser fallback.
+
+        The normal path keeps Chromium closed after the first navigation. A browser
+        relaunch is reserved for transport/runtime or JS-only compatibility failures.
+        Site refusals (403/429/challenge) are backed off and surfaced instead.
+        """
+        if not _allowed_url(url):
+            raise ValueError("Only public kleinanzeigen.de HTTPS URLs are allowed")
+
+        async with self._hybrid_lock:
+            expired = (
+                self._hybrid_request_context is None
+                or self._hybrid_seeded_at <= 0
+                or time.monotonic() - self._hybrid_seeded_at >= HYBRID_SESSION_TTL_SECONDS
+            )
+            if expired:
+                return await self._bootstrap_hybrid_session(url)
+
+            last_error: Exception | None = None
+            for attempt in range(1, HYBRID_HTTP_RETRIES + 1):
+                try:
+                    async with TRAFFIC.lease("scan", "high"):
+                        response = await self._hybrid_request_context.get(
+                            url,
+                            timeout=HYBRID_HTTP_TIMEOUT_MS,
+                            fail_on_status_code=False,
+                            max_retries=1,
+                        )
+                    status = int(response.status)
+                    final_url = str(getattr(response, "url", url) or url)
+
+                    if status in {403, 429}:
+                        try:
+                            await response.dispose()
+                        except Exception:
+                            pass
+                        await TRAFFIC.report_refusal(status, "scan")
+                        # Do not switch transports to defeat an explicit refusal.
+                        raise TemporaryAccessError(status, url)
+                    if status >= 500:
+                        try:
+                            await response.dispose()
+                        except Exception:
+                            pass
+                        last_error = RuntimeError(f"Hybrid HTTP {status}")
+                        if attempt < HYBRID_HTTP_RETRIES:
+                            await asyncio.sleep(0.5 * attempt + random.uniform(0.0, 0.25))
+                            continue
+                        break
+                    if status >= 400:
+                        try:
+                            await response.dispose()
+                        except Exception:
+                            pass
+                        raise RuntimeError(f"Hybrid HTTP {status}")
+
+                    text = await response.text()
+                    try:
+                        await response.dispose()
+                    except Exception:
+                        pass
+                    self._hybrid_request_count += 1
+                    if self._hybrid_html_is_challenge(text):
+                        await TRAFFIC.report_refusal(429, "scan")
+                        raise TemporaryAccessError(429, url)
+                    if self._hybrid_html_needs_browser(text):
+                        last_error = RuntimeError("Hybrid HTTP returned JS-only document")
+                        break
+
+                    await TRAFFIC.report_success("scan")
+                    return text, final_url
+                except TemporaryAccessError:
+                    raise
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < HYBRID_HTTP_RETRIES:
+                        await asyncio.sleep(0.4 * attempt + random.uniform(0.0, 0.2))
+                        continue
+
+            if self._hybrid_browser_fallbacks >= HYBRID_BROWSER_FALLBACK_LIMIT:
+                if last_error is not None:
+                    raise last_error
+                raise RuntimeError("Hybrid browser fallback limit reached")
+
+            # Compatibility fallback only. Reuse the newest API-request cookies when
+            # creating the browser context, navigate once, then return to HTTP mode.
+            self._hybrid_browser_fallbacks += 1
+            log.warning(
+                "Hybrid HTTP compatibility fallback to Chromium | count=%s/%s | error=%s | url=%s",
+                self._hybrid_browser_fallbacks, HYBRID_BROWSER_FALLBACK_LIMIT, last_error, url,
+            )
+            return await self._bootstrap_hybrid_session(url)
+
     async def fetch_html(
         self, url: str, *, traffic_kind: str = "scan", traffic_priority: str = "high"
     ) -> str:
         if traffic_kind == "scan" and self.scan_transport == "browser":
             text, _ = await self._fetch_scan_browser_document(url)
+            return text
+        if traffic_kind == "scan" and self.scan_transport == "hybrid":
+            text, _ = await self._fetch_scan_hybrid_document(url)
             return text
         return (await self._fetch_response(url, traffic_kind=traffic_kind, traffic_priority=traffic_priority)).text
 
@@ -1169,6 +1388,11 @@ class KleinanzeigenParser:
     async def parse_category_page_info(self, url: str, requested_page: int) -> CategoryPageInfo:
         if self.scan_transport == "browser":
             text, final_url = await self._fetch_scan_browser_document(url)
+            return category_page_info_from_html(
+                text, requested_page=requested_page, final_url=final_url
+            )
+        if self.scan_transport == "hybrid":
+            text, final_url = await self._fetch_scan_hybrid_document(url)
             return category_page_info_from_html(
                 text, requested_page=requested_page, final_url=final_url
             )
@@ -1206,17 +1430,23 @@ class KleinanzeigenParser:
         async with self._browser_lock:
             if self._browser_context is not None:
                 return self._browser_context
-            from playwright.async_api import async_playwright
-            self._playwright = await async_playwright().start()
+            if self._playwright is None:
+                from playwright.async_api import async_playwright
+                self._playwright = await async_playwright().start()
             self._browser = await self._playwright.chromium.launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage"],
             )
+            storage_state = None
+            if self.scan_transport == "hybrid":
+                await self._hybrid_state_from_request_context()
+                storage_state = self._hybrid_storage_state
             self._browser_context = await self._browser.new_context(
                 user_agent=USER_AGENT,
                 locale="de-DE",
                 viewport={"width": 1365, "height": 900},
                 extra_http_headers={"Accept-Language": "de-DE,de;q=0.9,en;q=0.7"},
+                storage_state=storage_state,
             )
             return self._browser_context
 
@@ -1486,19 +1716,34 @@ class KleinanzeigenParser:
         ad_id = extract_external_id(url)
         endpoint = self._direct_view_url(ad_id)
         try:
-            context = await self._ensure_view_browser()
+            # In hybrid mode the standalone APIRequestContext already owns the
+            # browser-seeded cookies, so view enrichment does not need to relaunch
+            # Chromium merely to issue an HTTP request.
+            if self.scan_transport == "hybrid" and self._hybrid_request_context is not None:
+                request_context = self._hybrid_request_context
+                source_prefix = "direct-hybrid"
+                browser_context = None
+            else:
+                browser_context = await self._ensure_view_browser()
+                request_context = browser_context.request
+                source_prefix = "direct-context"
+
             async with TRAFFIC.lease("view", traffic_priority):
-                response = await context.request.get(
+                response = await request_context.get(
                     endpoint,
                     headers=self._direct_view_headers(url),
                     timeout=12_000,
                     fail_on_status_code=False,
                 )
-            if response.status in {403, 429} and not self._context_session_seeded:
+            if (
+                response.status in {403, 429}
+                and browser_context is not None
+                and not self._context_session_seeded
+            ):
                 await TRAFFIC.report_refusal(response.status, "view")
-                await self._seed_context_request_session(context)
+                await self._seed_context_request_session(browser_context)
                 async with TRAFFIC.lease("view", traffic_priority):
-                    response = await context.request.get(
+                    response = await request_context.get(
                         endpoint,
                         headers=self._direct_view_headers(url),
                         timeout=12_000,
@@ -1509,16 +1754,25 @@ class KleinanzeigenParser:
             elif response.status == 200:
                 await TRAFFIC.report_success("view")
             if response.status != 200:
+                status = response.status
+                try:
+                    await response.dispose()
+                except Exception:
+                    pass
                 return ViewCountResult(
-                    None, None, f"direct-context:status-{response.status}",
-                    endpoint, None, error=f"HTTP {response.status}",
+                    None, None, f"{source_prefix}:status-{status}",
+                    endpoint, None, error=f"HTTP {status}",
                 )
             text = await response.text()
+            try:
+                await response.dispose()
+            except Exception:
+                pass
             value, shape = _extract_passive_view_payload(text[:350_000], ad_id=ad_id)
             if value is None:
-                return ViewCountResult(None, text[:500], "direct-context:unparsed", endpoint, None)
+                return ViewCountResult(None, text[:500], f"{source_prefix}:unparsed", endpoint, None)
             return ViewCountResult(
-                int(value), text[:500], f"direct-context:s-vac-inc-get:{shape or 'payload'}",
+                int(value), text[:500], f"{source_prefix}:s-vac-inc-get:{shape or 'payload'}",
                 endpoint, None,
             )
         except Exception as exc:
