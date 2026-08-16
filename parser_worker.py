@@ -16,7 +16,7 @@ from bot import (
     recover_distributed_unfinished_scans,
 )
 from db import DATABASE_BACKEND, init_db
-from parser import SCAN_TRANSPORT
+from parser import SCAN_TRANSPORT, SHARED_BROWSER_RUNTIME, shutdown_shared_browser_runtime
 from distributed import COORDINATOR, DISTRIBUTED_WORKERS, default_worker_id
 from stable_engine import cleanup_stable_state
 
@@ -74,6 +74,8 @@ async def main() -> None:
             task.cancel()
         await asyncio.gather(heartbeat, ticker, *workers, return_exceptions=True)
         await COORDINATOR.close()
+        if SHARED_BROWSER_RUNTIME:
+            await shutdown_shared_browser_runtime()
         await bot.session.close()
 
 

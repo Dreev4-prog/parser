@@ -1,4 +1,20 @@
-# DT PARSER v3.8.0 — Stable Scan Engine
+# DT PARSER v4.0.0 — Railway Browser Fleet
+
+## v4.0.0
+
+- Новый production entry point `python fleet_worker.py`.
+- Один Railway replica держит один долгоживущий Chromium process.
+- По умолчанию 2 независимых BrowserContext на replica (`FLEET_CONTEXTS_PER_REPLICA=2`).
+- На Hobby можно использовать 6 replicas: до 12 browser contexts при одном Chromium process на container.
+- BrowserContext создаётся на конкретный scan job и закрывается после него; browser process остаётся прогретым.
+- `SHARE_ACTIVE_CATEGORY_SCANS=0`: медленный активный пользователь не удерживает другого как subscriber.
+- Redis остаётся глобальным governor/circuit breaker; вычислительная мощность и внешний сетевой concurrency регулируются отдельно.
+- Просмотры остаются вне foreground scan path.
+- Stable Engine/PostgreSQL checkpoints сохранены.
+- Railway config: `railway.fleet-worker.json`.
+- Подробная инструкция: `DEPLOY_V4_BROWSER_FLEET.md`.
+
+---
 
 ## v3.8.0
 

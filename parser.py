@@ -77,8 +77,127 @@ HYBRID_WATCHDOG_SECONDS = max(6.0, min(45.0, float(os.getenv("HYBRID_WATCHDOG_SE
 HYBRID_DIRECT_HTTP_RETRIES = max(1, min(3, int(os.getenv("HYBRID_DIRECT_HTTP_RETRIES", "1"))))
 SCAN_PAGE_CHECKPOINT_TTL_SECONDS = max(60.0, min(3600.0, float(os.getenv("SCAN_PAGE_CHECKPOINT_TTL_SECONDS", "900"))))
 
+# v4.0 Railway Browser Fleet. When enabled, a Railway replica owns one long-lived
+# Chromium process and each concurrent scan gets its own isolated BrowserContext.
+# This uses Railway CPU/RAM more efficiently than launching a full Chromium process
+# for every scan while still keeping cookies/storage isolated between user jobs.
+SHARED_BROWSER_RUNTIME = os.getenv("SHARED_BROWSER_RUNTIME", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
 
 log = logging.getLogger("kleinanzeigen-parser")
+
+
+class _SharedBrowserRuntime:
+    """One Chromium process per worker replica, many isolated contexts.
+
+    The runtime is deliberately process-local. Railway replicas are already separate
+    containers/processes, so each replica receives its own Chromium instance.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._playwright = None
+        self._browser = None
+        self._contexts_created = 0
+
+    async def _ensure_browser(self):
+        async with self._lock:
+            browser = self._browser
+            try:
+                connected = bool(browser and browser.is_connected())
+            except Exception:
+                connected = False
+            if connected:
+                return browser
+
+            # Clean up a half-dead runtime before recreating it.
+            try:
+                if self._browser is not None:
+                    await self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+            try:
+                if self._playwright is not None:
+                    await self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+
+            from playwright.async_api import async_playwright
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-background-networking",
+                    "--disable-default-apps",
+                    "--disable-extensions",
+                    "--disable-sync",
+                    "--metrics-recording-only",
+                    "--no-first-run",
+                    "--mute-audio",
+                ],
+            )
+            log.info(
+                "Railway browser fleet runtime started | replica=%s",
+                os.getenv("RAILWAY_REPLICA_ID", "local"),
+            )
+            return self._browser
+
+    async def new_context(self, *, storage_state=None):
+        # If Chromium crashed between jobs, one retry recreates the process.
+        last_error = None
+        for attempt in range(2):
+            try:
+                browser = await self._ensure_browser()
+                context = await browser.new_context(
+                    user_agent=USER_AGENT,
+                    locale="de-DE",
+                    viewport={"width": 1365, "height": 900},
+                    extra_http_headers={"Accept-Language": "de-DE,de;q=0.9,en;q=0.7"},
+                    storage_state=storage_state,
+                )
+                self._contexts_created += 1
+                return context
+            except Exception as exc:
+                last_error = exc
+                async with self._lock:
+                    try:
+                        if self._browser is not None:
+                            await self._browser.close()
+                    except Exception:
+                        pass
+                    self._browser = None
+                if attempt == 0:
+                    await asyncio.sleep(0.4)
+        raise RuntimeError(f"Could not create shared browser context: {last_error}")
+
+    async def close(self) -> None:
+        async with self._lock:
+            try:
+                if self._browser is not None:
+                    await self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+            try:
+                if self._playwright is not None:
+                    await self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+
+
+_SHARED_BROWSER_FLEET = _SharedBrowserRuntime()
+
+
+async def shutdown_shared_browser_runtime() -> None:
+    if SHARED_BROWSER_RUNTIME:
+        await _SHARED_BROWSER_FLEET.close()
 
 
 class TemporaryAccessError(RuntimeError):
@@ -965,6 +1084,7 @@ class KleinanzeigenParser:
         self._playwright = None
         self._browser = None
         self._browser_context = None
+        self._uses_shared_browser_runtime = False
         self._browser_lock = asyncio.Lock()
         self._scan_page = None
         self._scan_page_lock = asyncio.Lock()
@@ -1003,11 +1123,14 @@ class KleinanzeigenParser:
                 await self._browser_context.close()
         except Exception:
             pass
-        try:
-            if self._browser is not None:
-                await self._browser.close()
-        except Exception:
-            pass
+        if not self._uses_shared_browser_runtime:
+            try:
+                if self._browser is not None:
+                    await self._browser.close()
+            except Exception:
+                pass
+        # In shared-browser mode self._playwright may still own a hybrid API request
+        # runtime, so it is always safe/necessary to stop when this parser created it.
         try:
             if self._playwright is not None:
                 await self._playwright.stop()
@@ -1199,12 +1322,13 @@ class KleinanzeigenParser:
         except Exception:
             pass
         self._browser_context = None
-        try:
-            if self._browser is not None:
-                await self._browser.close()
-        except Exception:
-            pass
-        self._browser = None
+        if not self._uses_shared_browser_runtime:
+            try:
+                if self._browser is not None:
+                    await self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
 
     async def _hybrid_state_from_request_context(self) -> dict | None:
         if self._hybrid_request_context is None:
@@ -1566,6 +1690,18 @@ class KleinanzeigenParser:
         async with self._browser_lock:
             if self._browser_context is not None:
                 return self._browser_context
+            storage_state = None
+            if self.scan_transport == "hybrid":
+                await self._hybrid_state_from_request_context()
+                storage_state = self._hybrid_storage_state
+
+            if SHARED_BROWSER_RUNTIME:
+                self._browser_context = await _SHARED_BROWSER_FLEET.new_context(
+                    storage_state=storage_state
+                )
+                self._uses_shared_browser_runtime = True
+                return self._browser_context
+
             if self._playwright is None:
                 from playwright.async_api import async_playwright
                 self._playwright = await async_playwright().start()
@@ -1573,10 +1709,6 @@ class KleinanzeigenParser:
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage"],
             )
-            storage_state = None
-            if self.scan_transport == "hybrid":
-                await self._hybrid_state_from_request_context()
-                storage_state = self._hybrid_storage_state
             self._browser_context = await self._browser.new_context(
                 user_agent=USER_AGENT,
                 locale="de-DE",
