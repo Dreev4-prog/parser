@@ -3,9 +3,14 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import logging
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+
+from distributed import COORDINATOR, DISTRIBUTED_WORKERS
+
+log = logging.getLogger("dtparser-traffic")
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -156,6 +161,11 @@ class AdaptiveTrafficManager:
                 cooldown = min(self.max_cooldown, cooldown * 1.5)
             self._cooldown_until = max(self._cooldown_until, now + cooldown)
             self._condition.notify_all()
+        if DISTRIBUTED_WORKERS:
+            try:
+                await COORDINATOR.report_traffic_refusal(int(status_code))
+            except Exception:
+                log.debug("Could not publish distributed traffic cooldown", exc_info=True)
 
     async def snapshot(self) -> TrafficSnapshot:
         now = time.monotonic()
@@ -238,7 +248,27 @@ class AdaptiveTrafficManager:
                         await asyncio.wait_for(self._condition.wait(), timeout=timeout)
                     except asyncio.TimeoutError:
                         pass
-            yield
+            distributed_token = None
+            if DISTRIBUTED_WORKERS:
+                try:
+                    distributed_token = await COORDINATOR.acquire_traffic(
+                        kind, interval_seconds=self._kind_interval(kind) / 2.0
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Redis queue/cache may still be healthy while a transient limiter
+                    # command fails. Keep the local safety limits rather than taking
+                    # every worker offline.
+                    log.warning("Distributed traffic limiter unavailable; using local limit", exc_info=True)
+            try:
+                yield
+            finally:
+                if distributed_token is not None:
+                    try:
+                        await COORDINATOR.release_traffic(kind, distributed_token)
+                    except Exception:
+                        log.debug("Could not release distributed traffic token", exc_info=True)
         finally:
             if acquired:
                 async with self._condition:

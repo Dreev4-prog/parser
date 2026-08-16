@@ -1,5 +1,46 @@
-# Kleinanzeigen Parser Bot v3.4.3
+# Kleinanzeigen Parser Bot v3.5.0
 
+## v3.5.0 — Multi-User Core / Redis Workers
+
+Это архитектурный релиз для стабильной одновременной работы нескольких пользователей. Старый односервисный режим сохранён как fallback (`DISTRIBUTED_WORKERS=0`), но production-рекомендация — отдельные сервисы bot + parser-worker + views-worker, общий PostgreSQL и Redis.
+
+### Что изменилось
+
+- **Telegram bot больше не обязан сам парсить.** В distributed-режиме `bot.py` занимается интерфейсом, пользователями, платежами и постановкой задач; реальные сканы выполняет `parser_worker.py`.
+- **Redis Streams — постоянная очередь.** Задание ACK-ается только после завершения. Если worker-процесс аварийно умер, pending job может быть автоматически забран другой репликой через `XAUTOCLAIM`.
+- **Защита от двойного запуска одного UserScan.** Короткий Redis job-lock с heartbeat не даёт двум worker-репликам одновременно выполнять один и тот же job UID.
+- **Shared Category Scan теперь межпроцессный.** Одинаковые `категория + дата + глубина` между разными пользователями/worker-репликами объединяются через Redis lock/result cache. Второй пользователь ждёт общий результат вместо повторного crawl.
+- **Живой прогресс общего скана передаётся между replicas.** Worker-владелец публикует `CategoryLiveProgress` в Redis, подписчик зеркалит его в свою Telegram-карточку.
+- **Глобальный Redis traffic governor.** Лимиты `scan/view/browser/global` применяются ко всем parser replicas вместе, а не отдельно в каждом контейнере. Первый 403/429 публикует общий cooldown, который видят все workers.
+- **Фоновые +3/+6/+12ч замеры вынесены в `views_worker.py`.** Они больше не конкурируют с Telegram polling и основными parser workers в одном event loop.
+- **PostgreSQL остаётся source of truth.** Redis хранит очередь, locks, краткий cache/progress; объявления, сканы, платежи и история по-прежнему живут в PostgreSQL.
+- **Distributed Stop.** `/stop` и кнопка остановки ставят cancel signal в Redis; running-worker подхватывает его примерно за секунду. Queued-job отменяется в PostgreSQL сразу, поэтому пользователь может запускать новый скан.
+- **Меньше DB connections на replica.** При `DISTRIBUTED_WORKERS=1` SQLAlchemy по умолчанию использует pool `3 + 2 overflow` вместо `5 + 5`, чтобы 5 parser replicas + bot + views-worker не раздували соединения PostgreSQL.
+- В админской статистике отображаются distributed-режим, число живых parser/views workers, running и queued scans.
+
+### Рекомендуемая production-схема
+
+```text
+Telegram
+   │
+   ▼
+DT PARSER BOT ×1
+   │
+   ├──────────────► PostgreSQL
+   │
+   ▼
+Redis Streams / locks / cache / traffic governor
+   │
+   ├──► parser-worker ×5
+   │
+   └──► views-worker ×1
+```
+
+Для пяти одновременных пользовательских сканов рекомендуется **5 parser-worker replicas с `PARSER_WORKER_CONCURRENCY=1`**. Это легче контролировать и восстанавливать, чем один контейнер с пятью тяжёлыми задачами.
+
+Подробная настройка Railway: **`DEPLOY_V3_5_MULTIUSER.md`**.
+
+---
 
 ## v3.4.3 — брендированное главное меню
 

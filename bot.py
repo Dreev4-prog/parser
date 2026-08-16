@@ -46,6 +46,7 @@ from filters import (
 from models import BotUser, CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing, ScanObservation, ScanViewHistory, SelectedCategory, SubscriptionPayment, SubscriptionPlan, UserScan, UserSettings, ViewHistory
 from product_identity import TYPE_DISPLAY, ProductIdentity, recognize_product
 from traffic import TRAFFIC
+from distributed import COORDINATOR, DISTRIBUTED_WORKERS
 from scan_control import ScanStopRequested, wait_for_task_or_stop
 from scan_selection import MAX_SELECTED_CATEGORIES, bulk_group_selection, toggle_selection, validate_scan_category_keys
 from commerce import (
@@ -78,7 +79,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "3.4.3"
+APP_VERSION = "3.5.0"
 MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -89,6 +90,7 @@ AVAILABILITY_CONCURRENCY = max(1, min(8, int(os.getenv("AVAILABILITY_CONCURRENCY
 # of jobs are processed at once, while category scans are shared globally.
 MAX_CONCURRENT_JOBS = max(1, min(12, int(os.getenv("MAX_CONCURRENT_JOBS", "5"))))
 MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
+PARSER_WORKER_CONCURRENCY = max(1, min(8, int(os.getenv("PARSER_WORKER_CONCURRENCY", "1"))))
 CATEGORY_CACHE_TTL_SECONDS = max(0, int(os.getenv("CATEGORY_CACHE_TTL_SECONDS", "300")))
 STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVAL_SECONDS", "1.5")))
 # v3.3.0 job-level resilience on top of parser HTTP retries. A category that
@@ -579,6 +581,55 @@ async def get_user_scan(user_id: int, scan_id: int) -> UserScan | None:
     async with SessionLocal() as session:
         result = await session.execute(select(UserScan).where(UserScan.id == scan_id, UserScan.user_id == user_id))
         return result.scalar_one_or_none()
+
+
+ACTIVE_SCAN_STATUSES = ("queued", "running", "cancelling")
+
+
+async def get_active_user_scan(user_id: int) -> UserScan | None:
+    """PostgreSQL source-of-truth for one user's active scan.
+
+    In distributed mode the Telegram process and parser workers do not share RAM,
+    so active_jobs cannot be authoritative. Keeping this check in PostgreSQL also
+    prevents duplicate launches when the bot process restarts.
+    """
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(UserScan)
+            .where(
+                UserScan.user_id == int(user_id),
+                UserScan.status.in_(ACTIVE_SCAN_STATUSES),
+                UserScan.finished_at.is_(None),
+            )
+            .order_by(UserScan.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+
+async def user_has_active_scan(user_id: int) -> bool:
+    if DISTRIBUTED_WORKERS:
+        return (await get_active_user_scan(user_id)) is not None
+    async with job_guard:
+        existing = active_jobs.get(user_id)
+        return bool(existing and existing.state in {"queued", "running"} and not existing.cancel_requested)
+
+
+async def queued_scan_count() -> int:
+    if DISTRIBUTED_WORKERS:
+        async with SessionLocal() as session:
+            value = (await session.execute(
+                select(func.count(UserScan.id)).where(
+                    UserScan.status == "queued", UserScan.finished_at.is_(None)
+                )
+            )).scalar_one()
+            return int(value or 0)
+    async with job_guard:
+        return len(queued_job_ids)
+
+
+async def queue_is_full() -> bool:
+    return (await queued_scan_count()) >= MAX_QUEUE_SIZE
 
 
 async def archive_expired_scans(user_id: int | None = None) -> int:
@@ -2150,6 +2201,12 @@ async def stats_text() -> str:
         fast_ready = (await session.execute(select(func.count(CategoryScanState.category_key)).where(
             CategoryScanState.scan_date == day_key, CategoryScanState.day_seed_complete.is_(True),
         ))).scalar_one()
+        db_running_jobs = (await session.execute(select(func.count(UserScan.id)).where(
+            UserScan.status == "running", UserScan.finished_at.is_(None),
+        ))).scalar_one()
+        db_queued_jobs = (await session.execute(select(func.count(UserScan.id)).where(
+            UserScan.status == "queued", UserScan.finished_at.is_(None),
+        ))).scalar_one()
     storage = DATABASE_BACKEND
     warning = ""
     coverage = round(priced / today * 100) if today else 0
@@ -2158,6 +2215,25 @@ async def stats_text() -> str:
         running_jobs_count = sum(1 for j in active_jobs.values() if j.state == "running")
         queued_jobs_count = sum(1 for j in active_jobs.values() if j.state == "queued" and not j.cancel_requested)
         inflight_categories_count = len(category_inflight)
+    multiuser_text = ""
+    if DISTRIBUTED_WORKERS:
+        parser_workers = views_workers = 0
+        try:
+            parser_workers = await COORDINATOR.worker_count("parser")
+            views_workers = await COORDINATOR.worker_count("views")
+        except Exception:
+            pass
+        multiuser_text = (
+            "<b>⚙️ Multi-user Core</b>\n"
+            "Режим: <b>Redis / distributed</b>\n"
+            f"Parser-worker: <b>{parser_workers}</b> · Views-worker: <b>{views_workers}</b>\n"
+            f"Сейчас сканируют: <b>{int(db_running_jobs or 0)}</b> · В очереди: <b>{int(db_queued_jobs or 0)}</b>\n\n"
+        )
+    else:
+        multiuser_text = (
+            "<b>⚙️ Multi-user Core</b>\n"
+            f"Режим: <b>локальный</b> · Запущено: <b>{running_jobs_count}</b> · Очередь: <b>{queued_jobs_count}</b>\n\n"
+        )
     return (
         f"<b>📊 База и парсинг</b>\n\n"
         f"Сегодня собрано: <b>{today}</b>\n"
@@ -2165,6 +2241,7 @@ async def stats_text() -> str:
         f"С просмотрами: <b>{viewed}</b> ({view_coverage}%)\n"
         f"Всего сохранено: <b>{total}</b>\n"
         f"Записей истории цен: <b>{drops}</b>\n\n"
+        f"{multiuser_text}"
         f"<b>🛡 v3.1 качество сегодня</b>\n"
         f"Запусков категорий: <b>{runs}</b>\n"
         f"Среднее качество: <b>{round(float(avg_quality or 0))}/100</b>\n"
@@ -2376,8 +2453,72 @@ manual_view_tasks_guard = asyncio.Lock()
 background_view_refresh_lock = asyncio.Lock()
 
 
-def berlin_date_key() -> str:
-    return datetime.now(BERLIN).date().isoformat()
+def scan_job_from_record(scan: UserScan, *, recovered: bool = False) -> ScanJob:
+    keys = [k for k in _scan_category_keys(scan) if k in CATEGORIES]
+    job = ScanJob(
+        job_id=str(scan.job_uid),
+        user_id=int(scan.user_id),
+        chat_id=int(scan.chat_id or scan.user_id),
+        status_message_id=int(scan.status_message_id or 0),
+        category_keys=keys,
+        created_at=scan.created_at or datetime.utcnow(),
+        warnings=[],
+        page_limit=int(scan.page_limit or 25),
+        scan_id=int(scan.id),
+        target_date=scan.target_date or _moscow_today_iso(),
+        recovered=recovered,
+    )
+    job.completed_categories = int(scan.completed_categories or 0)
+    job.incomplete_categories = int(getattr(scan, "incomplete_categories", 0) or 0)
+    job.incomplete_category_keys = set(
+        x for x in (getattr(scan, "incomplete_category_keys", "") or "").split(",") if x
+    )
+    if scan.status == "running":
+        job.state = "running"
+    elif scan.status == "cancelling":
+        job.state = "queued"
+        job.cancel_requested = True
+        job.stop_event.set()
+    else:
+        job.state = "queued"
+    return job
+
+
+async def load_scan_job_by_uid(job_uid: str) -> ScanJob | None:
+    async with SessionLocal() as session:
+        result = await session.execute(select(UserScan).where(UserScan.job_uid == str(job_uid)).limit(1))
+        scan = result.scalar_one_or_none()
+        if scan is None:
+            return None
+        return scan_job_from_record(scan, recovered=scan.status == "running")
+
+
+async def _distributed_cancel_watcher(job: ScanJob) -> None:
+    """Mirror cross-process cancel state into the worker-local asyncio.Event."""
+    while not job.stop_event.is_set() and job.state in {"queued", "running"}:
+        redis_cancelled = False
+        try:
+            redis_cancelled = await COORDINATOR.is_cancel_requested(job.job_id)
+        except Exception:
+            log.debug("Distributed Redis cancel check failed job=%s", job.job_id, exc_info=True)
+        if redis_cancelled:
+            job.cancel_requested = True
+            job.stop_event.set()
+            return
+
+        # PostgreSQL is an independent cancellation channel. It keeps Stop working
+        # even during a temporary Redis connectivity issue after the job started.
+        if job.scan_id is not None:
+            try:
+                async with SessionLocal() as session:
+                    scan = await session.get(UserScan, int(job.scan_id))
+                    if scan is not None and scan.status == "cancelling":
+                        job.cancel_requested = True
+                        job.stop_event.set()
+                        return
+            except Exception:
+                log.debug("Distributed DB cancel check failed job=%s", job.job_id, exc_info=True)
+        await asyncio.sleep(0.8)
 
 
 async def get_category_scan_state(category_key: str) -> CategoryScanState | None:
@@ -3169,6 +3310,95 @@ async def _scan_category_task(cat, user_id: int, page_limit: int, target_date: s
         await parser.close()
 
 
+async def _publish_distributed_category_progress(inflight_key: str, lock_token: str) -> None:
+    last_refresh = 0.0
+    while True:
+        try:
+            live = category_live_progress.get(inflight_key)
+            if live is not None:
+                await COORDINATOR.set_category_progress(inflight_key, live)
+            now = time.monotonic()
+            if now - last_refresh >= 20.0:
+                if not await COORDINATOR.refresh_category_lock(inflight_key, lock_token):
+                    return
+                last_refresh = now
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("Could not publish distributed category progress key=%s", inflight_key, exc_info=True)
+        await asyncio.sleep(1.0)
+
+
+async def _run_distributed_category_owner(
+    inflight_key: str, lock_token: str, cat, user_id: int, page_limit: int, target_date: str
+) -> ScanResult:
+    publisher = asyncio.create_task(
+        _publish_distributed_category_progress(inflight_key, lock_token),
+        name=f"category-progress-publisher:{inflight_key}",
+    )
+    try:
+        result = await _scan_category_task(cat, user_id, page_limit, target_date)
+        ttl = max(60, CATEGORY_CACHE_TTL_SECONDS or 60)
+        try:
+            await COORDINATOR.set_category_result(inflight_key, result, ttl)
+        except Exception:
+            # Redis cache is an optimization. The actual listing/result data has
+            # already been written to PostgreSQL and must still be returned.
+            log.warning("Could not publish distributed category result key=%s", inflight_key, exc_info=True)
+        return result
+    finally:
+        publisher.cancel()
+        await asyncio.gather(publisher, return_exceptions=True)
+        try:
+            await COORDINATOR.release_category_lock(inflight_key, lock_token)
+            await COORDINATOR.clear_category_progress(inflight_key)
+        except Exception:
+            log.debug("Could not release distributed category lock key=%s", inflight_key, exc_info=True)
+
+
+async def _wait_distributed_category_or_take_over(
+    inflight_key: str, cat, user_id: int, page_limit: int, target_date: str
+) -> ScanResult:
+    """Wait for another replica's scan, mirror progress, and take over on owner loss."""
+    redis_failures = 0
+    while True:
+        try:
+            cached = await COORDINATOR.get_category_result(inflight_key)
+            if cached is not None:
+                return ScanResult(**cached)
+
+            remote = await COORDINATOR.get_category_progress(inflight_key)
+            if remote:
+                fields = CategoryLiveProgress.__dataclass_fields__
+                safe = {k: v for k, v in remote.items() if k in fields}
+                try:
+                    category_live_progress[inflight_key] = CategoryLiveProgress(**safe)
+                except Exception:
+                    pass
+
+            if not await COORDINATOR.category_lock_exists(inflight_key):
+                token = await COORDINATOR.acquire_category_lock(inflight_key)
+                if token:
+                    return await _run_distributed_category_owner(
+                        inflight_key, token, cat, user_id, page_limit, target_date
+                    )
+            redis_failures = 0
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            redis_failures += 1
+            log.warning(
+                "Distributed shared-scan coordination unavailable key=%s failure=%s",
+                inflight_key, redis_failures, exc_info=True,
+            )
+            if redis_failures >= 5:
+                # PostgreSQL persistence + per-process traffic controls still make a
+                # local scan safe. This prevents a short Redis cache outage from
+                # turning an already-consumed user job into a hard failure.
+                return await _scan_category_task(cat, user_id, page_limit, target_date)
+        await asyncio.sleep(0.7)
+
+
 async def dispatch_category(
     cat,
     user_id: int,
@@ -3177,18 +3407,13 @@ async def dispatch_category(
     *,
     stop_event: asyncio.Event | None = None,
 ) -> CategoryDispatchResult:
-    """Reuse only results with the same category + date + requested depth.
-
-    Each user job is a subscriber to the shared category task. Pressing Stop
-    detaches that job immediately. If it was the last subscriber, the actual
-    network parser task is cancelled too; if another user still needs the same
-    shared scan, their work is left untouched.
-    """
+    """Share exact category/date/depth work locally and across Redis worker replicas."""
     inflight_key = _progress_key(cat.key, target_date, page_limit)
 
     if stop_event is not None and stop_event.is_set():
         raise ScanStopRequested()
 
+    # Fast process-local cache.
     if CATEGORY_CACHE_TTL_SECONDS > 0:
         cached = category_result_cache.get(inflight_key)
         if cached is not None:
@@ -3200,15 +3425,59 @@ async def dispatch_category(
                 return CategoryDispatchResult(source="cache", result=cached_result, cache_age_seconds=age)
             category_result_cache.pop(inflight_key, None)
 
+    # Cross-replica cache. PostgreSQL contains the listings themselves; Redis only
+    # stores the small ScanResult membership/quality summary for a few minutes.
+    if DISTRIBUTED_WORKERS:
+        try:
+            remote_cached = await COORDINATOR.get_category_result(inflight_key)
+            if remote_cached is not None:
+                result = ScanResult(**remote_cached)
+                if CATEGORY_CACHE_TTL_SECONDS > 0:
+                    category_result_cache[inflight_key] = (time.monotonic(), result)
+                return CategoryDispatchResult(source="cache", result=result, cache_age_seconds=0)
+        except Exception:
+            log.exception("Redis category cache read failed key=%s", inflight_key)
+
     async with category_inflight_guard:
         task = category_inflight.get(inflight_key)
         if task is None:
-            task = asyncio.create_task(
-                _scan_category_task(cat, user_id, page_limit, target_date),
-                name=f"category-scan:{inflight_key}",
-            )
+            if DISTRIBUTED_WORKERS:
+                redis_lock_failed = False
+                try:
+                    token = await COORDINATOR.acquire_category_lock(inflight_key)
+                except Exception:
+                    log.exception("Redis category lock failed key=%s; falling back locally", inflight_key)
+                    token = None
+                    redis_lock_failed = True
+                if token:
+                    task = asyncio.create_task(
+                        _run_distributed_category_owner(
+                            inflight_key, token, cat, user_id, page_limit, target_date
+                        ),
+                        name=f"category-scan-owner:{inflight_key}",
+                    )
+                    source = "scan"
+                elif redis_lock_failed:
+                    task = asyncio.create_task(
+                        _scan_category_task(cat, user_id, page_limit, target_date),
+                        name=f"category-scan-local-fallback:{inflight_key}",
+                    )
+                    source = "scan"
+                else:
+                    task = asyncio.create_task(
+                        _wait_distributed_category_or_take_over(
+                            inflight_key, cat, user_id, page_limit, target_date
+                        ),
+                        name=f"category-scan-subscriber:{inflight_key}",
+                    )
+                    source = "shared"
+            else:
+                task = asyncio.create_task(
+                    _scan_category_task(cat, user_id, page_limit, target_date),
+                    name=f"category-scan:{inflight_key}",
+                )
+                source = "scan"
             category_inflight[inflight_key] = task
-            source = "scan"
         else:
             source = "shared"
         category_inflight_waiters[inflight_key] = category_inflight_waiters.get(inflight_key, 0) + 1
@@ -3230,8 +3499,9 @@ async def dispatch_category(
                 category_inflight_waiters[inflight_key] = remaining
             else:
                 category_inflight_waiters.pop(inflight_key, None)
-                # No one else needs this network scan. A user-requested stop must
-                # terminate the HTTP/parser task rather than merely hide progress.
+                # In local mode, or when this process owns/waits on the task with no
+                # remaining local subscribers, cancel only our task. A remote Redis
+                # owner is never cancelled merely because one subscriber stops.
                 if stopped and category_inflight.get(inflight_key) is task and not task.done():
                     cancel_underlying = True
                     task.cancel()
@@ -3806,6 +4076,191 @@ async def scan_worker(bot: Bot, worker_id: int) -> None:
 
 
 
+async def recover_distributed_unfinished_scans() -> int:
+    """Ensure PostgreSQL unfinished scans have a Redis Stream item.
+
+    enqueue_scan() is idempotent through a Redis marker, so normal restarts do not
+    duplicate work. If Redis itself was recreated, the marker is gone and the DB
+    record is safely re-enqueued.
+    """
+    if not DISTRIBUTED_WORKERS:
+        return 0
+    async with SessionLocal() as session:
+        rows = list((await session.execute(
+            select(UserScan)
+            .where(UserScan.status.in_(ACTIVE_SCAN_STATUSES), UserScan.finished_at.is_(None))
+            .order_by(UserScan.created_at.asc())
+        )).scalars().all())
+    added = 0
+    for scan in rows:
+        try:
+            if await COORDINATOR.enqueue_scan(str(scan.job_uid)):
+                added += 1
+        except Exception:
+            log.exception("Could not recover distributed scan job=%s", scan.job_uid)
+    return added
+
+
+async def distributed_worker_heartbeat(worker_id: str, kind: str = "parser") -> None:
+    while True:
+        try:
+            await COORDINATOR.heartbeat(worker_id, kind)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("Worker heartbeat failed worker=%s", worker_id, exc_info=True)
+        await asyncio.sleep(6.0)
+
+
+async def _distributed_job_lock_refresher(job_uid: str, token: str) -> None:
+    while True:
+        await asyncio.sleep(12.0)
+        try:
+            if not await COORDINATOR.refresh_job_lock(job_uid, token):
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("Could not refresh distributed job lock job=%s", job_uid, exc_info=True)
+
+
+async def distributed_scan_worker(bot: Bot, worker_id: str) -> None:
+    """Consume persistent Redis Stream jobs; safe to run in many Railway replicas."""
+    consumer = worker_id.replace(":", "-")
+    log.info("Distributed scan worker started consumer=%s", consumer)
+    while True:
+        message_id: str | None = None
+        job_uid: str | None = None
+        job_lock_token: str | None = None
+        lock_refresher: asyncio.Task | None = None
+        execution_started = False
+        try:
+            item = await COORDINATOR.consume_scan(consumer)
+            if item is None:
+                continue
+            message_id, job_uid = item
+
+            # Prevent accidental duplicate Stream entries/recovery races from ever
+            # running the same UserScan on two worker replicas simultaneously.
+            try:
+                job_lock_token = await COORDINATOR.acquire_job_lock(job_uid)
+            except Exception:
+                log.warning("Redis job lock unavailable job=%s; leaving delivery pending", job_uid, exc_info=True)
+                await asyncio.sleep(1.0)
+                continue
+            if not job_lock_token:
+                # Keep this delivery pending. If the real owner crashes, its short
+                # lock expires and XAUTOCLAIM makes the job recoverable automatically.
+                await asyncio.sleep(0.5)
+                continue
+            lock_refresher = asyncio.create_task(
+                _distributed_job_lock_refresher(job_uid, job_lock_token),
+                name=f"job-lock-refresh:{job_uid}",
+            )
+
+            job = await load_scan_job_by_uid(job_uid)
+            if job is None:
+                await COORDINATOR.ack_scan(message_id)
+                await COORDINATOR.mark_job_complete(job_uid)
+                continue
+
+            # Another delivery of an already-finished job is harmless.
+            async with SessionLocal() as session:
+                db_scan = await session.get(UserScan, int(job.scan_id or 0))
+                if db_scan is None or db_scan.finished_at is not None or db_scan.status in ARCHIVABLE_SCAN_STATUSES:
+                    await COORDINATOR.ack_scan(message_id)
+                    await COORDINATOR.mark_job_complete(job_uid)
+                    continue
+                current_status = db_scan.status
+
+            redis_cancelled = False
+            try:
+                redis_cancelled = await COORDINATOR.is_cancel_requested(job_uid)
+            except Exception:
+                # The PostgreSQL status is also checked by the worker-side watcher;
+                # a short Redis hiccup must not fail the user scan.
+                log.debug("Could not read Redis cancel flag job=%s", job_uid, exc_info=True)
+            if current_status == "cancelling" or redis_cancelled:
+                execution_started = True
+                job.cancel_requested = True
+                job.stop_event.set()
+                await finish_job(bot, job, cancelled=True)
+                await COORDINATOR.ack_scan(message_id)
+                await COORDINATOR.mark_job_complete(job_uid)
+                continue
+
+            # From this point a caught execution error is terminal for this delivery.
+            # Errors before this line leave the Stream message pending for recovery.
+            execution_started = True
+            # Local active_jobs exists only so this worker's progress ticker can
+            # render the current CategoryLiveProgress. PostgreSQL is authoritative.
+            async with job_guard:
+                active_jobs[job.user_id] = job
+                if job.job_id not in queued_job_ids:
+                    queued_job_ids.append(job.job_id)
+
+            cancel_watcher = asyncio.create_task(
+                _distributed_cancel_watcher(job), name=f"cancel-watch:{job.job_id}"
+            )
+            await TRAFFIC.scan_job_started()
+            try:
+                await process_scan_job(bot, job, 1)
+            finally:
+                await TRAFFIC.scan_job_finished()
+                cancel_watcher.cancel()
+                await asyncio.gather(cancel_watcher, return_exceptions=True)
+                async with job_guard:
+                    if active_jobs.get(job.user_id) is job:
+                        active_jobs.pop(job.user_id, None)
+                    if job.job_id in queued_job_ids:
+                        queued_job_ids.remove(job.job_id)
+
+            await COORDINATOR.ack_scan(message_id)
+            await COORDINATOR.mark_job_complete(job_uid)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("Distributed scan worker failure job=%s message=%s", job_uid, message_id)
+            # Only failures after actual execution starts are terminal. Queue/Redis/DB
+            # coordination errors before execution keep the message pending so another
+            # worker can reclaim it instead of showing the user a false failure.
+            if execution_started:
+                if job_uid:
+                    try:
+                        async with SessionLocal() as session:
+                            result = await session.execute(select(UserScan).where(UserScan.job_uid == job_uid).limit(1))
+                            scan = result.scalar_one_or_none()
+                            if scan is not None and scan.finished_at is None:
+                                scan.status = "failed"
+                                scan.finished_at = datetime.utcnow()
+                                scan.last_error = f"Worker error: {type(exc).__name__}: {exc}"[:1000]
+                                await session.commit()
+                    except Exception:
+                        log.exception("Could not persist distributed worker failure job=%s", job_uid)
+                if message_id:
+                    try:
+                        await COORDINATOR.ack_scan(message_id)
+                    except Exception:
+                        pass
+                if job_uid:
+                    try:
+                        await COORDINATOR.mark_job_complete(job_uid)
+                    except Exception:
+                        pass
+            else:
+                log.warning("Job coordination failed before execution; Redis delivery will be reclaimed job=%s", job_uid)
+            await asyncio.sleep(1.0)
+        finally:
+            if lock_refresher is not None:
+                lock_refresher.cancel()
+                await asyncio.gather(lock_refresher, return_exceptions=True)
+            if job_uid and job_lock_token:
+                try:
+                    await COORDINATOR.release_job_lock(job_uid, job_lock_token)
+                except Exception:
+                    log.debug("Could not release distributed job lock job=%s", job_uid, exc_info=True)
+
+
 async def enqueue_user_scan(message: Message, user_id: int, category_keys: list[str], page_limit: int, target_date: str) -> ScanJob:
     """Create a persistent scan card and queue the network job."""
     category_keys = _validate_scan_category_count(category_keys)
@@ -3825,10 +4280,30 @@ async def enqueue_user_scan(message: Message, user_id: int, category_keys: list[
         scan_id=scan.id,
         target_date=target_date,
     )
-    async with job_guard:
-        active_jobs[job.user_id] = job
-        queued_job_ids.append(job.job_id)
-        scan_queue.put_nowait(job)
+    if DISTRIBUTED_WORKERS:
+        try:
+            await COORDINATOR.enqueue_scan(job.job_id)
+        except Exception as exc:
+            log.exception("Could not enqueue distributed scan job=%s", job.job_id)
+            async with SessionLocal() as session:
+                db_scan = await session.get(UserScan, int(scan.id))
+                if db_scan is not None:
+                    db_scan.status = "failed"
+                    db_scan.finished_at = datetime.utcnow()
+                    db_scan.last_error = f"Redis queue unavailable: {type(exc).__name__}"[:1000]
+                    await session.commit()
+            await status.edit_text(
+                "⚠️ <b>Не удалось поставить скан в очередь</b>\n\n"
+                "Сервис очереди временно недоступен. Попробуй повторить запуск через несколько секунд.",
+                parse_mode=ParseMode.HTML,
+            )
+            job.state = "failed"
+            return job
+    else:
+        async with job_guard:
+            active_jobs[job.user_id] = job
+            queued_job_ids.append(job.job_id)
+            scan_queue.put_nowait(job)
     await status.edit_text(
         render_user_job_status(job),
         parse_mode=ParseMode.HTML,
@@ -5147,11 +5622,9 @@ async def _begin_scan_from_message(message: Message, state: FSMContext) -> None:
         )
         return
 
-    async with job_guard:
-        existing = active_jobs.get(user_id)
-        if existing and existing.state in {"queued", "running"} and not existing.cancel_requested:
-            await message.answer("⏳ У тебя уже идёт парсинг.")
-            return
+    if await user_has_active_scan(user_id):
+        await message.answer("⏳ У тебя уже идёт парсинг.")
+        return
 
     await state.set_state(ScanInput.target_date)
     await message.answer(
@@ -6414,12 +6887,10 @@ async def scan_repeat(callback: CallbackQuery) -> None:
     scan = await get_user_scan(callback.from_user.id, scan_id)
     if scan is None:
         await callback.answer("Скан не найден", show_alert=True); return
-    async with job_guard:
-        existing = active_jobs.get(callback.from_user.id)
-        if existing and existing.state in {"queued", "running"} and not existing.cancel_requested:
-            await callback.answer("У тебя уже идёт скан", show_alert=True); return
-        if len(queued_job_ids) >= MAX_QUEUE_SIZE:
-            await callback.answer("Сервис сейчас сильно загружен. Попробуй чуть позже.", show_alert=True); return
+    if await user_has_active_scan(callback.from_user.id):
+        await callback.answer("У тебя уже идёт скан", show_alert=True); return
+    if await queue_is_full():
+        await callback.answer("Сервис сейчас сильно загружен. Попробуй чуть позже.", show_alert=True); return
     keys = [k for k in _scan_category_keys(scan) if k in CATEGORIES]
     if not keys:
         await callback.answer("Категории этого скана больше недоступны", show_alert=True); return
@@ -6458,20 +6929,24 @@ async def scan_recheck_partial(callback: CallbackQuery) -> None:
     if len(keys) > MAX_SELECTED_CATEGORIES:
         keys = keys[:MAX_SELECTED_CATEGORIES]
 
-    async with job_guard:
-        existing = active_jobs.get(callback.from_user.id)
-        if existing and existing.state in {"queued", "running"} and not existing.cancel_requested:
-            await callback.answer("У тебя уже идёт парсинг", show_alert=True)
-            return
-        if len(queued_job_ids) >= MAX_QUEUE_SIZE:
-            await callback.answer("Сервис сейчас сильно загружен. Попробуй чуть позже.", show_alert=True)
-            return
+    if await user_has_active_scan(callback.from_user.id):
+        await callback.answer("У тебя уже идёт парсинг", show_alert=True)
+        return
+    if await queue_is_full():
+        await callback.answer("Сервис сейчас сильно загружен. Попробуй чуть позже.", show_alert=True)
+        return
 
     depth = scan.page_limit if scan.page_limit in PAGE_LIMIT_CHOICES else 50
     target_date = scan.target_date or _moscow_today_iso()
     # Do not immediately reuse the partial 5-minute category result cache.
     for key in keys:
-        category_result_cache.pop(_progress_key(key, target_date, depth), None)
+        progress_key = _progress_key(key, target_date, depth)
+        category_result_cache.pop(progress_key, None)
+        if DISTRIBUTED_WORKERS:
+            try:
+                await COORDINATOR.delete_category_result(progress_key)
+            except Exception:
+                log.debug("Could not clear distributed partial cache key=%s", progress_key, exc_info=True)
 
     await callback.answer(f"Допроверяю категорий: {len(keys)}")
     await enqueue_user_scan(callback.message, callback.from_user.id, keys, depth, target_date)
@@ -6577,11 +7052,45 @@ async def export_smart(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "queue_status")
 async def queue_status(callback: CallbackQuery) -> None:
-    # Backward compatibility for old bot messages: never expose global queue/workers.
     if not allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer()
+
+    if DISTRIBUTED_WORKERS:
+        scan = await get_active_user_scan(callback.from_user.id)
+        if scan is not None:
+            worker_count = 0
+            try:
+                worker_count = await COORDINATOR.worker_count("parser")
+            except Exception:
+                pass
+            if scan.status == "queued":
+                text = (
+                    "⏳ <b>Скан стоит в распределённой очереди</b>\n\n"
+                    f"📅 <b>{_date_label(scan.target_date)}</b> · 📄 <b>{scan.page_limit} стр.</b>\n"
+                    f"🗂 Категорий: <b>{scan.total_categories}</b>\n"
+                    f"⚙️ Активных parser-worker: <b>{worker_count}</b>\n\n"
+                    "Как только освободится воркер, прогресс продолжится в карточке скана."
+                )
+            elif scan.status == "cancelling":
+                text = "⏹ <b>Останавливаю активный скан…</b>"
+            else:
+                text = (
+                    "⚙️ <b>Скан выполняется отдельным parser-worker</b>\n\n"
+                    f"📅 <b>{_date_label(scan.target_date)}</b> · 📄 <b>{scan.page_limit} стр.</b>\n"
+                    f"🗂 Категорий: <b>{scan.total_categories}</b>\n"
+                    f"⚙️ Активных parser-worker: <b>{worker_count}</b>\n\n"
+                    "Живой процент обновляется в основной карточке запуска."
+                )
+            markup = job_keyboard(str(scan.job_uid))
+        else:
+            text = "✅ Сейчас у тебя нет активного парсинга."
+            selected = await get_selected(callback.from_user.id)
+            markup = main_keyboard(len(selected))
+        await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
     async with job_guard:
         job = active_jobs.get(callback.from_user.id)
     if job and job.state in {"queued", "running"}:
@@ -6596,6 +7105,34 @@ async def queue_status(callback: CallbackQuery) -> None:
 
 async def request_user_scan_stop(user_id: int, job_id: str | None = None) -> tuple[ScanJob | None, str]:
     """Set and persist the hard-stop signal used by both the button and /stop."""
+    if DISTRIBUTED_WORKERS:
+        scan = await get_active_user_scan(user_id)
+        if scan is None or (job_id is not None and str(scan.job_uid) != str(job_id)):
+            return None, "missing"
+        if scan.status not in ACTIVE_SCAN_STATUSES:
+            return None, "finished"
+        previous = "queued" if scan.status == "queued" else "running"
+        job = scan_job_from_record(scan)
+        job.cancel_requested = True
+        job.stop_event.set()
+        async with SessionLocal() as session:
+            db_scan = await session.get(UserScan, int(scan.id))
+            if db_scan is not None and db_scan.status in ACTIVE_SCAN_STATUSES:
+                if db_scan.status == "queued":
+                    # No worker owns it yet: cancel immediately so the user can
+                    # start another scan without waiting for the stream item to be consumed.
+                    db_scan.status = "cancelled"
+                    db_scan.finished_at = datetime.utcnow()
+                else:
+                    db_scan.status = "cancelling"
+                db_scan.last_error = "Остановка запрошена пользователем"
+                await session.commit()
+        try:
+            await COORDINATOR.request_cancel(str(scan.job_uid))
+        except Exception:
+            log.exception("Could not publish distributed cancel job=%s", scan.job_uid)
+        return job, previous
+
     scan_id: int | None = None
     async with job_guard:
         job = active_jobs.get(user_id)
@@ -6610,8 +7147,6 @@ async def request_user_scan_stop(user_id: int, job_id: str | None = None) -> tup
         if job.job_id in queued_job_ids:
             queued_job_ids.remove(job.job_id)
 
-    # Persist intent immediately. If Railway restarts before finish_job(), startup
-    # recovery sees 'cancelling' and finalizes it as cancelled instead of resuming.
     if scan_id is not None:
         async with SessionLocal() as session:
             scan = await session.get(UserScan, int(scan_id))
@@ -6693,11 +7228,9 @@ async def start_scan(callback: CallbackQuery, state: FSMContext) -> None:
         )
         return
 
-    async with job_guard:
-        existing = active_jobs.get(callback.from_user.id)
-        if existing and existing.state in {"queued", "running"} and not existing.cancel_requested:
-            await callback.answer("У тебя уже идёт парсинг", show_alert=True)
-            return
+    if await user_has_active_scan(callback.from_user.id):
+        await callback.answer("У тебя уже идёт парсинг", show_alert=True)
+        return
 
     await state.set_state(ScanInput.target_date)
     await callback.answer()
@@ -6829,14 +7362,12 @@ async def start_scan_with_pages(callback: CallbackQuery, state: FSMContext) -> N
         )
         return
 
-    async with job_guard:
-        existing = active_jobs.get(callback.from_user.id)
-        if existing and existing.state in {"queued", "running"} and not existing.cancel_requested:
-            await callback.answer("У тебя уже идёт парсинг", show_alert=True)
-            return
-        if len(queued_job_ids) >= MAX_QUEUE_SIZE:
-            await callback.answer("Сервис сейчас сильно загружен. Попробуй чуть позже.", show_alert=True)
-            return
+    if await user_has_active_scan(callback.from_user.id):
+        await callback.answer("У тебя уже идёт парсинг", show_alert=True)
+        return
+    if await queue_is_full():
+        await callback.answer("Сервис сейчас сильно загружен. Попробуй чуть позже.", show_alert=True)
+        return
 
     await update_setting(callback.from_user.id, "page_limit", page_limit)
     await state.clear()
@@ -6854,9 +7385,14 @@ async def main() -> None:
     backfilled = await backfill_product_identities()
     if backfilled:
         log.info("v3.0 product identity backfill: %s listings", backfilled)
-    obsolete_observations = await cleanup_obsolete_observation_plans()
-    recovered_observations = await recover_running_observations()
-    planned = await backfill_recent_observation_plans()
+    if DISTRIBUTED_WORKERS:
+        # The dedicated views-worker owns observation recovery/scheduling. Running
+        # those routines in the Telegram service too can reset a live checkpoint.
+        obsolete_observations = recovered_observations = planned = 0
+    else:
+        obsolete_observations = await cleanup_obsolete_observation_plans()
+        recovered_observations = await recover_running_observations()
+        planned = await backfill_recent_observation_plans()
     archived = await archive_expired_scans()
     if recovered_observations or planned or obsolete_observations:
         log.info(
@@ -6873,37 +7409,51 @@ async def main() -> None:
         # A Telegram menu configuration error must never keep the parser offline.
         log.exception("Could not configure Telegram command menu")
 
-    recovered_scans = await recover_interrupted_user_scans(bot)
-    if recovered_scans:
-        log.warning("v3.3.0 recovered %s unfinished user scan(s) after restart", recovered_scans)
+    if DISTRIBUTED_WORKERS:
+        recovered_scans = 0
+        try:
+            await COORDINATOR.connect()
+            await COORDINATOR.ensure_group()
+        except Exception:
+            # Menu/payments remain online; enqueue_user_scan will show a clear error
+            # instead of silently freezing if Redis is unavailable.
+            log.exception("Distributed mode enabled but Redis is unavailable")
+    else:
+        recovered_scans = await recover_interrupted_user_scans(bot)
+        if recovered_scans:
+            log.warning("v3.3.0 recovered %s unfinished user scan(s) after restart", recovered_scans)
 
     me = await bot.get_me()
     traffic = await TRAFFIC.snapshot()
     log.info(
-        "Starting @%s | workers=%s cache_ttl=%ss | traffic scan=%s view=%s browser=%s global=%s",
-        me.username, MAX_CONCURRENT_JOBS, CATEGORY_CACHE_TTL_SECONDS,
+        "Starting @%s | mode=%s | local_workers=%s cache_ttl=%ss | traffic scan=%s view=%s browser=%s global=%s",
+        me.username, "distributed" if DISTRIBUTED_WORKERS else "local",
+        0 if DISTRIBUTED_WORKERS else MAX_CONCURRENT_JOBS, CATEGORY_CACHE_TTL_SECONDS,
         traffic.scan_limit, traffic.view_limit, traffic.browser_limit, traffic.global_limit,
     )
     log.info("Database backend: %s", DATABASE_BACKEND)
 
-    worker_tasks = [
+    worker_tasks = [] if DISTRIBUTED_WORKERS else [
         asyncio.create_task(scan_worker(bot, i), name=f"scan-worker-{i}")
         for i in range(1, MAX_CONCURRENT_JOBS + 1)
     ]
-    ticker_task = asyncio.create_task(progress_ticker(bot), name="user-progress-ticker")
+    ticker_task = None if DISTRIBUTED_WORKERS else asyncio.create_task(
+        progress_ticker(bot), name="user-progress-ticker"
+    )
     payment_task = asyncio.create_task(payment_scheduler(bot), name="payment-scheduler")
     subscription_task = asyncio.create_task(
         subscription_lifecycle_scheduler(bot), name="subscription-lifecycle-scheduler"
     )
     archive_task = asyncio.create_task(scan_archive_scheduler(), name="scan-archive-scheduler")
-    observation_tasks = [
+    observation_tasks = [] if DISTRIBUTED_WORKERS else [
         asyncio.create_task(observation_scheduler(bot, i), name=f"view-observation-worker-{i}")
         for i in range(1, OBSERVATION_CONCURRENCY + 1)
     ]
     try:
         await dp.start_polling(bot)
     finally:
-        ticker_task.cancel()
+        if ticker_task is not None:
+            ticker_task.cancel()
         payment_task.cancel()
         subscription_task.cancel()
         archive_task.cancel()
@@ -6911,16 +7461,18 @@ async def main() -> None:
             task.cancel()
         for task in worker_tasks:
             task.cancel()
-        await asyncio.gather(
-            ticker_task, payment_task, subscription_task, archive_task,
-            *observation_tasks, *worker_tasks, return_exceptions=True,
-        )
+        shutdown_tasks = [payment_task, subscription_task, archive_task, *observation_tasks, *worker_tasks]
+        if ticker_task is not None:
+            shutdown_tasks.insert(0, ticker_task)
+        await asyncio.gather(*shutdown_tasks, return_exceptions=True)
         async with category_inflight_guard:
             inflight = list(category_inflight.values())
         for task in inflight:
             task.cancel()
         if inflight:
             await asyncio.gather(*inflight, return_exceptions=True)
+        if DISTRIBUTED_WORKERS:
+            await COORDINATOR.close()
         await bot.session.close()
 
 

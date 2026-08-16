@@ -52,8 +52,14 @@ if _IS_SQLITE:
         connect_args={"timeout": 30},
     )
 else:
-    pool_size = max(1, int(os.getenv("DB_POOL_SIZE", "5")))
-    max_overflow = max(0, int(os.getenv("DB_MAX_OVERFLOW", "5")))
+    distributed_mode = os.getenv("DISTRIBUTED_WORKERS", "0").strip().lower() in {"1", "true", "yes", "on"}
+    # Each Railway replica owns its own SQLAlchemy pool. With 5 parser workers +
+    # bot + views worker, the old 5+5 default could reserve far too many PostgreSQL
+    # connections. Distributed mode therefore uses a smaller per-process pool.
+    default_pool = "3" if distributed_mode else "5"
+    default_overflow = "2" if distributed_mode else "5"
+    pool_size = max(1, int(os.getenv("DB_POOL_SIZE", default_pool)))
+    max_overflow = max(0, int(os.getenv("DB_MAX_OVERFLOW", default_overflow)))
     pool_timeout = max(5, int(os.getenv("DB_POOL_TIMEOUT_SECONDS", "30")))
     engine = create_async_engine(
         DATABASE_URL,
