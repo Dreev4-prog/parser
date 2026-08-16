@@ -85,7 +85,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.0.1"
 MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -98,6 +98,10 @@ AVAILABILITY_CONCURRENCY = max(1, min(8, int(os.getenv("AVAILABILITY_CONCURRENCY
 STABLE_SCAN_ENGINE = os.getenv("STABLE_SCAN_ENGINE", "1").strip().lower() not in {"0", "false", "no", "off"}
 STABLE_PAGE_RETRIES = max(1, min(5, int(os.getenv("STABLE_PAGE_RETRIES", "3"))))
 STABLE_PAGE_RETRY_SECONDS = max(0.2, min(10.0, float(os.getenv("STABLE_PAGE_RETRY_SECONDS", "1.2"))))
+# v4.0.1: tolerate a bounded number of pages with zero usable chronology evidence.
+# They are recorded for diagnostics/recovery but no longer force a whole recent
+# nationwide scan into the 16-region hidden fallback.
+STABLE_WEAK_PAGE_GAP_LIMIT = max(1, min(8, int(os.getenv("STABLE_WEAK_PAGE_GAP_LIMIT", "3"))))
 PRIMARY_SCAN_INLINE_VIEWS = os.getenv("PRIMARY_SCAN_INLINE_VIEWS", "0").strip().lower() not in {"0", "false", "no", "off"}
 
 # v2.6 Multi-User Core. User launches go into a queue. Only a limited number
@@ -2955,11 +2959,12 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 relation, pairs, days = "invalid", [], []
                 invalid_note = invalid_note or f"страница {page} была нормализована/не подтверждена сайтом"
 
+            dated_count = max(0, len(items) - int(getattr(info, "missing_date_count", 0) or 0))
             strong_page = (
                 valid
                 and bool(getattr(info, "page_verified", False))
                 and relation not in {"unknown", "invalid"}
-                and (not items or float(getattr(info, "date_coverage", 0.0) or 0.0) >= 0.60)
+                and (not items or dated_count >= 2 or relation == "target")
             )
             if STABLE_SCAN_ENGINE and strong_page and not from_checkpoint:
                 try:
@@ -3036,10 +3041,13 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     log.debug("Stored date index could not be revalidated", exc_info=True)
 
             saw_newer = False
+            weak_streak = 0
+            weak_total = 0
             page = 1
             while page <= effective_limit:
                 items, relation, pairs, days = await stable_fetch(page, "stable_scan")
                 if relation == "target":
+                    weak_streak = 0
                     try:
                         await save_date_index(
                             cat.key, target_date, base_url, status="found",
@@ -3049,6 +3057,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                         log.debug("Stable date-index write failed", exc_info=True)
                     return locator_result("found", candidate_page=page)
                 if relation == "newer":
+                    weak_streak = 0
                     saw_newer = True
                     page += 1
                     continue
@@ -3075,7 +3084,20 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     )
                     return locator_result(status, reason_text)
                 if relation in {"unknown", "invalid"}:
-                    return locator_result("unknown", f"страница {page} не подтвердила хронологию после повторов")
+                    weak_streak += 1
+                    weak_total += 1
+                    # A single A/B-template page with hidden timestamps is not a
+                    # reason to explode into hundreds of regional feeds. Look at
+                    # neighbouring pages first; only a sustained run of pages with
+                    # no chronology evidence is treated as a true parser problem.
+                    if weak_streak > STABLE_WEAK_PAGE_GAP_LIMIT:
+                        return locator_result(
+                            "unknown",
+                            f"{weak_streak} страниц подряд без достаточной хронологии",
+                        )
+                    page += 1
+                    continue
+                weak_streak = 0
                 page += 1
 
             try:
@@ -3169,7 +3191,13 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         return locator_result("unknown", "could not verify date boundary")
 
     async def collect_direct(locator) -> tuple[str, int]:
-        """Collect literal nationwide pages while they remain verified."""
+        """Collect nationwide pages without turning isolated weak pages into deep fallback.
+
+        v4.0.1 uses the sorted feed as a stream of chronology evidence. A weak
+        card template is retried and recorded, but only a sustained chronology
+        failure can stop the direct pass. Regional hidden-fill is reserved for a
+        real public-window/depth problem.
+        """
         nonlocal direct_pages_collected, collection_start_page, request_complete, reason, hit_limit
         candidate = int(locator["candidate"])
         limit = int(locator["limit"])
@@ -3180,33 +3208,71 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             live.phase = "collecting"
             live.collection_start_page = candidate
             live.collection_index = 0
-        for index in range(1, depth + 1):
-            page = candidate + index - 1
-            if page > limit:
-                hit_limit = True
-                return "needs_hidden", direct_pages_collected
+
+        page = candidate
+        weak_streak = 0
+        weak_pages = 0
+        # Small look-ahead compensates for weak card-template pages without
+        # silently reducing the requested 25/50/100-page depth.
+        hard_stop = min(limit, candidate + depth - 1 + STABLE_WEAK_PAGE_GAP_LIMIT * 2)
+        while page <= hard_stop:
             items, relation, pairs, days = await fetch(page, "collecting")
+            target_on_page = any(d == target_day for d in days)
+
             if relation in {"invalid", "unknown"}:
-                hit_limit = True
-                return "needs_hidden", direct_pages_collected
+                weak_streak += 1
+                weak_pages += 1
+                # Keep any cards whose date *was* parsed exactly even if the page
+                # as a whole had too little evidence for a directional verdict.
+                if target_on_page:
+                    await process_target_items(items, pairs)
+                    direct_pages_collected += 1
+                    update_live(page, days, "collecting", direct_pages_collected)
+                if weak_streak > STABLE_WEAK_PAGE_GAP_LIMIT:
+                    hit_limit = True
+                    reason = f"недостаточно дат на {weak_streak} страницах подряд"
+                    return "weak_stop", direct_pages_collected
+                page += 1
+                continue
+
+            weak_streak = 0
             if relation == "empty":
                 request_complete = True
                 reason = "выдача закончилась раньше выбранной глубины"
                 return "done", direct_pages_collected
-            if relation == "older" or (relation == "mixed" and not any(d == target_day for d in days)):
+            if relation == "older" or (relation == "mixed" and not target_on_page):
                 request_complete = True
-                reason = "выбранная дата закончилась раньше выбранной глубины" if target_seen_any else "выбранная дата пройдена; объявлений за неё не найдено"
+                reason = (
+                    "выбранная дата закончилась раньше выбранной глубины"
+                    if target_seen_any else "выбранная дата пройдена; объявлений за неё не найдено"
+                )
                 return "done", direct_pages_collected
-            direct_pages_collected += 1
-            update_live(page, days, "collecting", direct_pages_collected)
-            await process_target_items(items, pairs)
-            if direct_pages_collected >= depth:
-                request_complete = True
-                reason = f"собрано {depth} страниц от начала выбранной даты"
-                return "done", direct_pages_collected
+
+            if target_on_page or relation == "target":
+                direct_pages_collected += 1
+                update_live(page, days, "collecting", direct_pages_collected)
+                await process_target_items(items, pairs)
+                if direct_pages_collected >= depth:
+                    request_complete = True
+                    reason = f"собрано {depth} страниц от начала выбранной даты"
+                    return "done", direct_pages_collected
+
+            page += 1
             if PAGE_DELAY_SECONDS:
                 await asyncio.sleep(min(PAGE_DELAY_SECONDS, 0.25))
-        return "done", direct_pages_collected
+
+        if page > limit:
+            hit_limit = True
+            return "needs_hidden", direct_pages_collected
+
+        # We exhausted only the bounded look-ahead because of weak pages. If the
+        # target boundary was already seen, preserve useful data without launching
+        # the huge regional fallback merely to satisfy a coverage percentage.
+        if target_seen_any and weak_pages <= STABLE_WEAK_PAGE_GAP_LIMIT:
+            request_complete = True
+            reason = f"граница даты подтверждена; слабых страниц: {weak_pages}"
+            return "done", direct_pages_collected
+        return "weak_stop", direct_pages_collected
 
     async def hidden_fill(remaining_virtual_pages: int) -> tuple[bool, bool]:
         """Fill remaining depth from independent location feeds.
@@ -3376,14 +3442,23 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 if outcome == "needs_hidden" and not request_complete:
                     remaining = max(0, depth - direct_pages_collected)
                     await hidden_fill(remaining)
+                elif outcome == "weak_stop" and not request_complete:
+                    # Do not fan a chronology-template problem out into up to 180
+                    # regional feeds. Keep the direct evidence and let the bounded
+                    # server recovery retry only the weak pages on the next pass.
+                    reason = reason or "прямой проход остановлен на серии страниц без распознаваемых дат"
             elif nationwide["status"] == "absent":
                 request_complete = True
                 reason = "выбранная дата надёжно пройдена; объявлений за неё не найдено"
             elif nationwide["status"] == "too_deep":
+                # Deep regional work is justified only when the selected date is
+                # genuinely beyond the public nationwide window.
                 await hidden_fill(depth)
             else:
-                # Never convert an unknown/invalid date boundary into zero.
-                await hidden_fill(depth)
+                # Unknown chronology is a parser-quality issue, not proof that the
+                # date is deep. Avoid multiplying one weak page into hundreds of
+                # regional requests; automatic recovery will retry the weak area.
+                reason = nationwide.get("reason") or "не удалось подтвердить хронологию прямой выдачи"
 
         if not reason:
             reason = "завершено"

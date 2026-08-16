@@ -123,10 +123,11 @@ class ParserQualityTests(unittest.TestCase):
         self.assertFalse(info.request_matches_page)
         self.assertFalse(info.page_verified)
 
-    def test_low_date_coverage_cannot_prove_target(self):
+    def test_sparse_exact_target_timestamp_is_still_target_evidence(self):
         rows = [listing(1, "10.08.2026")] + [listing(i, None) for i in range(2, 6)]
         profile = profile_page_dates(rows, date(2026, 8, 10))
-        self.assertEqual(profile.relation, "unknown")
+        self.assertEqual(profile.relation, "target")
+        self.assertEqual(profile.target_count, 1)
         self.assertLess(profile.coverage, 0.55)
 
     def test_boundary_page_with_one_target_is_accepted_when_dates_are_good(self):

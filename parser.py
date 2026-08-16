@@ -43,8 +43,14 @@ STOP_AFTER_EMPTY_TODAY_PAGES = max(1, int(os.getenv("STOP_AFTER_EMPTY_TODAY_PAGE
 AVAILABILITY_TIMEOUT = max(5.0, float(os.getenv("AVAILABILITY_TIMEOUT", "20")))
 # v3.1 parser-quality thresholds. A page with too few trustworthy publication
 # timestamps is never used as proof that a target date is absent.
-MIN_PAGE_DATE_COVERAGE = min(0.95, max(0.20, float(os.getenv("MIN_PAGE_DATE_COVERAGE", "0.55"))))
-MIN_PAGE_DATED_ITEMS = max(1, int(os.getenv("MIN_PAGE_DATED_ITEMS", "3")))
+MIN_PAGE_DATE_COVERAGE = min(0.95, max(0.05, float(os.getenv("MIN_PAGE_DATE_COVERAGE", "0.20"))))
+MIN_PAGE_DATED_ITEMS = max(1, int(os.getenv("MIN_PAGE_DATED_ITEMS", "2")))
+# v4.0.1: chronology is evidence-based, not coverage-gated. Kleinanzeigen can
+# render a mixture of card templates where only part of the cards expose the
+# publication timestamp in the server HTML. A page with several trustworthy
+# dates is still useful even when overall date coverage is low.
+MIN_DIRECTION_DATED_ITEMS = max(1, int(os.getenv("MIN_DIRECTION_DATED_ITEMS", "2")))
+MIN_CHECKPOINT_DATED_ITEMS = max(1, int(os.getenv("MIN_CHECKPOINT_DATED_ITEMS", "2")))
 VIEW_COUNT_GLOBAL_CONCURRENCY = max(1, min(16, int(os.getenv("VIEW_COUNT_GLOBAL_CONCURRENCY", "6"))))
 DIRECT_VIEW_CONCURRENCY = max(1, min(16, int(os.getenv("DIRECT_VIEW_CONCURRENCY", "3"))))
 VIEW_DIRECT_BATCH_SIZE = max(5, min(200, int(os.getenv("VIEW_DIRECT_BATCH_SIZE", "40"))))
@@ -391,9 +397,16 @@ def _extract_posted_text(node) -> str | None:
     selectors = (
         ".aditem-main--top--right",
         "[class~='aditem-main--top--right']",
+        "[class*='top--right']",
         "time",
         "[class*='timestamp']",
         "[class*='date']",
+        "[data-testid*='date']",
+        "[data-testid*='time']",
+        "[aria-label*='Heute']",
+        "[aria-label*='Gestern']",
+        "[title*='Heute']",
+        "[title*='Gestern']",
     )
     for selector in selectors:
         try:
@@ -404,10 +417,17 @@ def _extract_posted_text(node) -> str | None:
             # If a semantic <time> carries an ISO datetime, prefer the visible German
             # label when present, otherwise retain the machine timestamp.
             visible = " ".join(element.get_text(" ", strip=True).split())
-            for pattern in patterns:
-                match = re.search(pattern, visible, flags=re.IGNORECASE)
-                if match:
-                    return match.group(0)
+            candidates = [visible]
+            if hasattr(element, "get"):
+                for attr_name in ("aria-label", "title", "data-date", "data-time", "data-timestamp"):
+                    attr_value = element.get(attr_name)
+                    if attr_value:
+                        candidates.append(" ".join(str(attr_value).split()))
+            for candidate in candidates:
+                for pattern in patterns:
+                    match = re.search(pattern, candidate, flags=re.IGNORECASE)
+                    if match:
+                        return match.group(0)
             dt_value = element.get("datetime") if hasattr(element, "get") else None
             if dt_value and re.search(r"\d{4}-\d{2}-\d{2}", str(dt_value)):
                 return str(dt_value).strip()
@@ -780,11 +800,13 @@ def parse_category_html(html_text: str) -> list[ParsedListing]:
 
 
 def profile_page_dates(items: list[ParsedListing], target_day) -> PageDateProfile:
-    """Classify page chronology without allowing weak date extraction to prove absence.
+    """Classify page chronology from trustworthy date evidence.
 
-    A target-day card may legitimately be the last card on a boundary page, so one
-    target hit is enough when the page has good overall date coverage. Conversely,
-    pages where most cards have no parseable publication timestamp are `unknown`.
+    v4.0.1 deliberately does *not* require a percentage of all cards to expose
+    dates. Kleinanzeigen currently mixes result-card templates, so a low
+    coverage page can still contain enough exact publication dates to establish
+    chronology. Missing timestamps lower confidence; they no longer turn an
+    otherwise useful page into a hard parser failure.
     """
     if not items:
         return PageDateProfile("empty", [], [], 0, 0, 0, 0, 0, 1.0, 1.0)
@@ -802,32 +824,36 @@ def profile_page_dates(items: list[ParsedListing], target_day) -> PageDateProfil
     target_count = counts.get(target_day, 0)
     newer = sum(count for day, count in counts.items() if day > target_day)
     older = sum(count for day, count in counts.items() if day < target_day)
-    enough_dates = parsed >= min(MIN_PAGE_DATED_ITEMS, len(items))
-    reliable = enough_dates and coverage >= MIN_PAGE_DATE_COVERAGE
 
-    # Good-coverage boundary pages may contain only one target card.
-    if target_count and (reliable or (parsed >= 2 and target_count == parsed)):
-        confidence = min(1.0, max(coverage, target_count / max(1, parsed)))
+    # An exact target-day timestamp is direct evidence. The extractor is kept
+    # narrow to metadata nodes, so withholding this signal just because other
+    # cards hide their timestamp creates false partial scans.
+    if target_count:
+        confidence = min(1.0, max(0.35, coverage, target_count / max(1, parsed)))
         return PageDateProfile("target", pairs, days, parsed, missing, target_count, newer, older, coverage, confidence)
-    if not reliable:
-        return PageDateProfile("unknown", pairs, days, parsed, missing, target_count, newer, older, coverage, coverage * 0.5)
+
+    # Direction needs a small absolute amount of evidence, not 55-60% coverage.
+    enough_direction = parsed >= min(MIN_DIRECTION_DATED_ITEMS, len(items))
+    if not enough_direction:
+        return PageDateProfile("unknown", pairs, days, parsed, missing, 0, newer, older, coverage, max(0.1, coverage * 0.5))
+
+    if newer and not older:
+        return PageDateProfile("newer", pairs, days, parsed, missing, 0, newer, older, coverage, max(0.35, coverage))
+    if older and not newer:
+        return PageDateProfile("older", pairs, days, parsed, missing, 0, newer, older, coverage, max(0.35, coverage))
 
     total_directional = newer + older
     if total_directional <= 0:
-        relation = "target" if target_count else "unknown"
-        return PageDateProfile(relation, pairs, days, parsed, missing, target_count, newer, older, coverage, coverage)
-    if newer and not older:
-        return PageDateProfile("newer", pairs, days, parsed, missing, target_count, newer, older, coverage, coverage)
-    if older and not newer:
-        return PageDateProfile("older", pairs, days, parsed, missing, target_count, newer, older, coverage, coverage)
+        return PageDateProfile("unknown", pairs, days, parsed, missing, 0, newer, older, coverage, coverage)
     dominance = max(newer, older) / total_directional
     if dominance >= 0.70:
         relation = "newer" if newer > older else "older"
-        return PageDateProfile(relation, pairs, days, parsed, missing, target_count, newer, older, coverage, coverage * dominance)
-    ordered = sorted(days)
-    median_day = ordered[len(ordered) // 2]
-    relation = "newer" if median_day > target_day else "older" if median_day < target_day else "mixed"
-    return PageDateProfile(relation, pairs, days, parsed, missing, target_count, newer, older, coverage, coverage * dominance)
+        return PageDateProfile(relation, pairs, days, parsed, missing, 0, newer, older, coverage, max(0.30, coverage * dominance))
+
+    # Mixed newer/older evidence means the page crosses the target boundary. It
+    # is not a transport/parser failure and therefore must never trigger the
+    # expensive regional fallback by itself.
+    return PageDateProfile("mixed", pairs, days, parsed, missing, 0, newer, older, coverage, max(0.25, coverage * dominance))
 
 
 def _de_int(value: str | None) -> int | None:
@@ -1653,11 +1679,16 @@ class KleinanzeigenParser:
         # Checkpoint only trustworthy pages. Weak/suspicious pages are intentionally
         # excluded so an automatic recovery pass really refetches the problematic
         # area rather than replaying the same bad response.
+        dated_count = max(0, len(info.items) - int(getattr(info, "missing_date_count", 0) or 0))
         strong_enough = (
             bool(getattr(info, "page_verified", False))
             and bool(getattr(info, "request_matches_page", True))
             and not bool(getattr(info, "suspicious", False))
-            and (not info.items or float(getattr(info, "date_coverage", 0.0) or 0.0) >= MIN_PAGE_DATE_COVERAGE)
+            and (
+                not info.items
+                or dated_count >= MIN_CHECKPOINT_DATED_ITEMS
+                or float(getattr(info, "date_coverage", 0.0) or 0.0) >= MIN_PAGE_DATE_COVERAGE
+            )
         )
         if strong_enough:
             self._scan_page_checkpoints[checkpoint_key] = (time.monotonic(), info)

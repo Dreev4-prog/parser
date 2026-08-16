@@ -1,3 +1,13 @@
+# v4.0.1 — Tolerant Chronology Fix
+
+- page chronology is evidence-based instead of requiring 55–60% timestamp coverage;
+- an exact target date is accepted even on mixed card templates;
+- two dated cards can establish newer/older direction;
+- weak pages no longer automatically trigger the huge regional fallback;
+- hidden/regional fallback is reserved for dates genuinely beyond the public window;
+- broader metadata selectors improve publication-date extraction across Kleinanzeigen card templates;
+- Browser Fleet architecture from v4.0 remains unchanged.
+
 # DT PARSER v4.0.0 — Railway Browser Fleet
 
 ## v4.0.0
