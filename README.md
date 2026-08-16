@@ -1,7 +1,7 @@
-# Kleinanzeigen Parser Bot v3.4.1
+# Kleinanzeigen Parser Bot v3.4.2
 
 
-## v3.4.1 — брендированное главное меню
+## v3.4.2 — брендированное главное меню
 
 - `/start`, `/menu` и кнопки **«🏠 Меню»** теперь открывают фирменную карточку **DT PARSER** с основной русскоязычной иллюстрацией.
 - Навигационные inline-кнопки находятся прямо под изображением: **Новый скан**, **Популярное**, **Мои сканы**, **Категории**, **Настройки**, **Подписка**.
@@ -408,3 +408,11 @@ v3.2.2+ requires Railway PostgreSQL in production so user access, payments, scan
 - «Мои сканы», «Категории», «Настройки» и «Главное меню» теперь безопасно открываются и из CSV-сообщения.
 - Если Telegram не позволяет редактировать документ через `edit_text`, бот автоматически отправляет новый текстовый экран.
 - Основные переходы также очищают незавершённое FSM-состояние пользователя.
+
+
+## v3.4.2 — Telegram BIGINT fix
+
+- All persisted Telegram `user_id` values use PostgreSQL `BIGINT`.
+- Existing PostgreSQL columns are migrated automatically on startup; no manual SQL is required.
+- Fixes silent `/start` failures for newer Telegram accounts whose IDs exceed 32-bit `INTEGER`.
+- `/start` now returns a visible temporary-database error instead of failing silently if profile persistence fails.

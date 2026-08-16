@@ -121,6 +121,38 @@ async def init_db() -> None:
 
         # Lightweight additive migrations so existing PostgreSQL databases can be
         # upgraded in place without destructive schema changes.
+
+        # v3.4.2: Telegram user IDs are 64-bit values. Newer accounts can exceed
+        # PostgreSQL INTEGER (2,147,483,647), which previously caused /start to
+        # fail before the user was even visible in the admin panel. Promote every
+        # persisted Telegram user_id column to BIGINT in-place. Existing values,
+        # indexes, unique constraints and primary keys are preserved by PostgreSQL.
+        if _IS_POSTGRES:
+            telegram_user_id_columns = (
+                ("bot_users", "user_id"),
+                ("selected_categories", "user_id"),
+                ("user_settings", "user_id"),
+                ("parser_runs", "user_id"),
+                ("user_scans", "user_id"),
+                ("subscription_payments", "user_id"),
+            )
+            for table_name, column_name in telegram_user_id_columns:
+                cols = await conn.run_sync(lambda sync_conn, t=table_name: _table_columns(sync_conn, t))
+                if column_name not in cols:
+                    continue
+                data_type = (await conn.execute(
+                    text(
+                        "SELECT data_type FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = :table_name AND column_name = :column_name"
+                    ),
+                    {"table_name": table_name, "column_name": column_name},
+                )).scalar_one_or_none()
+                if data_type == "integer":
+                    await conn.execute(text(
+                        f'ALTER TABLE "{table_name}" ALTER COLUMN "{column_name}" TYPE BIGINT USING "{column_name}"::BIGINT'
+                    ))
+                    log.info("Migrated %s.%s to BIGINT", table_name, column_name)
         columns = await conn.run_sync(_listing_columns)
         if columns and "category_key" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN category_key VARCHAR(80)"))

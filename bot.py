@@ -78,7 +78,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "3.4.1"
+APP_VERSION = "3.4.2"
 MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -5159,7 +5159,19 @@ async def onboarding_handler(callback: CallbackQuery, state: FSMContext) -> None
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await touch_user(message.from_user, force=True)
+    try:
+        await touch_user(message.from_user, force=True)
+    except Exception:
+        # Never leave a new user with a silent /start if PostgreSQL/profile storage
+        # is temporarily unavailable. The outer middleware already logs its own
+        # attempt, but this handler used to raise before sending any Telegram reply.
+        log.exception("Could not persist /start user=%s", message.from_user.id)
+        await message.answer(
+            "⚠️ <b>Не удалось зарегистрировать профиль</b>\n\n"
+            "База данных временно не приняла запрос. Попробуй нажать /start ещё раз через несколько секунд.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
     if not allowed(message.from_user.id):
         await send_access_screen(message, message.from_user.id)
         return

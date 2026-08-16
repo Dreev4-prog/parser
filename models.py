@@ -69,14 +69,14 @@ class SelectedCategory(Base):
     __table_args__ = (UniqueConstraint("user_id", "category_key", name="uq_user_category"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
     category_key: Mapped[str] = mapped_column(String(80), index=True)
 
 
 class UserSettings(Base):
     __tablename__ = "user_settings"
 
-    user_id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     output_mode: Mapped[str] = mapped_column(String(32), default="newest")
     smart_dedupe: Mapped[bool] = mapped_column(Boolean, default=True)
     clean_noise: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -120,7 +120,7 @@ class ParserRun(Base):
     __tablename__ = "parser_runs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
     category_key: Mapped[str] = mapped_column(String(80), index=True)
     category_name: Mapped[str] = mapped_column(String(255))
     mode: Mapped[str] = mapped_column(String(16), index=True)
@@ -156,7 +156,7 @@ class UserScan(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     job_uid: Mapped[str] = mapped_column(String(32), unique=True, index=True)
-    user_id: Mapped[int] = mapped_column(index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
     title: Mapped[str] = mapped_column(String(255))
     category_keys: Mapped[str] = mapped_column(Text, default="")
     page_limit: Mapped[int] = mapped_column(Integer, default=25)
@@ -241,7 +241,7 @@ class BotUser(Base):
 
     __tablename__ = "bot_users"
 
-    user_id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     username: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     first_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     joined_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
@@ -280,7 +280,7 @@ class SubscriptionPayment(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
     plan_key: Mapped[str] = mapped_column(String(32), index=True)
     provider: Mapped[str] = mapped_column(String(24), index=True)
     external_invoice_id: Mapped[str] = mapped_column(String(128), index=True)
