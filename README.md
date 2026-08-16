@@ -1,3 +1,9 @@
+# v4.1.1 — Post-scan crash fix
+
+- Fixed production `NameError: berlin_date_key is not defined` after a fully successful 25-page scan.
+- CategoryScanState bookkeeping is now non-fatal: a completed parse can no longer be converted to `partial` by a checkpoint-summary write failure.
+- No PostgreSQL migration or new Railway variables.
+
 # DT PARSER v4.1.0 — Universal Date Stream
 
 ## Главное изменение

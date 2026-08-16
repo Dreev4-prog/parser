@@ -85,7 +85,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.1.0"
+APP_VERSION = "4.1.1"
 MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -1475,6 +1475,16 @@ async def mark_promoted_listings(external_ids: list[str] | set[str]) -> int:
             if changed:
                 await session.commit()
             return changed
+
+
+def berlin_date_key() -> str:
+    """Legacy worker-day key kept in Moscow time to match scan date selection.
+
+    The helper existed conceptually in the category-state/statistics code, but was
+    accidentally dropped during the v4 refactor.  Missing it made a completely
+    successful category scan crash *after* all pages had already been parsed.
+    """
+    return datetime.now(MOSCOW).date().isoformat()
 
 
 def berlin_today_utc_bounds() -> tuple[datetime, datetime]:
@@ -3526,19 +3536,28 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         seed_capped = bool(hit_limit and not interrupted)
         pages_scanned = network_requests
 
-        await save_category_scan_state(
-            cat.key,
-            target_date=target_date,
-            mode=mode,
-            pages_scanned=pages_scanned,
-            new_count=new_count,
-            today_seen=today_seen,
-            reason=reason,
-            head_ids=first_page_head_ids,
-            seed_complete=seed_complete,
-            seed_capped=seed_capped,
-            coverage_pages=depth if request_complete else 0,
-        )
+        # CategoryScanState is an optimization/checkpoint summary, not the scan
+        # result itself.  Never turn an already successful parse into a partial
+        # result merely because this bookkeeping write failed.
+        try:
+            await save_category_scan_state(
+                cat.key,
+                target_date=target_date,
+                mode=mode,
+                pages_scanned=pages_scanned,
+                new_count=new_count,
+                today_seen=today_seen,
+                reason=reason,
+                head_ids=first_page_head_ids,
+                seed_complete=seed_complete,
+                seed_capped=seed_capped,
+                coverage_pages=depth if request_complete else 0,
+            )
+        except Exception:
+            log.exception(
+                "Non-fatal CategoryScanState save failed category=%s target=%s",
+                cat.key, target_date,
+            )
 
         result = ScanResult(
             new_count=new_count,
