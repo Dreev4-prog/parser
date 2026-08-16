@@ -1,3 +1,12 @@
+# v4.0.2 — Today Fast Path & Partial Cache Fix
+
+- Текущая дата больше не проходит отдельный date-locator: скан начинается с page 1 newest feed.
+- Partial ScanResult больше никогда не используется как общий 5-минутный cache.
+- Новый cache namespace `v402:` автоматически отсекает старые poisoned v4.0/v4.0.1 результаты.
+- Force refresh очищает distributed result cache.
+- Sparse timestamps на сегодняшних страницах не обрушивают всю категорию в partial.
+- Partial + 0 results больше не показывается пользователю как доказанный ноль.
+
 # v4.0.1 — Tolerant Chronology Fix
 
 - page chronology is evidence-based instead of requiring 55–60% timestamp coverage;

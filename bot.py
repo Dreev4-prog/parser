@@ -85,7 +85,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.0.1"
+APP_VERSION = "4.0.2"
 MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -2496,7 +2496,7 @@ def _date_scan_limit(target_date: str) -> int:
 
 def _progress_key(category_key: str, target_date: str, page_limit: int | None = None) -> str:
     depth = int(page_limit or 0)
-    return f"{category_key}:date:{target_date}:depth:{depth}"
+    return f"v402:{category_key}:date:{target_date}:depth:{depth}"
 
 
 scan_queue: asyncio.Queue[ScanJob] = asyncio.Queue()
@@ -2699,6 +2699,11 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     """
     depth = page_limit if page_limit in PAGE_LIMIT_CHOICES else 50
     target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
+    # v4.0.2: the current Moscow calendar day never needs a separate date-locator.
+    # Kleinanzeigen's default nationwide feed is sorted by newest, so start at page 1
+    # and filter exact listing timestamps while walking forward. This removes the
+    # most failure-prone stage for the common "today" scan.
+    today_fast_path = target_day == datetime.now(MOSCOW).date()
     progress_key = _progress_key(cat.key, target_date, depth)
     mode = "stable-date" if STABLE_SCAN_ENGINE else "date"
     scan_settings = await get_settings(user_id)
@@ -3021,6 +3026,12 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             return last
 
         if STABLE_SCAN_ENGINE:
+            # v4.0.2 current-day fast path: page 1 is the only safe/necessary
+            # starting point for a newest-sorted feed. Do not spend requests trying
+            # to "locate" today's date before collection begins.
+            if today_fast_path and feed_name == "nationwide":
+                return locator_result("found", "сегодняшняя дата начинается с первой страницы", candidate_page=1)
+
             # v3.8 deliberately prefers deterministic sequential chronology over
             # jump/binary probing. A single weak page is retried in place and
             # verified pages survive process restarts in PostgreSQL.
@@ -3228,6 +3239,15 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     await process_target_items(items, pairs)
                     direct_pages_collected += 1
                     update_live(page, days, "collecting", direct_pages_collected)
+
+                # v4.0.2: an otherwise valid current-day page with sparse timestamp
+                # metadata is not a reason to fail the whole category. The feed is
+                # newest-sorted and exact timestamps are still filtered individually.
+                # True invalid/challenge pages remain strict failures.
+                if today_fast_path and relation == "unknown" and items:
+                    page += 1
+                    continue
+
                 if weak_streak > STABLE_WEAK_PAGE_GAP_LIMIT:
                     hit_limit = True
                     reason = f"недостаточно дат на {weak_streak} страницах подряд"
@@ -3268,6 +3288,10 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         # We exhausted only the bounded look-ahead because of weak pages. If the
         # target boundary was already seen, preserve useful data without launching
         # the huge regional fallback merely to satisfy a coverage percentage.
+        if today_fast_path and target_seen_any:
+            request_complete = True
+            reason = f"сегодняшняя выдача обработана; страниц с неполными метаданными дат: {weak_pages}"
+            return "done", direct_pages_collected
         if target_seen_any and weak_pages <= STABLE_WEAK_PAGE_GAP_LIMIT:
             request_complete = True
             reason = f"граница даты подтверждена; слабых страниц: {weak_pages}"
@@ -3625,6 +3649,16 @@ def failed_job_keyboard(scan_id: int | None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _cacheable_category_result(result: ScanResult | None) -> bool:
+    """Only fully verified category scans may poison/share the short result cache.
+
+    v4.0/v4.0.1 cached partial results for five minutes, so one weak pass could be
+    replayed to the same user and to other Railway replicas. Partial/failed work is
+    recovery input, never a reusable final result.
+    """
+    return bool(result is not None and result.date_complete)
+
+
 async def fresh_category_cache_age(category_key: str, page_limit: int, target_date: str) -> int | None:
     """Legacy DB cache hook. Exact-depth scans use the in-memory ScanResult cache.
 
@@ -3681,7 +3715,10 @@ async def _run_distributed_category_owner(
         result = await _scan_category_task(cat, user_id, page_limit, target_date)
         ttl = max(60, CATEGORY_CACHE_TTL_SECONDS or 60)
         try:
-            await COORDINATOR.set_category_result(inflight_key, result, ttl)
+            if _cacheable_category_result(result):
+                await COORDINATOR.set_category_result(inflight_key, result, ttl)
+            else:
+                await COORDINATOR.delete_category_result(inflight_key)
         except Exception:
             # Redis cache is an optimization. The actual listing/result data has
             # already been written to PostgreSQL and must still be returned.
@@ -3706,7 +3743,10 @@ async def _wait_distributed_category_or_take_over(
         try:
             cached = await COORDINATOR.get_category_result(inflight_key)
             if cached is not None:
-                return ScanResult(**cached)
+                cached_result = ScanResult(**cached)
+                if _cacheable_category_result(cached_result):
+                    return cached_result
+                await COORDINATOR.delete_category_result(inflight_key)
 
             remote = await COORDINATOR.get_category_progress(inflight_key)
             if remote:
@@ -3755,13 +3795,21 @@ async def dispatch_category(
     if stop_event is not None and stop_event.is_set():
         raise ScanStopRequested()
 
+    if force_refresh:
+        category_result_cache.pop(inflight_key, None)
+        if DISTRIBUTED_WORKERS:
+            try:
+                await COORDINATOR.delete_category_result(inflight_key)
+            except Exception:
+                log.debug("Could not clear distributed result cache for force refresh key=%s", inflight_key, exc_info=True)
+
     # Fast process-local cache.
     if not force_refresh and CATEGORY_CACHE_TTL_SECONDS > 0:
         cached = category_result_cache.get(inflight_key)
         if cached is not None:
             cached_at, cached_result = cached
             age = max(0, int(time.monotonic() - cached_at))
-            if age <= CATEGORY_CACHE_TTL_SECONDS:
+            if age <= CATEGORY_CACHE_TTL_SECONDS and _cacheable_category_result(cached_result):
                 if stop_event is not None and stop_event.is_set():
                     raise ScanStopRequested()
                 return CategoryDispatchResult(source="cache", result=cached_result, cache_age_seconds=age)
@@ -3774,9 +3822,11 @@ async def dispatch_category(
             remote_cached = await COORDINATOR.get_category_result(inflight_key)
             if remote_cached is not None:
                 result = ScanResult(**remote_cached)
-                if CATEGORY_CACHE_TTL_SECONDS > 0:
-                    category_result_cache[inflight_key] = (time.monotonic(), result)
-                return CategoryDispatchResult(source="cache", result=result, cache_age_seconds=0)
+                if _cacheable_category_result(result):
+                    if CATEGORY_CACHE_TTL_SECONDS > 0:
+                        category_result_cache[inflight_key] = (time.monotonic(), result)
+                    return CategoryDispatchResult(source="cache", result=result, cache_age_seconds=0)
+                await COORDINATOR.delete_category_result(inflight_key)
         except Exception:
             log.exception("Redis category cache read failed key=%s", inflight_key)
 
@@ -3794,13 +3844,16 @@ async def dispatch_category(
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             raise
-        if CATEGORY_CACHE_TTL_SECONDS > 0:
+        if CATEGORY_CACHE_TTL_SECONDS > 0 and _cacheable_category_result(result):
             category_result_cache[inflight_key] = (time.monotonic(), result)
         if DISTRIBUTED_WORKERS:
             try:
-                await COORDINATOR.set_category_result(
-                    inflight_key, result, max(60, CATEGORY_CACHE_TTL_SECONDS or 60)
-                )
+                if _cacheable_category_result(result):
+                    await COORDINATOR.set_category_result(
+                        inflight_key, result, max(60, CATEGORY_CACHE_TTL_SECONDS or 60)
+                    )
+                else:
+                    await COORDINATOR.delete_category_result(inflight_key)
             except Exception:
                 log.debug("Could not publish isolated category cache key=%s", inflight_key, exc_info=True)
         return CategoryDispatchResult(source="scan", result=result)
@@ -3853,7 +3906,7 @@ async def dispatch_category(
     cancel_underlying = False
     try:
         result = await wait_for_task_or_stop(task, stop_event)
-        if CATEGORY_CACHE_TTL_SECONDS > 0:
+        if CATEGORY_CACHE_TTL_SECONDS > 0 and _cacheable_category_result(result):
             category_result_cache[inflight_key] = (time.monotonic(), result)
         return CategoryDispatchResult(source=source, result=result)
     except ScanStopRequested:
@@ -4222,9 +4275,18 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
     lines.append(f"⏱ Время: <b>{elapsed_text}</b>")
     if not job.incomplete_categories:
         lines.append("🔔 Автозамеры: <b>3 · 6 · 12 ч</b>")
-    lines += ["", "📄 CSV отправлен ниже." if export_ok and result_count else (
-        "По текущим фильтрам подходящих объявлений нет." if export_ok else "Данные сохранены в скане."
-    )]
+    if job.incomplete_categories:
+        result_tail = (
+            "Подтверждённые данные сохранены. Нулевой результат не считается окончательным, "
+            "пока сервер не подтвердил все участки."
+        )
+    elif export_ok and result_count:
+        result_tail = "📄 CSV отправлен ниже."
+    elif export_ok:
+        result_tail = "По текущим фильтрам подходящих объявлений нет."
+    else:
+        result_tail = "Данные сохранены в скане."
+    lines += ["", result_tail]
     await edit_job_status(bot, job, "\n".join(lines), force=True)
 
     if job.incomplete_categories:
