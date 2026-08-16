@@ -1,4 +1,10 @@
-# DT PARSER v4.1.2 — Auto-Distributed Railway Bootstrap
+# DT PARSER v4.1.3 — Railway Start Command Fix
+
+- Fixed Railway deploy failure: `railway.json` now uses only `python bot.py` as `startCommand`.
+- `PRIMARY_SCAN_INLINE_VIEWS=0` remains an environment Variable, never an executable command.
+- Keeps v4.1.2 Auto-Distributed behavior: `REDIS_URL` enables distributed mode automatically.
+
+# DT PARSER v4.1.3 — Auto-Distributed Railway Bootstrap
 
 - `REDIS_URL` now automatically enables distributed mode; stale `DISTRIBUTED_WORKERS=0` can no longer silently force Railway back to local workers.
 - Railway bot refuses to start without Redis instead of pretending to be healthy in `mode=local`.

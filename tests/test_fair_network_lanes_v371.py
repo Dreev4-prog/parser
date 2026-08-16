@@ -7,8 +7,8 @@ ENV = (ROOT / ".env.example").read_text(encoding="utf-8")
 
 
 def test_v371_version():
-    assert (ROOT / "VERSION").read_text().strip() == "4.1.2"
-    assert 'APP_VERSION = "4.1.2"' in (ROOT / "bot.py").read_text()
+    assert (ROOT / "VERSION").read_text().strip() == "4.1.3"
+    assert 'APP_VERSION = "4.1.3"' in (ROOT / "bot.py").read_text()
 
 
 def test_distributed_spacing_is_per_replica_not_one_global_clock():

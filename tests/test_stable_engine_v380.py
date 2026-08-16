@@ -9,8 +9,8 @@ ENV = (ROOT / ".env.example").read_text(encoding="utf-8")
 
 
 def test_v380_version_and_stable_worker():
-    assert (ROOT / "VERSION").read_text().strip() == "4.1.2"
-    assert 'APP_VERSION = "4.1.2"' in BOT
+    assert (ROOT / "VERSION").read_text().strip() == "4.1.3"
+    assert 'APP_VERSION = "4.1.3"' in BOT
     assert 'os.environ["STABLE_SCAN_ENGINE"] = "1"' in WORKER
     assert 'os.environ["SHARE_ACTIVE_CATEGORY_SCANS"] = "1"' in WORKER
     assert 'os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "0"' in WORKER

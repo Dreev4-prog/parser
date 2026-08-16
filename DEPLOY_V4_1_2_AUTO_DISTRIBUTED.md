@@ -1,4 +1,4 @@
-# DT PARSER v4.1.2 — Auto-Distributed Railway
+# DT PARSER v4.1.3 — Auto-Distributed Railway
 
 ## What changed
 
@@ -24,7 +24,7 @@ Correct bot startup log:
 Starting @DTTEAM_PARSER_BOT | mode=distributed source=redis-auto railway=True redis=True | local_workers=0 ...
 ```
 
-If the log contains `mode=local`, the process is not running v4.1.2 or Railway was not detected.
+If the log contains `mode=local`, the process is not running v4.1.3 or Railway was not detected.
 
 ## No new database migration
 

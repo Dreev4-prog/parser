@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 
-# v4.1.2: this executable is always a distributed worker.
+# v4.1.3: this executable is always a distributed worker.
 os.environ["DISTRIBUTED_WORKERS"] = "1"
 
 from aiogram import Bot

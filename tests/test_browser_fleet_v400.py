@@ -7,8 +7,8 @@ PARSER_WORKER = (ROOT / "parser_worker.py").read_text(encoding="utf-8")
 
 
 def test_v400_version_and_entrypoint():
-    assert (ROOT / "VERSION").read_text().strip() == "4.1.2"
-    assert 'APP_VERSION = "4.1.2"' in (ROOT / "bot.py").read_text(encoding="utf-8")
+    assert (ROOT / "VERSION").read_text().strip() == "4.1.3"
+    assert 'APP_VERSION = "4.1.3"' in (ROOT / "bot.py").read_text(encoding="utf-8")
     cfg = (ROOT / "railway.fleet-worker.json").read_text(encoding="utf-8")
     assert "python fleet_worker.py" in cfg
 
