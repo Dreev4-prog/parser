@@ -8,8 +8,8 @@ ENV = (ROOT / ".env.example").read_text(encoding="utf-8")
 
 
 def test_v370_version_and_hybrid_worker_profile():
-    assert (ROOT / "VERSION").read_text().strip() == "3.7.1"
-    assert 'APP_VERSION = "3.7.1"' in BOT
+    assert (ROOT / "VERSION").read_text().strip() == "3.7.2"
+    assert 'APP_VERSION = "3.7.2"' in BOT
     assert 'SCAN_TRANSPORT", "hybrid"' in WORKER
     assert 'PARSER_WORKER_CONCURRENCY", "1"' in WORKER
     assert 'SHARE_ACTIVE_CATEGORY_SCANS", "0"' in WORKER
@@ -46,7 +46,7 @@ def test_hybrid_reuses_lightweight_context_for_view_counter_path():
 
 
 def test_hybrid_progress_is_visible_and_env_documented():
-    assert 'Browser → HTTP hybrid' in BOT
+    assert 'HTTP-first' in BOT
     assert 'HYBRID_CLOSE_BROWSER_AFTER_SEED=1' in ENV
     cfg = (ROOT / "railway.hybrid-worker.json").read_text(encoding="utf-8")
     assert 'python hybrid_worker.py' in cfg

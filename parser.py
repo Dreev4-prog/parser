@@ -68,6 +68,14 @@ HYBRID_BROWSER_FALLBACK_LIMIT = max(0, min(10, int(os.getenv("HYBRID_BROWSER_FAL
 HYBRID_CLOSE_BROWSER_AFTER_SEED = os.getenv("HYBRID_CLOSE_BROWSER_AFTER_SEED", "1").strip().lower() not in {
     "0", "false", "no", "off",
 }
+# v3.7.2 Stability Core. Hybrid is HTTP-first: a lightweight persistent httpx
+# session is tried before Chromium is started. Chromium is only a compatibility
+# fallback for transport/JS-only failures; explicit 403/429 refusals are still
+# honored and never retried through a different transport.
+HYBRID_HTTP_FIRST = os.getenv("HYBRID_HTTP_FIRST", "1").strip().lower() not in {"0", "false", "no", "off"}
+HYBRID_WATCHDOG_SECONDS = max(6.0, min(45.0, float(os.getenv("HYBRID_WATCHDOG_SECONDS", "15"))))
+HYBRID_DIRECT_HTTP_RETRIES = max(1, min(3, int(os.getenv("HYBRID_DIRECT_HTTP_RETRIES", "1"))))
+SCAN_PAGE_CHECKPOINT_TTL_SECONDS = max(60.0, min(3600.0, float(os.getenv("SCAN_PAGE_CHECKPOINT_TTL_SECONDS", "900"))))
 
 
 log = logging.getLogger("kleinanzeigen-parser")
@@ -970,6 +978,12 @@ class KleinanzeigenParser:
         self._hybrid_seeded_at = 0.0
         self._hybrid_request_count = 0
         self._hybrid_browser_fallbacks = 0
+        self._hybrid_bulk_mode = "direct-http" if HYBRID_HTTP_FIRST else "browser-seed"
+        # Per-user-job page checkpoint cache. A retry/recovery pass reuses only
+        # already verified pages; suspicious/weak pages are deliberately fetched
+        # again. This makes recovery incremental instead of starting from zero.
+        self._scan_page_checkpoints: dict[tuple[str, int], tuple[float, CategoryPageInfo]] = {}
+        self._scan_page_checkpoint_hits = 0
 
     async def close(self) -> None:
         try:
@@ -1275,34 +1289,132 @@ class KleinanzeigenParser:
             "ungewöhnliche aktivität", "ungewoehnliche aktivitaet", "bot protection",
         ))
 
-    async def _fetch_scan_hybrid_document(self, url: str) -> tuple[str, str]:
-        """Browser seed -> lightweight HTTP requests -> controlled browser fallback.
+    def scan_transport_status(self) -> str:
+        if self.scan_transport != "hybrid":
+            return self.scan_transport
+        return self._hybrid_bulk_mode or "direct-http"
 
-        The normal path keeps Chromium closed after the first navigation. A browser
-        relaunch is reserved for transport/runtime or JS-only compatibility failures.
-        Site refusals (403/429/challenge) are backed off and surfaced instead.
+    @property
+    def scan_page_checkpoint_hits(self) -> int:
+        return int(self._scan_page_checkpoint_hits or 0)
+
+    async def _fetch_hybrid_direct_http_document(self, url: str) -> tuple[str, str]:
+        """Fast HTTP-first path with a hard per-request watchdog.
+
+        The persistent httpx client carries cookies between requests. A successful
+        normal document keeps the whole scan out of Chromium. Transport/runtime or
+        JS-only compatibility failures may fall back to the browser seed path.
+        403/429/challenge responses are explicit refusals and are never bypassed.
+        """
+        last_error: Exception | None = None
+        self._hybrid_bulk_mode = "direct-http"
+        for attempt in range(1, HYBRID_DIRECT_HTTP_RETRIES + 1):
+            try:
+                async with TRAFFIC.lease("scan", "high"):
+                    response = await asyncio.wait_for(
+                        self.client.get(url), timeout=HYBRID_WATCHDOG_SECONDS
+                    )
+                status = int(response.status_code)
+                final_url = str(response.url or url)
+                if status in {403, 429}:
+                    await TRAFFIC.report_refusal(status, "scan")
+                    # Do not switch transports to defeat an explicit refusal.
+                    raise TemporaryAccessError(status, url)
+                if status >= 500:
+                    last_error = RuntimeError(f"Hybrid direct HTTP {status}")
+                    if attempt < HYBRID_DIRECT_HTTP_RETRIES:
+                        await asyncio.sleep(0.35 * attempt + random.uniform(0.0, 0.15))
+                        continue
+                    raise last_error
+                if status >= 400:
+                    raise RuntimeError(f"Hybrid direct HTTP {status}")
+                text = response.text
+                if self._hybrid_html_is_challenge(text):
+                    await TRAFFIC.report_refusal(429, "scan")
+                    raise TemporaryAccessError(429, url)
+                if self._hybrid_html_needs_browser(text):
+                    raise RuntimeError("Hybrid direct HTTP returned JS-only document")
+                await TRAFFIC.report_success("scan")
+                self._hybrid_request_count += 1
+                return text, final_url
+            except TemporaryAccessError:
+                raise
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError as exc:
+                last_error = TimeoutError(
+                    f"Hybrid direct HTTP watchdog exceeded {HYBRID_WATCHDOG_SECONDS:.0f}s"
+                )
+                if attempt < HYBRID_DIRECT_HTTP_RETRIES:
+                    await asyncio.sleep(0.25 * attempt)
+                    continue
+            except Exception as exc:
+                last_error = exc
+                if attempt < HYBRID_DIRECT_HTTP_RETRIES:
+                    await asyncio.sleep(0.25 * attempt + random.uniform(0.0, 0.1))
+                    continue
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Hybrid direct HTTP failed")
+
+    async def _fetch_scan_hybrid_document(self, url: str) -> tuple[str, str]:
+        """HTTP-first -> lightweight API HTTP -> controlled browser compatibility fallback.
+
+        v3.7.2 avoids launching Chromium for the common case. If direct HTTP is
+        compatible, it stays active for the scan. If a transport/runtime/JS-only
+        problem occurs, Chromium seeds a normal session once and bulk work continues
+        through APIRequestContext. Explicit access refusals remain terminal/retriable
+        through normal backoff, never through transport switching.
         """
         if not _allowed_url(url):
             raise ValueError("Only public kleinanzeigen.de HTTPS URLs are allowed")
 
         async with self._hybrid_lock:
+            # Common path: no browser and no Playwright request context at all.
+            if HYBRID_HTTP_FIRST and self._hybrid_request_context is None:
+                try:
+                    return await self._fetch_hybrid_direct_http_document(url)
+                except TemporaryAccessError:
+                    raise
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if self._hybrid_browser_fallbacks >= HYBRID_BROWSER_FALLBACK_LIMIT:
+                        raise
+                    self._hybrid_browser_fallbacks += 1
+                    self._hybrid_bulk_mode = "browser-fallback"
+                    log.warning(
+                        "Hybrid HTTP-first compatibility fallback to Chromium | count=%s/%s | error=%s | url=%s",
+                        self._hybrid_browser_fallbacks, HYBRID_BROWSER_FALLBACK_LIMIT, exc, url,
+                    )
+                    text, final_url = await self._bootstrap_hybrid_session(url)
+                    self._hybrid_bulk_mode = "api-http"
+                    return text, final_url
+
             expired = (
                 self._hybrid_request_context is None
                 or self._hybrid_seeded_at <= 0
                 or time.monotonic() - self._hybrid_seeded_at >= HYBRID_SESSION_TTL_SECONDS
             )
             if expired:
-                return await self._bootstrap_hybrid_session(url)
+                self._hybrid_bulk_mode = "browser-fallback"
+                text, final_url = await self._bootstrap_hybrid_session(url)
+                self._hybrid_bulk_mode = "api-http"
+                return text, final_url
 
             last_error: Exception | None = None
+            self._hybrid_bulk_mode = "api-http"
             for attempt in range(1, HYBRID_HTTP_RETRIES + 1):
                 try:
                     async with TRAFFIC.lease("scan", "high"):
-                        response = await self._hybrid_request_context.get(
-                            url,
-                            timeout=HYBRID_HTTP_TIMEOUT_MS,
-                            fail_on_status_code=False,
-                            max_retries=1,
+                        response = await asyncio.wait_for(
+                            self._hybrid_request_context.get(
+                                url,
+                                timeout=min(HYBRID_HTTP_TIMEOUT_MS, int(HYBRID_WATCHDOG_SECONDS * 1000)),
+                                fail_on_status_code=False,
+                                max_retries=0,
+                            ),
+                            timeout=HYBRID_WATCHDOG_SECONDS + 1.0,
                         )
                     status = int(response.status)
                     final_url = str(getattr(response, "url", url) or url)
@@ -1313,7 +1425,6 @@ class KleinanzeigenParser:
                         except Exception:
                             pass
                         await TRAFFIC.report_refusal(status, "scan")
-                        # Do not switch transports to defeat an explicit refusal.
                         raise TemporaryAccessError(status, url)
                     if status >= 500:
                         try:
@@ -1322,7 +1433,7 @@ class KleinanzeigenParser:
                             pass
                         last_error = RuntimeError(f"Hybrid HTTP {status}")
                         if attempt < HYBRID_HTTP_RETRIES:
-                            await asyncio.sleep(0.5 * attempt + random.uniform(0.0, 0.25))
+                            await asyncio.sleep(0.4 * attempt + random.uniform(0.0, 0.2))
                             continue
                         break
                     if status >= 400:
@@ -1351,10 +1462,17 @@ class KleinanzeigenParser:
                     raise
                 except asyncio.CancelledError:
                     raise
+                except asyncio.TimeoutError:
+                    last_error = TimeoutError(
+                        f"Hybrid API HTTP watchdog exceeded {HYBRID_WATCHDOG_SECONDS:.0f}s"
+                    )
+                    if attempt < HYBRID_HTTP_RETRIES:
+                        await asyncio.sleep(0.25 * attempt)
+                        continue
                 except Exception as exc:
                     last_error = exc
                     if attempt < HYBRID_HTTP_RETRIES:
-                        await asyncio.sleep(0.4 * attempt + random.uniform(0.0, 0.2))
+                        await asyncio.sleep(0.3 * attempt + random.uniform(0.0, 0.15))
                         continue
 
             if self._hybrid_browser_fallbacks >= HYBRID_BROWSER_FALLBACK_LIMIT:
@@ -1362,14 +1480,15 @@ class KleinanzeigenParser:
                     raise last_error
                 raise RuntimeError("Hybrid browser fallback limit reached")
 
-            # Compatibility fallback only. Reuse the newest API-request cookies when
-            # creating the browser context, navigate once, then return to HTTP mode.
             self._hybrid_browser_fallbacks += 1
+            self._hybrid_bulk_mode = "browser-fallback"
             log.warning(
-                "Hybrid HTTP compatibility fallback to Chromium | count=%s/%s | error=%s | url=%s",
+                "Hybrid API HTTP compatibility fallback to Chromium | count=%s/%s | error=%s | url=%s",
                 self._hybrid_browser_fallbacks, HYBRID_BROWSER_FALLBACK_LIMIT, last_error, url,
             )
-            return await self._bootstrap_hybrid_session(url)
+            text, final_url = await self._bootstrap_hybrid_session(url)
+            self._hybrid_bulk_mode = "api-http"
+            return text, final_url
 
     async def fetch_html(
         self, url: str, *, traffic_kind: str = "scan", traffic_priority: str = "high"
@@ -1386,22 +1505,39 @@ class KleinanzeigenParser:
         return parse_category_html(await self.fetch_html(url))
 
     async def parse_category_page_info(self, url: str, requested_page: int) -> CategoryPageInfo:
+        checkpoint_key = (url, int(requested_page))
+        cached = self._scan_page_checkpoints.get(checkpoint_key)
+        if cached is not None:
+            cached_at, cached_info = cached
+            if time.monotonic() - cached_at <= SCAN_PAGE_CHECKPOINT_TTL_SECONDS:
+                self._scan_page_checkpoint_hits += 1
+                return cached_info
+            self._scan_page_checkpoints.pop(checkpoint_key, None)
+
         if self.scan_transport == "browser":
             text, final_url = await self._fetch_scan_browser_document(url)
-            return category_page_info_from_html(
-                text, requested_page=requested_page, final_url=final_url
-            )
-        if self.scan_transport == "hybrid":
+            info = category_page_info_from_html(text, requested_page=requested_page, final_url=final_url)
+        elif self.scan_transport == "hybrid":
             text, final_url = await self._fetch_scan_hybrid_document(url)
-            return category_page_info_from_html(
-                text, requested_page=requested_page, final_url=final_url
+            info = category_page_info_from_html(text, requested_page=requested_page, final_url=final_url)
+        else:
+            response = await self._fetch_response(url)
+            info = category_page_info_from_html(
+                response.text, requested_page=requested_page, final_url=str(response.url)
             )
-        response = await self._fetch_response(url)
-        return category_page_info_from_html(
-            response.text,
-            requested_page=requested_page,
-            final_url=str(response.url),
+
+        # Checkpoint only trustworthy pages. Weak/suspicious pages are intentionally
+        # excluded so an automatic recovery pass really refetches the problematic
+        # area rather than replaying the same bad response.
+        strong_enough = (
+            bool(getattr(info, "page_verified", False))
+            and bool(getattr(info, "request_matches_page", True))
+            and not bool(getattr(info, "suspicious", False))
+            and (not info.items or float(getattr(info, "date_coverage", 0.0) or 0.0) >= MIN_PAGE_DATE_COVERAGE)
         )
+        if strong_enough:
+            self._scan_page_checkpoints[checkpoint_key] = (time.monotonic(), info)
+        return info
 
 
     @staticmethod

@@ -81,7 +81,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "3.7.1"
+APP_VERSION = "3.7.2"
 MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -104,6 +104,11 @@ STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVA
 # user receives a partial result.
 SCAN_CATEGORY_ATTEMPTS = max(1, min(3, int(os.getenv("SCAN_CATEGORY_ATTEMPTS", "2"))))
 SCAN_CATEGORY_RETRY_SECONDS = max(1.0, min(30.0, float(os.getenv("SCAN_CATEGORY_RETRY_SECONDS", "4"))))
+# v3.7.2: a parser result that is structurally partial is automatically retried
+# inside the same per-user parser session. Verified page checkpoints are reused,
+# so recovery refetches weak/missing areas instead of making the user press a button.
+SCAN_AUTO_RECOVERY_PASSES = max(0, min(3, int(os.getenv("SCAN_AUTO_RECOVERY_PASSES", "2"))))
+SCAN_AUTO_RECOVERY_DELAY_SECONDS = max(0.5, min(15.0, float(os.getenv("SCAN_AUTO_RECOVERY_DELAY_SECONDS", "2"))))
 SUBSCRIPTION_NOTICE_POLL_SECONDS = max(60, int(os.getenv("SUBSCRIPTION_NOTICE_POLL_SECONDS", "300")))
 
 # Public view counts are collected inline while category pages are scanned.
@@ -2389,6 +2394,10 @@ class ScanJob:
     quality_notes: list[str] | None = None
     incomplete_category_keys: set[str] | None = None
     retry_note: str = ""
+    recovery_note: str = ""
+    recovery_attempt: int = 0
+    recovery_total: int = 0
+    auto_recovered_categories: int = 0
     recovered: bool = False
     stop_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False, compare=False)
 
@@ -2421,6 +2430,12 @@ class CategoryLiveProgress:
     # Number of real category-page HTTP responses already processed.  This gives
     # the UI a truthful heartbeat during date-location before collection starts.
     network_requests: int = 0
+    checkpoint_hits: int = 0
+    request_started_at_ts: float = 0.0
+    current_request_page: int = 0
+    last_request_ms: int = 0
+    request_timeouts: int = 0
+    transport_stage: str = ""
 
 
 category_live_progress: dict[str, CategoryLiveProgress] = {}
@@ -2792,12 +2807,42 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             if not fresh:
                 info = cache[page]
             else:
-                info = await parser.parse_category_page_info(page_url(base_url, page), page)
+                live_req = category_live_progress.get(progress_key)
+                checkpoint_before = int(getattr(parser, "scan_page_checkpoint_hits", 0) or 0)
+                req_started = time.monotonic()
+                if live_req is not None:
+                    live_req.request_started_at_ts = time.time()
+                    live_req.current_request_page = page
+                    try:
+                        live_req.transport_stage = parser.scan_transport_status()
+                    except Exception:
+                        live_req.transport_stage = getattr(parser, "scan_transport", "http")
+                try:
+                    info = await parser.parse_category_page_info(page_url(base_url, page), page)
+                except Exception as exc:
+                    if live_req is not None and (
+                        isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in str(exc).lower()
+                    ):
+                        live_req.request_timeouts += 1
+                    raise
+                finally:
+                    if live_req is not None:
+                        live_req.last_request_ms = max(0, int((time.monotonic() - req_started) * 1000))
+                        live_req.request_started_at_ts = 0.0
+                        try:
+                            live_req.transport_stage = parser.scan_transport_status()
+                        except Exception:
+                            pass
+                checkpoint_after = int(getattr(parser, "scan_page_checkpoint_hits", 0) or 0)
+                from_checkpoint = checkpoint_after > checkpoint_before
+                if live_req is not None and from_checkpoint:
+                    live_req.checkpoint_hits += 1
                 cache[page] = info
                 promoted_ids = list(getattr(info, "promoted_ids", None) or [])
                 if promoted_ids:
                     await mark_promoted_listings(promoted_ids)
-                network_requests += 1
+                if not from_checkpoint:
+                    network_requests += 1
                 cards_seen += int(getattr(info, "raw_candidates", 0) or 0)
                 listings_parsed += len(info.items)
                 missing_date_count += int(getattr(info, "missing_date_count", 0) or 0)
@@ -3420,6 +3465,7 @@ async def dispatch_category(
     target_date: str,
     *,
     stop_event: asyncio.Event | None = None,
+    force_refresh: bool = False,
 ) -> CategoryDispatchResult:
     """Share exact category/date/depth work locally and across Redis worker replicas."""
     inflight_key = _progress_key(cat.key, target_date, page_limit)
@@ -3428,7 +3474,7 @@ async def dispatch_category(
         raise ScanStopRequested()
 
     # Fast process-local cache.
-    if CATEGORY_CACHE_TTL_SECONDS > 0:
+    if not force_refresh and CATEGORY_CACHE_TTL_SECONDS > 0:
         cached = category_result_cache.get(inflight_key)
         if cached is not None:
             cached_at, cached_result = cached
@@ -3441,7 +3487,7 @@ async def dispatch_category(
 
     # Cross-replica cache. PostgreSQL contains the listings themselves; Redis only
     # stores the small ScanResult membership/quality summary for a few minutes.
-    if DISTRIBUTED_WORKERS:
+    if not force_refresh and DISTRIBUTED_WORKERS:
         try:
             remote_cached = await COORDINATOR.get_category_result(inflight_key)
             if remote_cached is not None:
@@ -3641,6 +3687,20 @@ def render_user_job_status(job: ScanJob) -> str:
             + f"⏱ <b>{_human_duration(waited)}</b>"
         )
 
+    if job.recovery_note:
+        live = category_live_progress.get(job.current_progress_key) if job.current_progress_key else None
+        checkpoint_line = ""
+        if live is not None and live.checkpoint_hits:
+            checkpoint_line = f"\n💾 Готовых страниц использовано: <b>{live.checkpoint_hits}</b>"
+        return (
+            "🔧 <b>Автовосстановление скана</b>\n\n"
+            f"📂 <b>{html.escape(job.current_category or 'Категория')}</b>\n"
+            f"♻️ Попытка: <b>{job.recovery_attempt}/{max(1, job.recovery_total)}</b>\n"
+            f"{html.escape(job.recovery_note)}"
+            f"{checkpoint_line}\n\n"
+            "Проблемные участки перепроверяются автоматически."
+        )
+
     if job.retry_note:
         return (
             "♻️ <b>Временный сбой — повторяю категорию</b>\n\n"
@@ -3687,15 +3747,35 @@ def render_user_job_status(job: ScanJob) -> str:
         requests_text = ""
         if live is not None and live.network_requests:
             requests_text = f"\n🌐 Проверено запросов: <b>{live.network_requests}</b>"
+        wait_text = ""
+        if live is not None and live.request_started_at_ts:
+            waiting = max(0, int(time.time() - float(live.request_started_at_ts)))
+            if waiting >= 2:
+                page_hint = f" · стр. {live.current_request_page}" if live.current_request_page else ""
+                wait_text = f"\n⏳ Ответ Kleinanzeigen: <b>{waiting} сек</b>{page_hint}"
+        transport_text = ""
+        if SCAN_TRANSPORT == "browser":
+            transport_text = "🌐 <b>Отдельная Chromium-сессия</b>\n"
+        elif SCAN_TRANSPORT == "hybrid":
+            stage = (live.transport_stage if live is not None else "") or "direct-http"
+            labels = {
+                "direct-http": "HTTP-first",
+                "api-http": "HTTP после browser-сессии",
+                "browser-fallback": "Browser fallback",
+                "browser-seed": "Browser fallback",
+            }
+            transport_text = f"⚡ <b>{labels.get(stage, 'HTTP-first hybrid')}</b>\n"
+        timeout_text = ""
+        if live is not None and live.request_timeouts:
+            timeout_text = f"⚠️ Автоповторов по таймауту: <b>{live.request_timeouts}</b>\n"
         return (
             f"🔎 <b>Поиск даты · {percent}%</b>\n"
             f"{_progress_bar(percent)}\n\n"
             f"🗂 <b>{category_line}</b> · {category_index}/{total}\n"
             f"📅 За <b>{_date_label(job.target_date)}</b>"
-            f"{requests_text}\n"
+            f"{requests_text}{wait_text}\n"
             f"⏱ <b>{_human_duration(elapsed)}</b>\n"
-            + ("🌐 <b>Отдельная Chromium-сессия</b>\n" if SCAN_TRANSPORT == "browser" else "")
-            + ("⚡ <b>Browser → HTTP hybrid</b>\n" if SCAN_TRANSPORT == "hybrid" else "")
+            + transport_text + timeout_text
             + "\nСтатус обновляется автоматически."
         )
 
@@ -3845,8 +3925,10 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
     ]
     if result_count is not None:
         lines.append(f"📦 В результате: <b>{result_count}</b>")
+    if job.auto_recovered_categories:
+        lines.append(f"🔧 Автовосстановлено: <b>{job.auto_recovered_categories}</b> категорий")
     if job.incomplete_categories:
-        lines.append(f"⚠️ Допроверка: <b>{job.incomplete_categories}</b> категорий")
+        lines.append(f"⚠️ Требуют ручной проверки: <b>{job.incomplete_categories}</b> категорий")
     elif quality_avg and quality_avg < 90:
         lines.append(f"🛡 Качество: <b>{quality_avg}/100</b>")
     lines.append(f"⏱ Время: <b>{elapsed_text}</b>")
@@ -3861,9 +3943,9 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
         try:
             await bot.send_message(
                 job.chat_id,
-                "<b>⚠️ Нужна допроверка</b>\n\n"
-                f"{job.incomplete_categories} из {len(job.category_keys)} категорий проверены не полностью. "
-                "Найденные данные сохранены.",
+                "<b>⚠️ Автовосстановление не завершило все участки</b>\n\n"
+                f"{job.incomplete_categories} из {len(job.category_keys)} категорий всё ещё проверены не полностью. "
+                "Найденные данные сохранены. Ручная допроверка доступна как резервный вариант.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=partial_recheck_keyboard(job.scan_id) if job.scan_id is not None else None,
             )
@@ -3873,7 +3955,9 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
         log.info("scan job=%s warnings=%s", job.job_id, job.warnings[:20])
 
 
-async def dispatch_category_with_retry(bot: Bot, job: ScanJob, cat) -> CategoryDispatchResult:
+async def dispatch_category_with_retry(
+    bot: Bot, job: ScanJob, cat, *, force_refresh: bool = False
+) -> CategoryDispatchResult:
     """Run one category with a small job-level retry safety net.
 
     The parser itself already retries HTTP/403/429/5xx responses. This outer layer
@@ -3885,7 +3969,8 @@ async def dispatch_category_with_retry(bot: Bot, job: ScanJob, cat) -> CategoryD
         try:
             job.retry_note = ""
             return await dispatch_category(
-                cat, job.user_id, job.page_limit, job.target_date, stop_event=job.stop_event
+                cat, job.user_id, job.page_limit, job.target_date,
+                stop_event=job.stop_event, force_refresh=force_refresh,
             )
         except ScanStopRequested:
             raise
@@ -3906,6 +3991,89 @@ async def dispatch_category_with_retry(bot: Bot, job: ScanJob, cat) -> CategoryD
                 raise ScanStopRequested()
     assert last_exc is not None
     raise last_exc
+
+
+async def auto_recover_partial_category(
+    bot: Bot, job: ScanJob, cat, dispatched: CategoryDispatchResult
+) -> CategoryDispatchResult:
+    """Automatically recheck only weak/missing page areas before exposing partial UI.
+
+    The per-job KleinanzeigenParser keeps verified CategoryPageInfo checkpoints. A
+    forced category pass therefore reuses strong pages and performs network work for
+    pages that were weak, missing or never reached. This is intentionally bounded.
+    """
+    result = dispatched.result
+    if result is None or result.date_complete or SCAN_AUTO_RECOVERY_PASSES <= 0:
+        return dispatched
+
+    merged_ids = set(result.matched_ids or [])
+    best = result
+    best_dispatch = dispatched
+    job.recovery_total = SCAN_AUTO_RECOVERY_PASSES
+
+    for attempt in range(1, SCAN_AUTO_RECOVERY_PASSES + 1):
+        if job.stop_event.is_set() or job.cancel_requested:
+            raise ScanStopRequested()
+        job.recovery_attempt = attempt
+        job.recovery_note = (
+            "Основной проход получился неполным. Уже подтверждённые страницы сохранены; "
+            "перепроверяю только слабые или недостающие участки."
+        )
+        await edit_job_status(bot, job, render_user_job_status(job), force=True)
+        if attempt > 1 or SCAN_AUTO_RECOVERY_DELAY_SECONDS:
+            await asyncio.sleep(SCAN_AUTO_RECOVERY_DELAY_SECONDS * attempt)
+        try:
+            candidate_dispatch = await dispatch_category_with_retry(
+                bot, job, cat, force_refresh=True
+            )
+            candidate = candidate_dispatch.result
+        except ScanStopRequested:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await record_user_scan_retry(
+                job.scan_id, f"auto-recovery {cat.name} {attempt}: {type(exc).__name__}: {exc}"
+            )
+            log.warning(
+                "Automatic partial recovery failed job=%s category=%s attempt=%s/%s: %s",
+                job.job_id, cat.name, attempt, SCAN_AUTO_RECOVERY_PASSES, exc,
+            )
+            continue
+
+        if candidate is None:
+            continue
+        merged_ids.update(candidate.matched_ids or [])
+        candidate.matched_ids = sorted(merged_ids)
+        # The recovery pass revisits rows already inserted by the first pass, so
+        # its DB-level `new_count` can legitimately be zero. Preserve the strongest
+        # user-facing counters from either pass while using the recovery verdict.
+        candidate.new_count = max(int(result.new_count or 0), int(candidate.new_count or 0))
+        candidate.today_seen = max(int(result.today_seen or 0), int(candidate.today_seen or 0))
+        candidate.enriched_count = max(int(result.enriched_count or 0), int(candidate.enriched_count or 0))
+        # Prefer a complete pass; otherwise keep the strongest partial verdict.
+        if candidate.date_complete:
+            candidate.reason = f"{candidate.reason}; автодопроверка успешна"
+            job.auto_recovered_categories += 1
+            job.recovery_note = ""
+            job.retry_note = ""
+            job.recovery_attempt = 0
+            job.recovery_total = 0
+            return candidate_dispatch
+        if (candidate.quality_score, candidate.verified_pages, candidate.today_seen) > (
+            best.quality_score, best.verified_pages, best.today_seen
+        ):
+            best = candidate
+            best_dispatch = candidate_dispatch
+
+    best.matched_ids = sorted(merged_ids)
+    job.recovery_note = ""
+    job.retry_note = ""
+    job.recovery_attempt = 0
+    job.recovery_total = 0
+    return CategoryDispatchResult(
+        source=best_dispatch.source, result=best, cache_age_seconds=best_dispatch.cache_age_seconds
+    )
 
 
 async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
@@ -3954,6 +4122,9 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
         try:
             await edit_job_status(bot, job, render_user_job_status(job), force=True)
             dispatched = await dispatch_category_with_retry(bot, job, cat)
+            if job.cancel_requested or job.stop_event.is_set():
+                raise ScanStopRequested()
+            dispatched = await auto_recover_partial_category(bot, job, cat, dispatched)
             if job.cancel_requested or job.stop_event.is_set():
                 raise ScanStopRequested()
             result = dispatched.result

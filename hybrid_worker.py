@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-"""Resource-efficient Browser -> HTTP parser worker for Railway.
+"""HTTP-first stability worker for Railway.
 
-Each Railway replica processes one user scan at a time. The scan opens Chromium only
-long enough to establish a normal public browser session, transfers its storage state
-to a lightweight Playwright APIRequestContext, closes Chromium, and performs the bulk
-category work over HTTP. Compatibility failures may briefly relaunch Chromium, while
-explicit 403/429 refusals are always honored and never bypassed by switching transport.
+Each replica processes one user scan at a time. Normal category pages are requested
+through lightweight persistent HTTP first. Chromium starts only for compatibility/JS
+failures, then hands its storage state to APIRequestContext and releases browser RAM.
+Verified page checkpoints are reused by automatic partial recovery. Explicit 403/429
+refusals are always honored and never bypassed by transport switching.
 """
 
 import os
@@ -20,8 +20,14 @@ os.environ.setdefault("SHARE_ACTIVE_CATEGORY_SCANS", "0")
 os.environ.setdefault("DIST_TRAFFIC_SHARED_COOLDOWN", "0")
 os.environ.setdefault("TRAFFIC_SCAN_CONCURRENCY", "1")
 os.environ.setdefault("TRAFFIC_BROWSER_CONCURRENCY", "1")
+os.environ.setdefault("HYBRID_HTTP_FIRST", "1")
+os.environ.setdefault("HYBRID_WATCHDOG_SECONDS", "15")
+os.environ.setdefault("HYBRID_DIRECT_HTTP_RETRIES", "1")
+os.environ.setdefault("SCAN_AUTO_RECOVERY_PASSES", "2")
+os.environ.setdefault("SCAN_AUTO_RECOVERY_DELAY_SECONDS", "2")
+os.environ.setdefault("SCAN_PAGE_CHECKPOINT_TTL_SECONDS", "900")
 
-# v3.7.1: hybrid replicas must have independent foreground network lanes.
+# v3.7.2: hybrid replicas keep independent foreground network lanes plus stability recovery.
 # Older Railway Variables could leave DIST_TRAFFIC_SCAN_LIMIT at 2/3 and make
 # some replicas look frozen. A dedicated hybrid profile deliberately wins over
 # those generic legacy values while remaining tunable through HYBRID_* vars.

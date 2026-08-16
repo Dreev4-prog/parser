@@ -1,4 +1,22 @@
-# Kleinanzeigen Parser Bot v3.7.1
+# Kleinanzeigen Parser Bot v3.7.2
+
+## v3.7.2 — Stability Core
+
+Цель релиза — перестать отдавать пользователю постоянный `partial` после единичного
+сетевого/качественного сбоя и сделать зависание на «Поиск даты» наблюдаемым.
+
+- **HTTP-first hybrid:** обычный foreground category request сначала идёт через лёгкий persistent HTTP. Chromium запускается только при transport/JS compatibility failure.
+- **Hard watchdog:** один HTTP request не может незаметно висеть дольше `HYBRID_WATCHDOG_SECONDS` (по умолчанию 15 сек.). После watchdog transport выполняет ограниченный fallback/retry.
+- **Verified page checkpoints:** сильные подтверждённые category pages сохраняются внутри parser-session текущего UserScan. Слабые, suspicious и low-date-coverage ответы намеренно не кэшируются.
+- **Automatic partial recovery:** если основной проход вернул `date_complete=False`, бот до финального результата автоматически выполняет до двух recovery-pass. Они обходят готовый category-result cache, но переиспользуют verified page checkpoints, поэтому цель — дополучить проблемные участки, а не повторить всю работу.
+- Ручная **«Допроверка»** остаётся только аварийным вариантом после исчерпания автоматических recovery-pass.
+- Во время поиска даты UI показывает текущий transport (`HTTP-first`, `HTTP после browser-сессии`, `Browser fallback`), время ожидания ответа Kleinanzeigen и число watchdog timeout.
+- Явные `403/429`/challenge по-прежнему не обходятся сменой транспорта.
+- PostgreSQL schema не менялась; новой миграции нет.
+
+Рекомендуемый production service остаётся `hybrid-worker`; подробности — в `DEPLOY_V3_7_2_STABILITY.md`.
+
+---
 
 ## v3.7.1 — Fair Network Lanes
 
