@@ -5,8 +5,8 @@ BOT = (ROOT / "bot.py").read_text()
 
 
 def test_v410_version():
-    assert (ROOT / "VERSION").read_text().strip() == "4.1.3"
-    assert 'APP_VERSION = "4.1.3"' in BOT
+    assert (ROOT / "VERSION").read_text().strip() == "4.1.4"
+    assert 'APP_VERSION = "4.1.4"' in BOT
 
 
 def test_today_has_no_special_parser_algorithm():

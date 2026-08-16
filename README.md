@@ -1,10 +1,17 @@
-# DT PARSER v4.1.3 — Railway Start Command Fix
+# DT PARSER v4.1.4 — Browser Fleet Bootstrap Fix
+
+- Railway Start Commands corrected for bot, fleet-worker and views-worker (no inline env assignments).
+- Distributed scans now verify a live parser/fleet-worker heartbeat before enqueueing.
+- If Redis is healthy but Browser Fleet is offline, the user gets an explicit error instead of an endless "Подготавливаю скан".
+- No PostgreSQL migration.
+
+# DT PARSER v4.1.4 — Railway Start Command Fix
 
 - Fixed Railway deploy failure: `railway.json` now uses only `python bot.py` as `startCommand`.
 - `PRIMARY_SCAN_INLINE_VIEWS=0` remains an environment Variable, never an executable command.
 - Keeps v4.1.2 Auto-Distributed behavior: `REDIS_URL` enables distributed mode automatically.
 
-# DT PARSER v4.1.3 — Auto-Distributed Railway Bootstrap
+# DT PARSER v4.1.4 — Auto-Distributed Railway Bootstrap
 
 - `REDIS_URL` now automatically enables distributed mode; stale `DISTRIBUTED_WORKERS=0` can no longer silently force Railway back to local workers.
 - Railway bot refuses to start without Redis instead of pretending to be healthy in `mode=local`.

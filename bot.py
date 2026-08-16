@@ -88,7 +88,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.1.3"
+APP_VERSION = "4.1.4"
 MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -4888,9 +4888,51 @@ async def distributed_scan_worker(bot: Bot, worker_id: str) -> None:
                     log.debug("Could not release distributed job lock job=%s", job_uid, exc_info=True)
 
 
-async def enqueue_user_scan(message: Message, user_id: int, category_keys: list[str], page_limit: int, target_date: str) -> ScanJob:
-    """Create a persistent scan card and queue the network job."""
+async def enqueue_user_scan(message: Message, user_id: int, category_keys: list[str], page_limit: int, target_date: str) -> ScanJob | None:
+    """Create a persistent scan card and queue the network job.
+
+    v4.1.4: in distributed mode do not create a user scan until at least one
+    live parser/fleet worker heartbeat exists. This prevents the UI from sitting
+    forever on "Подготавливаю скан" when Redis is healthy but the Browser Fleet
+    service is absent, misconfigured, or still booting.
+    """
     category_keys = _validate_scan_category_count(category_keys)
+    if DISTRIBUTED_WORKERS:
+        ready_wait = 8
+        try:
+            ready_wait = max(0, min(30, int(os.getenv("DISTRIBUTED_WORKER_READY_WAIT_SECONDS", "8"))))
+        except Exception:
+            ready_wait = 8
+        probe = await message.answer(
+            "⏳ <b>Проверяю Browser Fleet…</b>", parse_mode=ParseMode.HTML
+        )
+        workers = 0
+        deadline = asyncio.get_running_loop().time() + ready_wait
+        while True:
+            try:
+                workers = await COORDINATOR.worker_count(prefix="parser")
+            except Exception:
+                workers = 0
+            if workers > 0 or asyncio.get_running_loop().time() >= deadline:
+                break
+            await asyncio.sleep(1.0)
+        if workers <= 0:
+            log.error(
+                "Distributed scan rejected: no live parser/fleet workers user=%s target=%s depth=%s",
+                user_id, target_date, page_limit,
+            )
+            await probe.edit_text(
+                "⚠️ <b>Browser Fleet не запущен</b>\n\n"
+                "Redis работает, но сейчас нет ни одного активного parser/fleet-worker. "
+                "Скан не был запущен и не будет висеть в очереди.",
+                parse_mode=ParseMode.HTML,
+            )
+            return None
+        await probe.edit_text(
+            f"✅ <b>Browser Fleet готов</b> · активных worker: {workers}\n\nСоздаю скан…",
+            parse_mode=ParseMode.HTML,
+        )
+
     job_uid = uuid.uuid4().hex[:12]
     scan = await create_user_scan(user_id, job_uid, category_keys, page_limit, target_date)
     status = await message.answer("⏳ <b>Подготавливаю скан…</b>", parse_mode=ParseMode.HTML)

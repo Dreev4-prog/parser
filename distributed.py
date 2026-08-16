@@ -40,7 +40,7 @@ IS_RAILWAY = bool(
     or os.getenv("RAILWAY_PROJECT_ID")
     or os.getenv("RAILWAY_SERVICE_ID")
 )
-# v4.1.3 Auto-Distributed: REDIS_URL is the source of truth. Older Railway
+# v4.1.4 Auto-Distributed: REDIS_URL is the source of truth. Older Railway
 # deployments may still have DISTRIBUTED_WORKERS=0 left over from the legacy
 # single-service mode; that stale value must never silently disable the fleet.
 # FORCE_LOCAL_MODE is intentionally explicit and is meant only for local/dev use.

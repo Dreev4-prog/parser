@@ -13,7 +13,7 @@ def row(idx: int, posted: str | None):
 
 
 def test_v410_uses_one_date_algorithm_for_all_dates():
-    assert 'APP_VERSION = "4.1.3"' in BOT
+    assert 'APP_VERSION = "4.1.4"' in BOT
     assert 'universal_date_stream = bool(STABLE_SCAN_ENGINE)' in BOT
     assert 'one deterministic newest-sorted locator for every date/feed' in BOT
     assert 'if recent_fast_path and feed_name == "nationwide"' not in BOT
