@@ -1,7 +1,7 @@
-# Kleinanzeigen Parser Bot v3.4.2
+# Kleinanzeigen Parser Bot v3.4.3
 
 
-## v3.4.2 — брендированное главное меню
+## v3.4.3 — брендированное главное меню
 
 - `/start`, `/menu` и кнопки **«🏠 Меню»** теперь открывают фирменную карточку **DT PARSER** с основной русскоязычной иллюстрацией.
 - Навигационные inline-кнопки находятся прямо под изображением: **Новый скан**, **Популярное**, **Мои сканы**, **Категории**, **Настройки**, **Подписка**.
@@ -410,9 +410,18 @@ v3.2.2+ requires Railway PostgreSQL in production so user access, payments, scan
 - Основные переходы также очищают незавершённое FSM-состояние пользователя.
 
 
-## v3.4.2 — Telegram BIGINT fix
+## v3.4.3 — Telegram BIGINT fix
 
 - All persisted Telegram `user_id` values use PostgreSQL `BIGINT`.
 - Existing PostgreSQL columns are migrated automatically on startup; no manual SQL is required.
 - Fixes silent `/start` failures for newer Telegram accounts whose IDs exceed 32-bit `INTEGER`.
 - `/start` now returns a visible temporary-database error instead of failing silently if profile persistence fails.
+
+## v3.4.3 — 5-user concurrency & live progress
+
+- Default scan workers raised from 4 to 5.
+- Process-wide scan traffic can keep five category requests in flight while the shared rate limiter still smooths request starts.
+- Main scan traffic receives four reserved global slots so inline view-count work cannot starve category-page requests.
+- View enrichment is deliberately softened while 4+ scan jobs are active.
+- Progress now moves during the date-location phase and shows real processed request count; users no longer see only an elapsed timer for several minutes.
+- Existing 403/429 global cooldown/backoff remains enabled; the update does not bypass Kleinanzeigen limits.

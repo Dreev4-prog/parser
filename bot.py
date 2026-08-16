@@ -78,7 +78,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "3.4.2"
+APP_VERSION = "3.4.3"
 MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -87,7 +87,7 @@ AVAILABILITY_CONCURRENCY = max(1, min(8, int(os.getenv("AVAILABILITY_CONCURRENCY
 
 # v2.6 Multi-User Core. User launches go into a queue. Only a limited number
 # of jobs are processed at once, while category scans are shared globally.
-MAX_CONCURRENT_JOBS = max(1, min(12, int(os.getenv("MAX_CONCURRENT_JOBS", "4"))))
+MAX_CONCURRENT_JOBS = max(1, min(12, int(os.getenv("MAX_CONCURRENT_JOBS", "5"))))
 MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
 CATEGORY_CACHE_TTL_SECONDS = max(0, int(os.getenv("CATEGORY_CACHE_TTL_SECONDS", "300")))
 STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVAL_SECONDS", "1.5")))
@@ -2335,6 +2335,9 @@ class CategoryLiveProgress:
     date_coverage_pct: int = 0
     quality_score: int = 100
     quality_warning: str = ""
+    # Number of real category-page HTTP responses already processed.  This gives
+    # the UI a truthful heartbeat during date-location before collection starts.
+    network_requests: int = 0
 
 
 category_live_progress: dict[str, CategoryLiveProgress] = {}
@@ -2568,6 +2571,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 oldest_date_seen = page_oldest.isoformat()
         live = category_live_progress.get(progress_key)
         if live is not None:
+            live.network_requests = max(live.network_requests, network_requests)
             live.page = page
             live.oldest_date_seen = oldest_date_seen
             live.current_page_date = page_date_hint
@@ -3340,10 +3344,24 @@ def render_user_job_status(job: ScanJob) -> str:
     current_today = live.today_seen if live is not None else 0
     live_views_ready = live.views_ready if live is not None else 0
 
-    current_fraction = 0.0
-    if live is not None and live.phase == "collecting" and depth > 0:
-        current_fraction = min(1.0, max(0.0, live.collection_index / depth))
-    percent = int(max(0.0, min(1.0, (job.completed_categories + current_fraction) / total)) * 100)
+    # v3.4.3: progress must move from the first network request, not only after
+    # the date locator has finished.  Date discovery is not linear, so it owns a
+    # conservative first 18% of the current category.  Collection owns the next
+    # 77%; the final 5% is reserved for persistence/export.  This is a UI progress
+    # estimate, not a fake page count.
+    current_fraction = 0.02
+    if live is not None:
+        if live.phase == "collecting" and depth > 0:
+            collected = min(1.0, max(0.0, live.collection_index / depth))
+            current_fraction = 0.18 + 0.77 * collected
+        elif live.phase in {"jumping", "seeking"}:
+            request_steps = min(12, max(0, int(live.network_requests or 0)))
+            current_fraction = 0.03 + 0.15 * (request_steps / 12.0)
+        elif live.phase == "views":
+            total_views = max(1, int(live.today_seen or 0))
+            view_ratio = min(1.0, max(0.0, float(live.views_ready) / total_views))
+            current_fraction = 0.95 + 0.04 * view_ratio
+    percent = int(max(0.0, min(0.99, (job.completed_categories + current_fraction) / total)) * 100)
     if job.completed_categories >= total:
         percent = 100
 
@@ -3356,11 +3374,29 @@ def render_user_job_status(job: ScanJob) -> str:
 
     # Date-location can use jumps and internal fallback feeds, so page numbers and
     # quality telemetry are intentionally hidden from the everyday UI.
-    if live is None or live.phase != "collecting":
+    if live is None or live.phase not in {"collecting", "views"}:
+        requests_text = ""
+        if live is not None and live.network_requests:
+            requests_text = f"\n🌐 Проверено запросов: <b>{live.network_requests}</b>"
         return (
-            "🔎 <b>Ищу объявления</b>\n\n"
+            f"🔎 <b>Поиск даты · {percent}%</b>\n"
+            f"{_progress_bar(percent)}\n\n"
             f"🗂 <b>{category_line}</b> · {category_index}/{total}\n"
-            f"📅 За <b>{_date_label(job.target_date)}</b>\n"
+            f"📅 За <b>{_date_label(job.target_date)}</b>"
+            f"{requests_text}\n"
+            f"⏱ <b>{_human_duration(elapsed)}</b>\n\n"
+            "Запросы распределяются между активными сканами — статус обновляется автоматически."
+        )
+
+    if live.phase == "views":
+        total_views = max(1, int(live.today_seen or 0))
+        ready = min(total_views, int(live.views_ready or 0))
+        return (
+            f"👁 <b>Собираю просмотры · {percent}%</b>\n"
+            f"{_progress_bar(percent)}\n\n"
+            f"🗂 <b>{category_line}</b> · {category_index}/{total}\n"
+            f"📦 Объявлений: <b>{live.today_seen}</b>\n"
+            f"👁 Проверено: <b>{ready}/{total_views}</b>\n"
             f"⏱ <b>{_human_duration(elapsed)}</b>"
         )
 

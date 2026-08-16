@@ -51,15 +51,15 @@ class AdaptiveTrafficManager:
     """
 
     def __init__(self) -> None:
-        self.base_scan_limit = _env_int("TRAFFIC_SCAN_CONCURRENCY", 3, 1, 12)
-        self.base_view_limit = _env_int("TRAFFIC_VIEW_CONCURRENCY", 4, 1, 24)
+        self.base_scan_limit = _env_int("TRAFFIC_SCAN_CONCURRENCY", 5, 1, 12)
+        self.base_view_limit = _env_int("TRAFFIC_VIEW_CONCURRENCY", 3, 1, 24)
         self.base_browser_limit = _env_int("TRAFFIC_BROWSER_CONCURRENCY", 1, 1, 4)
-        self.base_global_limit = _env_int("TRAFFIC_GLOBAL_CONCURRENCY", 7, 2, 32)
+        self.base_global_limit = _env_int("TRAFFIC_GLOBAL_CONCURRENCY", 9, 2, 32)
         self.background_during_scans = _env_int("TRAFFIC_BACKGROUND_VIEWS_DURING_SCANS", 1, 0, 6)
-        self.reserved_scan_slots = _env_int("TRAFFIC_RESERVED_SCAN_SLOTS", 2, 0, 8)
+        self.reserved_scan_slots = _env_int("TRAFFIC_RESERVED_SCAN_SLOTS", 4, 0, 8)
 
         self.scan_min_interval = _env_float("TRAFFIC_SCAN_MIN_INTERVAL_SECONDS", 0.55, 0.0, 5.0)
-        self.view_min_interval = _env_float("TRAFFIC_VIEW_MIN_INTERVAL_SECONDS", 0.12, 0.0, 2.0)
+        self.view_min_interval = _env_float("TRAFFIC_VIEW_MIN_INTERVAL_SECONDS", 0.20, 0.0, 2.0)
         self.browser_min_interval = _env_float("TRAFFIC_BROWSER_MIN_INTERVAL_SECONDS", 0.75, 0.0, 10.0)
         self.base_cooldown = _env_float("TRAFFIC_403_COOLDOWN_SECONDS", 8.0, 1.0, 60.0)
         self.max_cooldown = _env_float("TRAFFIC_MAX_COOLDOWN_SECONDS", 60.0, 5.0, 240.0)
@@ -84,6 +84,11 @@ class AdaptiveTrafficManager:
         penalty = self._penalty
         scan = max(1, self.base_scan_limit - penalty)
         view = max(2 if self.base_view_limit >= 2 else 1, self.base_view_limit - penalty * 2)
+        # Foreground category pages are more valuable than view enrichment when
+        # several people scan at once.  Keep a small view lane alive, but never let
+        # it fill the process-wide pool and make all five users look frozen.
+        if self._scan_jobs_active >= 4:
+            view = min(view, 2)
         browser = max(1, self.base_browser_limit - (1 if penalty >= 2 else 0))
         global_limit = max(2, self.base_global_limit - penalty * 2)
         return scan, view, browser, global_limit
