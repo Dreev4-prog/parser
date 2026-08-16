@@ -1,3 +1,11 @@
+# v4.1.5 — Self-Bootstrap Fleet
+
+- With `REDIS_URL` present, the main `parser` service automatically starts one embedded browser-backed Redis consumer if no external `fleet-worker` heartbeat exists.
+- A clean Railway install can therefore run a stable single-user scan without creating a second service first.
+- Dedicated `fleet-worker` replicas remain the scaling path for multiple simultaneous users.
+- The embedded fallback is one lane only, uses Chromium/BrowserContext, keeps inline view collection disabled, and advertises the same parser heartbeat used by the queue readiness check.
+- If external fleet workers are already online at startup, the embedded fallback stays idle.
+
 # DT PARSER v4.1.4 — Browser Fleet Bootstrap Fix
 
 - Railway Start Commands corrected for bot, fleet-worker and views-worker (no inline env assignments).

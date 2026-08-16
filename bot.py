@@ -88,7 +88,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.1.4"
+APP_VERSION = "4.1.5"
 MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -115,6 +115,14 @@ if DISTRIBUTED_WORKERS:
 MAX_CONCURRENT_JOBS = max(1, min(12, int(os.getenv("MAX_CONCURRENT_JOBS", "5"))))
 MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
 PARSER_WORKER_CONCURRENCY = max(1, min(8, int(os.getenv("PARSER_WORKER_CONCURRENCY", "1"))))
+# v4.1.5: bootstrap one in-process browser consumer when Redis is configured but
+# no external parser/fleet worker is online yet. This keeps a fresh Railway
+# install functional with only the main parser service; external fleet replicas
+# can be added later for horizontal scaling.
+EMBEDDED_FLEET_FALLBACK = os.getenv("EMBEDDED_FLEET_FALLBACK", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+EMBEDDED_FLEET_READY_WAIT_SECONDS = max(0, min(15, int(os.getenv("EMBEDDED_FLEET_READY_WAIT_SECONDS", "3"))))
 CATEGORY_CACHE_TTL_SECONDS = max(0, int(os.getenv("CATEGORY_CACHE_TTL_SECONDS", "300")))
 SHARE_ACTIVE_CATEGORY_SCANS = os.getenv(
     "SHARE_ACTIVE_CATEGORY_SCANS",
@@ -8046,6 +8054,62 @@ async def start_scan_with_pages(callback: CallbackQuery, state: FSMContext) -> N
     )
 
 
+async def _start_embedded_fleet_fallback(bot: Bot) -> tuple[list[asyncio.Task], object | None]:
+    """Start one browser-backed Redis consumer inside the Telegram service if needed.
+
+    The fallback is intentionally only one lane. It exists so a clean Railway
+    install can parse for one user without creating a second service first. Once
+    dedicated fleet-worker replicas are deployed they share the same Redis Stream
+    and provide the horizontal capacity; the embedded lane remains a small reserve.
+    """
+    if not (DISTRIBUTED_WORKERS and EMBEDDED_FLEET_FALLBACK):
+        return [], None
+
+    deadline = asyncio.get_running_loop().time() + EMBEDDED_FLEET_READY_WAIT_SECONDS
+    external_workers = 0
+    while True:
+        try:
+            external_workers = await COORDINATOR.worker_count(prefix="parser")
+        except Exception:
+            external_workers = 0
+        if external_workers > 0 or asyncio.get_running_loop().time() >= deadline:
+            break
+        await asyncio.sleep(0.5)
+
+    if external_workers > 0:
+        log.info("External Browser Fleet detected at startup | workers=%s | embedded_fallback=idle", external_workers)
+        return [], None
+
+    # parser.py was imported before Railway role detection. Switch its process-local
+    # runtime explicitly for this single fallback lane; KleinanzeigenParser reads
+    # these module globals when each job instance is created.
+    import parser as parser_module
+    parser_module.SCAN_TRANSPORT = "browser"
+    parser_module.SHARED_BROWSER_RUNTIME = True
+    os.environ["SCAN_TRANSPORT"] = "browser"
+    os.environ["SHARED_BROWSER_RUNTIME"] = "1"
+    os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "0"
+
+    worker_id = f"parser-embedded-{os.getenv('RAILWAY_SERVICE_ID', 'service')}-{os.getpid()}"
+    tasks = [
+        asyncio.create_task(
+            distributed_worker_heartbeat(worker_id, "parser"),
+            name="embedded-fleet-heartbeat",
+        ),
+        asyncio.create_task(
+            distributed_scan_worker(bot, f"{worker_id}-1"),
+            name="embedded-fleet-worker",
+        ),
+        asyncio.create_task(progress_ticker(bot), name="embedded-fleet-progress-ticker"),
+    ]
+    log.warning(
+        "Embedded Browser Fleet fallback online | id=%s | lanes=1 | transport=browser | "
+        "add dedicated fleet-worker replicas later for multi-user capacity",
+        worker_id,
+    )
+    return tasks, parser_module
+
+
 async def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
@@ -8100,13 +8164,18 @@ async def main() -> None:
         if recovered_scans:
             log.warning("v3.3.0 recovered %s unfinished user scan(s) after restart", recovered_scans)
 
+    embedded_fleet_tasks: list[asyncio.Task] = []
+    embedded_parser_module = None
+    if DISTRIBUTED_WORKERS:
+        embedded_fleet_tasks, embedded_parser_module = await _start_embedded_fleet_fallback(bot)
+
     me = await bot.get_me()
     traffic = await TRAFFIC.snapshot()
     log.info(
-        "Starting @%s | mode=%s source=%s railway=%s redis=%s | local_workers=%s cache_ttl=%ss | traffic scan=%s view=%s browser=%s global=%s",
+        "Starting @%s | mode=%s source=%s railway=%s redis=%s | local_workers=%s embedded_fleet=%s cache_ttl=%ss | traffic scan=%s view=%s browser=%s global=%s",
         me.username, "distributed" if DISTRIBUTED_WORKERS else "local",
         DISTRIBUTED_MODE_SOURCE, IS_RAILWAY, bool(REDIS_URL),
-        0 if DISTRIBUTED_WORKERS else MAX_CONCURRENT_JOBS, CATEGORY_CACHE_TTL_SECONDS,
+        0 if DISTRIBUTED_WORKERS else MAX_CONCURRENT_JOBS, bool(embedded_fleet_tasks), CATEGORY_CACHE_TTL_SECONDS,
         traffic.scan_limit, traffic.view_limit, traffic.browser_limit, traffic.global_limit,
     )
     log.info("Database backend: %s", DATABASE_BACKEND)
@@ -8149,6 +8218,15 @@ async def main() -> None:
             task.cancel()
         if inflight:
             await asyncio.gather(*inflight, return_exceptions=True)
+        for task in embedded_fleet_tasks:
+            task.cancel()
+        if embedded_fleet_tasks:
+            await asyncio.gather(*embedded_fleet_tasks, return_exceptions=True)
+        if embedded_parser_module is not None:
+            try:
+                await embedded_parser_module.shutdown_shared_browser_runtime()
+            except Exception:
+                log.debug("Embedded browser runtime shutdown failed", exc_info=True)
         if DISTRIBUTED_WORKERS:
             await COORDINATOR.close()
         await bot.session.close()
