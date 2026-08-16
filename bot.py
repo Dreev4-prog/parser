@@ -85,7 +85,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.0.2"
+APP_VERSION = "4.0.3"
 MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -2699,11 +2699,14 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     """
     depth = page_limit if page_limit in PAGE_LIMIT_CHOICES else 50
     target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
-    # v4.0.2: the current Moscow calendar day never needs a separate date-locator.
-    # Kleinanzeigen's default nationwide feed is sorted by newest, so start at page 1
-    # and filter exact listing timestamps while walking forward. This removes the
-    # most failure-prone stage for the common "today" scan.
-    today_fast_path = target_day == datetime.now(MOSCOW).date()
+    # v4.0.3: recent dates (today / yesterday / day before yesterday) never need
+    # a separate date-locator. Kleinanzeigen's nationwide feed is newest-sorted,
+    # so page 1 is the deterministic starting point: skip newer pages, collect the
+    # requested day, and stop once the feed becomes older. This avoids the most
+    # failure-prone chronology-locator path for the dates users select most often.
+    moscow_today = datetime.now(MOSCOW).date()
+    recent_fast_path = 0 <= (moscow_today - target_day).days <= 2
+    today_fast_path = target_day == moscow_today
     progress_key = _progress_key(cat.key, target_date, depth)
     mode = "stable-date" if STABLE_SCAN_ENGINE else "date"
     scan_settings = await get_settings(user_id)
@@ -3026,11 +3029,15 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             return last
 
         if STABLE_SCAN_ENGINE:
-            # v4.0.2 current-day fast path: page 1 is the only safe/necessary
-            # starting point for a newest-sorted feed. Do not spend requests trying
-            # to "locate" today's date before collection begins.
-            if today_fast_path and feed_name == "nationwide":
-                return locator_result("found", "сегодняшняя дата начинается с первой страницы", candidate_page=1)
+            # v4.0.3 recent-date stream path: today / yesterday / day-before-yesterday
+            # all start deterministically from page 1. The collector itself skips
+            # newer pages until the requested day appears. No separate date search.
+            if recent_fast_path and feed_name == "nationwide":
+                return locator_result(
+                    "found",
+                    "свежая дата обрабатывается последовательным проходом с первой страницы",
+                    candidate_page=1,
+                )
 
             # v3.8 deliberately prefers deterministic sequential chronology over
             # jump/binary probing. A single weak page is retried in place and
@@ -3225,7 +3232,12 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         weak_pages = 0
         # Small look-ahead compensates for weak card-template pages without
         # silently reducing the requested 25/50/100-page depth.
-        hard_stop = min(limit, candidate + depth - 1 + STABLE_WEAK_PAGE_GAP_LIMIT * 2)
+        # Recent dates may start many pages below page 1. For them the requested
+        # 25/50/100 depth is measured from the first target-date page, not from page 1,
+        # so allow the deterministic stream to walk the whole public window.
+        hard_stop = limit if recent_fast_path else min(
+            limit, candidate + depth - 1 + STABLE_WEAK_PAGE_GAP_LIMIT * 2
+        )
         while page <= hard_stop:
             items, relation, pairs, days = await fetch(page, "collecting")
             target_on_page = any(d == target_day for d in days)
@@ -3240,11 +3252,11 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     direct_pages_collected += 1
                     update_live(page, days, "collecting", direct_pages_collected)
 
-                # v4.0.2: an otherwise valid current-day page with sparse timestamp
-                # metadata is not a reason to fail the whole category. The feed is
-                # newest-sorted and exact timestamps are still filtered individually.
-                # True invalid/challenge pages remain strict failures.
-                if today_fast_path and relation == "unknown" and items:
+                # v4.0.3: for recent dates an otherwise valid page with sparse
+                # timestamp metadata is not a reason to fail the whole category. The
+                # feed is newest-sorted and exact timestamps are still filtered per
+                # listing. True invalid/challenge pages remain strict failures.
+                if recent_fast_path and relation == "unknown" and items:
                     page += 1
                     continue
 
@@ -3288,9 +3300,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         # We exhausted only the bounded look-ahead because of weak pages. If the
         # target boundary was already seen, preserve useful data without launching
         # the huge regional fallback merely to satisfy a coverage percentage.
-        if today_fast_path and target_seen_any:
+        if recent_fast_path and target_seen_any:
             request_complete = True
-            reason = f"сегодняшняя выдача обработана; страниц с неполными метаданными дат: {weak_pages}"
+            reason = f"свежая дата обработана последовательным проходом; слабых страниц: {weak_pages}"
             return "done", direct_pages_collected
         if target_seen_any and weak_pages <= STABLE_WEAK_PAGE_GAP_LIMIT:
             request_complete = True

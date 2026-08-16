@@ -5,13 +5,13 @@ BOT = (ROOT / "bot.py").read_text()
 
 
 def test_v402_version():
-    assert (ROOT / "VERSION").read_text().strip() == "4.0.2"
-    assert 'APP_VERSION = "4.0.2"' in BOT
+    assert (ROOT / "VERSION").read_text().strip() == "4.0.3"
+    assert 'APP_VERSION = "4.0.3"' in BOT
 
 
 def test_today_skips_date_locator():
-    assert 'today_fast_path = target_day == datetime.now(MOSCOW).date()' in BOT
-    assert 'сегодняшняя дата начинается с первой страницы' in BOT
+    assert 'today_fast_path = target_day == moscow_today' in BOT
+    assert 'свежая дата обрабатывается последовательным проходом с первой страницы' in BOT
     assert 'candidate_page=1' in BOT
 
 
