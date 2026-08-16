@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""DT PARSER v4.0 Railway Browser Fleet worker.
+"""DT PARSER v4.1 Railway Browser Fleet worker.
 
 One Railway replica owns one long-lived Chromium process. Each local worker lane
 gets an isolated BrowserContext inside that process. Scaling replicas therefore
@@ -55,6 +55,8 @@ os.environ["DIST_TRAFFIC_SHARED_COOLDOWN"] = "1"
 # an endless date-search screen. The Stable Engine persists verified pages.
 os.environ.setdefault("BROWSER_SCAN_NAV_TIMEOUT_MS", "25000")
 os.environ.setdefault("BROWSER_SCAN_ACCESS_MAX_WAIT_SECONDS", "60")
+os.environ.setdefault("BROWSER_RESULTS_WAIT_MS", "4500")
+os.environ.setdefault("BROWSER_RENDER_SETTLE_MS", "250")
 os.environ.setdefault("SCAN_AUTO_RECOVERY_PASSES", "2")
 os.environ.setdefault("STABLE_PAGE_RETRIES", "2")
 os.environ.setdefault("STABLE_WEAK_PAGE_GAP_LIMIT", "3")

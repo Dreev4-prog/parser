@@ -67,6 +67,8 @@ if SCAN_TRANSPORT not in {"http", "browser", "hybrid"}:
 BROWSER_SCAN_NAV_TIMEOUT_MS = max(10_000, min(90_000, int(os.getenv("BROWSER_SCAN_NAV_TIMEOUT_MS", "35000"))))
 BROWSER_SCAN_ACCESS_MAX_WAIT_SECONDS = max(10.0, min(180.0, float(os.getenv("BROWSER_SCAN_ACCESS_MAX_WAIT_SECONDS", "45"))))
 BROWSER_SCAN_RETRY_MIN_SECONDS = max(2.0, min(30.0, float(os.getenv("BROWSER_SCAN_RETRY_MIN_SECONDS", "6"))))
+BROWSER_RESULTS_WAIT_MS = max(500, min(12_000, int(os.getenv("BROWSER_RESULTS_WAIT_MS", "4500"))))
+BROWSER_RENDER_SETTLE_MS = max(0, min(2500, int(os.getenv("BROWSER_RENDER_SETTLE_MS", "250"))))
 HYBRID_HTTP_TIMEOUT_MS = max(5_000, min(60_000, int(os.getenv("HYBRID_HTTP_TIMEOUT_MS", "18000"))))
 HYBRID_SESSION_TTL_SECONDS = max(60.0, min(3600.0, float(os.getenv("HYBRID_SESSION_TTL_SECONDS", "900"))))
 HYBRID_HTTP_RETRIES = max(1, min(3, int(os.getenv("HYBRID_HTTP_RETRIES", "2"))))
@@ -1317,12 +1319,31 @@ class KleinanzeigenParser:
                         raise RuntimeError(f"Chromium category HTTP {status}")
 
                     await TRAFFIC.report_success("scan")
+
+                    # v4.1.0 Universal Stream: parse the *rendered DOM*, not the
+                    # navigation response body. Kleinanzeigen can hydrate/normalize
+                    # result-card metadata after DOMContentLoaded; the old code ran a
+                    # real Chromium but then parsed response.text(), which could omit
+                    # publication timestamps and create false chronology/partial errors.
                     try:
-                        text = await response.text()
+                        await page.wait_for_selector(
+                            "article, li.ad-listitem, .ad-listitem, #srchrslt-adtable",
+                            state="attached", timeout=BROWSER_RESULTS_WAIT_MS,
+                        )
                     except Exception:
+                        # Empty result pages legitimately have no ad card selector.
+                        pass
+                    if BROWSER_RENDER_SETTLE_MS:
+                        try:
+                            await page.wait_for_timeout(BROWSER_RENDER_SETTLE_MS)
+                        except Exception:
+                            pass
+                    try:
                         text = await page.content()
+                    except Exception:
+                        text = ""
                     if not text:
-                        text = await page.content()
+                        text = await response.text()
                     return text, final_url
             except TemporaryAccessError:
                 raise

@@ -7,8 +7,8 @@ WORKER = (ROOT / "hybrid_worker.py").read_text(encoding="utf-8")
 
 
 def test_v372_version():
-    assert (ROOT / "VERSION").read_text().strip() == "4.0.4"
-    assert 'APP_VERSION = "4.0.4"' in BOT
+    assert (ROOT / "VERSION").read_text().strip() == "4.1.0"
+    assert 'APP_VERSION = "4.1.0"' in BOT
 
 
 def test_hybrid_is_http_first_with_hard_watchdog():

@@ -1,3 +1,21 @@
+# DT PARSER v4.1.0 — Universal Date Stream
+
+## Главное изменение
+
+В v4.1.0 удалены разные алгоритмы для «сегодня / вчера / позавчера / старая дата». Любая выбранная дата проходит через один newest-sorted chronology stream.
+
+Ключевой production fix: Railway Browser Fleet теперь разбирает **отрендеренный Chromium DOM (`page.content()`)**, а не сырой `response.text()` navigation-response. Это важно для карточек, метаданные которых гидратируются/нормализуются после DOMContentLoaded.
+
+- единый алгоритм любой даты;
+- последовательная проверка от новых объявлений к старым;
+- Date Index используется только как проверяемое ускорение;
+- `unknown` (частично скрытые timestamps) больше не делает категорию partial;
+- partial остаётся только для реальной invalid/challenge/transport ошибки после retries;
+- mixed newer/older без target — нормальное подтверждение пересечения даты, а не ошибка;
+- если дата действительно глубже 50 страниц, тот же алгоритм применяется к независимым location shards;
+- старые distributed result cache инвалидированы namespace `v410:`;
+- PostgreSQL migrations не нужны.
+
 # v4.0.4 — Recent Date Stream Fix
 
 - Сегодня / вчера / позавчера больше не используют отдельный поиск даты: nationwide-выдача идёт последовательно от страницы 1.

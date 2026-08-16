@@ -85,7 +85,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.0.4"
+APP_VERSION = "4.1.0"
 MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -2496,7 +2496,7 @@ def _date_scan_limit(target_date: str) -> int:
 
 def _progress_key(category_key: str, target_date: str, page_limit: int | None = None) -> str:
     depth = int(page_limit or 0)
-    return f"v402:{category_key}:date:{target_date}:depth:{depth}"
+    return f"v410:{category_key}:date:{target_date}:depth:{depth}"
 
 
 scan_queue: asyncio.Queue[ScanJob] = asyncio.Queue()
@@ -2699,14 +2699,15 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     """
     depth = page_limit if page_limit in PAGE_LIMIT_CHOICES else 50
     target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
-    # v4.0.4: recent dates (today / yesterday / day before yesterday) never need
-    # a separate date-locator. Kleinanzeigen's nationwide feed is newest-sorted,
-    # so page 1 is the deterministic starting point: skip newer pages, collect the
-    # requested day, and stop once the feed becomes older. This avoids the most
-    # failure-prone chronology-locator path for the dates users select most often.
+    # v4.1.0 Universal Date Stream. Every date uses the same newest-sorted
+    # chronology algorithm. There are no special "today/yesterday" branches:
+    # page 1 -> sequential evidence -> target window -> older boundary. If the
+    # target is genuinely deeper than the public window, the same stream is run
+    # over independent location shards.
     moscow_today = datetime.now(MOSCOW).date()
-    recent_fast_path = 0 <= (moscow_today - target_day).days <= 2
-    today_fast_path = target_day == moscow_today
+    universal_date_stream = bool(STABLE_SCAN_ENGINE)
+    recent_fast_path = 0 <= (moscow_today - target_day).days <= 2  # UI/telemetry only
+    today_fast_path = target_day == moscow_today  # UI/telemetry only
     progress_key = _progress_key(cat.key, target_date, depth)
     mode = "stable-date" if STABLE_SCAN_ENGINE else "date"
     scan_settings = await get_settings(user_id)
@@ -2724,7 +2725,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         estimated_pages=depth,
         started_monotonic=time.monotonic(),
         page_limit=depth,
-        phase="collecting" if recent_fast_path else "jumping",
+        phase="stable_scan" if universal_date_stream else "jumping",
     )
 
     new_count = 0
@@ -3036,16 +3037,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             return last
 
         if STABLE_SCAN_ENGINE:
-            # v4.0.4 recent-date stream path: today / yesterday / day-before-yesterday
-            # all start deterministically from page 1. The collector itself skips
-            # newer pages until the requested day appears. No separate date search.
-            if recent_fast_path and feed_name == "nationwide":
-                return locator_result(
-                    "found",
-                    "свежая дата обрабатывается последовательным проходом с первой страницы",
-                    candidate_page=1,
-                )
-
+            # v4.1.0: one deterministic newest-sorted locator for every date/feed.
+            # Never skip chronology validation just because the selected date is
+            # recent; that special case was the source of false partial scans.
             # v3.8 deliberately prefers deterministic sequential chronology over
             # jump/binary probing. A single weak page is retried in place and
             # verified pages survive process restarts in PostgreSQL.
@@ -3066,13 +3060,13 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     log.debug("Stored date index could not be revalidated", exc_info=True)
 
             saw_newer = False
-            weak_streak = 0
+            saw_chronology = False
             weak_total = 0
             page = 1
             while page <= effective_limit:
                 items, relation, pairs, days = await stable_fetch(page, "stable_scan")
                 if relation == "target":
-                    weak_streak = 0
+                    saw_chronology = True
                     try:
                         await save_date_index(
                             cat.key, target_date, base_url, status="found",
@@ -3082,49 +3076,58 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                         log.debug("Stable date-index write failed", exc_info=True)
                     return locator_result("found", candidate_page=page)
                 if relation == "newer":
-                    weak_streak = 0
+                    saw_chronology = True
                     saw_newer = True
                     page += 1
                     continue
                 if relation == "empty":
-                    full_feed_visible = site_max_page is not None and site_max_page <= effective_limit
-                    status = "absent" if full_feed_visible else "ambiguous_absent"
-                    if status == "absent":
-                        try:
-                            await save_date_index(cat.key, target_date, base_url, status="absent", max_page=site_max_page)
-                        except Exception:
-                            pass
-                    return locator_result(status, "последовательный проход завершил выдачу")
+                    try:
+                        await save_date_index(cat.key, target_date, base_url, status="absent", max_page=site_max_page)
+                    except Exception:
+                        pass
+                    return locator_result("absent", "последовательный проход завершил выдачу")
                 if relation == "older":
-                    full_feed_visible = site_max_page is not None and site_max_page <= effective_limit
-                    status = "absent" if full_feed_visible else "ambiguous_absent"
-                    if status == "absent":
-                        try:
-                            await save_date_index(cat.key, target_date, base_url, status="absent", max_page=site_max_page)
-                        except Exception:
-                            pass
+                    saw_chronology = True
+                    # The feed is newest-sorted. Once a trustworthy page is older
+                    # than the target (after newer pages, or already on page 1), no
+                    # target-day listing can exist deeper in this same feed.
+                    try:
+                        await save_date_index(cat.key, target_date, base_url, status="absent", max_page=site_max_page)
+                    except Exception:
+                        pass
                     reason_text = (
                         "последовательный проход пересёк выбранную дату без объявлений"
-                        if saw_newer else "выдача уже старше выбранной даты"
+                        if saw_newer else "самые новые объявления уже старше выбранной даты"
                     )
-                    return locator_result(status, reason_text)
-                if relation in {"unknown", "invalid"}:
-                    weak_streak += 1
+                    return locator_result("absent", reason_text)
+                if relation == "mixed":
+                    saw_chronology = True
+                    # Mixed newer/older dates are direct evidence that the sorted
+                    # stream crossed the target day with no exact target timestamp.
+                    try:
+                        await save_date_index(cat.key, target_date, base_url, status="absent", max_page=site_max_page)
+                    except Exception:
+                        pass
+                    return locator_result("absent", "граница выбранной даты пройдена без точных совпадений")
+                if relation == "invalid":
+                    # stable_fetch already retried this exact page. A persistent
+                    # page-identity/challenge failure is a real transport problem;
+                    # unlike sparse dates, it must not be silently skipped.
+                    return locator_result("invalid", invalid_note or f"не удалось получить страницу {page}")
+                if relation == "unknown":
+                    # Sparse/hidden timestamp templates are not a broken page. Keep
+                    # walking until real chronology evidence appears. This is the
+                    # crucial difference between v4.1 and the old partial-prone path.
                     weak_total += 1
-                    # A single A/B-template page with hidden timestamps is not a
-                    # reason to explode into hundreds of regional feeds. Look at
-                    # neighbouring pages first; only a sustained run of pages with
-                    # no chronology evidence is treated as a true parser problem.
-                    if weak_streak > STABLE_WEAK_PAGE_GAP_LIMIT:
-                        return locator_result(
-                            "unknown",
-                            f"{weak_streak} страниц подряд без достаточной хронологии",
-                        )
                     page += 1
                     continue
-                weak_streak = 0
                 page += 1
 
+            if not saw_chronology and weak_total:
+                return locator_result(
+                    "unknown",
+                    f"на {weak_total} страницах не удалось извлечь ни одной надёжной даты",
+                )
             try:
                 await save_date_index(cat.key, target_date, base_url, status="too_deep", max_page=site_max_page)
             except Exception:
@@ -3242,51 +3245,37 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         # Recent dates may start many pages below page 1. For them the requested
         # 25/50/100 depth is measured from the first target-date page, not from page 1,
         # so allow the deterministic stream to walk the whole public window.
-        hard_stop = limit if recent_fast_path else min(
-            limit, candidate + depth - 1 + STABLE_WEAK_PAGE_GAP_LIMIT * 2
-        )
+        # Universal stream may need to skip many newer pages before reaching an
+        # arbitrary historical date, so the search/collection walk may use the
+        # entire verified public window. Only confirmed target pages count toward
+        # the user's requested 25/50/100 depth.
+        hard_stop = limit
         while page <= hard_stop:
             items, relation, pairs, days = await fetch(page, "collecting")
             target_on_page = any(d == target_day for d in days)
 
-            if relation in {"invalid", "unknown"}:
+            if relation == "invalid":
+                # A persistent invalid page is a genuine page/transport failure. The
+                # per-page retry wrapper has already exhausted its attempts.
+                hit_limit = True
+                reason = f"страница {page} не была корректно получена после повторов"
+                return "invalid_stop", direct_pages_collected
+
+            if relation == "unknown":
                 weak_streak += 1
                 weak_pages += 1
-                # Keep any cards whose date *was* parsed exactly even if the page
-                # as a whole had too little evidence for a directional verdict.
+                # Unknown chronology is not a failed page. Preserve exact target-day
+                # cards if any were parsed, then keep walking until a later page gives
+                # us a trustworthy target/older boundary. Never make the whole scan
+                # partial merely because several cards hide their timestamp.
                 if target_on_page:
                     await process_target_items(items, pairs)
                     direct_pages_collected += 1
                     update_live(page, days, "collecting", direct_pages_collected)
-
-                # v4.0.4: for recent dates an otherwise valid page with sparse
-                # timestamp metadata is not a reason to fail the whole category. The
-                # feed is newest-sorted and exact timestamps are still filtered per
-                # listing. True invalid/challenge pages remain strict failures.
-                if recent_fast_path and relation == "unknown" and items:
-                    # A valid newest-sorted page with sparse/hidden timestamps is still
-                    # part of the recent stream. Once we are inside the requested-day
-                    # window (or scanning today from page 1), count the traversed page
-                    # toward the requested 25/50/100 depth even though only listings
-                    # with an exact parsed target date are inserted. This prevents a
-                    # few A/B-template cards from forcing a fake deep/regional scan.
-                    if not target_on_page and (target_seen_any or today_fast_path):
-                        direct_pages_collected += 1
-                        update_live(page, days, "collecting", direct_pages_collected)
-                        if direct_pages_collected >= depth:
-                            request_complete = True
-                            reason = (
-                                f"обработано {depth} последовательных страниц свежей даты; "
-                                f"часть карточек скрывала метку времени"
-                            )
-                            return "done", direct_pages_collected
-                    page += 1
-                    continue
-
-                if weak_streak > STABLE_WEAK_PAGE_GAP_LIMIT:
-                    hit_limit = True
-                    reason = f"недостаточно дат на {weak_streak} страницах подряд"
-                    return "weak_stop", direct_pages_collected
+                    if direct_pages_collected >= depth:
+                        request_complete = True
+                        reason = f"собрано {depth} подтверждённых страниц выбранной даты"
+                        return "done", direct_pages_collected
                 page += 1
                 continue
 
@@ -3320,18 +3309,10 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             hit_limit = True
             return "needs_hidden", direct_pages_collected
 
-        # We exhausted only the bounded look-ahead because of weak pages. If the
-        # target boundary was already seen, preserve useful data without launching
-        # the huge regional fallback merely to satisfy a coverage percentage.
-        if recent_fast_path and target_seen_any:
-            request_complete = True
-            reason = f"свежая дата обработана последовательным проходом; слабых страниц: {weak_pages}"
-            return "done", direct_pages_collected
-        if target_seen_any and weak_pages <= STABLE_WEAK_PAGE_GAP_LIMIT:
-            request_complete = True
-            reason = f"граница даты подтверждена; слабых страниц: {weak_pages}"
-            return "done", direct_pages_collected
-        return "weak_stop", direct_pages_collected
+        # Reaching the public window without an older boundary means the target
+        # may continue deeper. Ask the shard layer for the remaining confirmed
+        # target pages; sparse timestamp pages never cause a fake partial by themselves.
+        return "needs_hidden", direct_pages_collected
 
     async def hidden_fill(remaining_virtual_pages: int) -> tuple[bool, bool]:
         """Fill remaining depth from independent location feeds.
@@ -3437,9 +3418,14 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 except TemporaryAccessError:
                     unresolved = True
                     break
-                if relation in {"invalid", "unknown"}:
+                if relation == "invalid":
                     unresolved = True
                     break
+                if relation == "unknown":
+                    # Same universal rule as the nationwide stream: sparse dates are
+                    # not a transport failure. Continue until target/older evidence.
+                    page += 1
+                    continue
                 if relation == "empty":
                     state_exhausted = True
                     break
@@ -3500,23 +3486,11 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 outcome, direct_pages_collected = await collect_direct(nationwide)
                 if outcome == "needs_hidden" and not request_complete:
                     remaining = max(0, depth - direct_pages_collected)
-                    if recent_fast_path and target_seen_any:
-                        # Recent dates are a single deterministic newest-sorted stream.
-                        # Once the target day was observed, exhausting the public window
-                        # is not evidence that we should explode into 16-180 regional
-                        # feeds merely to compensate for sparse timestamp templates.
-                        request_complete = True
-                        reason = (
-                            f"свежая дата обработана до публичного лимита; "
-                            f"подтверждено {direct_pages_collected} страниц"
-                        )
-                    else:
-                        await hidden_fill(remaining)
-                elif outcome == "weak_stop" and not request_complete:
-                    # Do not fan a chronology-template problem out into up to 180
-                    # regional feeds. Keep the direct evidence and let the bounded
-                    # server recovery retry only the weak pages on the next pass.
-                    reason = reason or "прямой проход остановлен на серии страниц без распознаваемых дат"
+                    await hidden_fill(remaining)
+                elif outcome == "invalid_stop" and not request_complete:
+                    # This is now the only normal direct-pass partial condition:
+                    # an actual page/transport identity failure after retries.
+                    reason = reason or "не удалось корректно получить один из участков выдачи"
             elif nationwide["status"] == "absent":
                 request_complete = True
                 reason = "выбранная дата надёжно пройдена; объявлений за неё не найдено"
