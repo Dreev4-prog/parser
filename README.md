@@ -1,3 +1,7 @@
+## v4.3.0 Multi-User Stable
+
+3 parallel local scan workers, one shared Chromium process, isolated BrowserContext per job. Date/view logic remains v4.2.5.
+
 # DT PARSER v4.2.0 Stable Reset
 
 Production baseline: one reliable in-process browser parser lane, PostgreSQL page checkpoints, Redis removed from the interactive scan path. See `DEPLOY_V4_2_0_STABLE_RESET.md`.

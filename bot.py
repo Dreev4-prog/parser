@@ -88,7 +88,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.2.5"
+APP_VERSION = "4.3.0"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -104,13 +104,21 @@ AVAILABILITY_CONCURRENCY = max(1, min(8, int(os.getenv("AVAILABILITY_CONCURRENCY
 STABLE_SCAN_ENGINE = os.getenv("STABLE_SCAN_ENGINE", "1").strip().lower() not in {"0", "false", "no", "off"}
 STABLE_PAGE_RETRIES = max(1, min(5, int(os.getenv("STABLE_PAGE_RETRIES", "3"))))
 STABLE_PAGE_RETRY_SECONDS = max(0.2, min(10.0, float(os.getenv("STABLE_PAGE_RETRY_SECONDS", "1.2"))))
-# Stable Reset deliberately keeps the proven browser transport but removes the
-# distributed Browser Fleet from the interactive path. One job owns one browser
-# context; successful pages are still checkpointed in PostgreSQL.
+# v4.3.0 Multi-User Stable keeps the proven single Railway service / Stable Engine
+# path, but allows a small local worker pool.  All jobs share ONE Chromium process
+# while every KleinanzeigenParser owns an isolated BrowserContext.  This avoids the
+# old RAM-heavy "one Chromium process per user" design without coupling sessions.
+MULTIUSER_STABLE_MODE = os.getenv("MULTIUSER_STABLE_MODE", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+MULTIUSER_LOCAL_WORKERS = max(1, min(5, int(os.getenv("MULTIUSER_LOCAL_WORKERS", "3"))))
+SCAN_CATEGORY_HARD_TIMEOUT_SECONDS = max(300.0, min(3600.0, float(
+    os.getenv("SCAN_CATEGORY_HARD_TIMEOUT_SECONDS", "1200")
+)))
 if STABLE_SINGLE_SERVICE_MODE:
     import parser as _stable_parser_module
     _stable_parser_module.SCAN_TRANSPORT = "browser"
-    _stable_parser_module.SHARED_BROWSER_RUNTIME = False
+    _stable_parser_module.SHARED_BROWSER_RUNTIME = bool(MULTIUSER_STABLE_MODE)
     SCAN_TRANSPORT = "browser"
 # v4.0.1: tolerate a bounded number of pages with zero usable chronology evidence.
 # They are recorded for diagnostics/recovery but no longer force a whole recent
@@ -128,9 +136,19 @@ os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "1"
 # of jobs are processed at once, while category scans are shared globally.
 MAX_CONCURRENT_JOBS = max(1, min(12, int(os.getenv("MAX_CONCURRENT_JOBS", "5"))))
 if STABLE_SINGLE_SERVICE_MODE:
-    MAX_CONCURRENT_JOBS = 1
+    # Stable single-service no longer means a single user lane.  v4.3.0 starts
+    # three bounded local workers by default; set MULTIUSER_STABLE_MODE=0 for an
+    # instant rollback to the exact one-worker v4.2.5 execution model.
+    MAX_CONCURRENT_JOBS = MULTIUSER_LOCAL_WORKERS if MULTIUSER_STABLE_MODE else 1
 MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
 PARSER_WORKER_CONCURRENCY = max(1, min(8, int(os.getenv("PARSER_WORKER_CONCURRENCY", "1"))))
+if STABLE_SINGLE_SERVICE_MODE and MULTIUSER_STABLE_MODE:
+    # TRAFFIC is process-wide and was initialized during imports. Keep request
+    # pressure bounded, but guarantee enough foreground scan lanes for the local
+    # worker pool. Background 3/6/12h measurements wait while user scans are live.
+    TRAFFIC.base_scan_limit = max(TRAFFIC.base_scan_limit, MAX_CONCURRENT_JOBS)
+    TRAFFIC.base_global_limit = max(TRAFFIC.base_global_limit, MAX_CONCURRENT_JOBS + 2)
+    TRAFFIC.background_during_scans = 0
 # v4.1.7: always bootstrap one in-process browser reserve when Redis is configured.
 # A previous deployment can leave a heartbeat alive for ~20 seconds; treating that
 # stale heartbeat as an external fleet caused the new deployment to skip its own
@@ -151,6 +169,10 @@ SHARE_ACTIVE_CATEGORY_SCANS = os.getenv(
     "SHARE_ACTIVE_CATEGORY_SCANS",
     "1" if STABLE_SCAN_ENGINE else ("0" if SCAN_TRANSPORT in {"browser", "hybrid"} else "1")
 ).strip().lower() not in {"0", "false", "no", "off"}
+if STABLE_SINGLE_SERVICE_MODE and MULTIUSER_STABLE_MODE:
+    # Each user's job must keep its own BrowserContext. A slow date lookup for one
+    # user must never make another user await the same in-flight category task.
+    SHARE_ACTIVE_CATEGORY_SCANS = False
 JOB_PARSER: ContextVar[KleinanzeigenParser | None] = ContextVar("dtparser_job_parser", default=None)
 STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVAL_SECONDS", "1.5")))
 # v3.3.0 job-level resilience on top of parser HTTP retries. A category that
@@ -4912,12 +4934,22 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
         )
         try:
             await edit_job_status(bot, job, render_user_job_status(job), force=True)
-            dispatched = await dispatch_category_with_retry(bot, job, cat)
-            if job.cancel_requested or job.stop_event.is_set():
-                raise ScanStopRequested()
-            dispatched = await auto_recover_partial_category(bot, job, cat, dispatched)
-            if job.cancel_requested or job.stop_event.is_set():
-                raise ScanStopRequested()
+
+            async def _run_category_pipeline() -> CategoryDispatchResult:
+                dispatched_local = await dispatch_category_with_retry(bot, job, cat)
+                if job.cancel_requested or job.stop_event.is_set():
+                    raise ScanStopRequested()
+                dispatched_local = await auto_recover_partial_category(bot, job, cat, dispatched_local)
+                if job.cancel_requested or job.stop_event.is_set():
+                    raise ScanStopRequested()
+                return dispatched_local
+
+            # Hard safety net only. Normal browser/page requests have their own much
+            # shorter timeouts. This prevents a genuinely wedged category from
+            # occupying one of the three user lanes forever.
+            dispatched = await asyncio.wait_for(
+                _run_category_pipeline(), timeout=SCAN_CATEGORY_HARD_TIMEOUT_SECONDS
+            )
             result = dispatched.result
             source_label = "♻️ кэш"
             if dispatched.source == "cache":
@@ -4996,6 +5028,30 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
                 break
             # User sees only useful progress; cache/shared/worker details stay internal.
             await edit_job_status(bot, job, render_user_job_status(job), force=True)
+        except asyncio.TimeoutError:
+            # Cancelled wait_for() work can leave a Playwright page mid-navigation.
+            # Recycle ONLY this job's BrowserContext; the two other user contexts
+            # inside the shared Chromium process remain untouched.
+            parser = JOB_PARSER.get()
+            if parser is not None:
+                try:
+                    await parser.reset_scan_browser_context()
+                except Exception:
+                    log.debug("Could not recycle timed-out browser context job=%s", job.job_id, exc_info=True)
+            minutes = max(1, int(round(SCAN_CATEGORY_HARD_TIMEOUT_SECONDS / 60.0)))
+            note = f"{cat.name}: превышен защитный лимит {minutes} мин.; категория остановлена, остальные продолжаются"
+            log.error("Category watchdog timeout job=%s category=%s seconds=%s", job.job_id, cat.name, SCAN_CATEGORY_HARD_TIMEOUT_SECONDS)
+            job.warnings.append(note)
+            job.scan_notes = job.scan_notes or []
+            job.scan_notes.append(note)
+            job.quality_scores = job.quality_scores or []
+            job.quality_notes = job.quality_notes or []
+            job.quality_scores.append(0)
+            job.quality_notes.append(f"{cat.name}: 0/100 — защитный таймаут")
+            job.incomplete_categories += 1
+            job.incomplete_category_keys = job.incomplete_category_keys or set()
+            job.incomplete_category_keys.add(cat.key)
+            job.completed_categories += 1
         except ScanStopRequested:
             job.cancel_requested = True
             log.info("User stopped scan job=%s category=%s", job.job_id, cat.name)
@@ -8615,9 +8671,11 @@ async def main() -> None:
     log.info("Database backend: %s", DATABASE_BACKEND)
     if STABLE_SINGLE_SERVICE_MODE:
         log.warning(
-            "v4.2.2 Stable Reset + Accurate Views active | parser_lane=1 | transport=browser | "
-            "redis_in_scan_path=False | whole_category_recovery=False | accurate_views=%s | page_retries=%s",
-            ACCURATE_VIEWS_MODE, STABLE_PAGE_RETRIES,
+            "v4.3.0 Multi-User Stable active | parser_lanes=%s | shared_chromium=%s | "
+            "isolated_context_per_job=%s | transport=browser | redis_in_scan_path=False | "
+            "accurate_views=%s | category_watchdog=%ss | page_retries=%s",
+            MAX_CONCURRENT_JOBS, bool(MULTIUSER_STABLE_MODE), bool(MULTIUSER_STABLE_MODE),
+            ACCURATE_VIEWS_MODE, int(SCAN_CATEGORY_HARD_TIMEOUT_SECONDS), STABLE_PAGE_RETRIES,
         )
 
     worker_tasks = [] if DISTRIBUTED_WORKERS else [
@@ -8676,6 +8734,11 @@ async def main() -> None:
                 log.debug("Embedded browser runtime shutdown failed", exc_info=True)
         if DISTRIBUTED_WORKERS:
             await COORDINATOR.close()
+        if STABLE_SINGLE_SERVICE_MODE and MULTIUSER_STABLE_MODE:
+            try:
+                await _stable_parser_module.shutdown_shared_browser_runtime()
+            except Exception:
+                log.debug("Shared local Chromium shutdown failed", exc_info=True)
         await bot.session.close()
 
 
