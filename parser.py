@@ -1051,6 +1051,25 @@ def _extract_passive_view_payload(text: str, *, ad_id: str | None = None) -> tup
     except Exception:
         data = None
 
+    # Kleinanzeigen's own public view-counter endpoint uses the explicit
+    # numVisits / numVisitsStr contract to populate #viewad-cntr-num.  These
+    # names are endpoint-specific and therefore are not the ambiguous generic
+    # `num`/`count` fields rejected below.  If both are present they must agree.
+    if isinstance(data, dict):
+        official_values: list[tuple[str, int]] = []
+        for key in ("numVisits", "numVisitsStr"):
+            if key in data:
+                iv = _coerce_nonnegative_int(data.get(key))
+                if iv is not None:
+                    official_values.append((key, iv))
+        if official_values:
+            values = {v for _, v in official_values}
+            if len(values) == 1:
+                value = official_values[0][1]
+                fields = "+".join(k for k, _ in official_values)
+                return value, f"json-explicit:official-{fields}"
+            return None, "json-explicit:official-numVisits-conflict"
+
     keyed: list[tuple[str, int]] = []
 
     def walk(value, path: str = "$"):
