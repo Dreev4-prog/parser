@@ -51,7 +51,7 @@ MIN_PAGE_DATED_ITEMS = max(1, int(os.getenv("MIN_PAGE_DATED_ITEMS", "2")))
 # dates is still useful even when overall date coverage is low.
 MIN_DIRECTION_DATED_ITEMS = max(1, int(os.getenv("MIN_DIRECTION_DATED_ITEMS", "2")))
 MIN_CHECKPOINT_DATED_ITEMS = max(1, int(os.getenv("MIN_CHECKPOINT_DATED_ITEMS", "2")))
-VIEW_COUNT_GLOBAL_CONCURRENCY = max(1, min(16, int(os.getenv("VIEW_COUNT_GLOBAL_CONCURRENCY", "6"))))
+VIEW_COUNT_GLOBAL_CONCURRENCY = max(1, min(16, int(os.getenv("VIEW_COUNT_GLOBAL_CONCURRENCY", "9"))))
 DIRECT_VIEW_CONCURRENCY = max(1, min(16, int(os.getenv("DIRECT_VIEW_CONCURRENCY", "3"))))
 VIEW_DIRECT_BATCH_SIZE = max(5, min(200, int(os.getenv("VIEW_DIRECT_BATCH_SIZE", "40"))))
 VIEW_DIRECT_BATCH_PAUSE_SECONDS = max(0.0, min(5.0, float(os.getenv("VIEW_DIRECT_BATCH_PAUSE_SECONDS", "0.35"))))
@@ -63,7 +63,7 @@ ACCURATE_VIEW_BROWSER_CONCURRENCY = max(1, min(4, int(os.getenv("ACCURATE_VIEW_B
 # v4.3.2: the official counter endpoint is cheap HTTP.  Let a batch queue enough
 # direct requests to fill the process-wide Views Pool; Chromium fallback remains
 # separately capped by ACCURATE_VIEW_BROWSER_CONCURRENCY.
-ACCURATE_VIEW_HTTP_CONCURRENCY = max(2, min(24, int(os.getenv("ACCURATE_VIEW_HTTP_CONCURRENCY", "8"))))
+ACCURATE_VIEW_HTTP_CONCURRENCY = max(2, min(24, int(os.getenv("ACCURATE_VIEW_HTTP_CONCURRENCY", "12"))))
 ACCURATE_VIEW_DOM_TIMEOUT_MS = max(500, min(8000, int(os.getenv("ACCURATE_VIEW_DOM_TIMEOUT_MS", "2500"))))
 ACCURATE_VIEW_RETRIES = max(1, min(3, int(os.getenv("ACCURATE_VIEW_RETRIES", "2"))))
 
@@ -106,6 +106,12 @@ SHARED_BROWSER_RUNTIME = os.getenv("SHARED_BROWSER_RUNTIME", "0").strip().lower(
 
 
 log = logging.getLogger("kleinanzeigen-parser")
+
+# v4.3.3: coalesce only truly simultaneous direct-counter reads across parser
+# instances. This does NOT cache a measurement: once the in-flight task finishes
+# it is removed immediately. Two users checking the same ad at the same moment
+# therefore share one official endpoint request without changing freshness.
+_DIRECT_VIEW_INFLIGHT: dict[str, asyncio.Task] = {}
 
 
 class _SharedBrowserRuntime:
@@ -2182,6 +2188,33 @@ class KleinanzeigenParser:
             "Sec-Fetch-Site": "same-origin",
         }
 
+    async def _direct_view_http_shared(
+        self, url: str, *, traffic_priority: str = "normal"
+    ) -> tuple[ViewCountResult, bool]:
+        """Single-flight wrapper for simultaneous measurements only.
+
+        Returns ``(result, shared)``. There is intentionally no TTL cache here: the
+        task is removed as soon as it finishes, so later 3/6/12h measurements always
+        perform a fresh read.
+        """
+        ad_id = extract_external_id(url)
+        key = str(ad_id or url)
+        task = _DIRECT_VIEW_INFLIGHT.get(key)
+        shared = task is not None and not task.done()
+        if not shared:
+            task = asyncio.create_task(
+                self._direct_view_http(url, traffic_priority=traffic_priority)
+            )
+            _DIRECT_VIEW_INFLIGHT[key] = task
+
+            def _drop(done_task, *, inflight_key=key):
+                if _DIRECT_VIEW_INFLIGHT.get(inflight_key) is done_task:
+                    _DIRECT_VIEW_INFLIGHT.pop(inflight_key, None)
+
+            task.add_done_callback(_drop)
+        result = await asyncio.shield(task)
+        return result, shared
+
     async def _direct_view_http(self, url: str, *, traffic_priority: str = "normal") -> ViewCountResult:
         ad_id = extract_external_id(url)
         endpoint = self._direct_view_url(ad_id)
@@ -2649,9 +2682,11 @@ class KleinanzeigenParser:
             fallback_urls: list[str] = []
             direct_errors: dict[str, str] = {}
             fallback_lock = asyncio.Lock()
+            phase1_started = time.monotonic()
+            singleflight_hits = 0
 
             async def direct_phase(url: str):
-                nonlocal done_count
+                nonlocal done_count, singleflight_hits
                 if not _allowed_url(url) or "/s-anzeige/" not in url:
                     results[url] = ViewCountResult(
                         None, None, "verified:invalid-url",
@@ -2663,7 +2698,11 @@ class KleinanzeigenParser:
                     return
 
                 async with http_sem:
-                    direct = await self._direct_view_http(url, traffic_priority=traffic_priority)
+                    direct, shared = await self._direct_view_http_shared(
+                        url, traffic_priority=traffic_priority
+                    )
+                if shared:
+                    singleflight_hits += 1
                 if direct.views is not None:
                     results[url] = ViewCountResult(
                         int(direct.views),
@@ -2684,9 +2723,12 @@ class KleinanzeigenParser:
 
             await asyncio.gather(*(direct_phase(url) for url in urls))
             valid_total = sum(1 for url in urls if _allowed_url(url) and "/s-anzeige/" in url)
+            phase1_elapsed = max(0.001, time.monotonic() - phase1_started)
             log.info(
-                "Accurate views phase1 complete total=%s http_ok=%s browser_fallback=%s",
+                "Accurate views phase1 complete total=%s http_ok=%s browser_fallback=%s "
+                "shared=%s elapsed=%.2fs rate=%.1f/s",
                 total, valid_total - len(fallback_urls), len(fallback_urls),
+                singleflight_hits, phase1_elapsed, valid_total / phase1_elapsed,
             )
 
             if fallback_urls:

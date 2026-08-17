@@ -103,7 +103,11 @@ class AdaptiveTrafficManager:
             return self.scan_min_interval
         if kind == "browser":
             return self.browser_min_interval
-        return self.view_min_interval
+        # v4.3.3 Adaptive Fast View Lane. Healthy official-counter traffic can run
+        # at the faster configured cadence. Any 403/429 penalty immediately makes
+        # the cadence progressively more conservative after the global cooldown,
+        # in addition to the existing concurrency reduction.
+        return min(2.0, self.view_min_interval * (2 ** self._penalty))
 
     def _prune_refusals(self, now: float) -> None:
         while self._refusals and now - self._refusals[0] > 60.0:

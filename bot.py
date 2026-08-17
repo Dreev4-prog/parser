@@ -88,7 +88,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.2"
+APP_VERSION = "4.3.3"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -111,16 +111,16 @@ MULTIUSER_STABLE_MODE = os.getenv("MULTIUSER_STABLE_MODE", "1").strip().lower() 
     "0", "false", "no", "off",
 }
 MULTIUSER_LOCAL_WORKERS = max(1, min(5, int(os.getenv("MULTIUSER_LOCAL_WORKERS", "3"))))
-# v4.3.2: process-wide foreground public-view lane. v4.3.0 still inherited the
+# v4.3.3: process-wide foreground public-view lane. v4.3.0 still inherited the
 # old global traffic limit of three view requests, so three simultaneous scans
 # were forced to share only three slots. Six keeps two fast official-counter
 # requests available per default scan worker while the traffic manager still
 # reserves separate capacity for category-page work and serializes Chromium fallback.
-MULTIUSER_VIEW_POOL_SIZE = max(2, min(12, int(os.getenv("MULTIUSER_VIEW_POOL_SIZE", "6"))))
-# v4.3.2: the lightweight official counter can start faster than the old
+MULTIUSER_VIEW_POOL_SIZE = max(2, min(12, int(os.getenv("MULTIUSER_VIEW_POOL_SIZE", "9"))))
+# v4.3.3: the lightweight official counter can start faster than the old
 # 0.20s process-wide cadence. Chromium has its own slower browser limiter.
 MULTIUSER_VIEW_MIN_INTERVAL_SECONDS = max(0.05, min(0.50, float(
-    os.getenv("MULTIUSER_VIEW_MIN_INTERVAL_SECONDS", "0.10")
+    os.getenv("MULTIUSER_VIEW_MIN_INTERVAL_SECONDS", "0.05")
 )))
 SCAN_CATEGORY_HARD_TIMEOUT_SECONDS = max(300.0, min(3600.0, float(
     os.getenv("SCAN_CATEGORY_HARD_TIMEOUT_SECONDS", "1200")
