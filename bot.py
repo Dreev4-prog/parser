@@ -88,7 +88,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.2.3"
+APP_VERSION = "4.2.5"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -116,10 +116,13 @@ if STABLE_SINGLE_SERVICE_MODE:
 # They are recorded for diagnostics/recovery but no longer force a whole recent
 # nationwide scan into the 16-region hidden fallback.
 STABLE_WEAK_PAGE_GAP_LIMIT = max(1, min(8, int(os.getenv("STABLE_WEAK_PAGE_GAP_LIMIT", "3"))))
-PRIMARY_SCAN_INLINE_VIEWS = os.getenv("PRIMARY_SCAN_INLINE_VIEWS", "0").strip().lower() not in {"0", "false", "no", "off"}
-# Stable Reset and distributed scans both keep view-count IO out of page collection.
-if DISTRIBUTED_WORKERS or STABLE_SINGLE_SERVICE_MODE:
-    PRIMARY_SCAN_INLINE_VIEWS = False
+# v4.2.5: every completed primary scan gets a fresh baseline view measurement.
+# The work is deferred until AFTER category/date page collection, so it does not
+# slow the date locator page-by-page. Ignore the legacy Railway flag entirely:
+# older deployments often still have PRIMARY_SCAN_INLINE_VIEWS=0 persisted, which
+# would otherwise silently re-enable the exact v4.2.4 regression we are fixing.
+PRIMARY_SCAN_INLINE_VIEWS = True
+os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "1"
 
 # v2.6 Multi-User Core. User launches go into a queue. Only a limited number
 # of jobs are processed at once, while category scans are shared globally.
@@ -3235,12 +3238,13 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             return last
 
         if STABLE_SCAN_ENGINE:
-            # v4.1.0: one deterministic newest-sorted locator for every date/feed.
-            # Never skip chronology validation just because the selected date is
-            # recent; that special case was the source of false partial scans.
-            # v3.8 deliberately prefers deterministic sequential chronology over
-            # jump/binary probing. A single weak page is retried in place and
-            # verified pages survive process restarts in PostgreSQL.
+            # v4.1.0 kept one deterministic newest-sorted locator for every date/feed.
+            # Sparse/hidden timestamp templates are not a broken page: any weak
+            # probe falls back to the deterministic sequential stream below.
+            # v4.2.4 Fast Date Search. Keep the same verified stable_fetch() and
+            # sequential collection, but locate the first target-date page with
+            # exponential probes + a binary boundary search. If chronology is weak
+            # at any probe, fall back to the old deterministic sequential locator.
             indexed = None
             try:
                 indexed = await load_date_index(cat.key, target_date, base_url)
@@ -3257,80 +3261,235 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 except Exception:
                     log.debug("Stored date index could not be revalidated", exc_info=True)
 
+            async def sequential_locator(start_page: int = 1):
+                saw_newer = False
+                saw_chronology = False
+                weak_total = 0
+                page = max(1, int(start_page))
+                while page <= effective_limit:
+                    items, relation, pairs, days = await stable_fetch(page, "stable_scan")
+                    if relation == "target":
+                        saw_chronology = True
+                        try:
+                            await save_date_index(
+                                cat.key, target_date, base_url, status="found",
+                                candidate_page=page, max_page=site_max_page,
+                            )
+                        except Exception:
+                            log.debug("Stable date-index write failed", exc_info=True)
+                        return locator_result("found", candidate_page=page)
+                    if relation == "newer":
+                        saw_chronology = True
+                        saw_newer = True
+                        page += 1
+                        continue
+                    if relation == "empty":
+                        try:
+                            await save_date_index(cat.key, target_date, base_url, status="absent", max_page=site_max_page)
+                        except Exception:
+                            pass
+                        return locator_result("absent", "последовательный проход завершил выдачу")
+                    if relation == "older":
+                        saw_chronology = True
+                        try:
+                            await save_date_index(cat.key, target_date, base_url, status="absent", max_page=site_max_page)
+                        except Exception:
+                            pass
+                        reason_text = (
+                            "последовательный проход пересёк выбранную дату без объявлений"
+                            if saw_newer else "самые новые объявления уже старше выбранной даты"
+                        )
+                        return locator_result("absent", reason_text)
+                    if relation == "mixed":
+                        saw_chronology = True
+                        try:
+                            await save_date_index(cat.key, target_date, base_url, status="absent", max_page=site_max_page)
+                        except Exception:
+                            pass
+                        return locator_result("absent", "граница выбранной даты пройдена без точных совпадений")
+                    if relation == "invalid":
+                        return locator_result("invalid", invalid_note or f"не удалось получить страницу {page}")
+                    if relation == "unknown":
+                        weak_total += 1
+                        page += 1
+                        continue
+                    page += 1
+
+                if not saw_chronology and weak_total:
+                    return locator_result(
+                        "unknown",
+                        f"на {weak_total} страницах не удалось извлечь ни одной надёжной даты",
+                    )
+                try:
+                    await save_date_index(cat.key, target_date, base_url, status="too_deep", max_page=site_max_page)
+                except Exception:
+                    pass
+                return locator_result("too_deep", "дата глубже публичного окна; перехожу к независимым регионам")
+
+            async def recover_weak_probe(page: int, low_bound: int = 1, high_bound: int | None = None):
+                """Resolve one weak chronology probe locally, never with a full linear rewind.
+
+                v4.2.4 could turn a fast 1/2/4/8/... lookup into a 1..50 crawl as
+                soon as one page hid its timestamps.  We now inspect at most four
+                adjacent pages (distance 1-2).  If none has trustworthy chronology,
+                the scan reports an unknown boundary instead of opening dozens of
+                extra browser navigations.
+                """
+                upper = effective_limit if high_bound is None else min(effective_limit, int(high_bound))
+                lower = max(1, int(low_bound))
+                checked = {int(page)}
+                for radius in (1, 2):
+                    for candidate in (int(page) - radius, int(page) + radius):
+                        if candidate in checked or candidate < lower or candidate > upper:
+                            continue
+                        checked.add(candidate)
+                        _ri, recovered_relation, _rp, _rd = await stable_fetch(candidate, "date_recover")
+                        if recovered_relation == "target":
+                            return candidate, recovered_relation
+                        if recovered_relation not in {"unknown", "invalid"}:
+                            return candidate, recovered_relation
+                return int(page), "unknown"
+
+            # Page 1 is always checked first. For today's date this normally ends
+            # immediately; yesterday/older dates then jump 2,4,8,16,32,50.
+            low_newer = 0
+            high: int | None = None
+            probe = 1
+            while True:
+                _items, relation, _pairs, _days = await stable_fetch(probe, "date_probe")
+                if relation == "invalid":
+                    return locator_result("invalid", invalid_note or f"не удалось получить страницу {probe}")
+                if relation == "unknown":
+                    recovered_page, recovered_relation = await recover_weak_probe(
+                        probe, max(1, low_newer + 1), effective_limit
+                    )
+                    log.info(
+                        "Fast date local recovery category=%s target=%s weak_probe=%s recovered_page=%s relation=%s",
+                        cat.name, target_date, probe, recovered_page, recovered_relation,
+                    )
+                    if recovered_relation == "unknown":
+                        return locator_result(
+                            "unknown",
+                            f"не удалось подтвердить даты около страницы {probe}; полный линейный поиск отключён",
+                        )
+                    probe = recovered_page
+                    relation = recovered_relation
+                if relation == "newer":
+                    low_newer = probe
+                    if probe >= effective_limit:
+                        try:
+                            await save_date_index(cat.key, target_date, base_url, status="too_deep", max_page=site_max_page)
+                        except Exception:
+                            pass
+                        return locator_result("too_deep", "дата глубже публичного окна; перехожу к независимым регионам")
+                    next_probe = min(effective_limit, 2 if probe == 1 else probe * 2)
+                    if next_probe == probe:
+                        return locator_result("too_deep", "дата глубже публичного окна")
+                    probe = next_probe
+                    continue
+                # target / older / mixed / empty all prove that the first target
+                # page, if present, is no deeper than this probe.
+                high = probe
+                break
+
+            lo = max(1, low_newer + 1)
+            hi = max(lo, int(high or lo))
+            while lo < hi:
+                mid = (lo + hi) // 2
+                _items, relation, _pairs, _days = await stable_fetch(mid, "date_probe")
+                if relation == "invalid":
+                    return locator_result("invalid", invalid_note or f"не удалось получить страницу {mid}")
+                if relation == "unknown":
+                    recovered_page, recovered_relation = await recover_weak_probe(mid, lo, hi)
+                    log.info(
+                        "Fast date binary local recovery category=%s target=%s weak_mid=%s recovered_page=%s relation=%s",
+                        cat.name, target_date, mid, recovered_page, recovered_relation,
+                    )
+                    if recovered_relation == "unknown":
+                        return locator_result(
+                            "unknown",
+                            f"не удалось подтвердить границу даты около страницы {mid}",
+                        )
+                    mid = recovered_page
+                    relation = recovered_relation
+                if relation == "newer":
+                    lo = min(hi, mid + 1)
+                else:
+                    hi = max(lo, mid)
+
+            boundary = lo
+            # Verify a tight neighborhood. This protects against a page where a few
+            # cards hide dates without turning date discovery back into a 25-page walk.
+            start_verify = max(1, boundary - 2)
+            end_verify = min(effective_limit, boundary + 3)
             saw_newer = False
-            saw_chronology = False
-            weak_total = 0
-            page = 1
-            while page <= effective_limit:
-                items, relation, pairs, days = await stable_fetch(page, "stable_scan")
+            saw_older = False
+            saw_unknown = False
+            for page in range(start_verify, end_verify + 1):
+                _items, relation, _pairs, _days = await stable_fetch(page, "date_verify")
                 if relation == "target":
-                    saw_chronology = True
+                    candidate = page
+                    # Walk back only while the immediately previous page is also
+                    # target. Binary search already placed us at the first
+                    # non-newer boundary, so this normally costs zero/one request.
+                    while candidate > 1:
+                        prev = candidate - 1
+                        _i2, prev_relation, _p2, _d2 = await stable_fetch(prev, "date_verify")
+                        if prev_relation == "target":
+                            candidate = prev
+                            continue
+                        if prev_relation == "newer":
+                            break
+                        if prev_relation == "unknown":
+                            # Start collection one page earlier rather than launching
+                            # an expensive full linear date search. Collection itself
+                            # will process only cards with an exact target-day date.
+                            candidate = prev
+                            break
+                        if prev_relation == "invalid":
+                            return locator_result("invalid", invalid_note or f"не удалось получить страницу {prev}")
+                        break
                     try:
                         await save_date_index(
                             cat.key, target_date, base_url, status="found",
-                            candidate_page=page, max_page=site_max_page,
+                            candidate_page=candidate, max_page=site_max_page,
                         )
                     except Exception:
                         log.debug("Stable date-index write failed", exc_info=True)
-                    return locator_result("found", candidate_page=page)
-                if relation == "newer":
-                    saw_chronology = True
-                    saw_newer = True
-                    page += 1
-                    continue
-                if relation == "empty":
-                    try:
-                        await save_date_index(cat.key, target_date, base_url, status="absent", max_page=site_max_page)
-                    except Exception:
-                        pass
-                    return locator_result("absent", "последовательный проход завершил выдачу")
-                if relation == "older":
-                    saw_chronology = True
-                    # The feed is newest-sorted. Once a trustworthy page is older
-                    # than the target (after newer pages, or already on page 1), no
-                    # target-day listing can exist deeper in this same feed.
-                    try:
-                        await save_date_index(cat.key, target_date, base_url, status="absent", max_page=site_max_page)
-                    except Exception:
-                        pass
-                    reason_text = (
-                        "последовательный проход пересёк выбранную дату без объявлений"
-                        if saw_newer else "самые новые объявления уже старше выбранной даты"
+                    log.info(
+                        "Fast date locator found category=%s target=%s page=%s requests=%s",
+                        cat.name, target_date, candidate, network_requests,
                     )
-                    return locator_result("absent", reason_text)
-                if relation == "mixed":
-                    saw_chronology = True
-                    # Mixed newer/older dates are direct evidence that the sorted
-                    # stream crossed the target day with no exact target timestamp.
-                    try:
-                        await save_date_index(cat.key, target_date, base_url, status="absent", max_page=site_max_page)
-                    except Exception:
-                        pass
-                    return locator_result("absent", "граница выбранной даты пройдена без точных совпадений")
-                if relation == "invalid":
-                    # stable_fetch already retried this exact page. A persistent
-                    # page-identity/challenge failure is a real transport problem;
-                    # unlike sparse dates, it must not be silently skipped.
+                    return locator_result("found", candidate_page=candidate)
+                if relation == "newer":
+                    saw_newer = True
+                elif relation in {"older", "mixed", "empty"}:
+                    saw_older = True
+                elif relation == "invalid":
                     return locator_result("invalid", invalid_note or f"не удалось получить страницу {page}")
-                if relation == "unknown":
-                    # Sparse/hidden timestamp templates are not a broken page. Keep
-                    # walking until real chronology evidence appears. This is the
-                    # crucial difference between v4.1 and the old partial-prone path.
-                    weak_total += 1
-                    page += 1
+                elif relation == "unknown":
+                    saw_unknown = True
                     continue
-                page += 1
 
-            if not saw_chronology and weak_total:
-                return locator_result(
-                    "unknown",
-                    f"на {weak_total} страницах не удалось извлечь ни одной надёжной даты",
-                )
-            try:
-                await save_date_index(cat.key, target_date, base_url, status="too_deep", max_page=site_max_page)
-            except Exception:
-                pass
-            return locator_result("too_deep", "дата глубже публичного окна; перехожу к независимым регионам")
+            full_feed_visible = site_max_page is not None and site_max_page <= effective_limit
+            if saw_newer and saw_older and full_feed_visible and not saw_unknown:
+                try:
+                    await save_date_index(cat.key, target_date, base_url, status="absent", max_page=site_max_page)
+                except Exception:
+                    pass
+                return locator_result("absent", "быстрый поиск подтвердил пересечение даты без объявлений")
+            if saw_older and low_newer == 0 and full_feed_visible and not saw_unknown:
+                return locator_result("absent", "самые новые объявления уже старше выбранной даты")
+            if saw_unknown:
+                return locator_result("unknown", "часть страниц около границы даты не отдала надёжную дату")
+            # Large feeds need the existing hidden/regional logic rather than a
+            # false zero when the public 50-page window cannot prove absence.
+            if not full_feed_visible and saw_older:
+                return locator_result("ambiguous_absent", "large feed requires independent sub-feed verification")
+            return locator_result(
+                "unknown",
+                "быстрый поиск не смог надёжно определить границу даты без полного линейного прохода",
+            )
 
         low_newer = 0
         high: int | None = None
@@ -8346,7 +8505,6 @@ async def _start_embedded_fleet_fallback(bot: Bot) -> tuple[list[asyncio.Task], 
     parser_module.SHARED_BROWSER_RUNTIME = True
     os.environ["SCAN_TRANSPORT"] = "browser"
     os.environ["SHARED_BROWSER_RUNTIME"] = "1"
-    os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "0"
 
     worker_id = f"parser-embedded-{os.getenv('RAILWAY_SERVICE_ID', 'service')}-{os.getpid()}"
 

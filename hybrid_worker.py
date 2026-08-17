@@ -14,7 +14,7 @@ import os
 # Configure before parser/bot imports because production settings are read at import.
 os.environ.setdefault("SCAN_TRANSPORT", "hybrid")
 os.environ["STABLE_SCAN_ENGINE"] = "1"
-os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "0"
+os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "1"
 os.environ.setdefault("STABLE_PAGE_RETRIES", "3")
 os.environ.setdefault("STABLE_PAGE_CHECKPOINT_TTL_SECONDS", "300")
 os.environ.setdefault("STABLE_DATE_INDEX_TTL_SECONDS", "900")

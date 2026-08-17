@@ -11,7 +11,7 @@ import os
 
 os.environ["SCAN_TRANSPORT"] = "hybrid"
 os.environ["STABLE_SCAN_ENGINE"] = "1"
-os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "0"
+os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "1"
 os.environ["SHARE_ACTIVE_CATEGORY_SCANS"] = "1"
 os.environ.setdefault("PARSER_WORKER_CONCURRENCY", "1")
 os.environ["DIST_TRAFFIC_SHARED_COOLDOWN"] = "0"

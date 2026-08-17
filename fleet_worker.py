@@ -30,7 +30,7 @@ os.environ["DISTRIBUTED_WORKERS"] = "1"
 os.environ["SCAN_TRANSPORT"] = "browser"
 os.environ["STABLE_SCAN_ENGINE"] = "1"
 os.environ["SHARED_BROWSER_RUNTIME"] = "1"
-os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "0"
+os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "1"
 # Every active user gets an independent BrowserContext. Completed-result caches
 # still work, but a slow in-flight user cannot make another user subscribe to it.
 os.environ["SHARE_ACTIVE_CATEGORY_SCANS"] = "0"

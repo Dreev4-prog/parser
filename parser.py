@@ -1051,23 +1051,34 @@ def _extract_passive_view_payload(text: str, *, ad_id: str | None = None) -> tup
     except Exception:
         data = None
 
-    # Kleinanzeigen's own public view-counter endpoint uses the explicit
-    # numVisits / numVisitsStr contract to populate #viewad-cntr-num.  These
-    # names are endpoint-specific and therefore are not the ambiguous generic
-    # `num`/`count` fields rejected below.  If both are present they must agree.
-    if isinstance(data, dict):
-        official_values: list[tuple[str, int]] = []
-        for key in ("numVisits", "numVisitsStr"):
-            if key in data:
-                iv = _coerce_nonnegative_int(data.get(key))
-                if iv is not None:
-                    official_values.append((key, iv))
+    # Kleinanzeigen's public s-vac-inc-get endpoint is itself the view-counter
+    # endpoint. Accept its official numVisits/numVisitsStr contract anywhere in
+    # the JSON tree because some deployments wrap the payload. Generic
+    # count/value fields and bare numbers remain forbidden.
+    official_values: list[tuple[str, int]] = []
+
+    def walk_official(value, path: str = "$"):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                key = str(k)
+                compact = re.sub(r"[^a-z0-9]", "", key.lower())
+                next_path = f"{path}.{key}"
+                if compact in {"numvisits", "numvisitsstr"}:
+                    iv = _coerce_nonnegative_int(v)
+                    if iv is not None:
+                        official_values.append((next_path, iv))
+                walk_official(v, next_path)
+        elif isinstance(value, list):
+            for i, v in enumerate(value[:100]):
+                walk_official(v, f"{path}[{i}]")
+
+    if data is not None:
+        walk_official(data)
         if official_values:
             values = {v for _, v in official_values}
             if len(values) == 1:
-                value = official_values[0][1]
-                fields = "+".join(k for k, _ in official_values)
-                return value, f"json-explicit:official-{fields}"
+                path, value = official_values[0]
+                return value, f"json-explicit:official-{path}"
             return None, "json-explicit:official-numVisits-conflict"
 
     keyed: list[tuple[str, int]] = []
@@ -1098,7 +1109,7 @@ def _extract_passive_view_payload(text: str, *, ad_id: str | None = None) -> tup
             return None, "json-explicit:conflict"
 
     m = re.search(
-        r'(?i)(?:"|\b)(views?|view[_-]?count|view[_-]?counter|counter|cntr|aufrufe?)(?:"|\b)\s*[:=]\s*"?(\d{1,9})"?',
+        r'(?i)(?:"|\b)(num[_-]?visits?(?:str)?|views?|view[_-]?count|view[_-]?counter|counter|cntr|aufrufe?)(?:"|\b)\s*[:=]\s*"?(\d{1,9})"?',
         body,
     )
     if m:
@@ -2028,7 +2039,25 @@ class KleinanzeigenParser:
         except Exception as exc:
             return ViewCountResult(None, None, "verified:playwright-unavailable", error=str(exc))
 
-        last_error = None
+        # v4.2.4: use Kleinanzeigen's own dedicated public counter endpoint as
+        # the primary source. Earlier Accurate Views builds opened every ad page
+        # first; on Railway that was both slow and, when the counter XHR did not
+        # fire in headless Chromium, produced an all-empty spreadsheet. The direct
+        # endpoint already returned HTTP 200 reliably in production. We now parse
+        # only its official numVisits/numVisitsStr payload and fall back to the
+        # rendered ad page only when that exact contract is unavailable.
+        direct = await self._direct_view_http(url, traffic_priority=traffic_priority)
+        if direct.views is not None:
+            return ViewCountResult(
+                int(direct.views),
+                direct.raw_text,
+                f"verified-official:{direct.source}",
+                direct.final_url,
+                direct.page_title,
+                None,
+            )
+
+        last_error = direct.error or direct.source
         for attempt in range(1, ACCURATE_VIEW_RETRIES + 1):
             page = None
             passive_tasks = []
