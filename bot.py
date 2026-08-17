@@ -88,7 +88,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.4"
+APP_VERSION = "4.3.5"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -385,7 +385,7 @@ def scan_detail_keyboard(scan_id: int, *, archived: bool = False, recheck: bool 
          InlineKeyboardButton(text="📋 TOP-50", callback_data=f"scantop50:{scan_id}:0")],
         [InlineKeyboardButton(text="🚀 Топ роста", callback_data=f"scangrowth:{scan_id}:3")],
         [InlineKeyboardButton(text="👁 Обновить", callback_data=f"scanviews:{scan_id}"),
-         InlineKeyboardButton(text="📄 CSV", callback_data=f"scanexport:{scan_id}")],
+         InlineKeyboardButton(text="📊 XLSX", callback_data=f"scanexport:{scan_id}")],
     ]
     if recheck and not STABLE_SCAN_ENGINE:
         rows.append([InlineKeyboardButton(text="🔄 Допроверить категории", callback_data=f"scanrecheck:{scan_id}")])
@@ -1772,6 +1772,225 @@ def _group_export_rows(rows: list) -> list:
     return [row for _, row in decorated]
 
 
+def _export_section_name(row) -> str:
+    """Human-readable top-level Kleinanzeigen section for universal XLSX exports."""
+    category_key = getattr(row, "category_key", None)
+    cat = CATEGORIES.get(category_key) if category_key else None
+    if cat is None:
+        category_name = str(getattr(row, "category", "") or "")
+        cat = next((item for item in CATEGORIES.values() if item.name == category_name and not item.is_group), None)
+    if cat is None:
+        return "Другое"
+    group = GROUPS.get(cat.group)
+    return group.name if group is not None else cat.group
+
+
+def _write_universal_xlsx(
+    filename: str,
+    title: str,
+    headers: list[str],
+    data_rows: list[list],
+    *,
+    hyperlink_headers: set[str] | None = None,
+    integer_headers: set[str] | None = None,
+    decimal_headers: set[str] | None = None,
+) -> Path:
+    """Create a mobile-friendly XLSX that renders consistently across iOS/Android/desktop."""
+    out_dir = Path(tempfile.mkdtemp(prefix="kleinanzeigen_xlsx_"))
+    path = out_dir / filename
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Результаты"
+
+    max_col = max(1, len(headers))
+    ws.append([title])
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max_col)
+    ws["A1"].font = Font(bold=True, size=14, color="FFFFFF")
+    ws["A1"].fill = PatternFill("solid", fgColor="17365D")
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[1].height = 26
+
+    ws.append(headers)
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+    for cell in ws[2]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[2].height = 34
+
+    for values in data_rows:
+        ws.append(values)
+
+    ws.freeze_panes = "A3"
+    ws.auto_filter.ref = f"A2:{ws.cell(row=2, column=max_col).column_letter}{max(2, ws.max_row)}"
+    ws.sheet_view.showGridLines = False
+
+    hyperlink_headers = hyperlink_headers or set()
+    integer_headers = integer_headers or set()
+    decimal_headers = decimal_headers or set()
+    header_to_col = {str(cell.value): cell.column for cell in ws[2] if cell.value is not None}
+
+    for header in hyperlink_headers:
+        col = header_to_col.get(header)
+        if not col:
+            continue
+        for row_num in range(3, ws.max_row + 1):
+            cell = ws.cell(row=row_num, column=col)
+            if cell.value:
+                cell.hyperlink = str(cell.value)
+                cell.style = "Hyperlink"
+
+    for header in integer_headers:
+        col = header_to_col.get(header)
+        if col:
+            for row_num in range(3, ws.max_row + 1):
+                ws.cell(row=row_num, column=col).number_format = "0"
+    for header in decimal_headers:
+        col = header_to_col.get(header)
+        if col:
+            for row_num in range(3, ws.max_row + 1):
+                ws.cell(row=row_num, column=col).number_format = "0.00"
+
+    # Make section changes obvious without inserting blank rows that would break filters.
+    section_col = header_to_col.get("Раздел")
+    section_fill = PatternFill("solid", fgColor="D9EAF7")
+    last_section = None
+    for row_num in range(3, ws.max_row + 1):
+        current_section = ws.cell(row=row_num, column=section_col).value if section_col else None
+        if section_col and current_section != last_section:
+            for col_num in range(1, max_col + 1):
+                ws.cell(row=row_num, column=col_num).fill = section_fill
+                ws.cell(row=row_num, column=col_num).font = Font(bold=True)
+        last_section = current_section
+        for col_num in range(1, max_col + 1):
+            ws.cell(row=row_num, column=col_num).alignment = Alignment(vertical="top", wrap_text=True)
+
+    width_by_header = {
+        "#": 6, "Раздел": 28, "Категория": 28, "Название": 48, "Товар": 48,
+        "Группа товара": 34, "Пример названия": 46, "Цена": 15, "Цена, €": 12,
+        "Цена примера": 15, "👁 Просмотры": 15, "Публикаций": 13, "Мин. цена, €": 14,
+        "Медиана, €": 14, "Макс. цена, €": 14, "Точность группы, %": 18,
+        "Последнее": 18, "Дата (МСК)": 15, "Как показано на Kleinanzeigen": 25,
+        "Медиана группы, €": 18, "Ниже медианы, %": 18, "Образцов": 12,
+        "Точность": 15, "Время жизни, мин": 18, "Окно проверки, мин": 19,
+        "Впервые замечено": 19, "Обнаружено исчезновение": 22, "Старая цена, €": 15,
+        "Новая цена, €": 15, "Снижение, €": 14, "Снижение, %": 14,
+        "Зафиксировано": 18, "Ссылка": 48, "Ссылка-пример": 48,
+    }
+    for cell in ws[2]:
+        width = width_by_header.get(str(cell.value), 16)
+        ws.column_dimensions[cell.column_letter].width = width
+
+    # Keep rows compact enough for phone viewers while still allowing wrapped titles.
+    for row_num in range(3, ws.max_row + 1):
+        ws.row_dimensions[row_num].height = 32
+
+    wb.save(path)
+    return path
+
+
+def write_listing_xlsx(rows: list[Listing], mode: str) -> Path:
+    now = datetime.now(MOSCOW)
+    headers = [
+        "Раздел", "Категория", "Название", "Цена", "Цена, €", "👁 Просмотры",
+        "Дата (МСК)", "Как показано на Kleinanzeigen", "Ссылка",
+    ]
+    data = [[
+        _export_section_name(row), row.category, row.title,
+        _price_display(row.price_text, row.price_eur),
+        row.price_eur if row.price_eur is not None else None,
+        row.view_count if row.view_count is not None else None,
+        _date_label(row.posted_date_msk), row.posted_text or "", row.url,
+    ] for row in rows]
+    return _write_universal_xlsx(
+        f"kleinanzeigen_{mode}_{now:%Y-%m-%d_%H-%M}.xlsx",
+        f"Kleinanzeigen · {MODE_LABELS.get(mode, mode)} · {len(rows)} объявлений",
+        headers, data,
+        hyperlink_headers={"Ссылка"}, integer_headers={"Цена, €", "👁 Просмотры"},
+    )
+
+
+def write_frequent_xlsx(rows) -> Path:
+    now = datetime.now(MOSCOW)
+    headers = [
+        "Раздел", "Категория", "Группа товара", "Пример названия", "Цена примера",
+        "Публикаций", "Мин. цена, €", "Медиана, €", "Макс. цена, €",
+        "Точность группы, %", "Последнее", "Ссылка-пример",
+    ]
+    data = [[
+        _export_section_name(row), row.category, row.product_key, row.example_title,
+        row.example_price_text or "—", row.count, row.min_price, row.median_price,
+        row.max_price, row.confidence, row.newest_posted, row.example_url,
+    ] for row in rows]
+    return _write_universal_xlsx(
+        f"kleinanzeigen_chasto_publikuemye_{now:%Y-%m-%d_%H-%M}.xlsx",
+        f"Kleinanzeigen · Часто публикуемые · {len(rows)} групп",
+        headers, data, hyperlink_headers={"Ссылка-пример"},
+        integer_headers={"Публикаций", "Мин. цена, €", "Медиана, €", "Макс. цена, €", "Точность группы, %"},
+    )
+
+
+def write_market_xlsx(rows) -> Path:
+    now = datetime.now(MOSCOW)
+    headers = [
+        "Раздел", "Категория", "Название", "Цена", "Цена, €", "👁 Просмотры",
+        "Медиана группы, €", "Ниже медианы, %", "Образцов", "Точность группы, %", "Дата", "Ссылка",
+    ]
+    data = [[
+        _export_section_name(row), row.category, row.title,
+        row.price_text or (f"{row.price_eur} €" if row.price_eur is not None else "—"),
+        row.price_eur, getattr(row, "view_count", None), row.median_price,
+        row.discount_pct, row.samples, row.confidence, row.posted_text, row.url,
+    ] for row in rows]
+    return _write_universal_xlsx(
+        f"kleinanzeigen_nizhe_rynka_{now:%Y-%m-%d_%H-%M}.xlsx",
+        f"Kleinanzeigen · Ниже рынка · {len(rows)} объявлений",
+        headers, data, hyperlink_headers={"Ссылка"},
+        integer_headers={"Цена, €", "👁 Просмотры", "Медиана группы, €", "Образцов", "Точность группы, %"},
+        decimal_headers={"Ниже медианы, %"},
+    )
+
+
+def write_disappearing_xlsx(rows) -> Path:
+    now = datetime.now(MOSCOW)
+    headers = [
+        "Раздел", "Категория", "Название", "Цена", "Время жизни, мин",
+        "Окно проверки, мин", "Точность", "Впервые замечено", "Обнаружено исчезновение", "Ссылка",
+    ]
+    data = [[
+        _export_section_name(row), row.category, row.title, row.price_text or "—",
+        row.lifespan_minutes, row.detection_gap_minutes, row.confidence,
+        _berlin_text(row.first_seen_at), _berlin_text(row.disappeared_at), row.url,
+    ] for row in rows]
+    return _write_universal_xlsx(
+        f"kleinanzeigen_bystro_ischezayushchie_{now:%Y-%m-%d_%H-%M}.xlsx",
+        f"Kleinanzeigen · Быстро исчезающие · {len(rows)} объявлений",
+        headers, data, hyperlink_headers={"Ссылка"},
+        integer_headers={"Время жизни, мин", "Окно проверки, мин"},
+    )
+
+
+def write_price_drop_xlsx(rows) -> Path:
+    now = datetime.now(MOSCOW)
+    headers = [
+        "Раздел", "Категория", "Название", "Старая цена, €", "Новая цена, €",
+        "Снижение, €", "Снижение, %", "Зафиксировано", "Ссылка",
+    ]
+    data = [[
+        _export_section_name(row), row.category, row.title, row.previous_price, row.current_price,
+        row.drop_eur, row.drop_pct, _berlin_text(row.changed_at), row.url,
+    ] for row in rows]
+    return _write_universal_xlsx(
+        f"kleinanzeigen_snizhenie_ceny_{now:%Y-%m-%d_%H-%M}.xlsx",
+        f"Kleinanzeigen · Снижение цены · {len(rows)} объявлений",
+        headers, data, hyperlink_headers={"Ссылка"},
+        integer_headers={"Старая цена, €", "Новая цена, €", "Снижение, €"},
+        decimal_headers={"Снижение, %"},
+    )
+
+
 def write_listing_csv(rows: list[Listing], mode: str) -> Path:
     now = datetime.now(MOSCOW)
     path, writer, f = _temp_csv(f"kleinanzeigen_{mode}_{now:%Y-%m-%d_%H-%M}.csv")
@@ -2370,8 +2589,8 @@ async def send_smart_export(
             await message.answer("🔥 Пока нет групп минимум с 3 публикациями по текущим фильтрам.", reply_markup=main_keyboard(selected_count))
             return 0
         result = _group_export_rows(result)
-        path = write_frequent_csv(result)
-        caption = f"🔥 Часто публикуемые группы: {len(result)}"
+        path = write_frequent_xlsx(result)
+        caption = f"🔥 Часто публикуемые группы: {len(result)} · 📊 XLSX"
 
     elif mode == "below_market":
         result = below_market_rows(base)
@@ -2379,8 +2598,8 @@ async def send_smart_export(
             await message.answer("💰 Нужны минимум 5 цен в одной уверенной группе; сейчас нет позиций ≥20% ниже медианы похожих объявлений.", reply_markup=main_keyboard(selected_count))
             return 0
         result = _group_export_rows(result)
-        path = write_market_csv(result)
-        caption = f"💰 Потенциально ниже рынка: {len(result)}"
+        path = write_market_xlsx(result)
+        caption = f"💰 Потенциально ниже рынка: {len(result)} · 📊 XLSX"
 
     elif mode == "fast_disappearing":
         status = await message.answer(
@@ -2408,8 +2627,8 @@ async def send_smart_export(
             )
             return 0
         result = _group_export_rows(result)
-        path = write_disappearing_csv(result)
-        caption = f"⚡ Быстро исчезающие: {len(result)}"
+        path = write_disappearing_xlsx(result)
+        caption = f"⚡ Быстро исчезающие: {len(result)} · 📊 XLSX"
 
     elif mode == "price_drop":
         histories = await histories_for(base)
@@ -2421,8 +2640,8 @@ async def send_smart_export(
             )
             return 0
         result = _group_export_rows(result)
-        path = write_price_drop_csv(result)
-        caption = f"📉 Снижение цены: {len(result)}"
+        path = write_price_drop_xlsx(result)
+        caption = f"📉 Снижение цены: {len(result)} · 📊 XLSX"
 
     else:
         result = sort_rows(base, s.sort_mode)
@@ -2430,8 +2649,8 @@ async def send_smart_export(
             await message.answer("📦 По текущим фильтрам ничего не найдено.", reply_markup=main_keyboard(selected_count))
             return 0
         result = _group_export_rows(result)
-        path = write_listing_csv(result, mode)
-        caption = f"📦 {MODE_LABELS.get(mode, mode)}: {len(result)}"
+        path = write_listing_xlsx(result, mode)
+        caption = f"📦 {MODE_LABELS.get(mode, mode)}: {len(result)} · 📊 XLSX"
 
     try:
         await message.answer_document(FSInputFile(path), caption=caption, reply_markup=main_keyboard(selected_count))
