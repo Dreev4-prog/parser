@@ -60,6 +60,10 @@ VIEW_DIRECT_BATCH_PAUSE_SECONDS = max(0.0, min(5.0, float(os.getenv("VIEW_DIRECT
 # and only accept counters that can be tied to the visible view UI (or a strict
 # explicit views field from the page's own counter response).
 ACCURATE_VIEW_BROWSER_CONCURRENCY = max(1, min(4, int(os.getenv("ACCURATE_VIEW_BROWSER_CONCURRENCY", "2"))))
+# v4.3.2: the official counter endpoint is cheap HTTP.  Let a batch queue enough
+# direct requests to fill the process-wide Views Pool; Chromium fallback remains
+# separately capped by ACCURATE_VIEW_BROWSER_CONCURRENCY.
+ACCURATE_VIEW_HTTP_CONCURRENCY = max(2, min(24, int(os.getenv("ACCURATE_VIEW_HTTP_CONCURRENCY", "8"))))
 ACCURATE_VIEW_DOM_TIMEOUT_MS = max(500, min(8000, int(os.getenv("ACCURATE_VIEW_DOM_TIMEOUT_MS", "2500"))))
 ACCURATE_VIEW_RETRIES = max(1, min(3, int(os.getenv("ACCURATE_VIEW_RETRIES", "2"))))
 
@@ -2022,42 +2026,20 @@ class KleinanzeigenParser:
                 pass
         return None, None, "verified-dom:not-found"
 
-    async def fetch_public_view_count_accurate(
-        self, url: str, *, traffic_priority: str = "normal"
+    async def _fetch_public_view_count_browser_verified(
+        self,
+        url: str,
+        *,
+        traffic_priority: str = "normal",
+        initial_error: str | None = None,
     ) -> ViewCountResult:
-        """Return a fail-closed public view count suitable for ranking.
-
-        The rendered DOM is authoritative. The page's passive counter response is
-        only a fallback and is parsed with explicit view-field rules. Unknown is
-        returned instead of guessing or substituting zero.
-        """
-        if not _allowed_url(url) or "/s-anzeige/" not in url:
-            return ViewCountResult(None, None, "verified:invalid-url", error="Нужна публичная ссылка Kleinanzeigen")
-
+        """Verified Chromium fallback used only after the official HTTP counter misses."""
         try:
             from playwright.async_api import TimeoutError as PlaywrightTimeoutError
         except Exception as exc:
             return ViewCountResult(None, None, "verified:playwright-unavailable", error=str(exc))
 
-        # v4.2.4: use Kleinanzeigen's own dedicated public counter endpoint as
-        # the primary source. Earlier Accurate Views builds opened every ad page
-        # first; on Railway that was both slow and, when the counter XHR did not
-        # fire in headless Chromium, produced an all-empty spreadsheet. The direct
-        # endpoint already returned HTTP 200 reliably in production. We now parse
-        # only its official numVisits/numVisitsStr payload and fall back to the
-        # rendered ad page only when that exact contract is unavailable.
-        direct = await self._direct_view_http(url, traffic_priority=traffic_priority)
-        if direct.views is not None:
-            return ViewCountResult(
-                int(direct.views),
-                direct.raw_text,
-                f"verified-official:{direct.source}",
-                direct.final_url,
-                direct.page_title,
-                None,
-            )
-
-        last_error = direct.error or direct.source
+        last_error = initial_error
         for attempt in range(1, ACCURATE_VIEW_RETRIES + 1):
             page = None
             passive_tasks = []
@@ -2125,6 +2107,35 @@ class KleinanzeigenParser:
                 await asyncio.sleep(0.25 * attempt)
 
         return ViewCountResult(None, None, "verified:not-found", url, None, last_error or "counter not found")
+
+    async def fetch_public_view_count_accurate(
+        self, url: str, *, traffic_priority: str = "normal"
+    ) -> ViewCountResult:
+        """Return an exact public view count or unknown; never guess.
+
+        Kleinanzeigen's dedicated public counter endpoint is the fast primary
+        source. Chromium is a verified fallback only when that endpoint cannot
+        provide an explicit counter value.
+        """
+        if not _allowed_url(url) or "/s-anzeige/" not in url:
+            return ViewCountResult(None, None, "verified:invalid-url", error="Нужна публичная ссылка Kleinanzeigen")
+
+        direct = await self._direct_view_http(url, traffic_priority=traffic_priority)
+        if direct.views is not None:
+            return ViewCountResult(
+                int(direct.views),
+                direct.raw_text,
+                f"verified-official:{direct.source}",
+                direct.final_url,
+                direct.page_title,
+                None,
+            )
+
+        return await self._fetch_public_view_count_browser_verified(
+            url,
+            traffic_priority=traffic_priority,
+            initial_error=direct.error or direct.source,
+        )
 
     async def _page_diagnostic(self, page) -> dict:
         """Small non-sensitive diagnostics for explaining a missing public counter."""
@@ -2627,20 +2638,73 @@ class KleinanzeigenParser:
                 pass
 
         if accurate:
-            sem = asyncio.Semaphore(max(1, min(ACCURATE_VIEW_BROWSER_CONCURRENCY, concurrency)))
+            # v4.3.2 Two-Phase Accurate Views:
+            # 1) fill the shared HTTP Views Pool with Kleinanzeigen's official
+            #    counter endpoint for the entire batch;
+            # 2) only the misses enter the much heavier Chromium lane.
+            # Previously each item held a 2-slot semaphore across HTTP + browser,
+            # so three users could not actually use the process-wide 6-slot pool.
+            http_sem = asyncio.Semaphore(ACCURATE_VIEW_HTTP_CONCURRENCY)
+            browser_sem = asyncio.Semaphore(max(1, min(ACCURATE_VIEW_BROWSER_CONCURRENCY, concurrency)))
+            fallback_urls: list[str] = []
+            direct_errors: dict[str, str] = {}
+            fallback_lock = asyncio.Lock()
 
-            async def accurate_one(url: str):
+            async def direct_phase(url: str):
                 nonlocal done_count
-                async with sem:
-                    vr = await self.fetch_public_view_count_accurate(
-                        url, traffic_priority=traffic_priority
+                if not _allowed_url(url) or "/s-anzeige/" not in url:
+                    results[url] = ViewCountResult(
+                        None, None, "verified:invalid-url",
+                        error="Нужна публичная ссылка Kleinanzeigen",
                     )
-                    results[url] = vr
-                async with done_lock:
-                    done_count += 1
-                await report_progress()
+                    async with done_lock:
+                        done_count += 1
+                    await report_progress()
+                    return
 
-            await asyncio.gather(*(accurate_one(url) for url in urls))
+                async with http_sem:
+                    direct = await self._direct_view_http(url, traffic_priority=traffic_priority)
+                if direct.views is not None:
+                    results[url] = ViewCountResult(
+                        int(direct.views),
+                        direct.raw_text,
+                        f"verified-official:{direct.source}",
+                        direct.final_url,
+                        direct.page_title,
+                        None,
+                    )
+                    async with done_lock:
+                        done_count += 1
+                    await report_progress()
+                    return
+
+                async with fallback_lock:
+                    fallback_urls.append(url)
+                    direct_errors[url] = direct.error or direct.source
+
+            await asyncio.gather(*(direct_phase(url) for url in urls))
+            valid_total = sum(1 for url in urls if _allowed_url(url) and "/s-anzeige/" in url)
+            log.info(
+                "Accurate views phase1 complete total=%s http_ok=%s browser_fallback=%s",
+                total, valid_total - len(fallback_urls), len(fallback_urls),
+            )
+
+            if fallback_urls:
+                async def browser_phase(url: str):
+                    nonlocal done_count
+                    async with browser_sem:
+                        vr = await self._fetch_public_view_count_browser_verified(
+                            url,
+                            traffic_priority=traffic_priority,
+                            initial_error=direct_errors.get(url),
+                        )
+                        results[url] = vr
+                    async with done_lock:
+                        done_count += 1
+                    await report_progress()
+
+                await asyncio.gather(*(browser_phase(url) for url in fallback_urls))
+
             await report_progress()
             return results
 

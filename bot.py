@@ -88,7 +88,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.1"
+APP_VERSION = "4.3.2"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -111,12 +111,17 @@ MULTIUSER_STABLE_MODE = os.getenv("MULTIUSER_STABLE_MODE", "1").strip().lower() 
     "0", "false", "no", "off",
 }
 MULTIUSER_LOCAL_WORKERS = max(1, min(5, int(os.getenv("MULTIUSER_LOCAL_WORKERS", "3"))))
-# v4.3.1: process-wide foreground public-view lane. v4.3.0 still inherited the
+# v4.3.2: process-wide foreground public-view lane. v4.3.0 still inherited the
 # old global traffic limit of three view requests, so three simultaneous scans
 # were forced to share only three slots. Six keeps two fast official-counter
 # requests available per default scan worker while the traffic manager still
 # reserves separate capacity for category-page work and serializes Chromium fallback.
 MULTIUSER_VIEW_POOL_SIZE = max(2, min(12, int(os.getenv("MULTIUSER_VIEW_POOL_SIZE", "6"))))
+# v4.3.2: the lightweight official counter can start faster than the old
+# 0.20s process-wide cadence. Chromium has its own slower browser limiter.
+MULTIUSER_VIEW_MIN_INTERVAL_SECONDS = max(0.05, min(0.50, float(
+    os.getenv("MULTIUSER_VIEW_MIN_INTERVAL_SECONDS", "0.10")
+)))
 SCAN_CATEGORY_HARD_TIMEOUT_SECONDS = max(300.0, min(3600.0, float(
     os.getenv("SCAN_CATEGORY_HARD_TIMEOUT_SECONDS", "1200")
 )))
@@ -141,7 +146,7 @@ os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "1"
 # of jobs are processed at once, while category scans are shared globally.
 MAX_CONCURRENT_JOBS = max(1, min(12, int(os.getenv("MAX_CONCURRENT_JOBS", "5"))))
 if STABLE_SINGLE_SERVICE_MODE:
-    # Stable single-service no longer means a single user lane.  v4.3.1 starts
+    # Stable single-service no longer means a single user lane. v4.3.2 keeps
     # three bounded local workers by default; set MULTIUSER_STABLE_MODE=0 for an
     # instant rollback to the exact one-worker v4.2.5 execution model.
     MAX_CONCURRENT_JOBS = MULTIUSER_LOCAL_WORKERS if MULTIUSER_STABLE_MODE else 1
@@ -155,6 +160,7 @@ if STABLE_SINGLE_SERVICE_MODE and MULTIUSER_STABLE_MODE:
     # keeps its own capacity even while all three users are measuring views.
     TRAFFIC.base_scan_limit = max(TRAFFIC.base_scan_limit, MAX_CONCURRENT_JOBS)
     TRAFFIC.base_view_limit = MULTIUSER_VIEW_POOL_SIZE
+    TRAFFIC.view_min_interval = MULTIUSER_VIEW_MIN_INTERVAL_SECONDS
     TRAFFIC.base_global_limit = max(
         TRAFFIC.base_global_limit,
         MULTIUSER_VIEW_POOL_SIZE + TRAFFIC.reserved_scan_slots,
@@ -2004,7 +2010,7 @@ async def refresh_view_counts(
         try:
             status = await message.answer(
                 f"👁 Собираю просмотры для <b>{len(eligible)}</b> объявлений…\n"
-                f"🔎 Проверка публичного счётчика через Chromium · {status_note}",
+                f"🔎 Точный публичный счётчик + Chromium только при необходимости · {status_note}",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
@@ -2029,7 +2035,7 @@ async def refresh_view_counts(
                     f"{_progress_bar(pct)} <b>{pct}%</b>\n"
                     f"📦 Проверено: <b>{completed}/{len(eligible)}</b>\n"
                     f"🔎 Обработано в текущем замере: <b>{done}/{len(targets)}</b>\n"
-                    f"🔎 Проверяется по странице объявления, без приблизительных значений.\n\n"
+                    f"🔎 Сначала точный публичный счётчик; Chromium — только если он не ответил.\n\n"
                     "Неподтверждённое значение не заменяется нулём и не попадает в TOP.",
                     parse_mode=ParseMode.HTML,
                 )
@@ -7275,12 +7281,12 @@ async def run_view_test(message: Message, state: FSMContext) -> None:
         lines += [
             "",
             f"📈 Ускорение на тесте: <b>примерно ×{speedup:.1f}</b>",
-            "✅ Массовый сбор v3.1.6 использует только быстрый direct-счётчик. Chromium оставлен только для этого точечного теста/диагностики.",
+            "✅ Массовый сбор использует direct-счётчик первым; Chromium включается только для неподтверждённых объявлений.",
         ]
     else:
         lines += [
             "",
-            "ℹ️ В массовом сборе browser fallback отключён: проблемные объявления будут отмечены как «без данных», чтобы не перегружать сервис.",
+            "ℹ️ В массовом сборе неподтверждённые direct-счётчики точечно перепроверяются через Chromium.",
         ]
 
     await status.edit_text(
@@ -8682,11 +8688,11 @@ async def main() -> None:
     log.info("Database backend: %s", DATABASE_BACKEND)
     if STABLE_SINGLE_SERVICE_MODE:
         log.warning(
-            "v4.3.1 Multi-User Stable active | parser_lanes=%s | shared_chromium=%s | "
-            "isolated_context_per_job=%s | view_pool=%s | transport=browser | "
+            "v4.3.2 Multi-User Stable active | parser_lanes=%s | shared_chromium=%s | "
+            "isolated_context_per_job=%s | view_pool=%s | view_interval=%.2fs | transport=browser | "
             "redis_in_scan_path=False | accurate_views=%s | category_watchdog=%ss | page_retries=%s",
             MAX_CONCURRENT_JOBS, bool(MULTIUSER_STABLE_MODE), bool(MULTIUSER_STABLE_MODE),
-            MULTIUSER_VIEW_POOL_SIZE, ACCURATE_VIEWS_MODE,
+            MULTIUSER_VIEW_POOL_SIZE, TRAFFIC.view_min_interval, ACCURATE_VIEWS_MODE,
             int(SCAN_CATEGORY_HARD_TIMEOUT_SECONDS), STABLE_PAGE_RETRIES,
         )
 
