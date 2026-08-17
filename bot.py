@@ -88,8 +88,11 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.1.6"
-MENU_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "dt_parser_menu.png"
+APP_VERSION = "4.1.7"
+_PROJECT_DIR = Path(__file__).resolve().parent
+MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
+if not MENU_IMAGE_PATH.exists():
+    MENU_IMAGE_PATH = _PROJECT_DIR / "assets" / "dt_parser_menu.png"
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
@@ -115,10 +118,11 @@ if DISTRIBUTED_WORKERS:
 MAX_CONCURRENT_JOBS = max(1, min(12, int(os.getenv("MAX_CONCURRENT_JOBS", "5"))))
 MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
 PARSER_WORKER_CONCURRENCY = max(1, min(8, int(os.getenv("PARSER_WORKER_CONCURRENCY", "1"))))
-# v4.1.6: bootstrap one in-process browser consumer when Redis is configured but
-# no external parser/fleet worker is online yet. This keeps a fresh Railway
-# install functional with only the main parser service; external fleet replicas
-# can be added later for horizontal scaling.
+# v4.1.7: always bootstrap one in-process browser reserve when Redis is configured.
+# A previous deployment can leave a heartbeat alive for ~20 seconds; treating that
+# stale heartbeat as an external fleet caused the new deployment to skip its own
+# worker and then drop to zero workers after the stale key expired. Dedicated fleet
+# replicas can still be added later; Redis job locks keep execution safe.
 EMBEDDED_FLEET_FALLBACK = os.getenv("EMBEDDED_FLEET_FALLBACK", "1").strip().lower() not in {
     "0", "false", "no", "off",
 }
@@ -8174,33 +8178,20 @@ async def start_scan_with_pages(callback: CallbackQuery, state: FSMContext) -> N
 
 
 async def _start_embedded_fleet_fallback(bot: Bot) -> tuple[list[asyncio.Task], object | None]:
-    """Start one browser-backed Redis consumer inside the Telegram service if needed.
+    """Start one browser-backed Redis consumer inside the Telegram service.
 
-    The fallback is intentionally only one lane. It exists so a clean Railway
-    install can parse for one user without creating a second service first. Once
-    dedicated fleet-worker replicas are deployed they share the same Redis Stream
-    and provide the horizontal capacity; the embedded lane remains a small reserve.
+    v4.1.7 deliberately does *not* suppress this reserve lane when another
+    parser heartbeat is visible. Railway redeploys leave the old process heartbeat
+    in Redis until its TTL expires; v4.1.5/v4.1.6 could mistake that stale key for
+    a healthy external fleet, skip bootstrap, and end up with zero workers seconds
+    later. One embedded reserve is cheap, safe with dedicated replicas, and makes
+    the main parser service self-starting.
     """
     if not (DISTRIBUTED_WORKERS and EMBEDDED_FLEET_FALLBACK):
         return [], None
 
-    deadline = asyncio.get_running_loop().time() + EMBEDDED_FLEET_READY_WAIT_SECONDS
-    external_workers = 0
-    while True:
-        try:
-            external_workers = await COORDINATOR.worker_count(prefix="parser")
-        except Exception:
-            external_workers = 0
-        if external_workers > 0 or asyncio.get_running_loop().time() >= deadline:
-            break
-        await asyncio.sleep(0.5)
-
-    if external_workers > 0:
-        log.info("External Browser Fleet detected at startup | workers=%s | embedded_fallback=idle", external_workers)
-        return [], None
-
     # parser.py was imported before Railway role detection. Switch its process-local
-    # runtime explicitly for this single fallback lane; KleinanzeigenParser reads
+    # runtime explicitly for this single reserve lane; KleinanzeigenParser reads
     # these module globals when each job instance is created.
     import parser as parser_module
     parser_module.SCAN_TRANSPORT = "browser"
@@ -8210,6 +8201,12 @@ async def _start_embedded_fleet_fallback(bot: Bot) -> tuple[list[asyncio.Task], 
     os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "0"
 
     worker_id = f"parser-embedded-{os.getenv('RAILWAY_SERVICE_ID', 'service')}-{os.getpid()}"
+
+    # Register synchronously before Telegram polling starts. This closes the small
+    # race where the user could press 25/50/100 before the heartbeat task got its
+    # first event-loop turn.
+    await COORDINATOR.heartbeat(worker_id, "parser")
+
     tasks = [
         asyncio.create_task(
             distributed_worker_heartbeat(worker_id, "parser"),
@@ -8222,8 +8219,8 @@ async def _start_embedded_fleet_fallback(bot: Bot) -> tuple[list[asyncio.Task], 
         asyncio.create_task(progress_ticker(bot), name="embedded-fleet-progress-ticker"),
     ]
     log.warning(
-        "Embedded Browser Fleet fallback online | id=%s | lanes=1 | transport=browser | "
-        "add dedicated fleet-worker replicas later for multi-user capacity",
+        "Embedded Browser Fleet reserve online | id=%s | lanes=1 | transport=browser | "
+        "dedicated fleet-worker replicas may run alongside it",
         worker_id,
     )
     return tasks, parser_module
@@ -8241,7 +8238,7 @@ async def main() -> None:
     await init_db()
     stale_distributed = await cleanup_stale_distributed_queue_rows()
     if stale_distributed:
-        log.info("v4.1.6 stale distributed queue cleanup: %s", stale_distributed)
+        log.info("v4.1.7 stale distributed queue cleanup: %s", stale_distributed)
     await initialize_commerce()
     backfilled = await backfill_product_identities()
     if backfilled:

@@ -1,3 +1,10 @@
+# v4.1.7 — Embedded Fleet Redeploy Fix
+
+- The main Railway `parser` service now always starts one embedded browser reserve when Redis/distributed mode is enabled.
+- A stale heartbeat from the previous Railway deployment can no longer suppress bootstrap of the new worker.
+- The embedded worker registers its heartbeat synchronously before Telegram polling starts, so a scan cannot race worker readiness immediately after deploy.
+- Dedicated `fleet-worker` replicas can still run alongside the embedded reserve; Redis job locks prevent duplicate execution.
+
 # v4.1.6 — Queue Visibility + Deferred Views
 
 - Queued Redis jobs show queue position instead of appearing frozen.

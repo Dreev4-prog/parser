@@ -1,0 +1,8 @@
+DT PARSER v4.1.7 — GitHub Web Upload Pack
+
+1. Open this extracted folder.
+2. Select ALL files in this folder.
+3. Drag them into GitHub -> Add file -> Upload files.
+4. Commit changes.
+
+There are NO subfolders in this pack.
