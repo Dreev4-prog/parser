@@ -15,9 +15,11 @@ def test_embedded_fleet_uses_browser_transport_and_heartbeat():
     assert 'distributed_scan_worker(bot, f"{worker_id}-1")' in BOT
 
 
-def test_external_fleet_prevents_embedded_bootstrap():
-    assert 'External Browser Fleet detected at startup' in BOT
-    assert 'if external_workers > 0:' in BOT
+def test_stale_external_heartbeat_cannot_suppress_embedded_bootstrap():
+    assert 'External Browser Fleet detected at startup' not in BOT
+    assert 'if external_workers > 0:' not in BOT
+    assert 'await COORDINATOR.heartbeat(worker_id, "parser")' in BOT
+    assert 'Embedded Browser Fleet reserve online' in BOT
 
 
 def test_start_command_remains_clean():

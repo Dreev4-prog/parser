@@ -1,3 +1,7 @@
+# DT PARSER v4.2.0 Stable Reset
+
+Production baseline: one reliable in-process browser parser lane, PostgreSQL page checkpoints, Redis removed from the interactive scan path. See `DEPLOY_V4_2_0_STABLE_RESET.md`.
+
 # v4.1.7 — Embedded Fleet Redeploy Fix
 
 - The main Railway `parser` service now always starts one embedded browser reserve when Redis/distributed mode is enabled.

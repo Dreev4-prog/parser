@@ -4,8 +4,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_v350_version_and_redis_dependency():
-    assert (ROOT / "VERSION").read_text().strip() == "4.1.6"
-    assert 'APP_VERSION = "4.1.6"' in (ROOT / "bot.py").read_text()
+    assert (ROOT / "VERSION").read_text().strip() == "4.2.0"
+    assert 'APP_VERSION = "4.2.0"' in (ROOT / "bot.py").read_text()
     assert "redis>=" in (ROOT / "requirements.txt").read_text()
 
 

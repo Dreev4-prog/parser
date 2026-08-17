@@ -40,17 +40,22 @@ IS_RAILWAY = bool(
     or os.getenv("RAILWAY_PROJECT_ID")
     or os.getenv("RAILWAY_SERVICE_ID")
 )
-# v4.1.4 Auto-Distributed: REDIS_URL is the source of truth. Older Railway
-# deployments may still have DISTRIBUTED_WORKERS=0 left over from the legacy
-# single-service mode; that stale value must never silently disable the fleet.
-# FORCE_LOCAL_MODE is intentionally explicit and is meant only for local/dev use.
+# v4.2.0 Stable Reset. The production Telegram service intentionally runs one
+# in-process parser lane again. Redis may stay configured for cache/future fleet
+# work, but it is no longer allowed to decide whether an interactive scan can run.
+# Once the single-service parser is proven stable, set STABLE_SINGLE_SERVICE_MODE=0
+# on dedicated worker services to re-enable distributed execution deliberately.
+STABLE_SINGLE_SERVICE_MODE = _env_bool("STABLE_SINGLE_SERVICE_MODE", True)
 FORCE_LOCAL_MODE = _env_bool("FORCE_LOCAL_MODE", False)
-DISTRIBUTED_WORKERS = bool(REDIS_URL) and not FORCE_LOCAL_MODE
+DISTRIBUTED_WORKERS = bool(REDIS_URL) and not FORCE_LOCAL_MODE and not STABLE_SINGLE_SERVICE_MODE
 DISTRIBUTED_MODE_SOURCE = (
-    "forced-local" if FORCE_LOCAL_MODE else ("redis-auto" if REDIS_URL else "no-redis")
+    "stable-single-service" if STABLE_SINGLE_SERVICE_MODE
+    else ("forced-local" if FORCE_LOCAL_MODE else ("redis-auto" if REDIS_URL else "no-redis"))
 )
-RAILWAY_REQUIRES_REDIS = _env_bool("RAILWAY_REQUIRES_REDIS", True)
-DISTRIBUTED_CONFIG_ERROR = bool(IS_RAILWAY and RAILWAY_REQUIRES_REDIS and not REDIS_URL)
+RAILWAY_REQUIRES_REDIS = _env_bool("RAILWAY_REQUIRES_REDIS", not STABLE_SINGLE_SERVICE_MODE)
+DISTRIBUTED_CONFIG_ERROR = bool(
+    IS_RAILWAY and RAILWAY_REQUIRES_REDIS and not REDIS_URL and not STABLE_SINGLE_SERVICE_MODE
+)
 REDIS_PREFIX = os.getenv("REDIS_PREFIX", "dtparser").strip() or "dtparser"
 STREAM_NAME = f"{REDIS_PREFIX}:scan_jobs"
 STREAM_GROUP = f"{REDIS_PREFIX}:parser_workers"

@@ -49,7 +49,7 @@ from product_identity import TYPE_DISPLAY, ProductIdentity, recognize_product
 from traffic import TRAFFIC
 from distributed import (
     COORDINATOR, DISTRIBUTED_WORKERS, DISTRIBUTED_MODE_SOURCE,
-    DISTRIBUTED_CONFIG_ERROR, IS_RAILWAY, REDIS_URL,
+    DISTRIBUTED_CONFIG_ERROR, IS_RAILWAY, REDIS_URL, STABLE_SINGLE_SERVICE_MODE,
 )
 from scan_control import ScanStopRequested, wait_for_task_or_stop
 from scan_selection import MAX_SELECTED_CATEGORIES, bulk_group_selection, toggle_selection, validate_scan_category_keys
@@ -88,7 +88,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.1.7"
+APP_VERSION = "4.2.0"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -104,18 +104,28 @@ AVAILABILITY_CONCURRENCY = max(1, min(8, int(os.getenv("AVAILABILITY_CONCURRENCY
 STABLE_SCAN_ENGINE = os.getenv("STABLE_SCAN_ENGINE", "1").strip().lower() not in {"0", "false", "no", "off"}
 STABLE_PAGE_RETRIES = max(1, min(5, int(os.getenv("STABLE_PAGE_RETRIES", "3"))))
 STABLE_PAGE_RETRY_SECONDS = max(0.2, min(10.0, float(os.getenv("STABLE_PAGE_RETRY_SECONDS", "1.2"))))
+# Stable Reset deliberately keeps the proven browser transport but removes the
+# distributed Browser Fleet from the interactive path. One job owns one browser
+# context; successful pages are still checkpointed in PostgreSQL.
+if STABLE_SINGLE_SERVICE_MODE:
+    import parser as _stable_parser_module
+    _stable_parser_module.SCAN_TRANSPORT = "browser"
+    _stable_parser_module.SHARED_BROWSER_RUNTIME = False
+    SCAN_TRANSPORT = "browser"
 # v4.0.1: tolerate a bounded number of pages with zero usable chronology evidence.
 # They are recorded for diagnostics/recovery but no longer force a whole recent
 # nationwide scan into the 16-region hidden fallback.
 STABLE_WEAK_PAGE_GAP_LIMIT = max(1, min(8, int(os.getenv("STABLE_WEAK_PAGE_GAP_LIMIT", "3"))))
 PRIMARY_SCAN_INLINE_VIEWS = os.getenv("PRIMARY_SCAN_INLINE_VIEWS", "0").strip().lower() not in {"0", "false", "no", "off"}
-# Distributed scans must never spend the interactive scan path on view-count IO.
-if DISTRIBUTED_WORKERS:
+# Stable Reset and distributed scans both keep view-count IO out of page collection.
+if DISTRIBUTED_WORKERS or STABLE_SINGLE_SERVICE_MODE:
     PRIMARY_SCAN_INLINE_VIEWS = False
 
 # v2.6 Multi-User Core. User launches go into a queue. Only a limited number
 # of jobs are processed at once, while category scans are shared globally.
 MAX_CONCURRENT_JOBS = max(1, min(12, int(os.getenv("MAX_CONCURRENT_JOBS", "5"))))
+if STABLE_SINGLE_SERVICE_MODE:
+    MAX_CONCURRENT_JOBS = 1
 MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
 PARSER_WORKER_CONCURRENCY = max(1, min(8, int(os.getenv("PARSER_WORKER_CONCURRENCY", "1"))))
 # v4.1.7: always bootstrap one in-process browser reserve when Redis is configured.
@@ -130,6 +140,10 @@ EMBEDDED_FLEET_READY_WAIT_SECONDS = max(0, min(15, int(os.getenv("EMBEDDED_FLEET
 DISTRIBUTED_STALE_QUEUE_SECONDS = max(60, min(3600, int(os.getenv("DISTRIBUTED_STALE_QUEUE_SECONDS", "600"))))
 DISTRIBUTED_QUEUE_UI_SECONDS = max(2.0, min(15.0, float(os.getenv("DISTRIBUTED_QUEUE_UI_SECONDS", "3"))))
 CATEGORY_CACHE_TTL_SECONDS = max(0, int(os.getenv("CATEGORY_CACHE_TTL_SECONDS", "300")))
+if STABLE_SINGLE_SERVICE_MODE:
+    # Keep the baseline deterministic: each queued user gets the parser path.
+    # PostgreSQL verified-page checkpoints still protect restarts/retries.
+    CATEGORY_CACHE_TTL_SECONDS = 0
 SHARE_ACTIVE_CATEGORY_SCANS = os.getenv(
     "SHARE_ACTIVE_CATEGORY_SCANS",
     "1" if STABLE_SCAN_ENGINE else ("0" if SCAN_TRANSPORT in {"browser", "hybrid"} else "1")
@@ -140,11 +154,17 @@ STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVA
 # throws an unexpected transient exception gets one controlled retry before the
 # user receives a partial result.
 SCAN_CATEGORY_ATTEMPTS = max(1, min(3, int(os.getenv("SCAN_CATEGORY_ATTEMPTS", "2"))))
+if STABLE_SINGLE_SERVICE_MODE:
+    SCAN_CATEGORY_ATTEMPTS = 1
 SCAN_CATEGORY_RETRY_SECONDS = max(1.0, min(30.0, float(os.getenv("SCAN_CATEGORY_RETRY_SECONDS", "4"))))
 # v3.7.2: a parser result that is structurally partial is automatically retried
 # inside the same per-user parser session. Verified page checkpoints are reused,
 # so recovery refetches weak/missing areas instead of making the user press a button.
 SCAN_AUTO_RECOVERY_PASSES = max(0, min(3, int(os.getenv("SCAN_AUTO_RECOVERY_PASSES", "3"))))
+if STABLE_SINGLE_SERVICE_MODE:
+    # Page-level retry + one clean browser-context recycle replaces repeated whole
+    # category passes. This makes failures deterministic and keeps scans short.
+    SCAN_AUTO_RECOVERY_PASSES = 0
 SCAN_AUTO_RECOVERY_DELAY_SECONDS = max(0.5, min(15.0, float(os.getenv("SCAN_AUTO_RECOVERY_DELAY_SECONDS", "2"))))
 SUBSCRIPTION_NOTICE_POLL_SECONDS = max(60, int(os.getenv("SUBSCRIPTION_NOTICE_POLL_SECONDS", "300")))
 
@@ -3030,15 +3050,26 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 update_quality_live(f"не хватает дат на странице {page}")
             elif relation == "invalid":
                 update_quality_live(invalid_note)
+            invalid_reason = ""
+            if not valid:
+                if bool(getattr(info, "suspicious", False)):
+                    invalid_reason = "challenge"
+                elif not bool(getattr(info, "request_matches_page", True)):
+                    invalid_reason = "page-identity"
+                elif repeated:
+                    invalid_reason = "repeated-content"
+                else:
+                    invalid_reason = invalid_note or "unknown"
             log.info(
                 "category=%s feed=%s phase=%s page=%s relation=%s actual=%s max=%s verified=%s "
-                "date_cov=%.0f%% parsed=%s missing_date=%s raw=%s promoted=%s duplicates=%s valid=%s requests=%s checkpoint=%s",
+                "date_cov=%.0f%% parsed=%s missing_date=%s raw=%s promoted=%s duplicates=%s valid=%s "
+                "invalid_reason=%s requests=%s checkpoint=%s",
                 cat.name, feed_name, phase, page, relation,
                 getattr(info, "actual_page", None), getattr(info, "max_page", None),
                 getattr(info, "page_verified", False), float(getattr(info, "date_coverage", 0.0) or 0.0) * 100,
                 len(items), getattr(info, "missing_date_count", 0), getattr(info, "raw_candidates", 0),
-                getattr(info, "promoted_filtered", 0), getattr(info, "duplicate_cards", 0), valid, network_requests,
-                from_checkpoint,
+                getattr(info, "promoted_filtered", 0), getattr(info, "duplicate_cards", 0), valid, invalid_reason,
+                network_requests, from_checkpoint,
             )
             return items, relation, pairs, days
 
@@ -3061,11 +3092,37 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 if attempt < STABLE_PAGE_RETRIES:
                     cache.pop(page, None)
                     await asyncio.sleep(STABLE_PAGE_RETRY_SECONDS * attempt)
+            # v4.2.0: if the exact page is still invalid after normal retries,
+            # recycle only this job's browser context and make one final request.
+            # Do not restart the category and do not replay already verified pages.
+            if (
+                STABLE_SINGLE_SERVICE_MODE and last is not None and last[1] == "invalid"
+                and getattr(parser, "scan_transport", "") == "browser"
+            ):
+                try:
+                    await parser.reset_scan_browser_context()
+                    cache.pop(page, None)
+                    await asyncio.sleep(STABLE_PAGE_RETRY_SECONDS)
+                    final = await fetch(page, phase)
+                    if final[1] not in {"unknown", "invalid"}:
+                        log.info(
+                            "Stable Reset recovered page after browser recycle category=%s page=%s",
+                            cat.name, page,
+                        )
+                        return final
+                    last = final
+                except TemporaryAccessError:
+                    raise
+                except Exception as exc:
+                    log.warning(
+                        "Stable Reset final page retry failed category=%s page=%s: %s",
+                        cat.name, page, exc,
+                    )
             if STABLE_SCAN_ENGINE and last is not None and last[1] in {"unknown", "invalid"}:
                 try:
                     await record_page_failure(
                         cat.key, target_date, base_url, page,
-                        f"weak chronology after {STABLE_PAGE_RETRIES} attempts: {last[1]}",
+                        f"weak chronology after page retries/context recycle: {last[1]}",
                     )
                 except Exception:
                     log.debug("Could not persist weak page failure", exc_info=True)
@@ -4103,9 +4160,19 @@ def render_user_job_status(job: ScanJob) -> str:
 
     if job.state == "queued":
         waited = max(0, int((datetime.utcnow() - job.created_at).total_seconds()))
-        headline = "♻️ <b>Восстанавливаю скан…</b>\n\n" if job.recovered else "⏳ <b>Подготавливаю скан</b>\n\n"
+        if STABLE_SINGLE_SERVICE_MODE and not job.recovered:
+            try:
+                position = queued_job_ids.index(job.job_id) + 1
+            except ValueError:
+                position = 1
+            headline = "⏳ <b>Ожидание парсера</b>\n\n"
+            queue_line = f"📍 Позиция в очереди: <b>{position}</b>\n"
+        else:
+            headline = "♻️ <b>Восстанавливаю скан…</b>\n\n" if job.recovered else "⏳ <b>Подготавливаю скан</b>\n\n"
+            queue_line = ""
         return (
             headline
+            + queue_line
             + f"🗂 Категорий: <b>{total}</b>\n"
             + f"📅 <b>{_date_label(job.target_date)}</b> · 📄 <b>{depth} стр.</b>\n"
             + f"⏱ <b>{_human_duration(waited)}</b>"
@@ -4381,13 +4448,21 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
     if job.incomplete_categories:
         try:
             if STABLE_SCAN_ENGINE:
-                text = (
-                    "<b>⚠️ Не все участки удалось подтвердить</b>\n\n"
-                    f"Сервер автоматически выполнил до {SCAN_AUTO_RECOVERY_PASSES} повторных проходов. "
-                    f"{job.incomplete_categories} из {len(job.category_keys)} категорий всё ещё имеют непроверенные участки. "
-                    "Все подтверждённые страницы сохранены в PostgreSQL и будут переиспользованы при следующем запуске — "
-                    "повторный скан не начнётся с нуля."
-                )
+                if STABLE_SINGLE_SERVICE_MODE:
+                    text = (
+                        "<b>⚠️ Не все страницы удалось подтвердить</b>\n\n"
+                        f"{job.incomplete_categories} из {len(job.category_keys)} категорий завершены не полностью. "
+                        "Парсер уже повторил проблемную страницу и один раз обновил браузерный контекст. "
+                        "Успешные страницы сохранены в PostgreSQL, поэтому следующий запуск продолжит с проверенных данных."
+                    )
+                else:
+                    text = (
+                        "<b>⚠️ Не все участки удалось подтвердить</b>\n\n"
+                        f"Сервер автоматически выполнил до {SCAN_AUTO_RECOVERY_PASSES} повторных проходов. "
+                        f"{job.incomplete_categories} из {len(job.category_keys)} категорий всё ещё имеют непроверенные участки. "
+                        "Все подтверждённые страницы сохранены в PostgreSQL и будут переиспользованы при следующем запуске — "
+                        "повторный скан не начнётся с нуля."
+                    )
                 markup = InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="🔄 Повторить скан", callback_data=f"scanrepeat:{job.scan_id}")],
                     [InlineKeyboardButton(text="📊 Открыть сохранённый скан", callback_data=f"scan:{job.scan_id}")],
@@ -8291,13 +8366,19 @@ async def main() -> None:
     me = await bot.get_me()
     traffic = await TRAFFIC.snapshot()
     log.info(
-        "Starting @%s | mode=%s source=%s railway=%s redis=%s | local_workers=%s embedded_fleet=%s cache_ttl=%ss | traffic scan=%s view=%s browser=%s global=%s",
-        me.username, "distributed" if DISTRIBUTED_WORKERS else "local",
+        "Starting @%s | version=%s | mode=%s source=%s railway=%s redis=%s | local_workers=%s embedded_fleet=%s cache_ttl=%ss | traffic scan=%s view=%s browser=%s global=%s",
+        me.username, APP_VERSION, "distributed" if DISTRIBUTED_WORKERS else "local",
         DISTRIBUTED_MODE_SOURCE, IS_RAILWAY, bool(REDIS_URL),
         0 if DISTRIBUTED_WORKERS else MAX_CONCURRENT_JOBS, bool(embedded_fleet_tasks), CATEGORY_CACHE_TTL_SECONDS,
         traffic.scan_limit, traffic.view_limit, traffic.browser_limit, traffic.global_limit,
     )
     log.info("Database backend: %s", DATABASE_BACKEND)
+    if STABLE_SINGLE_SERVICE_MODE:
+        log.warning(
+            "v4.2.0 Stable Reset active | parser_lane=1 | transport=browser | redis_in_scan_path=False | "
+            "whole_category_recovery=False | page_retries=%s",
+            STABLE_PAGE_RETRIES,
+        )
 
     worker_tasks = [] if DISTRIBUTED_WORKERS else [
         asyncio.create_task(scan_worker(bot, i), name=f"scan-worker-{i}")

@@ -958,9 +958,14 @@ def category_page_info_from_html(
         location_shards = counted[:120] if counted else uncounted[:40]
 
     lower = text.lower()
+    # v4.2.0: only explicit challenge/access phrases may invalidate an otherwise
+    # healthy result page. The old bare marker "robot" matched ordinary listings
+    # such as Mähroboter/Saugroboter and produced deterministic false partial scans.
     suspicious_markers = (
         "captcha", "ungewöhnliche aktivität", "ungewoehnliche aktivitaet",
-        "zugriff verweigert", "access denied", "robot",
+        "zugriff verweigert", "access denied",
+        "bist du ein roboter", "sind sie ein roboter", "are you a robot",
+        "robot verification", "verify you are human", "human verification",
     )
     suspicious = any(marker in lower for marker in suspicious_markers)
     if suspicious:
@@ -1253,6 +1258,32 @@ class KleinanzeigenParser:
                 await page.close()
             except Exception:
                 pass
+
+    async def reset_scan_browser_context(self) -> None:
+        """Drop only the scan browser context so one bad page gets a clean retry.
+
+        v4.2.0 uses this once after the normal per-page retry budget is exhausted.
+        It never restarts the whole category and never changes network identity.
+        """
+        await self._reset_scan_page()
+        context = self._browser_context
+        self._browser_context = None
+        self._context_session_seeded = False
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
+        if not self._uses_shared_browser_runtime and self._browser is not None:
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+        # Any cached page verdict for this parser instance must be revalidated after
+        # a browser-session reset; PostgreSQL keeps only separately verified pages.
+        self._scan_page_checkpoints.clear()
+        log.warning("Stable Reset: scan browser session recycled after persistent page failure")
 
     async def _ensure_scan_page(self):
         if self._scan_page is not None and not self._scan_page.is_closed():

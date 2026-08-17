@@ -30,5 +30,5 @@ def test_distributed_scan_checks_for_live_workers_before_enqueue():
 
 
 def test_version_414():
-    assert (ROOT / "VERSION").read_text().strip() == "4.1.6"
-    assert 'APP_VERSION = "4.1.6"' in BOT
+    assert (ROOT / "VERSION").read_text().strip() == "4.2.0"
+    assert 'APP_VERSION = "4.2.0"' in BOT
