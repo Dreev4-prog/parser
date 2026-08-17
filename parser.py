@@ -2496,6 +2496,10 @@ class KleinanzeigenParser:
                 results[url] = vr
             async with done_lock:
                 done_count += 1
+            # v4.2.1: report after every completed direct request. Callers that
+            # edit Telegram messages already throttle their own edits, while the
+            # scan card callback only updates an in-memory counter for the ticker.
+            await report_progress()
 
         # Chunking is intentional: it yields the event loop and smooths network
         # pressure while Telegram UI callbacks remain responsive.

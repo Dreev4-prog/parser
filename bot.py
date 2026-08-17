@@ -88,7 +88,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.2.0"
+APP_VERSION = "4.2.1"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -1801,9 +1801,29 @@ async def enrich_page_view_counts(
             live.views_ready += len(unique)
         return 0, 0, 0
 
+    # v4.2.1: live progress must reflect completed counter requests while the
+    # batch is running. v4.2.0 updated ``views_ready`` only after the entire
+    # batch returned, so Telegram could sit at 0/575 for several minutes even
+    # though Railway logs showed hundreds of successful 200 responses.
+    base_ready = int(live.views_ready or 0) if live is not None else 0
+    reused_count = max(0, len(unique) - len(targets))
+    if live is not None:
+        live.views_ready = base_ready + reused_count
+
+    async def live_progress(done: int, total: int) -> None:
+        if live is None:
+            return
+        live.views_ready = base_ready + reused_count + min(max(0, int(done)), len(targets))
+        if done == total or (done > 0 and done % 25 == 0):
+            log.info(
+                "View progress category=%s checked=%s/%s failed_so_far=%s",
+                live.category_name, live.views_ready, len(unique), live.views_failed,
+            )
+
     results = await parser.fetch_public_view_counts(
         [item.url for item in targets],
         concurrency=VIEW_COUNT_CONCURRENCY,
+        progress_cb=live_progress,
         traffic_priority="scan_inline",
         browser_fallback=False,
         direct_http_only=True,
@@ -1838,7 +1858,10 @@ async def enrich_page_view_counts(
             await session.commit()
 
     if live is not None:
-        live.views_ready += updated + max(0, len(unique) - len(targets))
+        # ``views_ready`` is a checked/progress counter in the user-facing card.
+        # Failed counters are tracked separately but still count as completed work,
+        # otherwise progress could stop forever below 100%.
+        live.views_ready = base_ready + len(unique)
         live.views_failed += failed
     return len(targets), updated, failed
 
@@ -5231,21 +5254,38 @@ async def recover_interrupted_user_scans(bot: Bot) -> int:
                 continue
 
             status_message_id = int(scan.status_message_id or 0)
-            try:
-                msg = await bot.send_message(
-                    int(scan.chat_id),
-                    "♻️ <b>Сервис перезапустился — восстанавливаю незавершённый скан.</b>\n\n"
-                    "Уже сохранённые объявления не потеряны. Продолжаю безопасным повторным запуском.",
-                    parse_mode=ParseMode.HTML,
-                )
-                status_message_id = msg.message_id
-            except Exception:
-                log.exception("Could not create recovery status message scan=%s", scan.id)
-                if not status_message_id:
-                    scan.status = "failed"
-                    scan.finished_at = now
-                    scan.last_error = "Не удалось восстановить Telegram-контекст после перезапуска"
-                    continue
+            recovery_text = (
+                "♻️ <b>Сервис перезапустился — восстанавливаю незавершённый скан.</b>\n\n"
+                "Уже сохранённые объявления не потеряны. Продолжаю безопасным повторным запуском."
+            )
+            reused_status_card = False
+            if status_message_id:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=int(scan.chat_id),
+                        message_id=status_message_id,
+                        text=recovery_text,
+                        parse_mode=ParseMode.HTML,
+                    )
+                    reused_status_card = True
+                except Exception:
+                    log.info(
+                        "Could not reuse recovery status message; creating replacement scan=%s message=%s",
+                        scan.id, status_message_id,
+                    )
+            if not reused_status_card:
+                try:
+                    msg = await bot.send_message(
+                        int(scan.chat_id), recovery_text, parse_mode=ParseMode.HTML
+                    )
+                    status_message_id = msg.message_id
+                except Exception:
+                    log.exception("Could not create recovery status message scan=%s", scan.id)
+                    if not status_message_id:
+                        scan.status = "failed"
+                        scan.finished_at = now
+                        scan.last_error = "Не удалось восстановить Telegram-контекст после перезапуска"
+                        continue
 
             scan.status = "queued"
             scan.status_message_id = status_message_id
