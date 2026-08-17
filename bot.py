@@ -88,7 +88,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.0"
+APP_VERSION = "4.3.1"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -104,14 +104,19 @@ AVAILABILITY_CONCURRENCY = max(1, min(8, int(os.getenv("AVAILABILITY_CONCURRENCY
 STABLE_SCAN_ENGINE = os.getenv("STABLE_SCAN_ENGINE", "1").strip().lower() not in {"0", "false", "no", "off"}
 STABLE_PAGE_RETRIES = max(1, min(5, int(os.getenv("STABLE_PAGE_RETRIES", "3"))))
 STABLE_PAGE_RETRY_SECONDS = max(0.2, min(10.0, float(os.getenv("STABLE_PAGE_RETRY_SECONDS", "1.2"))))
-# v4.3.0 Multi-User Stable keeps the proven single Railway service / Stable Engine
-# path, but allows a small local worker pool.  All jobs share ONE Chromium process
-# while every KleinanzeigenParser owns an isolated BrowserContext.  This avoids the
-# old RAM-heavy "one Chromium process per user" design without coupling sessions.
+# v4.3.x Multi-User Stable keeps the proven single Railway service / Stable Engine
+# path, but allows a small local worker pool. All jobs share ONE Chromium process
+# while every KleinanzeigenParser owns an isolated BrowserContext.
 MULTIUSER_STABLE_MODE = os.getenv("MULTIUSER_STABLE_MODE", "1").strip().lower() not in {
     "0", "false", "no", "off",
 }
 MULTIUSER_LOCAL_WORKERS = max(1, min(5, int(os.getenv("MULTIUSER_LOCAL_WORKERS", "3"))))
+# v4.3.1: process-wide foreground public-view lane. v4.3.0 still inherited the
+# old global traffic limit of three view requests, so three simultaneous scans
+# were forced to share only three slots. Six keeps two fast official-counter
+# requests available per default scan worker while the traffic manager still
+# reserves separate capacity for category-page work and serializes Chromium fallback.
+MULTIUSER_VIEW_POOL_SIZE = max(2, min(12, int(os.getenv("MULTIUSER_VIEW_POOL_SIZE", "6"))))
 SCAN_CATEGORY_HARD_TIMEOUT_SECONDS = max(300.0, min(3600.0, float(
     os.getenv("SCAN_CATEGORY_HARD_TIMEOUT_SECONDS", "1200")
 )))
@@ -136,18 +141,24 @@ os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "1"
 # of jobs are processed at once, while category scans are shared globally.
 MAX_CONCURRENT_JOBS = max(1, min(12, int(os.getenv("MAX_CONCURRENT_JOBS", "5"))))
 if STABLE_SINGLE_SERVICE_MODE:
-    # Stable single-service no longer means a single user lane.  v4.3.0 starts
+    # Stable single-service no longer means a single user lane.  v4.3.1 starts
     # three bounded local workers by default; set MULTIUSER_STABLE_MODE=0 for an
     # instant rollback to the exact one-worker v4.2.5 execution model.
     MAX_CONCURRENT_JOBS = MULTIUSER_LOCAL_WORKERS if MULTIUSER_STABLE_MODE else 1
 MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
 PARSER_WORKER_CONCURRENCY = max(1, min(8, int(os.getenv("PARSER_WORKER_CONCURRENCY", "1"))))
 if STABLE_SINGLE_SERVICE_MODE and MULTIUSER_STABLE_MODE:
-    # TRAFFIC is process-wide and was initialized during imports. Keep request
-    # pressure bounded, but guarantee enough foreground scan lanes for the local
-    # worker pool. Background 3/6/12h measurements wait while user scans are live.
+    # TRAFFIC is process-wide and acts as the global Views Pool. Keep request
+    # pressure bounded, but let three foreground scans share six official-counter
+    # HTTP slots instead of the old process-wide limit of three. The global cap
+    # deliberately includes TRAFFIC.reserved_scan_slots, so category/date traffic
+    # keeps its own capacity even while all three users are measuring views.
     TRAFFIC.base_scan_limit = max(TRAFFIC.base_scan_limit, MAX_CONCURRENT_JOBS)
-    TRAFFIC.base_global_limit = max(TRAFFIC.base_global_limit, MAX_CONCURRENT_JOBS + 2)
+    TRAFFIC.base_view_limit = MULTIUSER_VIEW_POOL_SIZE
+    TRAFFIC.base_global_limit = max(
+        TRAFFIC.base_global_limit,
+        MULTIUSER_VIEW_POOL_SIZE + TRAFFIC.reserved_scan_slots,
+    )
     TRAFFIC.background_during_scans = 0
 # v4.1.7: always bootstrap one in-process browser reserve when Redis is configured.
 # A previous deployment can leave a heartbeat alive for ~20 seconds; treating that
@@ -8671,11 +8682,12 @@ async def main() -> None:
     log.info("Database backend: %s", DATABASE_BACKEND)
     if STABLE_SINGLE_SERVICE_MODE:
         log.warning(
-            "v4.3.0 Multi-User Stable active | parser_lanes=%s | shared_chromium=%s | "
-            "isolated_context_per_job=%s | transport=browser | redis_in_scan_path=False | "
-            "accurate_views=%s | category_watchdog=%ss | page_retries=%s",
+            "v4.3.1 Multi-User Stable active | parser_lanes=%s | shared_chromium=%s | "
+            "isolated_context_per_job=%s | view_pool=%s | transport=browser | "
+            "redis_in_scan_path=False | accurate_views=%s | category_watchdog=%ss | page_retries=%s",
             MAX_CONCURRENT_JOBS, bool(MULTIUSER_STABLE_MODE), bool(MULTIUSER_STABLE_MODE),
-            ACCURATE_VIEWS_MODE, int(SCAN_CATEGORY_HARD_TIMEOUT_SECONDS), STABLE_PAGE_RETRIES,
+            MULTIUSER_VIEW_POOL_SIZE, ACCURATE_VIEWS_MODE,
+            int(SCAN_CATEGORY_HARD_TIMEOUT_SECONDS), STABLE_PAGE_RETRIES,
         )
 
     worker_tasks = [] if DISTRIBUTED_WORKERS else [

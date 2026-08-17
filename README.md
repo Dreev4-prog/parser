@@ -1,3 +1,11 @@
+## v4.3.1 Multi-User Views Pool
+
+- Keeps the stable 3-worker isolated-context architecture from v4.3.0.
+- Uses one process-wide foreground Views Pool with 6 HTTP slots by default.
+- Keeps category/date network capacity reserved while views are being measured.
+- Exact view extraction and date search logic are unchanged.
+- Roll back only the new pressure with `MULTIUSER_VIEW_POOL_SIZE=3`.
+
 ## v4.3.0 Multi-User Stable
 
 3 parallel local scan workers, one shared Chromium process, isolated BrowserContext per job. Date/view logic remains v4.2.5.
