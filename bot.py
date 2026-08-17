@@ -88,7 +88,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.3"
+APP_VERSION = "4.3.4"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -352,13 +352,14 @@ def main_keyboard(selected_count: int = 0, *, admin: bool = False) -> InlineKeyb
 
 
 def post_scan_keyboard(scan_id: int | None = None, *, recheck: bool = False) -> InlineKeyboardMarkup:
-    """Short result actions: analytics first, secondary actions inside scan details."""
+    """Short result actions: TOP-12 remains instant, TOP-50 is available on demand."""
     rows = []
     if scan_id is not None:
         rows.append([
-            InlineKeyboardButton(text="🔥 Открыть TOP", callback_data=f"scantop:{scan_id}"),
-            InlineKeyboardButton(text="📊 Открыть скан", callback_data=f"scan:{scan_id}"),
+            InlineKeyboardButton(text="🔥 TOP-12", callback_data=f"scantop:{scan_id}"),
+            InlineKeyboardButton(text="📋 TOP-50", callback_data=f"scantop50:{scan_id}:0"),
         ])
+        rows.append([InlineKeyboardButton(text="📊 Открыть скан", callback_data=f"scan:{scan_id}")])
         if recheck and not STABLE_SCAN_ENGINE:
             rows.append([InlineKeyboardButton(text="🔄 Допроверить категории", callback_data=f"scanrecheck:{scan_id}")])
         rows.append([InlineKeyboardButton(text="🔄 Повторить скан", callback_data=f"scanrepeat:{scan_id}")])
@@ -376,12 +377,13 @@ def partial_recheck_keyboard(scan_id: int) -> InlineKeyboardMarkup:
 
 
 def scan_detail_keyboard(scan_id: int, *, archived: bool = False, recheck: bool = False) -> InlineKeyboardMarkup:
-    """Compact scan actions with analytics grouped together."""
+    """Compact scan actions with both quick TOP-12 and full TOP-50."""
     back_text = "⬅️ Архив" if archived else "⬅️ Мои сканы"
     back_callback = "scan_archive:0" if archived else "my_scans"
     rows = [
-        [InlineKeyboardButton(text="🔥 Топ просмотров", callback_data=f"scantop:{scan_id}"),
-         InlineKeyboardButton(text="🚀 Топ роста", callback_data=f"scangrowth:{scan_id}:3")],
+        [InlineKeyboardButton(text="🔥 TOP-12", callback_data=f"scantop:{scan_id}"),
+         InlineKeyboardButton(text="📋 TOP-50", callback_data=f"scantop50:{scan_id}:0")],
+        [InlineKeyboardButton(text="🚀 Топ роста", callback_data=f"scangrowth:{scan_id}:3")],
         [InlineKeyboardButton(text="👁 Обновить", callback_data=f"scanviews:{scan_id}"),
          InlineKeyboardButton(text="📄 CSV", callback_data=f"scanexport:{scan_id}")],
     ]
@@ -469,16 +471,36 @@ class BotChatAdapter:
         return await self.bot.send_document(self.chat_id, document, caption=full_caption, **kwargs)
 
 
+def _button_text(text: str, limit: int = 62) -> str:
+    """Keep long one-row category labels readable in Telegram clients."""
+    clean = " ".join((text or "").split())
+    return clean if len(clean) <= limit else clean[: max(1, limit - 1)].rstrip() + "…"
+
+
+def _selected_group_children(group_key: str, selected_keys: set[str]) -> list:
+    return [
+        cat for cat in categories_for_group(group_key)
+        if not cat.is_group and cat.key in selected_keys
+    ]
+
+
 def groups_keyboard(selected_keys: set[str]) -> InlineKeyboardMarkup:
-    rows = []
-    items = list(GROUPS.values())
-    for i in range(0, len(items), 2):
-        row = []
-        for group in items[i:i+2]:
-            count = sum(1 for c in CATEGORIES.values() if c.group == group.key and c.key in selected_keys)
-            suffix = f" · {count}" if count else ""
-            row.append(InlineKeyboardButton(text=f"{group.icon} {group.name}{suffix}", callback_data=f"grp:{group.key}"))
-        rows.append(row)
+    # v4.3.4: one long vertical list. A selected section shows not only a count,
+    # but also the chosen subcategory names so the user can see the selection
+    # without opening every section again.
+    rows: list[list[InlineKeyboardButton]] = []
+    for group in GROUPS.values():
+        chosen = _selected_group_children(group.key, selected_keys)
+        if chosen:
+            preview_names = [cat.name for cat in chosen[:2]]
+            preview = ", ".join(preview_names)
+            if len(chosen) > 2:
+                preview += f" +{len(chosen) - 2}"
+            label = _button_text(f"✅ {group.icon} {group.name} · {len(chosen)} · {preview}")
+        else:
+            label = _button_text(f"▫️ {group.icon} {group.name}")
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"grp:{group.key}")])
+
     counter_icon = "⚠️" if len(selected_keys) > MAX_SELECTED_CATEGORIES else "✅"
     rows.append([InlineKeyboardButton(
         text=f"{counter_icon} Выбрано: {len(selected_keys)}/{MAX_SELECTED_CATEGORIES}",
@@ -490,19 +512,15 @@ def groups_keyboard(selected_keys: set[str]) -> InlineKeyboardMarkup:
 
 
 def category_keyboard(group_key: str, selected_keys: set[str]) -> InlineKeyboardMarkup:
-    cats = categories_for_group(group_key)
-    rows = [[InlineKeyboardButton(
-        text=("⚠️" if len(selected_keys) > MAX_SELECTED_CATEGORIES else "✅")
-             + f" Выбрано: {len(selected_keys)}/{MAX_SELECTED_CATEGORIES}",
-        callback_data="selected",
-    )]]
+    # "Весь раздел" and bulk-select are intentionally gone. Only explicit
+    # subcategory choices are shown, so every scan has a clear scope.
+    cats = [cat for cat in categories_for_group(group_key) if not cat.is_group]
+    chosen_here = [cat for cat in cats if cat.key in selected_keys]
+    header = f"✅ В разделе выбрано: {len(chosen_here)} · всего {len(selected_keys)}/{MAX_SELECTED_CATEGORIES}"
+    rows = [[InlineKeyboardButton(text=_button_text(header), callback_data="selected")]]
     for cat in cats:
         marker = "✅" if cat.key in selected_keys else "▫️"
-        rows.append([InlineKeyboardButton(text=f"{marker} {cat.name}", callback_data=f"cat:{cat.key}")])
-    child_keys = [c.key for c in cats if not c.is_group]
-    selected_children = [k for k in child_keys if k in selected_keys]
-    bulk_label = "🧹 Убрать выбранные в разделе" if selected_children else f"☑️ Выбрать до {MAX_SELECTED_CATEGORIES}"
-    rows.append([InlineKeyboardButton(text=bulk_label, callback_data=f"grpall:{group_key}")])
+        rows.append([InlineKeyboardButton(text=_button_text(f"{marker} {cat.name}"), callback_data=f"cat:{cat.key}")])
     rows.append([InlineKeyboardButton(text="▶️ Новый скан", callback_data="start_scan")])
     rows.append([InlineKeyboardButton(text="⬅️ К разделам", callback_data="groups")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -619,7 +637,13 @@ async def reset_user_settings(user_id: int) -> UserSettings:
 async def get_selected(user_id: int) -> set[str]:
     async with SessionLocal() as session:
         result = await session.execute(select(SelectedCategory.category_key).where(SelectedCategory.user_id == user_id))
-        return {x for x in result.scalars().all() if x in CATEGORIES}
+        # v4.3.4: root/"whole section" categories remain in CATEGORIES only for
+        # backwards compatibility with old saved scans. They are no longer a
+        # selectable user option and therefore must not leak back into a new run.
+        return {
+            x for x in result.scalars().all()
+            if x in CATEGORIES and not CATEGORIES[x].is_group
+        }
 
 
 def _scan_category_keys(scan: UserScan) -> list[str]:
@@ -1721,6 +1745,33 @@ def _parse_scan_date_input(text: str | None) -> str | None:
     return value.isoformat()
 
 
+def _export_group_meta(row) -> tuple[int, int, str]:
+    """Return section/category order for a result row without changing its inner ranking."""
+    group_order = {key: i for i, key in enumerate(GROUPS)}
+    category_order = {key: i for i, key in enumerate(CATEGORIES)}
+
+    category_key = getattr(row, "category_key", None)
+    cat = CATEGORIES.get(category_key) if category_key else None
+    if cat is None:
+        category_name = str(getattr(row, "category", "") or "")
+        cat = next((item for item in CATEGORIES.values() if item.name == category_name), None)
+
+    if cat is None:
+        return (len(group_order) + 1, len(category_order) + 1, "")
+    return (
+        group_order.get(cat.group, len(group_order)),
+        category_order.get(cat.key, len(category_order)),
+        cat.group,
+    )
+
+
+def _group_export_rows(rows: list) -> list:
+    """Group multi-section exports as section -> subcategory, preserving ranking inside each subcategory."""
+    decorated = list(enumerate(rows))
+    decorated.sort(key=lambda pair: (*_export_group_meta(pair[1])[:2], pair[0]))
+    return [row for _, row in decorated]
+
+
 def write_listing_csv(rows: list[Listing], mode: str) -> Path:
     now = datetime.now(MOSCOW)
     path, writer, f = _temp_csv(f"kleinanzeigen_{mode}_{now:%Y-%m-%d_%H-%M}.csv")
@@ -2318,6 +2369,7 @@ async def send_smart_export(
         if not result:
             await message.answer("🔥 Пока нет групп минимум с 3 публикациями по текущим фильтрам.", reply_markup=main_keyboard(selected_count))
             return 0
+        result = _group_export_rows(result)
         path = write_frequent_csv(result)
         caption = f"🔥 Часто публикуемые группы: {len(result)}"
 
@@ -2326,6 +2378,7 @@ async def send_smart_export(
         if not result:
             await message.answer("💰 Нужны минимум 5 цен в одной уверенной группе; сейчас нет позиций ≥20% ниже медианы похожих объявлений.", reply_markup=main_keyboard(selected_count))
             return 0
+        result = _group_export_rows(result)
         path = write_market_csv(result)
         caption = f"💰 Потенциально ниже рынка: {len(result)}"
 
@@ -2354,6 +2407,7 @@ async def send_smart_export(
                 reply_markup=main_keyboard(selected_count),
             )
             return 0
+        result = _group_export_rows(result)
         path = write_disappearing_csv(result)
         caption = f"⚡ Быстро исчезающие: {len(result)}"
 
@@ -2366,6 +2420,7 @@ async def send_smart_export(
                 reply_markup=main_keyboard(selected_count),
             )
             return 0
+        result = _group_export_rows(result)
         path = write_price_drop_csv(result)
         caption = f"📉 Снижение цены: {len(result)}"
 
@@ -2374,6 +2429,7 @@ async def send_smart_export(
         if not result:
             await message.answer("📦 По текущим фильтрам ничего не найдено.", reply_markup=main_keyboard(selected_count))
             return 0
+        result = _group_export_rows(result)
         path = write_listing_csv(result, mode)
         caption = f"📦 {MODE_LABELS.get(mode, mode)}: {len(result)}"
 
@@ -7648,35 +7704,119 @@ async def scan_products(callback: CallbackQuery) -> None:
     )
 
 
-@dp.callback_query(F.data.startswith("scantop:"))
-async def scan_top(callback: CallbackQuery) -> None:
-    scan_id = int(callback.data.split(":", 1)[1])
-    scan = await get_user_scan(callback.from_user.id, scan_id)
+async def _scan_top_pairs(user_id: int, scan_id: int) -> tuple[UserScan | None, list[tuple[Listing, ScanListing]]]:
+    scan = await get_user_scan(user_id, scan_id)
     if scan is None:
-        await callback.answer("Скан не найден", show_alert=True); return
+        return None, []
     pairs = await get_scan_rows(scan_id)
-    scan_settings = await get_settings(callback.from_user.id)
+    scan_settings = await get_settings(user_id)
     allowed_rows = apply_listing_settings(
         [p[0] for p in pairs], scan_settings, exact_date_scan=True, apply_output_mode=True
     )
     allowed_ids = {row.external_id for row in allowed_rows}
-    pairs = [p for p in pairs if p[0].external_id in allowed_ids and p[0].view_count is not None]
+    pairs = [
+        p for p in pairs
+        if p[0].external_id in allowed_ids and p[0].view_count is not None
+    ]
     pairs.sort(key=lambda p: p[0].view_count or 0, reverse=True)
+    return scan, pairs
+
+
+def _top_entry(index: int, row: Listing, snap: ScanListing) -> str:
+    delta = (row.view_count - snap.initial_view_count) if snap.initial_view_count is not None else None
+    growth = f" · 🚀 +{delta}" if delta is not None and delta > 0 else ""
+    return (
+        f"<b>{index}. {html.escape(row.title[:55])}</b>\n"
+        f"👁 {row.view_count}{growth} · 💶 {html.escape(_price_display(row.price_text, row.price_eur))}\n"
+        f'<a href="{html.escape(row.url)}">Открыть</a>'
+    )
+
+
+def scan_top12_keyboard(scan_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Показать TOP-50", callback_data=f"scantop50:{scan_id}:0")],
+        [InlineKeyboardButton(text="📊 Открыть скан", callback_data=f"scan:{scan_id}")],
+    ])
+
+
+def scan_top50_keyboard(scan_id: int, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"scantop50:{scan_id}:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{max(1, total_pages)}", callback_data="archive_noop"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"scantop50:{scan_id}:{page + 1}"))
+    rows.append(nav)
+    rows.append([
+        InlineKeyboardButton(text="🔥 TOP-12", callback_data=f"scantop:{scan_id}"),
+        InlineKeyboardButton(text="📊 Скан", callback_data=f"scan:{scan_id}"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data.startswith("scantop:"))
+async def scan_top(callback: CallbackQuery) -> None:
+    scan_id = int(callback.data.split(":", 1)[1])
+    scan, pairs = await _scan_top_pairs(callback.from_user.id, scan_id)
+    if scan is None:
+        await callback.answer("Скан не найден", show_alert=True); return
     await callback.answer()
     if not pairs:
         text = "🔥 <b>Самые просматриваемые</b>\n\nПока нет данных просмотров."
     else:
-        lines = [f"🔥 <b>Топ скана: {html.escape(scan.title)}</b>", ""]
+        lines = [f"🔥 <b>TOP-12: {html.escape(scan.title)}</b>", ""]
         for i, (row, snap) in enumerate(pairs[:12], 1):
-            delta = (row.view_count - snap.initial_view_count) if snap.initial_view_count is not None else None
-            growth = f" · 🚀 +{delta}" if delta is not None and delta > 0 else ""
-            lines.append(
-                f"<b>{i}. {html.escape(row.title[:55])}</b>\n"
-                                f"👁 {row.view_count}{growth} · 💶 {html.escape(_price_display(row.price_text, row.price_eur))}\n"
-                f"<a href=\"{html.escape(row.url)}\">Открыть</a>"
-            )
+            lines.append(_top_entry(i, row, snap))
+        if len(pairs) > 12:
+            lines += ["", f"📋 Доступен полный <b>TOP-{min(50, len(pairs))}</b> по кнопке ниже."]
         text = "\n\n".join(lines)
-    await callback.message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=scan_detail_keyboard(scan_id, archived=scan.archived_at is not None, recheck=bool(getattr(scan, "incomplete_category_keys", ""))))
+    await callback.message.answer(
+        text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        reply_markup=scan_top12_keyboard(scan_id),
+    )
+
+
+@dp.callback_query(F.data.startswith("scantop50:"))
+async def scan_top50(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    try:
+        scan_id = int(parts[1])
+        requested_page = int(parts[2]) if len(parts) > 2 else 0
+    except Exception:
+        await callback.answer("Некорректный запрос", show_alert=True); return
+
+    scan, pairs = await _scan_top_pairs(callback.from_user.id, scan_id)
+    if scan is None:
+        await callback.answer("Скан не найден", show_alert=True); return
+    top = pairs[:50]
+    if not top:
+        await callback.answer("Пока нет данных просмотров", show_alert=True)
+        return
+
+    page_size = 10
+    total_pages = max(1, (len(top) + page_size - 1) // page_size)
+    page = max(0, min(requested_page, total_pages - 1))
+    start_idx = page * page_size
+    chunk = top[start_idx:start_idx + page_size]
+    lines = [
+        f"📋 <b>TOP-{len(top)} по просмотрам</b>",
+        f"<b>{html.escape(scan.title)}</b> · позиции {start_idx + 1}–{start_idx + len(chunk)}",
+        "",
+    ]
+    for i, (row, snap) in enumerate(chunk, start_idx + 1):
+        lines.append(_top_entry(i, row, snap))
+    text = "\n\n".join(lines)
+    markup = scan_top50_keyboard(scan_id, page, total_pages)
+    await callback.answer(f"TOP-{len(top)} · страница {page + 1}/{total_pages}")
+    if callback.message.text:
+        await callback.message.edit_text(
+            text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=markup
+        )
+    else:
+        await callback.message.answer(
+            text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=markup
+        )
 
 
 @dp.callback_query(F.data.startswith("scangrowth:"))
@@ -8164,6 +8304,9 @@ async def open_group(callback: CallbackQuery) -> None:
 async def toggle_cat(callback: CallbackQuery) -> None:
     key = callback.data.split(":", 1)[1]
     if key not in CATEGORIES: await callback.answer("Категория не найдена", show_alert=True); return
+    if CATEGORIES[key].is_group:
+        await callback.answer("Выбор всего раздела убран. Выбери нужные подкатегории.", show_alert=True)
+        return
     selected, limit_reached = await toggle_category(callback.from_user.id, key)
     if limit_reached:
         await callback.answer(
@@ -8177,17 +8320,12 @@ async def toggle_cat(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("grpall:"))
 async def toggle_all_children(callback: CallbackQuery) -> None:
-    group_key = callback.data.split(":", 1)[1]
-    if group_key not in GROUPS: return
-    selected, limit_reached = await toggle_group_children(callback.from_user.id, group_key)
-    if limit_reached:
-        await callback.answer(
-            f"Выбраны свободные места до лимита {MAX_SELECTED_CATEGORIES}. Для одного скана больше нельзя.",
-            show_alert=True,
-        )
-    else:
-        await callback.answer(f"Выбрано: {len(selected)}/{MAX_SELECTED_CATEGORIES}")
-    await callback.message.edit_reply_markup(reply_markup=category_keyboard(group_key, selected))
+    # Legacy buttons from old Telegram messages are disabled too, not only hidden
+    # from the new UI. This prevents accidental whole/bulk section selection.
+    await callback.answer(
+        "Массовый выбор раздела убран. Выбери нужные подкатегории вручную.",
+        show_alert=True,
+    )
 
 
 @dp.callback_query(F.data == "clear_all")
@@ -8208,9 +8346,14 @@ async def selected(callback: CallbackQuery) -> None:
         lines = [f"<b>Выбрано категорий: {counter}</b>", ""]
         if len(cats) > MAX_SELECTED_CATEGORIES:
             lines += [f"⚠️ Для нового запуска оставь максимум {MAX_SELECTED_CATEGORIES} категорий.", ""]
-        for cat in cats[:70]: lines.append(f"• {html.escape(cat.name)}")
-        if len(cats) > 70: lines.append(f"…и ещё {len(cats)-70}")
-        text = "\n".join(lines)
+        for group in GROUPS.values():
+            chosen = [cat for cat in cats if cat.group == group.key and not cat.is_group]
+            if not chosen:
+                continue
+            lines.append(f"{group.icon} <b>{html.escape(group.name)}</b>")
+            lines.extend(f"  • {html.escape(cat.name)}" for cat in chosen)
+            lines.append("")
+        text = "\n".join(lines).rstrip()
     await callback.answer()
     await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(len(keys)))
 
