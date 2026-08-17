@@ -44,7 +44,7 @@ from filters import (
     sort_rows,
     unique_rows,
 )
-from models import BotUser, CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing, ScanObservation, ScanViewHistory, SelectedCategory, StableCategoryJob, StablePageCheckpoint, SubscriptionPayment, SubscriptionPlan, UserScan, UserSettings, ViewHistory
+from models import AppSetting, BotUser, CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing, ScanObservation, ScanViewHistory, SelectedCategory, StableCategoryJob, StablePageCheckpoint, SubscriptionPayment, SubscriptionPlan, UserScan, UserSettings, ViewHistory
 from product_identity import TYPE_DISPLAY, ProductIdentity, recognize_product
 from traffic import TRAFFIC
 from distributed import (
@@ -88,7 +88,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.2.1"
+APP_VERSION = "4.2.2"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -172,6 +172,11 @@ SUBSCRIPTION_NOTICE_POLL_SECONDS = max(60, int(os.getenv("SUBSCRIPTION_NOTICE_PO
 # Recent values are cached so shared/multi-user scans do not reopen the same ad.
 VIEW_COUNT_CACHE_TTL_SECONDS = max(60, int(os.getenv("VIEW_COUNT_CACHE_TTL_SECONDS", "1800")))
 VIEW_COUNT_CONCURRENCY = max(1, min(10, int(os.getenv("VIEW_COUNT_CONCURRENCY", "3"))))
+# v4.2.2 Accurate Views Core. Ranking/filter measurements never reuse the old
+# direct-only cache: each measurement must produce a freshly verified public
+# counter or remain unknown.
+ACCURATE_VIEWS_MODE = os.getenv("ACCURATE_VIEWS_MODE", "1").strip().lower() not in {"0", "false", "no", "off"}
+VIEW_ANALYTICS_CORE_VERSION = "4.2.2"
 # A control measurement must be fresh. This tiny window is only for coalescing
 # truly simultaneous checks of the same IDs across users/scans; it is not a
 # normal cache and cannot replace a 3/6/12h measurement.
@@ -622,6 +627,59 @@ async def create_user_scan(user_id: int, job_uid: str, category_keys: list[str],
         await session.commit()
         await session.refresh(scan)
         return scan
+
+
+async def invalidate_untrusted_view_analytics_once() -> int:
+    """One-time reset of counters produced before Accurate Views Core.
+
+    Existing listing/scan rows are preserved. Only view values and growth history
+    are invalidated because mixing old unverified numbers with verified v4.2.2
+    measurements would create false TOP/growth signals.
+    """
+    if not ACCURATE_VIEWS_MODE:
+        return 0
+    async with db_write_lock:
+        async with SessionLocal() as session:
+            setting = await session.get(AppSetting, "view_analytics_core_version")
+            if setting is not None and (setting.value or "").strip() == VIEW_ANALYTICS_CORE_VERSION:
+                return 0
+
+            listing_result = await session.execute(
+                update(Listing).values(view_count=None, views_checked_at=None)
+            )
+            await session.execute(update(ScanListing).values(initial_view_count=None))
+            await session.execute(delete(ViewHistory))
+            await session.execute(delete(ScanViewHistory))
+            await session.execute(delete(ScanObservation))
+
+            if setting is None:
+                setting = AppSetting(
+                    key="view_analytics_core_version",
+                    value=VIEW_ANALYTICS_CORE_VERSION,
+                    updated_at=datetime.utcnow(),
+                )
+                session.add(setting)
+            else:
+                setting.value = VIEW_ANALYTICS_CORE_VERSION
+                setting.updated_at = datetime.utcnow()
+            await session.commit()
+            return int(listing_result.rowcount or 0)
+
+
+async def get_persisted_active_scan(user_id: int) -> UserScan | None:
+    """Return the user's unfinished scan from PostgreSQL, if any."""
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(UserScan)
+            .where(
+                UserScan.user_id == int(user_id),
+                UserScan.status.in_(["queued", "running", "cancelling"]),
+                UserScan.finished_at.is_(None),
+            )
+            .order_by(UserScan.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
 
 
 async def attach_user_scan_message(scan_id: int, chat_id: int, status_message_id: int) -> None:
@@ -1787,18 +1845,15 @@ async def enrich_page_view_counts(
     if not unique:
         return 0, 0, 0
 
-    cutoff = datetime.utcnow() - timedelta(seconds=VIEW_COUNT_CACHE_TTL_SECONDS)
     async with SessionLocal() as session:
         result = await session.execute(select(Listing).where(Listing.external_id.in_(list(unique))))
         rows = {row.external_id: row for row in result.scalars().all()}
-        targets = [
-            unique[eid] for eid, row in rows.items()
-            if row.views_checked_at is None or row.views_checked_at < cutoff
-        ]
+        # Accurate Views Core always verifies every target in the current
+        # measurement. A previously stored value is never allowed to satisfy a
+        # 50+/100+ filter without a fresh verified read.
+        targets = [unique[eid] for eid in rows if eid in unique]
 
     if not targets:
-        if live is not None:
-            live.views_ready += len(unique)
         return 0, 0, 0
 
     # v4.2.1: live progress must reflect completed counter requests while the
@@ -1806,9 +1861,9 @@ async def enrich_page_view_counts(
     # batch returned, so Telegram could sit at 0/575 for several minutes even
     # though Railway logs showed hundreds of successful 200 responses.
     base_ready = int(live.views_ready or 0) if live is not None else 0
-    reused_count = max(0, len(unique) - len(targets))
+    reused_count = 0
     if live is not None:
-        live.views_ready = base_ready + reused_count
+        live.views_ready = base_ready
 
     async def live_progress(done: int, total: int) -> None:
         if live is None:
@@ -1825,8 +1880,15 @@ async def enrich_page_view_counts(
         concurrency=VIEW_COUNT_CONCURRENCY,
         progress_cb=live_progress,
         traffic_priority="scan_inline",
-        browser_fallback=False,
-        direct_http_only=True,
+        browser_fallback=True,
+        direct_http_only=False,
+        accurate=True,
+    )
+
+    source_counts = Counter(vr.source for vr in results.values())
+    log.info(
+        "Accurate views batch category=%s total=%s sources=%s",
+        (live.category_name if live is not None else "manual"), len(results), dict(source_counts),
     )
 
     now = datetime.utcnow()
@@ -1844,6 +1906,10 @@ async def enrich_page_view_counts(
                     continue
                 if vr.views is None:
                     failed += 1
+                    # Fail closed: a stale number from an earlier measurement must
+                    # never survive a failed current verification and pass 50+/100+.
+                    row.view_count = None
+                    row.views_checked_at = now
                     continue
                 old = row.view_count
                 row.view_count = int(vr.views)
@@ -1881,7 +1947,13 @@ async def refresh_view_counts(
     if not rows:
         return 0, 0, 0
 
-    effective_ttl = VIEW_COUNT_CACHE_TTL_SECONDS if max_age_seconds is None else max(0, int(max_age_seconds))
+    if ACCURATE_VIEWS_MODE:
+        # Never reuse the historical 30-minute cache. A caller may explicitly
+        # request a tiny <=60s coalescing window so an immediate baseline does not
+        # reopen hundreds of ads that were verified seconds ago by the same scan.
+        effective_ttl = max(0, min(60, int(max_age_seconds or 0)))
+    else:
+        effective_ttl = VIEW_COUNT_CACHE_TTL_SECONDS if max_age_seconds is None else max(0, int(max_age_seconds))
     cutoff = datetime.utcnow() - timedelta(seconds=effective_ttl)
     eligible = [row for row in rows if row.url]
     targets = [
@@ -1891,12 +1963,12 @@ async def refresh_view_counts(
     reused_count = max(0, len(eligible) - len(targets))
 
     status = progress_message
-    status_note = "свежий контрольный замер" if effective_ttl <= 60 else f"кэш {max(1, effective_ttl // 60)} мин."
+    status_note = "точный свежий замер" if ACCURATE_VIEWS_MODE else ("свежий контрольный замер" if effective_ttl <= 60 else f"кэш {max(1, effective_ttl // 60)} мин.")
     if status is None and message is not None:
         try:
             status = await message.answer(
                 f"👁 Собираю просмотры для <b>{len(eligible)}</b> объявлений…\n"
-                f"⚡ Лёгкий прямой счётчик · без browser fallback · {status_note}",
+                f"🔎 Проверка публичного счётчика через Chromium · {status_note}",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
@@ -1920,9 +1992,9 @@ async def refresh_view_counts(
                     f"<b>{html.escape(title)}</b>\n\n"
                     f"{_progress_bar(pct)} <b>{pct}%</b>\n"
                     f"📦 Проверено: <b>{completed}/{len(eligible)}</b>\n"
-                    f"⚡ Direct-запросы: <b>{done}/{len(targets)}</b>\n"
-                    f"♻️ Уже свежих: <b>{reused_count}</b>\n\n"
-                    "Можно пользоваться другими разделами — замер идёт в фоне.",
+                    f"🔎 Обработано в текущем замере: <b>{done}/{len(targets)}</b>\n"
+                    f"🔎 Проверяется по странице объявления, без приблизительных значений.\n\n"
+                    "Неподтверждённое значение не заменяется нулём и не попадает в TOP.",
                     parse_mode=ParseMode.HTML,
                 )
             except Exception:
@@ -1940,11 +2012,15 @@ async def refresh_view_counts(
             concurrency=VIEW_COUNT_CONCURRENCY,
             progress_cb=progress_cb,
             traffic_priority=traffic_priority,
-            browser_fallback=False,
-            direct_http_only=True,
+            browser_fallback=True,
+            direct_http_only=False,
+            accurate=True,
         )
     finally:
         await parser.close()
+
+    source_counts = Counter(vr.source for vr in results.values())
+    log.info("Accurate views refresh total=%s sources=%s", len(results), dict(source_counts))
 
     now = datetime.utcnow()
     updated = 0
@@ -1962,6 +2038,10 @@ async def refresh_view_counts(
                     continue
                 if vr.views is None:
                     failed += 1
+                    # Fail closed: a stale number from an earlier measurement must
+                    # never survive a failed current verification and pass 50+/100+.
+                    row.view_count = None
+                    row.views_checked_at = now
                     continue
                 old = row.view_count
                 row.view_count = int(vr.views)
@@ -1981,11 +2061,14 @@ async def refresh_view_counts(
         if vr and vr.views is not None:
             row.view_count = int(vr.views)
             row.views_checked_at = now
+        elif vr is not None:
+            row.view_count = None
+            row.views_checked_at = now
 
     if status is not None and hasattr(status, "edit_text"):
         try:
             await status.edit_text(
-                f"👁 Просмотры готовы: <b>{updated}</b> · не удалось: <b>{failed}</b>",
+                f"👁 Точные просмотры готовы: <b>{updated}</b> · не подтверждено: <b>{failed}</b>",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
@@ -5126,6 +5209,15 @@ async def enqueue_user_scan(message: Message, user_id: int, category_keys: list[
     service is absent, misconfigured, or still booting.
     """
     category_keys = _validate_scan_category_count(category_keys)
+    if STABLE_SINGLE_SERVICE_MODE:
+        existing = await get_persisted_active_scan(user_id)
+        if existing is not None:
+            await message.answer(
+                "⏳ <b>У тебя уже есть активный скан.</b>\n\n"
+                "Дождись завершения или останови его. Второй scan_id одновременно не создаётся.",
+                parse_mode=ParseMode.HTML,
+            )
+            return None
     if DISTRIBUTED_WORKERS:
         ready_wait = 8
         try:
@@ -5212,107 +5304,48 @@ async def enqueue_user_scan(message: Message, user_id: int, category_keys: list[
 
 
 async def recover_interrupted_user_scans(bot: Bot) -> int:
-    """Requeue unfinished scans after a Railway/process restart.
+    """Close unfinished pre-restart jobs; never resurrect them automatically.
 
-    The already collected Listing/ParserRun rows stay in PostgreSQL. Re-running
-    unfinished categories is idempotent at listing level, so a restart cannot turn
-    a 70-page crawl into lost data even though live in-memory progress resets.
+    v4.2.2 Hard Stable Reset keeps one scan = one explicit user launch. A Railway
+    deploy/restart may interrupt a job, but it must not create a second Telegram
+    card or silently start an old date hours later. Verified page checkpoints stay
+    in PostgreSQL and can be reused when the user explicitly repeats the scan.
     """
     now = datetime.utcnow()
-    recovered_jobs: list[ScanJob] = []
-    seen_users: set[int] = set()
     async with SessionLocal() as session:
-        # A user may have pressed Stop milliseconds before a process crash. Persisted
-        # 'cancelling' jobs must remain cancelled rather than resurrecting.
-        cancelling = list((await session.execute(
-            select(UserScan).where(UserScan.status == "cancelling", UserScan.finished_at.is_(None))
+        rows = list((await session.execute(
+            select(UserScan).where(
+                UserScan.status.in_(["queued", "running", "cancelling"]),
+                UserScan.finished_at.is_(None),
+            )
         )).scalars().all())
-        for scan in cancelling:
-            scan.status = "cancelled"
+        for scan in rows:
+            if scan.status == "cancelling":
+                scan.status = "cancelled"
+                scan.last_error = "Остановлен перед перезапуском сервиса"
+            else:
+                scan.status = "failed"
+                scan.last_error = "Скан прерван перезапуском Railway; повтори его вручную"
             scan.finished_at = now
-            scan.last_error = "Остановлен пользователем перед перезапуском сервиса"
-
-        unfinished = list((await session.execute(
-            select(UserScan)
-            .where(UserScan.status.in_(["queued", "running"]), UserScan.finished_at.is_(None))
-            .order_by(UserScan.created_at.desc())
-        )).scalars().all())
-
-        for scan in unfinished:
-            uid = int(scan.user_id)
-            if uid in seen_users:
-                scan.status = "failed"
-                scan.finished_at = now
-                scan.last_error = "Найден дублирующий незавершённый запуск после перезапуска"
-                continue
-            seen_users.add(uid)
-            keys = [k for k in _scan_category_keys(scan) if k in CATEGORIES]
-            if not keys or not scan.chat_id:
-                scan.status = "failed"
-                scan.finished_at = now
-                scan.last_error = "Не удалось восстановить запуск: нет категории или Telegram chat_id"
-                continue
-
-            status_message_id = int(scan.status_message_id or 0)
-            recovery_text = (
-                "♻️ <b>Сервис перезапустился — восстанавливаю незавершённый скан.</b>\n\n"
-                "Уже сохранённые объявления не потеряны. Продолжаю безопасным повторным запуском."
-            )
-            reused_status_card = False
-            if status_message_id:
-                try:
-                    await bot.edit_message_text(
-                        chat_id=int(scan.chat_id),
-                        message_id=status_message_id,
-                        text=recovery_text,
-                        parse_mode=ParseMode.HTML,
-                    )
-                    reused_status_card = True
-                except Exception:
-                    log.info(
-                        "Could not reuse recovery status message; creating replacement scan=%s message=%s",
-                        scan.id, status_message_id,
-                    )
-            if not reused_status_card:
-                try:
-                    msg = await bot.send_message(
-                        int(scan.chat_id), recovery_text, parse_mode=ParseMode.HTML
-                    )
-                    status_message_id = msg.message_id
-                except Exception:
-                    log.exception("Could not create recovery status message scan=%s", scan.id)
-                    if not status_message_id:
-                        scan.status = "failed"
-                        scan.finished_at = now
-                        scan.last_error = "Не удалось восстановить Telegram-контекст после перезапуска"
-                        continue
-
-            scan.status = "queued"
-            scan.status_message_id = status_message_id
-            scan.resumed_count = int(scan.resumed_count or 0) + 1
-            scan.last_error = "Автоматически восстановлен после перезапуска Railway"
-            job = ScanJob(
-                job_id=scan.job_uid,
-                user_id=uid,
-                chat_id=int(scan.chat_id),
-                status_message_id=status_message_id,
-                category_keys=keys,
-                created_at=scan.created_at or now,
-                warnings=["Скан автоматически восстановлен после перезапуска сервиса."],
-                page_limit=int(scan.page_limit or 25),
-                scan_id=scan.id,
-                target_date=scan.target_date or _moscow_today_iso(),
-                recovered=True,
-            )
-            recovered_jobs.append(job)
         await session.commit()
 
-    async with job_guard:
-        for job in recovered_jobs:
-            active_jobs[job.user_id] = job
-            queued_job_ids.append(job.job_id)
-            scan_queue.put_nowait(job)
-    return len(recovered_jobs)
+    for scan in rows:
+        if not scan.chat_id or not scan.status_message_id:
+            continue
+        try:
+            await bot.edit_message_text(
+                chat_id=int(scan.chat_id),
+                message_id=int(scan.status_message_id),
+                text=(
+                    "⚠️ <b>Скан был прерван перезапуском сервиса</b>\n\n"
+                    "Он не запускается повторно автоматически. Уже подтверждённые страницы "
+                    "сохранены; при необходимости нажми «Повторить скан» вручную."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            log.debug("Could not mark interrupted Telegram card scan=%s", scan.id, exc_info=True)
+    return len(rows)
 
 
 
@@ -8351,6 +8384,12 @@ async def main() -> None:
             "disabled on Railway so production cannot silently run in mode=local."
         )
     await init_db()
+    invalidated_views = await invalidate_untrusted_view_analytics_once()
+    if invalidated_views:
+        log.warning(
+            "v4.2.2 Accurate Views reset: invalidated %s legacy listing counters and old growth history",
+            invalidated_views,
+        )
     stale_distributed = await cleanup_stale_distributed_queue_rows()
     if stale_distributed:
         log.info("v4.1.7 stale distributed queue cleanup: %s", stale_distributed)
@@ -8365,7 +8404,10 @@ async def main() -> None:
     else:
         obsolete_observations = await cleanup_obsolete_observation_plans()
         recovered_observations = await recover_running_observations()
-        planned = await backfill_recent_observation_plans()
+        # After the one-time Accurate Views reset, old scans no longer have a
+        # trustworthy baseline. Do not schedule new growth points for them; only
+        # scans completed under v4.2.2 create fresh 0/+3/+6/+12 plans.
+        planned = 0 if invalidated_views else await backfill_recent_observation_plans()
     archived = await archive_expired_scans()
     if recovered_observations or planned or obsolete_observations:
         log.info(
@@ -8396,7 +8438,7 @@ async def main() -> None:
     else:
         recovered_scans = await recover_interrupted_user_scans(bot)
         if recovered_scans:
-            log.warning("v3.3.0 recovered %s unfinished user scan(s) after restart", recovered_scans)
+            log.warning("v4.2.2 closed %s interrupted user scan(s); no automatic resurrection", recovered_scans)
 
     embedded_fleet_tasks: list[asyncio.Task] = []
     embedded_parser_module = None
@@ -8415,9 +8457,9 @@ async def main() -> None:
     log.info("Database backend: %s", DATABASE_BACKEND)
     if STABLE_SINGLE_SERVICE_MODE:
         log.warning(
-            "v4.2.0 Stable Reset active | parser_lane=1 | transport=browser | redis_in_scan_path=False | "
-            "whole_category_recovery=False | page_retries=%s",
-            STABLE_PAGE_RETRIES,
+            "v4.2.2 Stable Reset + Accurate Views active | parser_lane=1 | transport=browser | "
+            "redis_in_scan_path=False | whole_category_recovery=False | accurate_views=%s | page_retries=%s",
+            ACCURATE_VIEWS_MODE, STABLE_PAGE_RETRIES,
         )
 
     worker_tasks = [] if DISTRIBUTED_WORKERS else [

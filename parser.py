@@ -55,6 +55,13 @@ VIEW_COUNT_GLOBAL_CONCURRENCY = max(1, min(16, int(os.getenv("VIEW_COUNT_GLOBAL_
 DIRECT_VIEW_CONCURRENCY = max(1, min(16, int(os.getenv("DIRECT_VIEW_CONCURRENCY", "3"))))
 VIEW_DIRECT_BATCH_SIZE = max(5, min(200, int(os.getenv("VIEW_DIRECT_BATCH_SIZE", "40"))))
 VIEW_DIRECT_BATCH_PAUSE_SECONDS = max(0.0, min(5.0, float(os.getenv("VIEW_DIRECT_BATCH_PAUSE_SECONDS", "0.35"))))
+# v4.2.2 Accurate Views Core. Public view counts are a ranking signal, not an
+# optional decoration. Batch measurements therefore use the rendered ad page
+# and only accept counters that can be tied to the visible view UI (or a strict
+# explicit views field from the page's own counter response).
+ACCURATE_VIEW_BROWSER_CONCURRENCY = max(1, min(4, int(os.getenv("ACCURATE_VIEW_BROWSER_CONCURRENCY", "2"))))
+ACCURATE_VIEW_DOM_TIMEOUT_MS = max(500, min(8000, int(os.getenv("ACCURATE_VIEW_DOM_TIMEOUT_MS", "2500"))))
+ACCURATE_VIEW_RETRIES = max(1, min(3, int(os.getenv("ACCURATE_VIEW_RETRIES", "2"))))
 
 # v3.7.0 Hybrid Transport. A foreground scan can use one short Chromium navigation
 # to establish a normal public browser session and then switch to Playwright's
@@ -999,7 +1006,13 @@ def category_page_info_from_html(
 
 
 PASSIVE_VIEW_ENDPOINT_RE = re.compile(r"/s-vac-inc-get\.json(?:\?|$)", re.IGNORECASE)
-VIEW_KEY_RE = re.compile(r"(?:^|[_-])(view(?:s|count)?|counter|cntr|aufruf(?:e)?|impression(?:s)?|visit(?:s)?)(?:$|[_-])", re.IGNORECASE)
+# Only names that explicitly mean the public view counter are trusted. Generic
+# keys such as count/num/value and impression/visit metrics are intentionally
+# excluded: accepting those was able to produce believable but wrong numbers.
+STRICT_VIEW_KEYS = {
+    "views", "view", "viewcount", "view_count", "aufrufe", "aufruf",
+    "counter", "cntr", "viewcounter", "view_counter",
+}
 
 
 def _coerce_nonnegative_int(value) -> int | None:
@@ -1020,12 +1033,12 @@ def _coerce_nonnegative_int(value) -> int | None:
 
 
 def _extract_passive_view_payload(text: str, *, ad_id: str | None = None) -> tuple[int | None, str | None]:
-    """Extract a likely public view count from a response Kleinanzeigen itself requested.
+    """Parse only an explicitly identified public view counter.
 
-    This function NEVER performs the request. It only parses the response body captured
-    while a normal public ad page is loading. Keyed values such as views/viewCount/
-    counter/Aufrufe are preferred. For the known s-vac-inc-get endpoint a single scalar
-    integer is accepted as a conservative fallback.
+    v4.2.2 is deliberately fail-closed. A 200 response is not proof that an
+    arbitrary integer is the view count. We accept only JSON/text fields whose
+    key explicitly denotes views. Bare integers and generic count/value fields
+    return None and are verified through the rendered ad page instead.
     """
     if not text:
         return None, None
@@ -1038,68 +1051,39 @@ def _extract_passive_view_payload(text: str, *, ad_id: str | None = None) -> tup
     except Exception:
         data = None
 
-    keyed: list[tuple[int, str, int]] = []
-    scalars: list[tuple[str, int]] = []
+    keyed: list[tuple[str, int]] = []
 
     def walk(value, path: str = "$"):
         if isinstance(value, dict):
             for k, v in value.items():
                 key = str(k)
                 next_path = f"{path}.{key}"
+                normalized = re.sub(r"[-\s]+", "_", key.strip().lower())
+                compact = normalized.replace("_", "")
                 iv = _coerce_nonnegative_int(v)
-                if iv is not None:
-                    scalars.append((next_path, iv))
-                    low = key.lower().replace("-", "_")
-                    score = 0
-                    if low in {"views", "view", "viewcount", "view_count", "aufrufe", "counter", "cntr"}:
-                        score = 10
-                    elif VIEW_KEY_RE.search(low):
-                        score = 7
-                    elif low in {"count", "num", "value"}:
-                        score = 3
-                    if score:
-                        keyed.append((score, next_path, iv))
+                if iv is not None and (normalized in STRICT_VIEW_KEYS or compact in STRICT_VIEW_KEYS):
+                    keyed.append((next_path, iv))
                 walk(v, next_path)
         elif isinstance(value, list):
             for i, v in enumerate(value[:100]):
                 walk(v, f"{path}[{i}]")
-        else:
-            iv = _coerce_nonnegative_int(value)
-            if iv is not None:
-                scalars.append((path, iv))
 
     if data is not None:
         walk(data)
         if keyed:
-            keyed.sort(key=lambda x: (-x[0], len(x[1]), x[1]))
-            score, path, value = keyed[0]
-            return value, f"json:{path}"
+            # Multiple explicit view fields are accepted only when they agree.
+            values = {v for _, v in keyed}
+            if len(values) == 1:
+                path, value = sorted(keyed, key=lambda x: (len(x[0]), x[0]))[0]
+                return value, f"json-explicit:{path}"
+            return None, "json-explicit:conflict"
 
-        # Conservative endpoint-specific fallback: one numeric scalar other than the ad ID.
-        ad_num = int(ad_id) if ad_id and ad_id.isdigit() else None
-        unique = []
-        seen = set()
-        for path, value in scalars:
-            if value == ad_num or value in seen:
-                continue
-            seen.add(value)
-            unique.append((path, value))
-        if len(unique) == 1:
-            path, value = unique[0]
-            return value, f"json-single:{path}"
-
-    # Plain-text number is also a safe shape for this specific captured endpoint.
-    iv = _coerce_nonnegative_int(body)
-    if iv is not None and (not ad_id or str(iv) != ad_id):
-        return iv, "text:integer"
-
-    # Narrow textual keyed fallback; avoid arbitrary numbers such as ad IDs/statuses.
     m = re.search(
-        r'(?i)(?:"|\\b)(views?|view[_-]?count|counter|cntr|aufrufe?|impressions?|visits?)(?:"|\\b)\\s*[:=]\\s*"?(\\d{1,9})"?',
+        r'(?i)(?:"|\b)(views?|view[_-]?count|view[_-]?counter|counter|cntr|aufrufe?)(?:"|\b)\s*[:=]\s*"?(\d{1,9})"?',
         body,
     )
     if m:
-        return int(m.group(2)), f"text-key:{m.group(1)}"
+        return int(m.group(2)), f"text-explicit:{m.group(1)}"
     return None, None
 
 
@@ -1969,6 +1953,131 @@ class KleinanzeigenParser:
 
         return None, None, "browser:not-found"
 
+    async def _extract_verified_view_count_from_page(self, page) -> tuple[int | None, str | None, str]:
+        """Read only the counter that is visibly rendered for the ad.
+
+        This is stricter than the legacy diagnostic extractor: no hydration
+        impressions, generic metadata numbers, or arbitrary script integers are
+        accepted as a ranking signal.
+        """
+        selectors = [
+            "#viewad-cntr-num",
+            "[data-testid='view-count']",
+            "[data-testid='viewad-cntr-num']",
+        ]
+        for selector in selectors:
+            try:
+                loc = page.locator(selector)
+                count = await loc.count()
+                for i in range(min(count, 3)):
+                    raw = (await loc.nth(i).inner_text()).strip()
+                    value, raw_norm = self._view_value_from_text(raw)
+                    if value is not None:
+                        return value, raw_norm, f"verified-dom:{selector}"
+            except Exception:
+                pass
+
+        # Kleinanzeigen has also rendered date/time + eye count in one public
+        # extra-info block. Its parser strips date/time tokens before accepting
+        # the remaining standalone integer.
+        for selector in ("#viewad-extra-info", "[id='viewad-extra-info']"):
+            try:
+                loc = page.locator(selector)
+                if await loc.count():
+                    raw = (await loc.first.inner_text()).strip()
+                    value, raw_norm = self._view_value_from_extra_text(raw)
+                    if value is not None:
+                        return value, raw_norm, f"verified-dom:{selector}:extra-info"
+            except Exception:
+                pass
+        return None, None, "verified-dom:not-found"
+
+    async def fetch_public_view_count_accurate(
+        self, url: str, *, traffic_priority: str = "normal"
+    ) -> ViewCountResult:
+        """Return a fail-closed public view count suitable for ranking.
+
+        The rendered DOM is authoritative. The page's passive counter response is
+        only a fallback and is parsed with explicit view-field rules. Unknown is
+        returned instead of guessing or substituting zero.
+        """
+        if not _allowed_url(url) or "/s-anzeige/" not in url:
+            return ViewCountResult(None, None, "verified:invalid-url", error="Нужна публичная ссылка Kleinanzeigen")
+
+        try:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        except Exception as exc:
+            return ViewCountResult(None, None, "verified:playwright-unavailable", error=str(exc))
+
+        last_error = None
+        for attempt in range(1, ACCURATE_VIEW_RETRIES + 1):
+            page = None
+            passive_tasks = []
+            try:
+                context = await self._ensure_view_browser()
+                page = await context.new_page()
+                await self._install_lightweight_route(page)
+                ad_id = extract_external_id(url)
+                passive_future, passive_tasks = self._attach_passive_view_capture(page, ad_id)
+
+                async with TRAFFIC.lease("browser", traffic_priority):
+                    response = await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+                if response is not None:
+                    if response.status in {403, 429}:
+                        await TRAFFIC.report_refusal(response.status, "browser")
+                    elif 200 <= response.status < 400:
+                        await TRAFFIC.report_success("browser")
+
+                final_url = page.url
+                title = await page.title()
+                try:
+                    await page.wait_for_selector(
+                        "#viewad-cntr-num, [data-testid='view-count'], #viewad-extra-info",
+                        state="attached", timeout=ACCURATE_VIEW_DOM_TIMEOUT_MS,
+                    )
+                except PlaywrightTimeoutError:
+                    pass
+                await page.wait_for_timeout(700)
+
+                value, raw, source = await self._extract_verified_view_count_from_page(page)
+                if value is not None:
+                    return ViewCountResult(int(value), raw, source, final_url, title)
+
+                # The public page can hydrate the visible counter from its own XHR.
+                # Only an explicitly named view field is accepted here.
+                try:
+                    value, raw_payload, endpoint_url, shape = await asyncio.wait_for(
+                        asyncio.shield(passive_future), timeout=1.2
+                    )
+                    if value is not None and shape and "explicit" in shape:
+                        return ViewCountResult(
+                            int(value), raw_payload,
+                            f"verified-network:s-vac-inc-get:{shape}", final_url, title,
+                        )
+                except (asyncio.TimeoutError, PlaywrightTimeoutError):
+                    pass
+
+                diag = await self._page_diagnostic(page)
+                last_error = f"page={diag.get('classification')}; source={source}"
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"[:400]
+            finally:
+                for task in passive_tasks:
+                    if not task.done():
+                        task.cancel()
+                if passive_tasks:
+                    await asyncio.gather(*passive_tasks, return_exceptions=True)
+                if page is not None:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+
+            if attempt < ACCURATE_VIEW_RETRIES:
+                await asyncio.sleep(0.25 * attempt)
+
+        return ViewCountResult(None, None, "verified:not-found", url, None, last_error or "counter not found")
+
     async def _page_diagnostic(self, page) -> dict:
         """Small non-sensitive diagnostics for explaining a missing public counter."""
         diag = {"final_url": None, "title": None, "extra_info": None, "classification": "normal"}
@@ -2441,16 +2550,14 @@ class KleinanzeigenParser:
         direct_http_only: bool = True,
         batch_size: int | None = None,
         batch_pause_seconds: float | None = None,
+        accurate: bool = True,
     ) -> dict[str, ViewCountResult]:
-        """Batch public view counters with a lightweight direct-first strategy.
+        """Batch public view counters.
 
-        v3.1.4 deliberately keeps mass view refreshes cheap: by default it uses
-        only the public direct HTTP counter and *does not* open Chromium for failed
-        listings. Browser fallback remains available for explicit one-off diagnostics
-        by passing ``browser_fallback=True`` and ``direct_http_only=False``.
-
-        Requests are processed in small batches so background 3/6/12-hour
-        checkpoints do not create a burst that competes with interactive scans.
+        v4.2.2 defaults to Accurate Views Core: every accepted number must come
+        from the rendered public counter or an explicit view field requested by
+        that rendered page. The old direct-only mode remains opt-in for diagnostics
+        but is never used for ranking, filters, TOP or scheduled measurements.
         """
         if not urls:
             return {}
@@ -2460,8 +2567,6 @@ class KleinanzeigenParser:
         total = len(urls)
         done_count = 0
         done_lock = asyncio.Lock()
-        effective_batch = max(1, int(batch_size or VIEW_DIRECT_BATCH_SIZE))
-        effective_pause = VIEW_DIRECT_BATCH_PAUSE_SECONDS if batch_pause_seconds is None else max(0.0, float(batch_pause_seconds))
 
         async def report_progress():
             if progress_cb is None:
@@ -2473,62 +2578,42 @@ class KleinanzeigenParser:
             except Exception:
                 pass
 
-        # Mass refreshes stay HTTP-only. This avoids creating a Playwright context
-        # merely because one direct request failed.
-        mode = "http"
-        if not direct_http_only:
-            mode, probe = await self.probe_direct_view_mode(urls[0], traffic_priority=traffic_priority)
-            if probe.views is not None:
-                results[urls[0]] = probe
-                done_count = 1
+        if accurate:
+            sem = asyncio.Semaphore(max(1, min(ACCURATE_VIEW_BROWSER_CONCURRENCY, concurrency)))
 
+            async def accurate_one(url: str):
+                nonlocal done_count
+                async with sem:
+                    vr = await self.fetch_public_view_count_accurate(
+                        url, traffic_priority=traffic_priority
+                    )
+                    results[url] = vr
+                async with done_lock:
+                    done_count += 1
+                await report_progress()
+
+            await asyncio.gather(*(accurate_one(url) for url in urls))
+            await report_progress()
+            return results
+
+        # Legacy/diagnostic direct mode. It is intentionally opt-in.
+        effective_batch = max(1, int(batch_size or VIEW_DIRECT_BATCH_SIZE))
+        effective_pause = VIEW_DIRECT_BATCH_PAUSE_SECONDS if batch_pause_seconds is None else max(0.0, float(batch_pause_seconds))
         direct_sem = asyncio.Semaphore(max(1, min(DIRECT_VIEW_CONCURRENCY, concurrency)))
 
         async def direct_one(url: str):
             nonlocal done_count
-            if url in results:
-                return
             async with direct_sem:
-                if direct_http_only:
-                    vr = await self._direct_view_http(url, traffic_priority=traffic_priority)
-                else:
-                    vr = await self.fetch_public_view_count_direct(url, mode=mode, traffic_priority=traffic_priority)
-                results[url] = vr
+                results[url] = await self._direct_view_http(url, traffic_priority=traffic_priority)
             async with done_lock:
                 done_count += 1
-            # v4.2.1: report after every completed direct request. Callers that
-            # edit Telegram messages already throttle their own edits, while the
-            # scan card callback only updates an in-memory counter for the ticker.
             await report_progress()
 
-        # Chunking is intentional: it yields the event loop and smooths network
-        # pressure while Telegram UI callbacks remain responsive.
-        pending_urls = [url for url in urls if url not in results]
-        for offset in range(0, len(pending_urls), effective_batch):
-            chunk = pending_urls[offset:offset + effective_batch]
+        for offset in range(0, len(urls), effective_batch):
+            chunk = urls[offset:offset + effective_batch]
             await asyncio.gather(*(direct_one(url) for url in chunk))
-            await report_progress()
-            if offset + effective_batch < len(pending_urls) and effective_pause > 0:
+            if offset + effective_batch < len(urls) and effective_pause > 0:
                 await asyncio.sleep(effective_pause)
-
-        failed_urls = [url for url in urls if results.get(url) is None or results[url].views is None]
-        if not failed_urls or not browser_fallback:
-            await report_progress()
-            return results
-
-        # Explicit opt-in only. This path is kept for diagnostics/small targeted
-        # checks, never for automatic or manual mass refreshes.
-        page_sem = asyncio.Semaphore(1)
-
-        async def browser_one(url: str):
-            async with page_sem:
-                vr = await self.fetch_public_view_count(
-                    url, http_fast_path=False, traffic_priority=traffic_priority
-                )
-                results[url] = vr
-
-        for url in failed_urls:
-            await browser_one(url)
         await report_progress()
         return results
 
