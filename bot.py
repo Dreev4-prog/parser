@@ -88,7 +88,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.10"
+APP_VERSION = "4.3.12"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -231,7 +231,12 @@ VIEW_COUNT_CONCURRENCY = max(1, min(10, int(os.getenv("VIEW_COUNT_CONCURRENCY", 
 # direct-only cache: each measurement must produce a freshly verified public
 # counter or remain unknown.
 ACCURATE_VIEWS_MODE = os.getenv("ACCURATE_VIEWS_MODE", "1").strip().lower() not in {"0", "false", "no", "off"}
-VIEW_ANALYTICS_CORE_VERSION = "4.2.2"
+# v4.3.12: a scan must not claim success when almost every exact counter failed.
+# Small batches are exempt from the ratio guard because a few deleted/private ads
+# can legitimately dominate them.
+MIN_PRIMARY_VIEW_COVERAGE = max(0.0, min(1.0, float(os.getenv("MIN_PRIMARY_VIEW_COVERAGE", "0.80"))))
+MIN_PRIMARY_VIEW_COVERAGE_SAMPLE = max(1, int(os.getenv("MIN_PRIMARY_VIEW_COVERAGE_SAMPLE", "20")))
+VIEW_ANALYTICS_CORE_VERSION = "4.3.12"
 # A control measurement must be fresh. This tiny window is only for coalescing
 # truly simultaneous checks of the same IDs across users/scans; it is not a
 # normal cache and cannot replace a 3/6/12h measurement.
@@ -2903,6 +2908,9 @@ class ScanResult:
     low_quality_pages: int = 0
     verified_pages: int = 0
     view_failures: int = 0
+    view_requested: int = 0
+    view_updated: int = 0
+    views_complete: bool = True
     quality_score: int = 0
     quality_note: str = ""
 
@@ -3333,6 +3341,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     low_quality_pages = 0
     verified_pages = 0
     view_failures = 0
+    view_requested = 0
+    view_updated = 0
+    views_complete = True
 
     def classify(items):
         profile = profile_page_dates(items, target_day)
@@ -4306,9 +4317,11 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 view_slot_acquired = True
                 if live is not None:
                     live.phase = "views"
-                _, _, failed_views = await enrich_page_view_counts(
+                requested_views, updated_views, failed_views = await enrich_page_view_counts(
                     parser, list(deferred_view_items.values()), live
                 )
+                view_requested += requested_views
+                view_updated += updated_views
                 view_failures += failed_views
             except ScanStopRequested:
                 if not acquire_view_task.done():
@@ -4320,6 +4333,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 # counter.  Do not convert a successfully crawled date into a
                 # partial category merely because the optional counter endpoint
                 # had a transient problem.
+                view_requested += len(deferred_view_items)
                 view_failures += len(deferred_view_items)
                 log.exception(
                     "Deferred view-count phase failed category=%s target=%s",
@@ -4328,6 +4342,12 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             finally:
                 if view_slot_acquired:
                     inline_view_phase_sem.release()
+
+        if view_requested >= MIN_PRIMARY_VIEW_COVERAGE_SAMPLE:
+            view_ratio = view_updated / max(1, view_requested)
+            views_complete = view_ratio >= MIN_PRIMARY_VIEW_COVERAGE
+        else:
+            views_complete = True
 
         quality_score, quality_note = _calculate_scan_quality(
             listings_parsed=listings_parsed,
@@ -4341,6 +4361,11 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             view_failures=view_failures,
             date_complete=request_complete,
         )
+        if not views_complete:
+            pct = round((view_updated / max(1, view_requested)) * 100)
+            quality_score = min(quality_score, 69)
+            quality_note = f"точные просмотры {view_updated}/{view_requested} ({pct}%); {quality_note}"[:500]
+            reason = f"{reason}; просмотры подтверждены {view_updated}/{view_requested}"
         update_quality_live(quality_note if quality_score < 85 else "")
 
         interrupted = reason.startswith("временный лимит Kleinanzeigen")
@@ -4396,6 +4421,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             low_quality_pages=low_quality_pages,
             verified_pages=verified_pages,
             view_failures=view_failures,
+            view_requested=view_requested,
+            view_updated=view_updated,
+            views_complete=views_complete,
             quality_score=quality_score,
             quality_note=quality_note,
         )
@@ -4459,6 +4487,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             low_quality_pages=low_quality_pages,
             verified_pages=verified_pages,
             view_failures=view_failures,
+            view_requested=view_requested,
+            view_updated=view_updated,
+            views_complete=views_complete,
             quality_score=quality_score,
             quality_note=quality_note,
         )
@@ -4507,7 +4538,7 @@ def _cacheable_category_result(result: ScanResult | None) -> bool:
     replayed to the same user and to other Railway replicas. Partial/failed work is
     recovery input, never a reusable final result.
     """
-    return bool(result is not None and result.date_complete)
+    return bool(result is not None and result.date_complete and result.views_complete)
 
 
 def _may_publish_category_result_cache() -> bool:
@@ -5469,6 +5500,17 @@ async def _run_category_child(
                     f"самая старая распознанная дата — {reached}; "
                     f"сетевых запросов {result.pages_scanned}; качество {result.quality_score}/100; "
                     f"причина: {result.reason}"
+                )
+                child.warnings.append(note)
+                child.scan_notes.append(note)
+            elif not result.views_complete:
+                child.incomplete_categories += 1
+                child.incomplete_category_keys.add(cat.key)
+                pct = round((result.view_updated / max(1, result.view_requested)) * 100) if result.view_requested else 0
+                note = (
+                    f"{cat.name}: точные просмотры собраны только для "
+                    f"{result.view_updated}/{result.view_requested} объявлений ({pct}%). "
+                    "Категория сохранена, но скан не считается полностью завершённым."
                 )
                 child.warnings.append(note)
                 child.scan_notes.append(note)

@@ -8,6 +8,7 @@ import random
 import re
 import time
 from dataclasses import dataclass
+from collections import Counter
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import unquote, urljoin, urlparse, urlsplit, urlunsplit
@@ -64,6 +65,13 @@ ACCURATE_VIEW_BROWSER_CONCURRENCY = max(1, min(4, int(os.getenv("ACCURATE_VIEW_B
 # direct requests to fill the process-wide Views Pool; Chromium fallback remains
 # separately capped by ACCURATE_VIEW_BROWSER_CONCURRENCY.
 ACCURATE_VIEW_HTTP_CONCURRENCY = max(2, min(24, int(os.getenv("ACCURATE_VIEW_HTTP_CONCURRENCY", "12"))))
+# v4.3.12: if plain httpx loses the public counter session, retry the SAME
+# official s-vac endpoint through BrowserContext.request before rendering pages.
+# This recovers cookies/session state cheaply and avoids both false 2/1123
+# completions and opening hundreds of Chromium tabs.
+ACCURATE_VIEW_CONTEXT_CONCURRENCY = max(1, min(8, int(os.getenv("ACCURATE_VIEW_CONTEXT_CONCURRENCY", "4"))))
+ACCURATE_VIEW_BROWSER_FALLBACK_MAX = max(0, min(300, int(os.getenv("ACCURATE_VIEW_BROWSER_FALLBACK_MAX", "50"))))
+ACCURATE_VIEW_BROWSER_PROBE_ATTEMPTS = max(1, min(5, int(os.getenv("ACCURATE_VIEW_BROWSER_PROBE_ATTEMPTS", "3"))))
 ACCURATE_VIEW_DOM_TIMEOUT_MS = max(500, min(8000, int(os.getenv("ACCURATE_VIEW_DOM_TIMEOUT_MS", "2500"))))
 ACCURATE_VIEW_BROWSER_NAV_TIMEOUT_MS = max(5_000, min(30_000, int(os.getenv("ACCURATE_VIEW_BROWSER_NAV_TIMEOUT_MS", "15000"))))
 ACCURATE_VIEW_RETRIES = max(1, min(3, int(os.getenv("ACCURATE_VIEW_RETRIES", "2"))))
@@ -2672,126 +2680,172 @@ class KleinanzeigenParser:
                 pass
 
         if accurate:
-            # v4.3.2 Two-Phase Accurate Views:
-            # 1) fill the shared HTTP Views Pool with Kleinanzeigen's official
-            #    counter endpoint for the entire batch;
-            # 2) only the misses enter the much heavier Chromium lane.
-            # Previously each item held a 2-slot semaphore across HTTP + browser,
-            # so three users could not actually use the process-wide 6-slot pool.
+            # v4.3.12 Three-stage Accurate Views pipeline.
+            #
+            # Stage 1: cheapest official counter through the shared httpx client.
+            # Stage 2: on a miss, retry the SAME official endpoint through the
+            #          Playwright BrowserContext request API (shared cookies/session).
+            # Stage 3: only if both exact endpoint paths miss, probe a rendered page.
+            #
+            # Each stage has its own semaphore, so a slow browser fallback never
+            # occupies an HTTP slot. This keeps multi-user scans moving while still
+            # refusing to invent a view number.
             http_sem = asyncio.Semaphore(ACCURATE_VIEW_HTTP_CONCURRENCY)
+            context_sem = asyncio.Semaphore(ACCURATE_VIEW_CONTEXT_CONCURRENCY)
             browser_sem = asyncio.Semaphore(max(1, min(ACCURATE_VIEW_BROWSER_CONCURRENCY, concurrency)))
-            fallback_urls: list[str] = []
-            direct_errors: dict[str, str] = {}
-            fallback_lock = asyncio.Lock()
-            phase1_started = time.monotonic()
+            context_seed_lock = asyncio.Lock()
+            browser_probe_lock = asyncio.Lock()
+            browser_count_lock = asyncio.Lock()
+            context_ready = False
+            browser_viable: bool | None = None
+            browser_probe_failures = 0
+            browser_fallback_used = 0
             singleflight_hits = 0
-            direct_ok_count = 0
-            direct_unknown_count = 0
-            direct_retry_count = 0
+            stats = Counter()
+            phase_started = time.monotonic()
 
-            async def direct_phase(url: str):
-                nonlocal done_count, singleflight_hits, direct_ok_count, direct_unknown_count, direct_retry_count
+            async def finalize(url: str, vr: ViewCountResult) -> ViewCountResult:
+                nonlocal done_count
+                results[url] = vr
+                async with done_lock:
+                    done_count += 1
+                await report_progress()
+                return vr
+
+            async def ensure_context_session() -> None:
+                nonlocal context_ready
+                if context_ready:
+                    return
+                async with context_seed_lock:
+                    if context_ready:
+                        return
+                    context = await self._ensure_view_browser()
+                    await self._seed_context_request_session(context)
+                    context_ready = True
+
+            def verified(vr: ViewCountResult, prefix: str) -> ViewCountResult:
+                return ViewCountResult(
+                    int(vr.views), vr.raw_text, f"{prefix}:{vr.source}",
+                    vr.final_url, vr.page_title, None,
+                )
+
+            async def browser_recover(url: str, initial_error: str | None) -> ViewCountResult:
+                nonlocal browser_viable, browser_probe_failures, browser_fallback_used
+
+                # Probe a few different ads before declaring rendered fallback dead.
+                # One listing may simply have disappeared, so a single failed page
+                # must not disable recovery for the other thousand items.
+                async with browser_probe_lock:
+                    if browser_viable is None:
+                        async with browser_sem:
+                            probe = await self._fetch_public_view_count_browser_verified(
+                                url, traffic_priority=traffic_priority, initial_error=initial_error
+                            )
+                        if probe.views is not None:
+                            browser_viable = True
+                            stats["browser_probe_ok"] += 1
+                            return probe
+                        browser_probe_failures += 1
+                        stats["browser_probe_failed"] += 1
+                        if browser_probe_failures >= ACCURATE_VIEW_BROWSER_PROBE_ATTEMPTS:
+                            browser_viable = False
+                        return probe
+
+                if not browser_viable:
+                    return ViewCountResult(
+                        None, None, "verified:browser-fallback-unavailable", url, None,
+                        initial_error or "rendered counter fallback unavailable",
+                    )
+
+                # A successful browser probe can refresh cookies. Retry the cheap
+                # context endpoint once before spending a full page navigation.
+                try:
+                    async with context_sem:
+                        retry = await self._direct_view_context_request(
+                            url, traffic_priority=traffic_priority
+                        )
+                    if retry.views is not None:
+                        stats["context_after_probe_ok"] += 1
+                        return verified(retry, "verified-context-retry")
+                except Exception:
+                    pass
+
+                async with browser_count_lock:
+                    if browser_fallback_used >= ACCURATE_VIEW_BROWSER_FALLBACK_MAX:
+                        stats["browser_cap"] += 1
+                        return ViewCountResult(
+                            None, None, "verified:browser-fallback-cap", url, None,
+                            f"browser fallback cap {ACCURATE_VIEW_BROWSER_FALLBACK_MAX} reached",
+                        )
+                    browser_fallback_used += 1
+
+                async with browser_sem:
+                    vr = await self._fetch_public_view_count_browser_verified(
+                        url, traffic_priority=traffic_priority, initial_error=initial_error
+                    )
+                stats["browser_ok" if vr.views is not None else "browser_failed"] += 1
+                return vr
+
+            async def accurate_one(url: str):
+                nonlocal singleflight_hits
                 if not _allowed_url(url) or "/s-anzeige/" not in url:
-                    results[url] = ViewCountResult(
+                    stats["invalid"] += 1
+                    return await finalize(url, ViewCountResult(
                         None, None, "verified:invalid-url",
                         error="Нужна публичная ссылка Kleinanzeigen",
-                    )
-                    async with done_lock:
-                        done_count += 1
-                    await report_progress()
-                    return
+                    ))
 
+                # Stage 1 — plain official HTTP counter.
                 async with http_sem:
                     direct, shared = await self._direct_view_http_shared(
                         url, traffic_priority=traffic_priority
                     )
                 if shared:
                     singleflight_hits += 1
-
-                # A single refusal/transport hiccup may be retried once through the
-                # SAME official endpoint. The adaptive TRAFFIC lease waits for the
-                # cooldown first. A refusal cluster is not retried here, otherwise
-                # thousands of tasks would pile up behind a 60-second cooldown.
-                miss_source = direct.source or ""
-                retryable_refusal = miss_source in {"direct-http:status-403", "direct-http:status-429"}
-                retryable_error = miss_source == "direct-http:error"
-                if direct.views is None and (retryable_refusal or retryable_error):
-                    snap = await TRAFFIC.snapshot()
-                    should_retry = (
-                        (retryable_refusal and snap.penalty_level <= 1 and snap.cooldown_seconds <= 20.0)
-                        or (retryable_error and snap.penalty_level == 0)
-                    )
-                    if should_retry:
-                        direct_retry_count += 1
-                        async with http_sem:
-                            direct, shared_retry = await self._direct_view_http_shared(
-                                url, traffic_priority=traffic_priority
-                            )
-                        if shared_retry:
-                            singleflight_hits += 1
-                        miss_source = direct.source or miss_source
-
                 if direct.views is not None:
-                    direct_ok_count += 1
-                    results[url] = ViewCountResult(
-                        int(direct.views),
-                        direct.raw_text,
-                        f"verified-official:{direct.source}",
-                        direct.final_url,
-                        direct.page_title,
-                        None,
-                    )
-                    async with done_lock:
-                        done_count += 1
-                    await report_progress()
-                    return
+                    stats["http_ok"] += 1
+                    return await finalize(url, verified(direct, "verified-official"))
+                stats[f"http_miss:{direct.source}"] += 1
 
-                # Chromium is a compatibility fallback only when the official
-                # endpoint answered HTTP 200 but its payload could not be parsed.
-                # Explicit 403/429, timeouts and other HTTP failures are honored as
-                # unknown values instead of opening hundreds of browser pages.
-                if miss_source == "direct-http:unparsed":
-                    async with fallback_lock:
-                        fallback_urls.append(url)
-                        direct_errors[url] = direct.error or direct.source
-                    return
-
-                direct_unknown_count += 1
-                results[url] = ViewCountResult(
-                    None, direct.raw_text, f"verified-official-miss:{miss_source}",
-                    direct.final_url, direct.page_title,
-                    direct.error or miss_source or "official counter unavailable",
-                )
-                async with done_lock:
-                    done_count += 1
-                await report_progress()
-
-            await asyncio.gather(*(direct_phase(url) for url in urls))
-            valid_total = sum(1 for url in urls if _allowed_url(url) and "/s-anzeige/" in url)
-            phase1_elapsed = max(0.001, time.monotonic() - phase1_started)
-            log.info(
-                "Accurate views phase1 complete total=%s http_ok=%s official_unknown=%s "
-                "browser_fallback=%s retries=%s shared=%s elapsed=%.2fs rate=%.1f/s",
-                total, direct_ok_count, direct_unknown_count, len(fallback_urls),
-                direct_retry_count, singleflight_hits, phase1_elapsed, valid_total / phase1_elapsed,
-            )
-
-            if fallback_urls:
-                async def browser_phase(url: str):
-                    nonlocal done_count
-                    async with browser_sem:
-                        vr = await self._fetch_public_view_count_browser_verified(
-                            url,
-                            traffic_priority=traffic_priority,
-                            initial_error=direct_errors.get(url),
+                # Stage 2 — same official endpoint, but with browser-context cookies.
+                try:
+                    await ensure_context_session()
+                    async with context_sem:
+                        context_direct = await self._direct_view_context_request(
+                            url, traffic_priority=traffic_priority
                         )
-                        results[url] = vr
-                    async with done_lock:
-                        done_count += 1
-                    await report_progress()
+                except Exception as exc:
+                    context_direct = ViewCountResult(
+                        None, None, "direct-context:error", url, None, str(exc)[:300]
+                    )
+                if context_direct.views is not None:
+                    stats["context_ok"] += 1
+                    return await finalize(url, verified(context_direct, "verified-context"))
+                stats[f"context_miss:{context_direct.source}"] += 1
 
-                await asyncio.gather(*(browser_phase(url) for url in fallback_urls))
+                # Stage 3 — rendered public page, guarded by a viability probe and cap.
+                vr = await browser_recover(
+                    url, context_direct.error or context_direct.source or direct.error or direct.source
+                )
+                if vr.views is None:
+                    stats["final_unknown"] += 1
+                return await finalize(url, vr)
 
+            await asyncio.gather(*(accurate_one(url) for url in urls))
+            elapsed = max(0.001, time.monotonic() - phase_started)
+            log.info(
+                "Accurate views v4.3.12 complete total=%s exact=%s unknown=%s "
+                "http_ok=%s context_ok=%s context_after_probe=%s browser_ok=%s "
+                "browser_probe_ok=%s browser_probe_failed=%s browser_cap=%s shared=%s "
+                "elapsed=%.2fs rate=%.1f/s",
+                total,
+                sum(1 for vr in results.values() if vr.views is not None),
+                sum(1 for vr in results.values() if vr.views is None),
+                stats.get("http_ok", 0), stats.get("context_ok", 0),
+                stats.get("context_after_probe_ok", 0), stats.get("browser_ok", 0),
+                stats.get("browser_probe_ok", 0), stats.get("browser_probe_failed", 0),
+                stats.get("browser_cap", 0), singleflight_hits, elapsed, total / elapsed,
+            )
             await report_progress()
             return results
 
