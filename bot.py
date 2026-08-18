@@ -120,20 +120,20 @@ MULTIUSER_VIEW_POOL_SIZE = max(2, min(12, int(os.getenv("MULTIUSER_VIEW_POOL_SIZ
 MULTIUSER_VIEW_MIN_INTERVAL_SECONDS = max(0.05, min(0.50, float(
     os.getenv("MULTIUSER_VIEW_MIN_INTERVAL_SECONDS", "0.05")
 )))
-# v4.3.9: two selected categories may advance in parallel inside one user scan.
-# A separate process-wide cap prevents 4 users x 2 categories from exploding into
-# eight simultaneous category crawls. The adaptive traffic manager still owns the
-# actual request cadence and 403/429 backoff.
-CATEGORY_PIPELINE_PER_JOB = max(1, min(2, int(os.getenv("CATEGORY_PIPELINE_PER_JOB", "2"))))
-CATEGORY_PIPELINE_GLOBAL_LIMIT = max(
-    CATEGORY_PIPELINE_PER_JOB,
-    min(8, int(os.getenv("CATEGORY_PIPELINE_GLOBAL_LIMIT", "6"))),
-)
+# v4.3.11 Stability rollback: keep four independent USER scan lanes, but never
+# overlap two categories inside the same user job. v4.3.9/v4.3.10 proved that
+# 2 categories per job can multiply BrowserContext + date + view work fast enough
+# to create long stalls under only two users. Old Railway values are intentionally
+# ignored here so CATEGORY_PIPELINE_PER_JOB=2 cannot silently re-enable the issue.
+CATEGORY_PIPELINE_PER_JOB = 1
+os.environ["CATEGORY_PIPELINE_PER_JOB"] = "1"
+CATEGORY_PIPELINE_GLOBAL_LIMIT = max(1, min(4, int(os.getenv("CATEGORY_PIPELINE_GLOBAL_LIMIT", "4"))))
+os.environ["CATEGORY_PIPELINE_GLOBAL_LIMIT"] = str(CATEGORY_PIPELINE_GLOBAL_LIMIT)
 category_pipeline_sem = asyncio.Semaphore(CATEGORY_PIPELINE_GLOBAL_LIMIT)
-# v4.3.10: category crawling may stay parallel, but large public-view phases must
-# not all burst at once. Two category view batches are enough to keep the official
-# counter lane busy while avoiding 2 users x 2 categories = four huge batches.
-INLINE_VIEW_PHASE_GLOBAL_LIMIT = max(1, min(4, int(os.getenv("INLINE_VIEW_PHASE_GLOBAL_LIMIT", "2"))))
+# v4.3.11: at most two categories across ALL users may be in the heavy exact-view
+# phase. Other user scans can continue category/date work instead of creating a
+# second layer of view contention.
+INLINE_VIEW_PHASE_GLOBAL_LIMIT = max(1, min(2, int(os.getenv("INLINE_VIEW_PHASE_GLOBAL_LIMIT", "2"))))
 inline_view_phase_sem = asyncio.Semaphore(INLINE_VIEW_PHASE_GLOBAL_LIMIT)
 SCAN_CATEGORY_HARD_TIMEOUT_SECONDS = max(300.0, min(3600.0, float(
     os.getenv("SCAN_CATEGORY_HARD_TIMEOUT_SECONDS", "1200")
@@ -159,8 +159,8 @@ os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "1"
 # of jobs are processed at once, while category scans are shared globally.
 MAX_CONCURRENT_JOBS = max(1, min(12, int(os.getenv("MAX_CONCURRENT_JOBS", "5"))))
 if STABLE_SINGLE_SERVICE_MODE:
-    # Stable single-service no longer means a single user lane. v4.3.9 keeps
-    # four bounded local workers by default; set MULTIUSER_STABLE_MODE=0 for an
+    # Stable single-service no longer means a single user lane. v4.3.11 keeps
+    # four bounded USER workers by default while categories stay sequential per job; set MULTIUSER_STABLE_MODE=0 for an
     # instant rollback to the exact one-worker v4.2.5 execution model.
     MAX_CONCURRENT_JOBS = MULTIUSER_LOCAL_WORKERS if MULTIUSER_STABLE_MODE else 1
 MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
@@ -5353,10 +5353,10 @@ async def _run_category_child(
 ) -> tuple[ScanJob, bool]:
     """Run one category in an isolated parser/context and return mergeable stats.
 
-    v4.3.9 deliberately gives every concurrently running category its own
+    v4.3.11 keeps this isolated child runner, but invokes only one child at a time per user; it still gives each running category its own
     KleinanzeigenParser. In shared-runtime mode those parsers still use one Chromium
     process, but each owns a separate BrowserContext. This keeps the proven date/view
-    logic untouched while allowing two categories of the same user to overlap.
+    logic untouched without allowing two categories of the same user to overlap.
     """
     child = replace(
         parent,
