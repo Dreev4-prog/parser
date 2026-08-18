@@ -1,3 +1,23 @@
+## v4.3.9 Category Pipeline + 4 User Scans
+
+- Default local user scan lanes increased from 3 to 4 (`MULTIUSER_LOCAL_WORKERS=4`).
+- Up to 2 selected categories in one scan advance in parallel.
+- A process-wide category cap of 6 prevents 4 users x 2 categories from turning into 8 uncontrolled crawls.
+- Every concurrent category gets its own BrowserContext inside the shared Chromium runtime.
+- The immutable per-scan price filter is applied before the expensive public-view phase, reducing counter work for scans such as `200–300 €` or `500+`.
+- Price-filtered scans do not publish the universal short category-result cache, so another all-price scan can never inherit a partial view baseline.
+- At 4 active user scans, the view lane is capped at 4 instead of collapsing to 2; the existing adaptive 403/429 backoff remains active.
+- Date search and exact view extraction algorithms themselves are unchanged.
+
+Recommended Railway values:
+
+```env
+MULTIUSER_LOCAL_WORKERS=4
+CATEGORY_PIPELINE_PER_JOB=2
+CATEGORY_PIPELINE_GLOBAL_LIMIT=6
+TRAFFIC_HIGH_LOAD_VIEW_LIMIT=4
+```
+
 ## v4.3.1 Multi-User Views Pool
 
 - Keeps the stable 3-worker isolated-context architecture from v4.3.0.
