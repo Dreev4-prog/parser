@@ -1,3 +1,12 @@
+# v4.3.14 Dedicated View Manager + Railway View Worker
+
+- Built directly on the known-good v4.3.8 tree.
+- `parser.py` remains byte-identical to v4.3.8.
+- Exact view batches can run on a separate Railway service via Redis.
+- Fair View Manager shares one dedicated global lane across active scans.
+- Main bot automatically falls back to the unchanged local v4.3.8 path if the remote worker is unavailable.
+- Full deployment guide: `DEPLOY_V4_3_14_DEDICATED_VIEW_WORKER.md`.
+
 ## v4.3.1 Multi-User Views Pool
 
 - Keeps the stable 3-worker isolated-context architecture from v4.3.0.

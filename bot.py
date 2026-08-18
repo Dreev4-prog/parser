@@ -78,6 +78,7 @@ from parser import (
     page_url,
     private_provider_url,
 )
+from view_manager import REMOTE_VIEW_MANAGER, REMOTE_VIEW_WORKER_ENABLED
 from stable_engine import (
     load_date_index, load_page_checkpoint, mark_category_job, record_page_failure,
     save_date_index, save_page_checkpoint,
@@ -88,7 +89,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.8"
+APP_VERSION = "4.3.14"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -2212,6 +2213,38 @@ async def refresh_availability(rows: list[Listing]) -> tuple[int, int, int]:
     return len(candidates), len(disappeared_ids), unknown
 
 
+async def fetch_exact_views_v438_compatible(
+    parser: KleinanzeigenParser,
+    urls: list[str],
+    *,
+    concurrency: int,
+    progress_cb=None,
+    traffic_priority: str,
+) -> dict[str, ViewCountResult]:
+    """Use a dedicated view service when healthy, else run unchanged v4.3.8 locally.
+
+    The parser algorithm is not duplicated or modified. The worker imports the same
+    parser.py; this wrapper changes only where the batch executes.
+    """
+    if REMOTE_VIEW_WORKER_ENABLED:
+        remote = await REMOTE_VIEW_MANAGER.fetch(
+            urls, progress_cb=progress_cb, traffic_priority=traffic_priority,
+        )
+        if remote is not None:
+            return {
+                url: ViewCountResult(
+                    item.views, item.raw_text, item.source, item.final_url, item.page_title, item.error
+                )
+                for url, item in remote.items()
+            }
+        log.warning("Dedicated view worker unavailable; using local v4.3.8 view path")
+    return await parser.fetch_public_view_counts(
+        urls, concurrency=concurrency, progress_cb=progress_cb,
+        traffic_priority=traffic_priority, browser_fallback=True,
+        direct_http_only=False, accurate=True,
+    )
+
+
 async def enrich_page_view_counts(
     parser: KleinanzeigenParser,
     items: list[ParsedListing],
@@ -2260,14 +2293,11 @@ async def enrich_page_view_counts(
                 live.category_name, live.views_ready, len(unique), live.views_failed,
             )
 
-    results = await parser.fetch_public_view_counts(
-        [item.url for item in targets],
+    results = await fetch_exact_views_v438_compatible(
+        parser, [item.url for item in targets],
         concurrency=VIEW_COUNT_CONCURRENCY,
         progress_cb=live_progress,
         traffic_priority="scan_inline",
-        browser_fallback=True,
-        direct_http_only=False,
-        accurate=True,
     )
 
     source_counts = Counter(vr.source for vr in results.values())
@@ -2392,14 +2422,11 @@ async def refresh_view_counts(
 
     parser = KleinanzeigenParser()
     try:
-        results = await parser.fetch_public_view_counts(
-            [row.url for row in targets],
+        results = await fetch_exact_views_v438_compatible(
+            parser, [row.url for row in targets],
             concurrency=VIEW_COUNT_CONCURRENCY,
             progress_cb=progress_cb,
             traffic_priority=traffic_priority,
-            browser_fallback=True,
-            direct_http_only=False,
-            accurate=True,
         )
     finally:
         await parser.close()
