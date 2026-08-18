@@ -62,11 +62,6 @@ class AdaptiveTrafficManager:
         self.base_global_limit = _env_int("TRAFFIC_GLOBAL_CONCURRENCY", 9, 2, 32)
         self.background_during_scans = _env_int("TRAFFIC_BACKGROUND_VIEWS_DURING_SCANS", 1, 0, 6)
         self.reserved_scan_slots = _env_int("TRAFFIC_RESERVED_SCAN_SLOTS", 4, 0, 8)
-        # v4.3.10: with the category pipeline, two user scans can already mean four
-        # simultaneous category tasks. Start throttling the lightweight view lane at
-        # medium load instead of waiting for four user jobs.
-        self.medium_load_view_limit = _env_int("TRAFFIC_MEDIUM_LOAD_VIEW_LIMIT", 6, 2, 12)
-        self.high_load_view_limit = _env_int("TRAFFIC_HIGH_LOAD_VIEW_LIMIT", 4, 2, 8)
 
         self.scan_min_interval = _env_float("TRAFFIC_SCAN_MIN_INTERVAL_SECONDS", 0.55, 0.0, 5.0)
         self.view_min_interval = _env_float("TRAFFIC_VIEW_MIN_INTERVAL_SECONDS", 0.20, 0.0, 2.0)
@@ -98,9 +93,7 @@ class AdaptiveTrafficManager:
         # several people scan at once.  Keep a small view lane alive, but never let
         # it fill the process-wide pool and make all five users look frozen.
         if self._scan_jobs_active >= 4:
-            view = min(view, self.high_load_view_limit)
-        elif self._scan_jobs_active >= 2:
-            view = min(view, self.medium_load_view_limit)
+            view = min(view, 2)
         browser = max(1, self.base_browser_limit - (1 if penalty >= 2 else 0))
         global_limit = max(2, self.base_global_limit - penalty * 2)
         return scan, view, browser, global_limit
