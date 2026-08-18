@@ -13,7 +13,7 @@ import statistics
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -88,7 +88,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.8"
+APP_VERSION = "4.3.9"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -110,18 +110,26 @@ STABLE_PAGE_RETRY_SECONDS = max(0.2, min(10.0, float(os.getenv("STABLE_PAGE_RETR
 MULTIUSER_STABLE_MODE = os.getenv("MULTIUSER_STABLE_MODE", "1").strip().lower() not in {
     "0", "false", "no", "off",
 }
-MULTIUSER_LOCAL_WORKERS = max(1, min(5, int(os.getenv("MULTIUSER_LOCAL_WORKERS", "3"))))
-# v4.3.3: process-wide foreground public-view lane. v4.3.0 still inherited the
-# old global traffic limit of three view requests, so three simultaneous scans
-# were forced to share only three slots. Six keeps two fast official-counter
-# requests available per default scan worker while the traffic manager still
-# reserves separate capacity for category-page work and serializes Chromium fallback.
+MULTIUSER_LOCAL_WORKERS = max(1, min(5, int(os.getenv("MULTIUSER_LOCAL_WORKERS", "4"))))
+# v4.3.9: process-wide foreground public-view lane. Four user scans share this
+# adaptive pool; category/date traffic keeps reserved capacity and Chromium fallback
+# stays separately serialized.
 MULTIUSER_VIEW_POOL_SIZE = max(2, min(12, int(os.getenv("MULTIUSER_VIEW_POOL_SIZE", "9"))))
 # v4.3.3: the lightweight official counter can start faster than the old
 # 0.20s process-wide cadence. Chromium has its own slower browser limiter.
 MULTIUSER_VIEW_MIN_INTERVAL_SECONDS = max(0.05, min(0.50, float(
     os.getenv("MULTIUSER_VIEW_MIN_INTERVAL_SECONDS", "0.05")
 )))
+# v4.3.9: two selected categories may advance in parallel inside one user scan.
+# A separate process-wide cap prevents 4 users x 2 categories from exploding into
+# eight simultaneous category crawls. The adaptive traffic manager still owns the
+# actual request cadence and 403/429 backoff.
+CATEGORY_PIPELINE_PER_JOB = max(1, min(2, int(os.getenv("CATEGORY_PIPELINE_PER_JOB", "2"))))
+CATEGORY_PIPELINE_GLOBAL_LIMIT = max(
+    CATEGORY_PIPELINE_PER_JOB,
+    min(8, int(os.getenv("CATEGORY_PIPELINE_GLOBAL_LIMIT", "6"))),
+)
+category_pipeline_sem = asyncio.Semaphore(CATEGORY_PIPELINE_GLOBAL_LIMIT)
 SCAN_CATEGORY_HARD_TIMEOUT_SECONDS = max(300.0, min(3600.0, float(
     os.getenv("SCAN_CATEGORY_HARD_TIMEOUT_SECONDS", "1200")
 )))
@@ -146,18 +154,17 @@ os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "1"
 # of jobs are processed at once, while category scans are shared globally.
 MAX_CONCURRENT_JOBS = max(1, min(12, int(os.getenv("MAX_CONCURRENT_JOBS", "5"))))
 if STABLE_SINGLE_SERVICE_MODE:
-    # Stable single-service no longer means a single user lane. v4.3.2 keeps
-    # three bounded local workers by default; set MULTIUSER_STABLE_MODE=0 for an
+    # Stable single-service no longer means a single user lane. v4.3.9 keeps
+    # four bounded local workers by default; set MULTIUSER_STABLE_MODE=0 for an
     # instant rollback to the exact one-worker v4.2.5 execution model.
     MAX_CONCURRENT_JOBS = MULTIUSER_LOCAL_WORKERS if MULTIUSER_STABLE_MODE else 1
 MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
 PARSER_WORKER_CONCURRENCY = max(1, min(8, int(os.getenv("PARSER_WORKER_CONCURRENCY", "1"))))
 if STABLE_SINGLE_SERVICE_MODE and MULTIUSER_STABLE_MODE:
     # TRAFFIC is process-wide and acts as the global Views Pool. Keep request
-    # pressure bounded, but let three foreground scans share six official-counter
-    # HTTP slots instead of the old process-wide limit of three. The global cap
-    # deliberately includes TRAFFIC.reserved_scan_slots, so category/date traffic
-    # keeps its own capacity even while all three users are measuring views.
+    # pressure bounded while four foreground scans share the adaptive official-counter
+    # lane. The global cap deliberately includes TRAFFIC.reserved_scan_slots, so
+    # category/date traffic keeps its own capacity even while users measure views.
     TRAFFIC.base_scan_limit = max(TRAFFIC.base_scan_limit, MAX_CONCURRENT_JOBS)
     TRAFFIC.base_view_limit = MULTIUSER_VIEW_POOL_SIZE
     TRAFFIC.view_min_interval = MULTIUSER_VIEW_MIN_INTERVAL_SECONDS
@@ -191,6 +198,7 @@ if STABLE_SINGLE_SERVICE_MODE and MULTIUSER_STABLE_MODE:
     # user must never make another user await the same in-flight category task.
     SHARE_ACTIVE_CATEGORY_SCANS = False
 JOB_PARSER: ContextVar[KleinanzeigenParser | None] = ContextVar("dtparser_job_parser", default=None)
+ACTIVE_SCAN_PRICE_FILTER: ContextVar[str] = ContextVar("dtparser_scan_price_filter", default="any")
 STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVAL_SECONDS", "1.5")))
 # v3.3.0 job-level resilience on top of parser HTTP retries. A category that
 # throws an unexpected transient exception gets one controlled retry before the
@@ -2997,6 +3005,11 @@ class ScanJob:
     recovery_total: int = 0
     auto_recovered_categories: int = 0
     recovered: bool = False
+    # v4.3.9 progress metadata for a two-category pipeline. Child category jobs
+    # share the parent stop_event but suppress Telegram edits of their own.
+    active_progress_keys: list[str] | None = None
+    active_category_names: list[str] | None = None
+    suppress_status_updates: bool = False
     stop_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False, compare=False)
 
 
@@ -3011,6 +3024,7 @@ class CategoryLiveProgress:
     known_count: int = 0
     views_ready: int = 0
     views_failed: int = 0
+    views_total: int = 0
     estimated_pages: int = 10
     started_monotonic: float = 0.0
     page_limit: int = 100
@@ -3382,7 +3396,21 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             new_items, known_count, enriched_count = await upsert_page_items(cat.key, cat.name, target_items)
         live = category_live_progress.get(progress_key)
         if need_view_counts:
-            for item in target_items:
+            # v4.3.9: price is immutable per scan, so listings that cannot possibly
+            # survive that scan's price filter do not need an expensive public-view
+            # measurement. We still persist every listing itself; only the counter
+            # workload is reduced. Mutable keyword/noise settings are intentionally
+            # NOT applied here so reopening an old scan after changing settings does
+            # not lose counters unexpectedly.
+            price_filtered_view_items = base_filter(
+                list(target_items),
+                period=None,
+                price_filter=ACTIVE_SCAN_PRICE_FILTER.get() or "any",
+                clean_noise=False,
+                include_words="",
+                exclude_words="",
+            )
+            for item in price_filtered_view_items:
                 deferred_view_items[item.external_id] = item
         new_count += len(new_items)
         known_total += known_count
@@ -4264,6 +4292,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             if live is not None:
                 live.phase = "views"
                 live.today_seen = today_seen
+                live.views_total = len(deferred_view_items)
                 live.page_limit = depth
             try:
                 _, _, failed_views = await enrich_page_view_counts(
@@ -4462,6 +4491,17 @@ def _cacheable_category_result(result: ScanResult | None) -> bool:
     return bool(result is not None and result.date_complete)
 
 
+def _may_publish_category_result_cache() -> bool:
+    """Price-filtered v4.3.9 scans measure views only for their immutable price slice.
+
+    The page/listing result itself is universal, but publishing it as a completed
+    short cache entry could let a later `any price` scan skip its own view baseline.
+    Therefore only all-price scans create reusable result-cache entries. A filtered
+    scan may still *consume* a recent all-price cache safely.
+    """
+    return (ACTIVE_SCAN_PRICE_FILTER.get() or "any") == "any"
+
+
 async def fresh_category_cache_age(category_key: str, page_limit: int, target_date: str) -> int | None:
     """Legacy DB cache hook. Exact-depth scans use the in-memory ScanResult cache.
 
@@ -4518,7 +4558,7 @@ async def _run_distributed_category_owner(
         result = await _scan_category_task(cat, user_id, page_limit, target_date)
         ttl = max(60, CATEGORY_CACHE_TTL_SECONDS or 60)
         try:
-            if _cacheable_category_result(result):
+            if _cacheable_category_result(result) and _may_publish_category_result_cache():
                 await COORDINATOR.set_category_result(inflight_key, result, ttl)
             else:
                 await COORDINATOR.delete_category_result(inflight_key)
@@ -4647,11 +4687,11 @@ async def dispatch_category(
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             raise
-        if CATEGORY_CACHE_TTL_SECONDS > 0 and _cacheable_category_result(result):
+        if CATEGORY_CACHE_TTL_SECONDS > 0 and _cacheable_category_result(result) and _may_publish_category_result_cache():
             category_result_cache[inflight_key] = (time.monotonic(), result)
         if DISTRIBUTED_WORKERS:
             try:
-                if _cacheable_category_result(result):
+                if _cacheable_category_result(result) and _may_publish_category_result_cache():
                     await COORDINATOR.set_category_result(
                         inflight_key, result, max(60, CATEGORY_CACHE_TTL_SECONDS or 60)
                     )
@@ -4709,7 +4749,7 @@ async def dispatch_category(
     cancel_underlying = False
     try:
         result = await wait_for_task_or_stop(task, stop_event)
-        if CATEGORY_CACHE_TTL_SECONDS > 0 and _cacheable_category_result(result):
+        if CATEGORY_CACHE_TTL_SECONDS > 0 and _cacheable_category_result(result) and _may_publish_category_result_cache():
             category_result_cache[inflight_key] = (time.monotonic(), result)
         return CategoryDispatchResult(source=source, result=result)
     except ScanStopRequested:
@@ -4858,31 +4898,38 @@ def render_user_job_status(job: ScanJob) -> str:
             "Уже собранные данные сохранены."
         )
 
-    live = category_live_progress.get(job.current_progress_key) if job.current_progress_key else None
+    def _live_fraction(value: CategoryLiveProgress | None) -> float:
+        if value is None:
+            return 0.02
+        if value.phase == "collecting" and depth > 0:
+            collected = min(1.0, max(0.0, value.collection_index / depth))
+            return 0.18 + 0.77 * collected
+        if value.phase == "stable_scan":
+            request_steps = min(50, max(int(value.page or 0), int(value.network_requests or 0)))
+            return 0.03 + 0.15 * (request_steps / 50.0)
+        if value.phase in {"jumping", "seeking"}:
+            request_steps = min(12, max(0, int(value.network_requests or 0)))
+            return 0.03 + 0.15 * (request_steps / 12.0)
+        if value.phase == "views":
+            total_views = max(1, int(value.views_total or value.today_seen or 0))
+            view_ratio = min(1.0, max(0.0, float(value.views_ready) / total_views))
+            return 0.95 + 0.04 * view_ratio
+        return 0.02
+
+    active_keys = list(job.active_progress_keys or [])
+    if not active_keys and job.current_progress_key:
+        active_keys = [job.current_progress_key]
+    active_lives = [category_live_progress.get(key) for key in active_keys]
+    # Show details for the slower of the two active categories, while the overall
+    # percent counts progress from both. This avoids the old 25% -> 50% jumps when
+    # two categories are actually advancing at the same time.
+    live = None
+    if active_lives:
+        live = min(active_lives, key=_live_fraction)
     current_today = live.today_seen if live is not None else 0
     live_views_ready = live.views_ready if live is not None else 0
-
-    # v3.4.3: progress must move from the first network request, not only after
-    # the date locator has finished.  Date discovery is not linear, so it owns a
-    # conservative first 18% of the current category.  Collection owns the next
-    # 77%; the final 5% is reserved for persistence/export.  This is a UI progress
-    # estimate, not a fake page count.
-    current_fraction = 0.02
-    if live is not None:
-        if live.phase == "collecting" and depth > 0:
-            collected = min(1.0, max(0.0, live.collection_index / depth))
-            current_fraction = 0.18 + 0.77 * collected
-        elif live.phase == "stable_scan":
-            request_steps = min(50, max(int(live.page or 0), int(live.network_requests or 0)))
-            current_fraction = 0.03 + 0.15 * (request_steps / 50.0)
-        elif live.phase in {"jumping", "seeking"}:
-            request_steps = min(12, max(0, int(live.network_requests or 0)))
-            current_fraction = 0.03 + 0.15 * (request_steps / 12.0)
-        elif live.phase == "views":
-            total_views = max(1, int(live.today_seen or 0))
-            view_ratio = min(1.0, max(0.0, float(live.views_ready) / total_views))
-            current_fraction = 0.95 + 0.04 * view_ratio
-    percent = int(max(0.0, min(0.99, (job.completed_categories + current_fraction) / total)) * 100)
+    active_fraction = sum(_live_fraction(item) for item in active_lives) if active_lives else 0.02
+    percent = int(max(0.0, min(0.99, (job.completed_categories + active_fraction) / total)) * 100)
     if job.completed_categories >= total:
         percent = 100
 
@@ -4892,6 +4939,11 @@ def render_user_job_status(job: ScanJob) -> str:
 
     category_line = html.escape(job.current_category) if job.current_category else "Подготовка…"
     category_index = max(1, job.current_category_index)
+    active_count = max(1, len(job.active_category_names or []))
+    category_index_text = (
+        f"{category_index}–{min(total, category_index + active_count - 1)}"
+        if active_count > 1 else str(category_index)
+    )
 
     # Date-location can use jumps and internal fallback feeds, so page numbers and
     # quality telemetry are intentionally hidden from the everyday UI.
@@ -4925,7 +4977,7 @@ def render_user_job_status(job: ScanJob) -> str:
         return (
             f"🔎 <b>{stage_title} · {percent}%</b>\n"
             f"{_progress_bar(percent)}\n\n"
-            f"🗂 <b>{category_line}</b> · {category_index}/{total}\n"
+            f"🗂 <b>{category_line}</b> · {category_index_text}/{total}\n"
             f"📅 За <b>{_date_label(job.target_date)}</b>"
             f"{requests_text}{wait_text}\n"
             f"⏱ <b>{_human_duration(elapsed)}</b>\n"
@@ -4934,12 +4986,12 @@ def render_user_job_status(job: ScanJob) -> str:
         )
 
     if live.phase == "views":
-        total_views = max(1, int(live.today_seen or 0))
+        total_views = max(1, int(live.views_total or live.today_seen or 0))
         ready = min(total_views, int(live.views_ready or 0))
         return (
             f"👁 <b>Собираю просмотры · {percent}%</b>\n"
             f"{_progress_bar(percent)}\n\n"
-            f"🗂 <b>{category_line}</b> · {category_index}/{total}\n"
+            f"🗂 <b>{category_line}</b> · {category_index_text}/{total}\n"
             f"📦 Объявлений: <b>{live.today_seen}</b>\n"
             f"👁 Проверено: <b>{ready}/{total_views}</b>\n"
             f"⏱ <b>{_human_duration(elapsed)}</b>"
@@ -4953,7 +5005,7 @@ def render_user_job_status(job: ScanJob) -> str:
     return (
         f"🔎 <b>Сканирование · {percent}%</b>\n"
         f"{_progress_bar(percent)}\n\n"
-        f"🗂 <b>{category_line}</b> · {category_index}/{total}\n"
+        f"🗂 <b>{category_line}</b> · {category_index_text}/{total}\n"
         f"📄 <b>{pages_done}/{depth}</b> страниц\n"
         f"📦 <b>{current_today}</b> объявлений{views_text}\n"
         f"⏱ <b>{_human_duration(elapsed)}</b>"
@@ -4976,6 +5028,8 @@ async def progress_ticker(bot: Bot) -> None:
 
 
 async def edit_job_status(bot: Bot, job: ScanJob, text: str, *, force: bool = False) -> None:
+    if getattr(job, "suppress_status_updates", False):
+        return
     now = time.monotonic()
     if not force and now - job.last_status_update < STATUS_UPDATE_INTERVAL_SECONDS:
         return
@@ -5261,6 +5315,215 @@ async def auto_recover_partial_category(
     )
 
 
+async def _run_category_child(
+    bot: Bot, parent: ScanJob, cat, idx: int,
+) -> tuple[ScanJob, bool]:
+    """Run one category in an isolated parser/context and return mergeable stats.
+
+    v4.3.9 deliberately gives every concurrently running category its own
+    KleinanzeigenParser. In shared-runtime mode those parsers still use one Chromium
+    process, but each owns a separate BrowserContext. This keeps the proven date/view
+    logic untouched while allowing two categories of the same user to overlap.
+    """
+    child = replace(
+        parent,
+        category_keys=[cat.key],
+        cancel_requested=False,
+        current_category=cat.name,
+        current_category_key=cat.key,
+        current_progress_key=_progress_key(cat.key, parent.target_date, parent.page_limit),
+        current_category_index=idx,
+        completed_categories=0,
+        total_new=0,
+        total_pages=0,
+        total_avoided=0,
+        cache_hits=0,
+        shared_hits=0,
+        scanned_categories=0,
+        fast_categories=0,
+        full_categories=0,
+        warnings=[],
+        scan_notes=[],
+        matched_ids=set(),
+        quality_scores=[],
+        quality_notes=[],
+        incomplete_categories=0,
+        incomplete_category_keys=set(),
+        retry_note="",
+        recovery_note="",
+        recovery_attempt=0,
+        recovery_total=0,
+        auto_recovered_categories=0,
+        active_progress_keys=None,
+        active_category_names=None,
+        suppress_status_updates=True,
+        stop_event=parent.stop_event,
+    )
+    category_live_progress.pop(child.current_progress_key, None)
+    log.info(
+        "category-pipeline queued job=%s category=%s index=%s/%s target=%s depth=%s",
+        parent.job_id, cat.name, idx, len(parent.category_keys), parent.target_date, parent.page_limit,
+    )
+
+    acquired = False
+    parser: KleinanzeigenParser | None = None
+    parser_token = None
+    rate_limited = False
+    try:
+        if parent.stop_event.is_set() or parent.cancel_requested:
+            raise ScanStopRequested()
+
+        acquire_task = asyncio.create_task(category_pipeline_sem.acquire())
+        try:
+            await wait_for_task_or_stop(acquire_task, parent.stop_event)
+            acquired = True
+        except ScanStopRequested:
+            acquire_task.cancel()
+            await asyncio.gather(acquire_task, return_exceptions=True)
+            raise
+
+        if parent.stop_event.is_set() or parent.cancel_requested:
+            raise ScanStopRequested()
+
+        # The parent scan worker owns a parser for the legacy/sequential path. A
+        # parallel child overrides that ContextVar only inside this asyncio task.
+        # asyncio task context isolation guarantees the sibling gets another parser.
+        parser = KleinanzeigenParser()
+        parser_token = JOB_PARSER.set(parser)
+        log.info(
+            "category-pipeline start job=%s category=%s active_limit=%s",
+            parent.job_id, cat.name, CATEGORY_PIPELINE_GLOBAL_LIMIT,
+        )
+
+        async def _run_category_pipeline() -> CategoryDispatchResult:
+            dispatched_local = await dispatch_category_with_retry(bot, child, cat)
+            if parent.stop_event.is_set() or parent.cancel_requested:
+                raise ScanStopRequested()
+            dispatched_local = await auto_recover_partial_category(bot, child, cat, dispatched_local)
+            if parent.stop_event.is_set() or parent.cancel_requested:
+                raise ScanStopRequested()
+            return dispatched_local
+
+        dispatched = await asyncio.wait_for(
+            _run_category_pipeline(), timeout=SCAN_CATEGORY_HARD_TIMEOUT_SECONDS
+        )
+        result = dispatched.result
+        if dispatched.source == "cache":
+            child.cache_hits += 1
+        elif dispatched.source == "shared":
+            child.shared_hits += 1
+        else:
+            child.scanned_categories += 1
+
+        if result is not None:
+            child.matched_ids.update(result.matched_ids or [])
+            child.quality_scores.append(int(result.quality_score or 0))
+            child.quality_notes.append(f"{cat.name}: {result.quality_score}/100 — {result.quality_note}")
+            child.total_new += result.new_count
+            if dispatched.source == "scan":
+                child.total_pages += result.pages_scanned
+                child.total_avoided += result.avoided_pages
+                if result.mode == "fast":
+                    child.fast_categories += 1
+                else:
+                    child.full_categories += 1
+            if not result.date_complete:
+                child.incomplete_categories += 1
+                child.incomplete_category_keys.add(cat.key)
+                reached = _date_label(result.oldest_date_seen) if result.oldest_date_seen else "не определена"
+                note = (
+                    f"{cat.name}: охват {_date_label(parent.target_date)} не подтверждён полностью; "
+                    f"самая старая распознанная дата — {reached}; "
+                    f"сетевых запросов {result.pages_scanned}; качество {result.quality_score}/100; "
+                    f"причина: {result.reason}"
+                )
+                child.warnings.append(note)
+                child.scan_notes.append(note)
+            if "временный лимит Kleinanzeigen" in (result.reason or ""):
+                rate_limited = True
+                child.warnings.append(
+                    f"{cat.name}: Kleinanzeigen временно ограничил запросы; "
+                    f"успели сделать {result.pages_scanned} запросов "
+                    f"(до стр. {result.max_page_reached or '?'}), можно повторить позже"
+                )
+
+        child.completed_categories = 1
+        log.info(
+            "category-pipeline finish job=%s category=%s matched=%s complete=%s reason=%s",
+            parent.job_id, cat.name, (result.today_seen if result is not None else 0),
+            (result.date_complete if result is not None else False),
+            (result.reason if result is not None else "no result"),
+        )
+    except asyncio.TimeoutError:
+        if parser is not None:
+            try:
+                await parser.reset_scan_browser_context()
+            except Exception:
+                log.debug("Could not recycle timed-out category context job=%s", parent.job_id, exc_info=True)
+        minutes = max(1, int(round(SCAN_CATEGORY_HARD_TIMEOUT_SECONDS / 60.0)))
+        note = f"{cat.name}: превышен защитный лимит {minutes} мин.; категория остановлена, остальные продолжаются"
+        log.error(
+            "Category watchdog timeout job=%s category=%s seconds=%s",
+            parent.job_id, cat.name, SCAN_CATEGORY_HARD_TIMEOUT_SECONDS,
+        )
+        child.warnings.append(note)
+        child.scan_notes.append(note)
+        child.quality_scores.append(0)
+        child.quality_notes.append(f"{cat.name}: 0/100 — защитный таймаут")
+        child.incomplete_categories = 1
+        child.incomplete_category_keys.add(cat.key)
+        child.completed_categories = 1
+    except ScanStopRequested:
+        child.cancel_requested = True
+        log.info("User stopped category-pipeline job=%s category=%s", parent.job_id, cat.name)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.exception("Category-pipeline error job=%s category=%s", parent.job_id, cat.name)
+        note = f"{cat.name}: ошибка скана — {str(exc)[:160]}"
+        child.warnings.append(note)
+        child.scan_notes.append(note)
+        child.quality_scores.append(0)
+        child.quality_notes.append(f"{cat.name}: 0/100 — ошибка скана")
+        child.incomplete_categories = 1
+        child.incomplete_category_keys.add(cat.key)
+        child.completed_categories = 1
+    finally:
+        if parser_token is not None:
+            JOB_PARSER.reset(parser_token)
+        if parser is not None:
+            try:
+                await parser.close()
+            except Exception:
+                log.debug("Could not close category parser job=%s category=%s", parent.job_id, cat.name, exc_info=True)
+        if acquired:
+            category_pipeline_sem.release()
+
+    return child, rate_limited
+
+
+def _merge_category_child(parent: ScanJob, child: ScanJob) -> None:
+    parent.completed_categories += int(child.completed_categories or 0)
+    parent.total_new += int(child.total_new or 0)
+    parent.total_pages += int(child.total_pages or 0)
+    parent.total_avoided += int(child.total_avoided or 0)
+    parent.cache_hits += int(child.cache_hits or 0)
+    parent.shared_hits += int(child.shared_hits or 0)
+    parent.scanned_categories += int(child.scanned_categories or 0)
+    parent.fast_categories += int(child.fast_categories or 0)
+    parent.full_categories += int(child.full_categories or 0)
+    parent.incomplete_categories += int(child.incomplete_categories or 0)
+    parent.auto_recovered_categories += int(child.auto_recovered_categories or 0)
+    parent.warnings.extend(child.warnings or [])
+    parent.scan_notes.extend(child.scan_notes or [])
+    parent.matched_ids.update(child.matched_ids or set())
+    parent.quality_scores.extend(child.quality_scores or [])
+    parent.quality_notes.extend(child.quality_notes or [])
+    parent.incomplete_category_keys.update(child.incomplete_category_keys or set())
+    if child.cancel_requested:
+        parent.cancel_requested = True
+
+
 async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
     job.state = "running"
     if job.scan_id is not None:
@@ -5279,170 +5542,91 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
     job.incomplete_category_keys = job.incomplete_category_keys or set()
     await edit_job_status(bot, job, render_user_job_status(job), force=True)
 
+    # Validate unknown keys first so they cannot occupy a category-pipeline slot.
+    valid_entries: list[tuple[int, object]] = []
     for idx, key in enumerate(job.category_keys, start=1):
-        if job.cancel_requested:
-            break
         cat = CATEGORIES.get(key)
         if cat is None:
             job.warnings.append(f"Неизвестная категория: {key}")
             job.incomplete_categories += 1
-            job.incomplete_category_keys = job.incomplete_category_keys or set()
             job.incomplete_category_keys.add(key)
             job.completed_categories += 1
-            job.quality_scores = job.quality_scores or []
             job.quality_scores.append(0)
             continue
-        job.current_category = cat.name
-        job.current_category_key = cat.key
-        job.current_progress_key = _progress_key(cat.key, job.target_date, job.page_limit)
-        job.current_category_index = idx
-        # Multi-category isolation: every selected category starts with a clean
-        # live-progress slot and performs its own date location cycle. No boundary
-        # or progress state from the previous category may leak into this one.
-        category_live_progress.pop(job.current_progress_key, None)
-        log.info(
-            "multi-category start job=%s category=%s index=%s/%s target=%s depth=%s",
-            job.job_id, cat.name, idx, len(job.category_keys), job.target_date, job.page_limit,
-        )
-        try:
-            await edit_job_status(bot, job, render_user_job_status(job), force=True)
+        valid_entries.append((idx, cat))
 
-            async def _run_category_pipeline() -> CategoryDispatchResult:
-                dispatched_local = await dispatch_category_with_retry(bot, job, cat)
-                if job.cancel_requested or job.stop_event.is_set():
-                    raise ScanStopRequested()
-                dispatched_local = await auto_recover_partial_category(bot, job, cat, dispatched_local)
-                if job.cancel_requested or job.stop_event.is_set():
-                    raise ScanStopRequested()
-                return dispatched_local
-
-            # Hard safety net only. Normal browser/page requests have their own much
-            # shorter timeouts. This prevents a genuinely wedged category from
-            # occupying one of the three user lanes forever.
-            dispatched = await asyncio.wait_for(
-                _run_category_pipeline(), timeout=SCAN_CATEGORY_HARD_TIMEOUT_SECONDS
-            )
-            result = dispatched.result
-            source_label = "♻️ кэш"
-            if dispatched.source == "cache":
-                job.cache_hits += 1
-                source_label = f"♻️ кэш ({dispatched.cache_age_seconds} сек.)"
-            elif dispatched.source == "shared":
-                job.shared_hits += 1
-                source_label = "🤝 общий скан"
-            else:
-                job.scanned_categories += 1
-                source_label = "🌐 новый скан"
-
-            if result is not None:
-                job.matched_ids = job.matched_ids or set()
-                job.matched_ids.update(result.matched_ids or [])
-                job.quality_scores = job.quality_scores or []
-                job.quality_notes = job.quality_notes or []
-                job.quality_scores.append(int(result.quality_score or 0))
-                job.quality_notes.append(f"{cat.name}: {result.quality_score}/100 — {result.quality_note}")
-                # New_count is a global DB fact from this shared scan. Pages are counted
-                # only for the job that actually started the network scan.
-                job.total_new += result.new_count
-                if dispatched.source == "scan":
-                    job.total_pages += result.pages_scanned
-                    job.total_avoided += result.avoided_pages
-                    if result.mode == "fast":
-                        job.fast_categories += 1
-                    else:
-                        job.full_categories += 1
-                if not result.date_complete:
-                    job.incomplete_categories += 1
-                    job.incomplete_category_keys = job.incomplete_category_keys or set()
-                    job.incomplete_category_keys.add(cat.key)
-                    reached = _date_label(result.oldest_date_seen) if result.oldest_date_seen else "не определена"
-                    note = (
-                        f"{cat.name}: охват {_date_label(job.target_date)} не подтверждён полностью; "
-                        f"самая старая распознанная дата — {reached}; "
-                        f"сетевых запросов {result.pages_scanned}; качество {result.quality_score}/100; "
-                        f"причина: {result.reason}"
-                    )
-                    job.warnings.append(note)
-                    job.scan_notes = job.scan_notes or []
-                    job.scan_notes.append(note)
-                elif result.reason.startswith("временный лимит Kleinanzeigen"):
-                    job.warnings.append(
-                        f"{cat.name}: Kleinanzeigen временно ограничил запросы; "
-                        f"успели сделать {result.pages_scanned} запросов (до стр. {result.max_page_reached or '?'}), можно повторить позже"
-                    )
-
-            log.info(
-                "multi-category finish job=%s category=%s matched=%s complete=%s reason=%s",
-                job.job_id, cat.name, (result.today_seen if result is not None else 0),
-                (result.date_complete if result is not None else False),
-                (result.reason if result is not None else "no result"),
-            )
-            job.completed_categories += 1
-
-            # If an interactive category already spent the full recovery window and
-            # Kleinanzeigen still refuses the process, immediately trying the next
-            # selected category only extends the block. Stop this job gracefully;
-            # completed categories remain saved and no false zeros are produced.
-            if result is not None and "временный лимит Kleinanzeigen" in (result.reason or ""):
-                remaining_categories = max(0, len(job.category_keys) - idx)
-                if remaining_categories:
-                    note = (
-                        f"Kleinanzeigen всё ещё ограничивает доступ после автоматического ожидания. "
-                        f"Оставшиеся категории ({remaining_categories}) не запускались, чтобы не усиливать лимит."
-                    )
-                    job.warnings.append(note)
-                    job.scan_notes = job.scan_notes or []
-                    job.scan_notes.append(note)
-                    job.incomplete_categories += remaining_categories
-                    job.incomplete_category_keys = job.incomplete_category_keys or set()
-                    job.incomplete_category_keys.update(job.category_keys[idx:])
-                    job.completed_categories += remaining_categories
-                break
-            # User sees only useful progress; cache/shared/worker details stay internal.
-            await edit_job_status(bot, job, render_user_job_status(job), force=True)
-        except asyncio.TimeoutError:
-            # Cancelled wait_for() work can leave a Playwright page mid-navigation.
-            # Recycle ONLY this job's BrowserContext; the two other user contexts
-            # inside the shared Chromium process remain untouched.
-            parser = JOB_PARSER.get()
-            if parser is not None:
-                try:
-                    await parser.reset_scan_browser_context()
-                except Exception:
-                    log.debug("Could not recycle timed-out browser context job=%s", job.job_id, exc_info=True)
-            minutes = max(1, int(round(SCAN_CATEGORY_HARD_TIMEOUT_SECONDS / 60.0)))
-            note = f"{cat.name}: превышен защитный лимит {minutes} мин.; категория остановлена, остальные продолжаются"
-            log.error("Category watchdog timeout job=%s category=%s seconds=%s", job.job_id, cat.name, SCAN_CATEGORY_HARD_TIMEOUT_SECONDS)
-            job.warnings.append(note)
-            job.scan_notes = job.scan_notes or []
-            job.scan_notes.append(note)
-            job.quality_scores = job.quality_scores or []
-            job.quality_notes = job.quality_notes or []
-            job.quality_scores.append(0)
-            job.quality_notes.append(f"{cat.name}: 0/100 — защитный таймаут")
-            job.incomplete_categories += 1
-            job.incomplete_category_keys = job.incomplete_category_keys or set()
-            job.incomplete_category_keys.add(cat.key)
-            job.completed_categories += 1
-        except ScanStopRequested:
+    stop_after_batch = False
+    for batch_start in range(0, len(valid_entries), CATEGORY_PIPELINE_PER_JOB):
+        if job.cancel_requested or job.stop_event.is_set():
             job.cancel_requested = True
-            log.info("User stopped scan job=%s category=%s", job.job_id, cat.name)
             break
-        except Exception as exc:
-            log.exception("Queue scan error job=%s category=%s", job.job_id, cat.name)
-            note = f"{cat.name}: ошибка скана — {str(exc)[:160]}"
-            job.warnings.append(note)
-            job.scan_notes = job.scan_notes or []
-            job.scan_notes.append(note)
-            job.quality_scores = job.quality_scores or []
-            job.quality_notes = job.quality_notes or []
-            job.quality_scores.append(0)
-            job.quality_notes.append(f"{cat.name}: 0/100 — ошибка скана")
-            job.incomplete_categories += 1
-            job.incomplete_category_keys = job.incomplete_category_keys or set()
-            job.incomplete_category_keys.add(cat.key)
-            job.completed_categories += 1
+        batch = valid_entries[batch_start:batch_start + CATEGORY_PIPELINE_PER_JOB]
+        if not batch:
+            continue
 
+        job.active_category_names = [cat.name for _, cat in batch]
+        job.active_progress_keys = [
+            _progress_key(cat.key, job.target_date, job.page_limit) for _, cat in batch
+        ]
+        job.current_category = " + ".join(job.active_category_names)
+        job.current_category_key = batch[0][1].key
+        job.current_progress_key = job.active_progress_keys[0]
+        job.current_category_index = batch[0][0]
+        await edit_job_status(bot, job, render_user_job_status(job), force=True)
+
+        tasks = [
+            asyncio.create_task(
+                _run_category_child(bot, job, cat, idx),
+                name=f"category-pipeline:{job.job_id}:{cat.key}",
+            )
+            for idx, cat in batch
+        ]
+        try:
+            outcomes = await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        batch_rate_limited = False
+        for child, rate_limited in outcomes:
+            _merge_category_child(job, child)
+            batch_rate_limited = batch_rate_limited or rate_limited
+
+        job.active_category_names = None
+        job.active_progress_keys = None
+        job.retry_note = ""
+        job.recovery_note = ""
+        await edit_job_status(bot, job, render_user_job_status(job), force=True)
+
+        if job.cancel_requested or job.stop_event.is_set():
+            job.cancel_requested = True
+            break
+
+        # If one of the two concurrent categories hit an explicit temporary site
+        # limit, do not start a fresh batch and amplify it. The already-running
+        # sibling is allowed to finish, then remaining categories are marked partial.
+        if batch_rate_limited:
+            processed_positions = {idx for idx, _ in valid_entries[:batch_start + len(batch)]}
+            remaining = [(idx, cat) for idx, cat in valid_entries if idx not in processed_positions]
+            if remaining:
+                note = (
+                    "Kleinanzeigen всё ещё ограничивает доступ после автоматического ожидания. "
+                    f"Оставшиеся категории ({len(remaining)}) не запускались, чтобы не усиливать лимит."
+                )
+                job.warnings.append(note)
+                job.scan_notes.append(note)
+                job.incomplete_categories += len(remaining)
+                job.incomplete_category_keys.update(cat.key for _, cat in remaining)
+                job.completed_categories += len(remaining)
+                job.quality_scores.extend([0] * len(remaining))
+            stop_after_batch = True
+        if stop_after_batch:
+            break
+
+    job.active_category_names = None
+    job.active_progress_keys = None
     await finish_job(bot, job, cancelled=job.cancel_requested)
 
 
@@ -5466,9 +5650,11 @@ async def scan_worker(bot: Bot, worker_id: int) -> None:
                 await TRAFFIC.scan_job_started()
                 parser = KleinanzeigenParser()
                 parser_token = JOB_PARSER.set(parser)
+                price_token = ACTIVE_SCAN_PRICE_FILTER.set(job.price_filter or "any")
                 try:
                     await process_scan_job(bot, job, worker_id)
                 finally:
+                    ACTIVE_SCAN_PRICE_FILTER.reset(price_token)
                     JOB_PARSER.reset(parser_token)
                     await parser.close()
                     await TRAFFIC.scan_job_finished()
@@ -5727,9 +5913,11 @@ async def distributed_scan_worker(bot: Bot, worker_id: str) -> None:
             await TRAFFIC.scan_job_started()
             parser = KleinanzeigenParser()
             parser_token = JOB_PARSER.set(parser)
+            price_token = ACTIVE_SCAN_PRICE_FILTER.set(job.price_filter or "any")
             try:
                 await process_scan_job(bot, job, 1)
             finally:
+                ACTIVE_SCAN_PRICE_FILTER.reset(price_token)
                 JOB_PARSER.reset(parser_token)
                 await parser.close()
                 await TRAFFIC.scan_job_finished()
@@ -9237,12 +9425,14 @@ async def main() -> None:
     log.info("Database backend: %s", DATABASE_BACKEND)
     if STABLE_SINGLE_SERVICE_MODE:
         log.warning(
-            "v4.3.2 Multi-User Stable active | parser_lanes=%s | shared_chromium=%s | "
-            "isolated_context_per_job=%s | view_pool=%s | view_interval=%.2fs | transport=browser | "
+            "v4.3.9 Multi-User Category Pipeline active | user_lanes=%s | category_per_job=%s | "
+            "category_global=%s | shared_chromium=%s | isolated_context_per_category=%s | "
+            "view_pool=%s | high_load_view_cap=%s | view_interval=%.2fs | transport=browser | "
             "redis_in_scan_path=False | accurate_views=%s | category_watchdog=%ss | page_retries=%s",
-            MAX_CONCURRENT_JOBS, bool(MULTIUSER_STABLE_MODE), bool(MULTIUSER_STABLE_MODE),
-            MULTIUSER_VIEW_POOL_SIZE, TRAFFIC.view_min_interval, ACCURATE_VIEWS_MODE,
-            int(SCAN_CATEGORY_HARD_TIMEOUT_SECONDS), STABLE_PAGE_RETRIES,
+            MAX_CONCURRENT_JOBS, CATEGORY_PIPELINE_PER_JOB, CATEGORY_PIPELINE_GLOBAL_LIMIT,
+            bool(MULTIUSER_STABLE_MODE), bool(MULTIUSER_STABLE_MODE),
+            MULTIUSER_VIEW_POOL_SIZE, TRAFFIC.high_load_view_limit, TRAFFIC.view_min_interval,
+            ACCURATE_VIEWS_MODE, int(SCAN_CATEGORY_HARD_TIMEOUT_SECONDS), STABLE_PAGE_RETRIES,
         )
 
     worker_tasks = [] if DISTRIBUTED_WORKERS else [
