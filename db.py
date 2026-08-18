@@ -230,6 +230,8 @@ async def init_db() -> None:
         user_scan_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "user_scans"))
         if user_scan_columns and "target_date" not in user_scan_columns:
             await conn.execute(text("ALTER TABLE user_scans ADD COLUMN target_date VARCHAR(10) DEFAULT ''"))
+        if user_scan_columns and "price_filter" not in user_scan_columns:
+            await conn.execute(text("ALTER TABLE user_scans ADD COLUMN price_filter VARCHAR(32) DEFAULT 'any'"))
         if user_scan_columns and "target_complete" not in user_scan_columns:
             await conn.execute(text("ALTER TABLE user_scans ADD COLUMN target_complete BOOLEAN DEFAULT FALSE"))
         if user_scan_columns and "scan_note" not in user_scan_columns:

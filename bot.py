@@ -263,13 +263,61 @@ MODE_LABELS = {
     "price_drop": "📉 Снижение цены",
 }
 PRICE_LABELS = {
-    "any": "Любая",
+    "any": "Любая цена",
+    "50_plus": "50+ €",
+    "100_plus": "100+ €",
+    "200_plus": "200+ €",
+    "500_plus": "500+ €",
+    # Legacy values are kept so old saved settings/scans remain readable.
     "0_50": "0–50 €",
     "50_100": "50–100 €",
     "100_200": "100–200 €",
     "200_500": "200–500 €",
-    "500_plus": "500+ €",
 }
+
+
+def price_filter_label(value: str | None) -> str:
+    value = (value or "any").strip()
+    if value in PRICE_LABELS:
+        return PRICE_LABELS[value]
+    if value.startswith("custom:"):
+        parts = value.split(":", 2)
+        if len(parts) == 3:
+            lo = parts[1].strip()
+            hi = parts[2].strip()
+            if lo and hi:
+                return f"{lo}–{hi} €"
+            if lo:
+                return f"{lo}+ €"
+            if hi:
+                return f"до {hi} €"
+    return value or "Любая цена"
+
+
+def parse_scan_price_input(text: str | None) -> str | None:
+    raw = (text or "").strip().lower().replace("€", "").replace("eur", "")
+    raw = re.sub(r"\s+", "", raw)
+    if not raw:
+        return None
+    m = re.fullmatch(r"(\d{1,7})[-–—](\d{1,7})", raw)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        if lo <= hi:
+            return f"custom:{lo}:{hi}"
+        return None
+    m = re.fullmatch(r"(\d{1,7})\+", raw)
+    if m:
+        return f"custom:{int(m.group(1))}:"
+    m = re.fullmatch(r"[-–—](\d{1,7})", raw)
+    if m:
+        return f"custom::{int(m.group(1))}"
+    m = re.fullmatch(r"до(\d{1,7})", raw)
+    if m:
+        return f"custom::{int(m.group(1))}"
+    m = re.fullmatch(r"от(\d{1,7})", raw)
+    if m:
+        return f"custom:{int(m.group(1))}:"
+    return None
 SORT_LABELS = {"newest": "Сначала новые", "price_asc": "Цена ↑", "price_desc": "Цена ↓"}
 PAGE_LIMIT_CHOICES = (25, 50, 100)
 # Conservative baseline for user-facing ETA. A full 100-page category starts
@@ -324,6 +372,7 @@ class SettingsInput(StatesGroup):
 
 class ScanInput(StatesGroup):
     target_date = State()
+    custom_price = State()
 
 
 class AdminInput(StatesGroup):
@@ -542,8 +591,7 @@ def settings_keyboard(s: UserSettings) -> InlineKeyboardMarkup:
     mode_label = MODE_LABELS.get(s.output_mode, s.output_mode)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"Режим: {mode_label}", callback_data="set_mode")],
-        [InlineKeyboardButton(text=f"💶 {PRICE_LABELS.get(s.price_filter, s.price_filter)}", callback_data="set_price"),
-         InlineKeyboardButton(text=f"👁 {min_views_label(getattr(s, 'min_views', 0))}", callback_data="set_min_views")],
+        [InlineKeyboardButton(text=f"👁 {min_views_label(getattr(s, 'min_views', 0))}", callback_data="set_min_views")],
         [InlineKeyboardButton(text=f"🧠 Дубли · {'Вкл' if s.smart_dedupe else 'Выкл'}", callback_data="toggle_dedupe"),
          InlineKeyboardButton(text=f"🧹 Шум · {'Вкл' if s.clean_noise else 'Выкл'}", callback_data="toggle_noise")],
         [InlineKeyboardButton(text=f"↕️ {SORT_LABELS.get(s.sort_mode, s.sort_mode)}", callback_data="set_sort")],
@@ -556,11 +604,25 @@ def settings_keyboard(s: UserSettings) -> InlineKeyboardMarkup:
     ])
 
 
+def scan_price_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💶 Любая цена", callback_data="scanprice:any")],
+        [InlineKeyboardButton(text="50+ €", callback_data="scanprice:50_plus"),
+         InlineKeyboardButton(text="100+ €", callback_data="scanprice:100_plus")],
+        [InlineKeyboardButton(text="200+ €", callback_data="scanprice:200_plus"),
+         InlineKeyboardButton(text="500+ €", callback_data="scanprice:500_plus")],
+        [InlineKeyboardButton(text="✍️ Свой диапазон", callback_data="scanprice:custom")],
+        [InlineKeyboardButton(text="⬅️ Другая дата", callback_data="start_scan"),
+         InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
+    ])
+
+
 def page_limit_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="25 стр.", callback_data="scanpages:25"),
          InlineKeyboardButton(text="50 стр.", callback_data="scanpages:50"),
          InlineKeyboardButton(text="100 стр.", callback_data="scanpages:100")],
+        [InlineKeyboardButton(text="💶 Изменить цену", callback_data="scanprice_menu")],
         [InlineKeyboardButton(text="⬅️ Другая дата", callback_data="start_scan"),
          InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
     ])
@@ -611,6 +673,15 @@ async def get_settings(user_id: int) -> UserSettings:
             await session.commit()
             await session.refresh(s)
         return s
+
+
+async def get_settings_for_scan(scan: UserScan) -> UserSettings:
+    s = await get_settings(int(scan.user_id))
+    # Price is a snapshot property of the scan since v4.3.7. Other filters keep
+    # their existing behavior, but opening an old scan must never silently change
+    # its price range after the user starts a different scan later.
+    s.price_filter = (getattr(scan, "price_filter", "any") or "any").strip()
+    return s
 
 
 async def update_setting(user_id: int, field: str, value) -> UserSettings:
@@ -676,7 +747,7 @@ def _validate_scan_category_count(category_keys: list[str]) -> list[str]:
     return validate_scan_category_keys(category_keys, set(CATEGORIES))
 
 
-async def create_user_scan(user_id: int, job_uid: str, category_keys: list[str], page_limit: int, target_date: str) -> UserScan:
+async def create_user_scan(user_id: int, job_uid: str, category_keys: list[str], page_limit: int, target_date: str, price_filter: str = "any") -> UserScan:
     category_keys = _validate_scan_category_count(category_keys)
     scan = UserScan(
         job_uid=job_uid,
@@ -685,6 +756,7 @@ async def create_user_scan(user_id: int, job_uid: str, category_keys: list[str],
         category_keys=",".join(category_keys),
         page_limit=page_limit,
         target_date=target_date,
+        price_filter=(price_filter or "any"),
         status="queued",
         total_categories=len(category_keys),
     )
@@ -1116,6 +1188,7 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
             scan_settings = await session.get(UserSettings, job.user_id)
             if scan_settings is None:
                 scan_settings = UserSettings(user_id=job.user_id)
+            scan_settings.price_filter = job.price_filter or "any"
             rows = apply_listing_settings(
                 rows, scan_settings, exact_date_scan=True, apply_output_mode=True
             )
@@ -2557,15 +2630,17 @@ async def send_smart_export(
     *,
     category_keys_override: set[str] | None = None,
     rows_override: list[Listing] | None = None,
+    price_filter_override: str | None = None,
 ) -> int:
     s = await get_settings(user_id)
     mode = s.output_mode
+    effective_price_filter = (price_filter_override or "any").strip()
     all_rows = list(rows_override) if rows_override is not None else await today_rows()
     selected_keys = category_keys_override if category_keys_override is not None else await get_selected(user_id)
     if selected_keys:
         all_rows = [row for row in all_rows if row.category_key in selected_keys]
     raw_base = base_filter(
-        all_rows, period=None, price_filter=s.price_filter, clean_noise=s.clean_noise,
+        all_rows, period=None, price_filter=effective_price_filter, clean_noise=s.clean_noise,
         include_words=s.include_words or "", exclude_words=s.exclude_words or "",
     )
 
@@ -2610,7 +2685,7 @@ async def send_smart_export(
         # Reload rows because availability status may have changed.
         all_rows = await today_rows()
         refreshed = base_filter(
-            all_rows, period=None, price_filter=s.price_filter, clean_noise=s.clean_noise,
+            all_rows, period=None, price_filter=effective_price_filter, clean_noise=s.clean_noise,
             include_words=s.include_words or "", exclude_words=s.exclude_words or "",
         )
         if s.smart_dedupe:
@@ -2665,14 +2740,13 @@ def settings_text(s: UserSettings) -> str:
     return (
         "<b>⚙️ Настройки</b>\n\n"
         f"Режим: <b>{MODE_LABELS.get(s.output_mode, s.output_mode)}</b>\n"
-        f"💶 Цена: <b>{PRICE_LABELS.get(s.price_filter, s.price_filter)}</b>\n"
         f"👁 Просмотры: <b>{min_views_label(getattr(s, 'min_views', 0))}</b>\n"
         f"🧠 Умные дубли: <b>{'Вкл' if s.smart_dedupe else 'Выкл'}</b>\n"
         f"🧹 Очистка шума: <b>{'Вкл' if s.clean_noise else 'Выкл'}</b>\n"
         f"↕️ Сортировка: <b>{SORT_LABELS.get(s.sort_mode, s.sort_mode)}</b>\n"
         f"🔎 Ключевые слова: <b>{include}</b>\n"
         f"🚫 Исключения: <b>{exclude}</b>\n\n"
-        "<i>Дата выбирается отдельно при запуске нового скана.</i>"
+        "<i>Дата, цена и глубина выбираются отдельно при каждом новом скане.</i>"
     )
 
 
@@ -2908,6 +2982,7 @@ class ScanJob:
     current_progress_key: str = ""
     scan_id: int | None = None
     target_date: str = ""
+    price_filter: str = "any"
     incomplete_categories: int = 0
     scan_notes: list[str] | None = None
     matched_ids: set[str] | None = None
@@ -3008,6 +3083,7 @@ def scan_job_from_record(scan: UserScan, *, recovered: bool = False) -> ScanJob:
         page_limit=int(scan.page_limit or 25),
         scan_id=int(scan.id),
         target_date=scan.target_date or _moscow_today_iso(),
+        price_filter=(getattr(scan, "price_filter", "any") or "any"),
         recovered=recovered,
     )
     job.completed_categories = int(scan.completed_categories or 0)
@@ -4754,6 +4830,7 @@ def render_user_job_status(job: ScanJob) -> str:
             + queue_line
             + f"🗂 Категорий: <b>{total}</b>\n"
             + f"📅 <b>{_date_label(job.target_date)}</b> · 📄 <b>{depth} стр.</b>\n"
+            + f"💶 <b>{html.escape(price_filter_label(job.price_filter))}</b>\n"
             + f"⏱ <b>{_human_duration(waited)}</b>"
         )
 
@@ -4974,6 +5051,7 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
             len(job.category_keys),
             category_keys_override=set(job.category_keys),
             rows_override=snapshot_rows,
+            price_filter_override=job.price_filter,
         )
         export_ok = True
     except Exception:
@@ -4981,7 +5059,7 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
         try:
             await bot.send_message(
                 job.chat_id,
-                "⚠️ <b>Результат сохранён, но CSV не отправился.</b>\n\n"
+                "⚠️ <b>Результат сохранён, но XLSX не отправился.</b>\n\n"
                 "Открой скан — файл можно скачать повторно.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=post_scan_keyboard(job.scan_id, recheck=bool(job.incomplete_categories)),
@@ -5016,7 +5094,7 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
             "пока сервер не подтвердил все участки."
         )
     elif export_ok and result_count:
-        result_tail = "📄 CSV отправлен ниже."
+        result_tail = "📊 XLSX отправлен ниже."
     elif export_ok:
         result_tail = "По текущим фильтрам подходящих объявлений нет."
     else:
@@ -5707,7 +5785,10 @@ async def distributed_scan_worker(bot: Bot, worker_id: str) -> None:
                     log.debug("Could not release distributed job lock job=%s", job_uid, exc_info=True)
 
 
-async def enqueue_user_scan(message: Message, user_id: int, category_keys: list[str], page_limit: int, target_date: str) -> ScanJob | None:
+async def enqueue_user_scan(
+    message: Message, user_id: int, category_keys: list[str], page_limit: int, target_date: str,
+    *, price_filter: str = "any",
+) -> ScanJob | None:
     """Create a persistent scan card and queue the network job.
 
     v4.1.4: in distributed mode do not create a user scan until at least one
@@ -5762,7 +5843,7 @@ async def enqueue_user_scan(message: Message, user_id: int, category_keys: list[
         )
 
     job_uid = uuid.uuid4().hex[:12]
-    scan = await create_user_scan(user_id, job_uid, category_keys, page_limit, target_date)
+    scan = await create_user_scan(user_id, job_uid, category_keys, page_limit, target_date, price_filter=price_filter)
     status = await message.answer("⏳ <b>Подготавливаю скан…</b>", parse_mode=ParseMode.HTML)
     await attach_user_scan_message(scan.id, message.chat.id, status.message_id)
     job = ScanJob(
@@ -5776,6 +5857,7 @@ async def enqueue_user_scan(message: Message, user_id: int, category_keys: list[
         page_limit=page_limit,
         scan_id=scan.id,
         target_date=target_date,
+        price_filter=price_filter or "any",
     )
     if DISTRIBUTED_WORKERS:
         try:
@@ -7084,7 +7166,7 @@ async def _begin_scan_from_message(message: Message, state: FSMContext) -> None:
     await state.set_state(ScanInput.target_date)
     await message.answer(
         "<b>▶️ Новый скан</b>\n\n"
-        "<b>1/2 · Дата объявлений</b>\n"
+        "<b>1/3 · Дата объявлений</b>\n"
         "Выбери день. Время считаем по Москве.",
         parse_mode=ParseMode.HTML,
         reply_markup=scan_date_keyboard(),
@@ -7212,7 +7294,7 @@ async def help_command(message: Message, state: FSMContext) -> None:
     await message.answer(
         "<b>ℹ️ Помощь</b>\n\n"
         "Основные разделы всегда доступны через кнопку <b>Menu</b>.\n\n"
-        "▶️ Новый скан — выбрать дату и запустить сбор\n"
+        "▶️ Новый скан — выбрать дату, цену, глубину и запустить сбор\n"
         "🔥 Популярное — актуальный TOP последнего успешного скана\n"
         "📊 Мои сканы — свежие запуски и архив\n"
         "🗂 Категории — что анализировать\n"
@@ -7351,17 +7433,13 @@ async def choose_period(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "set_price")
 async def set_price(callback: CallbackQuery) -> None:
-    await callback.answer()
-    await callback.message.edit_text("<b>💶 Диапазон цены</b>", reply_markup=choice_keyboard("price", [(k, v) for k, v in PRICE_LABELS.items()]), parse_mode=ParseMode.HTML)
+    # Compatibility with old Telegram messages created before v4.3.7.
+    await callback.answer("Цена теперь выбирается при запуске скана", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("price:"))
 async def choose_price(callback: CallbackQuery) -> None:
-    value = callback.data.split(":", 1)[1]
-    if value not in PRICE_LABELS: return
-    s = await update_setting(callback.from_user.id, "price_filter", value)
-    await callback.answer("Цена сохранена")
-    await callback.message.edit_text(settings_text(s), reply_markup=settings_keyboard(s), parse_mode=ParseMode.HTML)
+    await callback.answer("Цена теперь выбирается при запуске скана", show_alert=True)
 
 
 @dp.callback_query(F.data == "set_min_views")
@@ -7610,7 +7688,7 @@ async def popular_category(callback: CallbackQuery) -> None:
     rows, scans = await get_category_scan_rows(callback.from_user.id, category_key)
     if cat is None or not scans:
         await callback.answer("Категория или сканы не найдены", show_alert=True); return
-    scan_settings = await get_settings(callback.from_user.id)
+    scan_settings = await get_settings_for_scan(scans[0])
     rows = apply_listing_settings(rows, scan_settings, exact_date_scan=True, apply_output_mode=True)
     scan = scans[0]
     viewed = sum(1 for row in rows if row.view_count is not None)
@@ -7645,7 +7723,7 @@ async def popular_category_views(callback: CallbackQuery) -> None:
     # Prefer the newest owned scan for navigation even when an old Telegram
     # message contains a stale representative scan id.
     scan_id = scans[0].id
-    scan_settings = await get_settings(callback.from_user.id)
+    scan_settings = await get_settings_for_scan(scans[0])
     rows = apply_listing_settings(rows, scan_settings, exact_date_scan=True, apply_output_mode=True)
     rows = [row for row in rows if row.view_count is not None]
     rows.sort(key=lambda row: (row.view_count or 0, row.first_seen_at), reverse=True)
@@ -7691,7 +7769,7 @@ async def popular_category_growth(callback: CallbackQuery) -> None:
     growth, scan_count, rounds = await get_category_growth_rows(
         callback.from_user.id, category_key, period_hours
     )
-    scan_settings = await get_settings(callback.from_user.id)
+    scan_settings = await get_settings_for_scan(scans[0])
     allowed_growth_rows = apply_listing_settings(
         [item.listing for item in growth], scan_settings, exact_date_scan=True, apply_output_mode=True
     )
@@ -7803,7 +7881,7 @@ async def archive_noop(callback: CallbackQuery) -> None:
 async def render_scan_detail(scan: UserScan) -> str:
     """Compact product-style scan card. Show diagnostics only when actionable."""
     pairs = await get_scan_rows(scan.id)
-    scan_settings = await get_settings(scan.user_id)
+    scan_settings = await get_settings_for_scan(scan)
     allowed_rows = apply_listing_settings(
         [listing for listing, _ in pairs], scan_settings, exact_date_scan=True, apply_output_mode=True
     )
@@ -7847,6 +7925,7 @@ async def render_scan_detail(scan: UserScan) -> str:
         status_label,
         "",
         f"📅 <b>{_date_label(scan.target_date)}</b> · 📄 <b>{depth} стр.</b>",
+        f"💶 Цена: <b>{html.escape(price_filter_label(getattr(scan, 'price_filter', 'any')))}</b>",
         f"📦 Объявлений: <b>{len(rows)}</b> · 👁 С просмотрами: <b>{viewed}</b>",
     ]
     if scan.total_categories > 1:
@@ -7928,7 +8007,7 @@ async def _scan_top_pairs(user_id: int, scan_id: int) -> tuple[UserScan | None, 
     if scan is None:
         return None, []
     pairs = await get_scan_rows(scan_id)
-    scan_settings = await get_settings(user_id)
+    scan_settings = await get_settings_for_scan(scan)
     allowed_rows = apply_listing_settings(
         [p[0] for p in pairs], scan_settings, exact_date_scan=True, apply_output_mode=True
     )
@@ -8053,7 +8132,7 @@ async def scan_growth(callback: CallbackQuery) -> None:
         await callback.answer("Скан не найден", show_alert=True); return
 
     growth, rounds = await get_scan_growth_rows(scan_id, period_hours)
-    scan_settings = await get_settings(callback.from_user.id)
+    scan_settings = await get_settings_for_scan(scan)
     allowed_growth_rows = apply_listing_settings(
         [item.listing for item in growth], scan_settings, exact_date_scan=True, apply_output_mode=True
     )
@@ -8157,7 +8236,7 @@ async def send_growth_xlsx(
     message: Message, scan: UserScan, period_hours: int, category_key: str | None = None
 ) -> None:
     growth, _ = await get_scan_growth_rows(scan.id, period_hours, category_key=category_key)
-    scan_settings = await get_settings(scan.user_id)
+    scan_settings = await get_settings_for_scan(scan)
     allowed_rows = apply_listing_settings(
         [item.listing for item in growth], scan_settings, exact_date_scan=True, apply_output_mode=True
     )
@@ -8186,19 +8265,25 @@ async def send_category_growth_xlsx(
 ) -> None:
     scans = await get_user_category_scans(user_id, category_key)
     growth, scan_count, _ = await get_category_growth_rows(user_id, category_key, period_hours)
-    scan_settings = await get_settings(user_id)
-    allowed_rows = apply_listing_settings(
-        [item.listing for item in growth], scan_settings, exact_date_scan=True, apply_output_mode=True
-    )
-    allowed_ids = {row.external_id for row in allowed_rows}
-    growth = [item for item in growth if item.listing.external_id in allowed_ids]
-    if not scans or not growth:
+    if not scans:
         await message.answer(
             f"📊 TOP-{GROWTH_TOP_LIMIT} за {period_hours}ч пока нельзя сформировать: "
             "контрольные замеры ещё не готовы или прироста нет."
         )
         return
     representative = scans[0]
+    scan_settings = await get_settings_for_scan(representative)
+    allowed_rows = apply_listing_settings(
+        [item.listing for item in growth], scan_settings, exact_date_scan=True, apply_output_mode=True
+    )
+    allowed_ids = {row.external_id for row in allowed_rows}
+    growth = [item for item in growth if item.listing.external_id in allowed_ids]
+    if not growth:
+        await message.answer(
+            f"📊 TOP-{GROWTH_TOP_LIMIT} за {period_hours}ч пока нельзя сформировать: "
+            "контрольные замеры ещё не готовы или прироста нет."
+        )
+        return
     path = build_growth_top_xlsx(
         representative, period_hours, growth, category_key=category_key
     )
@@ -8295,19 +8380,23 @@ async def _manual_view_refresh_job(
         title = html.escape(scan.title)
         measurement_started = datetime.utcnow() - timedelta(seconds=VIEW_MEASUREMENT_REUSE_SECONDS)
 
-        # A manual control measurement is fresh: the normal 5/30-minute view cache
-        # cannot substitute it. Only values fetched in the last few seconds may be
-        # shared with another simultaneous user's measurement.
-        async with background_view_refresh_lock:
-            requested, updated, failed = await refresh_view_counts(
-                rows, None, force=False, max_age_seconds=VIEW_MEASUREMENT_REUSE_SECONDS,
-                traffic_priority="background",
-                progress_message=progress_message,
-                progress_title=f"👁 Повторный замер · {scan.title}",
-            )
-            recorded = await update_scan_view_refresh(
-                scan_id, fresh_after=measurement_started
-            )
+        # v4.3.6: a button press is foreground/manual work, not a scheduled
+        # background checkpoint. In Multi-User Stable mode background view traffic
+        # is intentionally paused while ANY scan job is active. Treating this
+        # explicit user action as background therefore left the card at 0/N until
+        # every other user's scan finished. Manual refreshes now use the normal
+        # adaptive view lane directly; TRAFFIC still reserves scan slots, so this
+        # cannot starve category/date parsing. Same-scan duplicate clicks are
+        # already coalesced by manual_view_tasks.
+        requested, updated, failed = await refresh_view_counts(
+            rows, None, force=False, max_age_seconds=VIEW_MEASUREMENT_REUSE_SECONDS,
+            traffic_priority="manual",
+            progress_message=progress_message,
+            progress_title=f"👁 Повторный замер · {scan.title}",
+        )
+        recorded = await update_scan_view_refresh(
+            scan_id, fresh_after=measurement_started
+        )
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🚀 Открыть динамику", callback_data=f"scangrowth:{scan_id}:3"),
@@ -8417,6 +8506,7 @@ async def scan_export(callback: CallbackQuery) -> None:
     await send_smart_export(
         callback.message, callback.from_user.id, scan.total_categories,
         category_keys_override=set(_scan_category_keys(scan)), rows_override=rows,
+        price_filter_override=(getattr(scan, "price_filter", "any") or "any"),
     )
 
 
@@ -8441,7 +8531,10 @@ async def scan_repeat(callback: CallbackQuery) -> None:
         return
     repeat_depth = scan.page_limit if scan.page_limit in PAGE_LIMIT_CHOICES else 50
     await callback.answer("Повторяю скан")
-    await enqueue_user_scan(callback.message, callback.from_user.id, keys, repeat_depth, scan.target_date or _moscow_today_iso())
+    await enqueue_user_scan(
+        callback.message, callback.from_user.id, keys, repeat_depth, scan.target_date or _moscow_today_iso(),
+        price_filter=(getattr(scan, "price_filter", "any") or "any"),
+    )
 
 
 @dp.callback_query(F.data.startswith("scanrecheck:"))
@@ -8488,7 +8581,10 @@ async def scan_recheck_partial(callback: CallbackQuery) -> None:
                 log.debug("Could not clear distributed partial cache key=%s", progress_key, exc_info=True)
 
     await callback.answer(f"Допроверяю категорий: {len(keys)}")
-    await enqueue_user_scan(callback.message, callback.from_user.id, keys, depth, target_date)
+    await enqueue_user_scan(
+        callback.message, callback.from_user.id, keys, depth, target_date,
+        price_filter=(getattr(scan, "price_filter", "any") or "any"),
+    )
 
 
 @dp.callback_query(F.data == "groups")
@@ -8778,15 +8874,37 @@ async def start_scan(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await callback.message.answer(
         "<b>▶️ Новый скан</b>\n\n"
-        "<b>1/2 · Дата объявлений</b>\n"
+        "<b>1/3 · Дата объявлений</b>\n"
         "Выбери день. Время считаем по Москве.",
         parse_mode=ParseMode.HTML,
         reply_markup=scan_date_keyboard(),
     )
 
 
-async def _show_scan_depth_choice(message: Message, state: FSMContext, user_id: int, target_date: str) -> None:
+async def _show_scan_price_choice(message: Message, state: FSMContext, user_id: int, target_date: str) -> None:
     await state.update_data(target_date=target_date)
+    await state.set_state(None)
+    selected = await get_selected(user_id)
+    selected_cats = [CATEGORIES[k] for k in CATEGORIES if k in selected]
+    if not selected_cats:
+        await state.clear()
+        await message.answer("Сначала выбери хотя бы одну категорию.")
+        return
+    await message.answer(
+        "<b>▶️ Новый скан</b>\n\n"
+        "<b>2/3 · Цена</b>\n"
+        f"📅 Дата: <b>{_date_label(target_date)}</b>\n\n"
+        "Выбери минимальную цену или укажи свой диапазон.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=scan_price_keyboard(),
+    )
+
+
+async def _show_scan_depth_choice(
+    message: Message, state: FSMContext, user_id: int, target_date: str, price_filter: str
+) -> None:
+    await state.update_data(target_date=target_date, price_filter=price_filter)
+    await state.set_state(None)
     selected = await get_selected(user_id)
     selected_cats = [CATEGORIES[k] for k in CATEGORIES if k in selected]
     if not selected_cats:
@@ -8814,16 +8932,16 @@ async def _show_scan_depth_choice(message: Message, state: FSMContext, user_id: 
     extras = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
     await message.answer(
         "<b>▶️ Новый скан</b>\n\n"
-        "<b>2/2 · Проверка запуска</b>\n"
+        "<b>3/3 · Глубина сканирования</b>\n"
         f"📅 Дата: <b>{_date_label(target_date)}</b>\n"
         f"🗂 Категорий: <b>{len(selected_cats)}/{MAX_SELECTED_CATEGORIES}</b>\n"
         f"Режим: <b>{MODE_LABELS.get(scan_settings.output_mode, scan_settings.output_mode)}</b>\n"
-        f"💶 Цена: <b>{PRICE_LABELS.get(scan_settings.price_filter, scan_settings.price_filter)}</b> · "
+        f"💶 Цена: <b>{price_filter_label(price_filter)}</b> · "
         f"👁 <b>{min_views_label(getattr(scan_settings, 'min_views', 0))}</b>\n"
         f"🧠 Дубли: <b>{'Вкл' if scan_settings.smart_dedupe else 'Выкл'}</b> · "
         f"🧹 Шум: <b>{'Вкл' if scan_settings.clean_noise else 'Выкл'}</b>"
         f"{extras}\n\n"
-        "Выбери глубину сканирования.",
+        "Выбери количество страниц.",
         parse_mode=ParseMode.HTML,
         reply_markup=page_limit_keyboard(),
     )
@@ -8855,7 +8973,7 @@ async def choose_scan_date(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     await callback.answer()
-    await _show_scan_depth_choice(callback.message, state, callback.from_user.id, target_date)
+    await _show_scan_price_choice(callback.message, state, callback.from_user.id, target_date)
 
 
 @dp.message(ScanInput.target_date)
@@ -8872,7 +8990,60 @@ async def receive_scan_date(message: Message, state: FSMContext) -> None:
             parse_mode=ParseMode.HTML,
         )
         return
-    await _show_scan_depth_choice(message, state, message.from_user.id, target_date)
+    await _show_scan_price_choice(message, state, message.from_user.id, target_date)
+
+
+@dp.callback_query(F.data == "scanprice_menu")
+async def reopen_scan_price(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    target_date = data.get("target_date") or _moscow_today_iso()
+    await callback.answer()
+    await _show_scan_price_choice(callback.message, state, callback.from_user.id, target_date)
+
+
+@dp.callback_query(F.data.startswith("scanprice:"))
+async def choose_scan_price(callback: CallbackQuery, state: FSMContext) -> None:
+    if not allowed(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    choice = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    target_date = data.get("target_date") or _moscow_today_iso()
+    if choice == "custom":
+        await state.set_state(ScanInput.custom_price)
+        await callback.answer()
+        await callback.message.answer(
+            "<b>💶 Свой диапазон цены</b>\n\n"
+            "Отправь, например:\n"
+            "<code>200-300</code> — от 200 до 300 €\n"
+            "<code>500+</code> — от 500 €\n"
+            "<code>-200</code> — до 200 €",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if choice not in {"any", "50_plus", "100_plus", "200_plus", "500_plus"}:
+        await callback.answer("Неизвестный диапазон", show_alert=True)
+        return
+    await callback.answer(f"Цена: {price_filter_label(choice)}")
+    await _show_scan_depth_choice(callback.message, state, callback.from_user.id, target_date, choice)
+
+
+@dp.message(ScanInput.custom_price)
+async def receive_scan_price(message: Message, state: FSMContext) -> None:
+    if not allowed(message.from_user.id):
+        await state.clear()
+        await message.answer("Нет доступа.")
+        return
+    price_filter = parse_scan_price_input(message.text)
+    if price_filter is None:
+        await message.answer(
+            "⚠️ Не понял диапазон. Используй <code>200-300</code>, <code>500+</code> или <code>-200</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    data = await state.get_data()
+    target_date = data.get("target_date") or _moscow_today_iso()
+    await _show_scan_depth_choice(message, state, message.from_user.id, target_date, price_filter)
 
 
 @dp.callback_query(F.data.startswith("scanpages:"))
@@ -8892,6 +9063,7 @@ async def start_scan_with_pages(callback: CallbackQuery, state: FSMContext) -> N
 
     data = await state.get_data()
     target_date = data.get("target_date") or _moscow_today_iso()
+    price_filter = (data.get("price_filter") or "any").strip()
     selected_keys = await get_selected(callback.from_user.id)
     selected_cats = [CATEGORIES[k] for k in CATEGORIES if k in selected_keys]
     if not selected_cats:
@@ -8915,7 +9087,8 @@ async def start_scan_with_pages(callback: CallbackQuery, state: FSMContext) -> N
     await state.clear()
     await callback.answer("Скан запущен")
     await enqueue_user_scan(
-        callback.message, callback.from_user.id, [cat.key for cat in selected_cats], page_limit, target_date
+        callback.message, callback.from_user.id, [cat.key for cat in selected_cats], page_limit, target_date,
+        price_filter=price_filter,
     )
 
 

@@ -161,6 +161,8 @@ class UserScan(Base):
     category_keys: Mapped[str] = mapped_column(Text, default="")
     page_limit: Mapped[int] = mapped_column(Integer, default=25)
     target_date: Mapped[str] = mapped_column(String(10), default="", index=True)
+    # Snapshot price filter selected for this exact scan (v4.3.7+).
+    price_filter: Mapped[str] = mapped_column(String(32), default="any")
     status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)

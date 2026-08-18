@@ -336,15 +336,33 @@ def period_cutoff(period: str) -> datetime | None:
 
 
 def price_bounds(price_filter: str) -> tuple[int | None, int | None]:
+    value = (price_filter or "any").strip()
     mapping = {
         "any": (None, None),
+        "50_plus": (50, None),
+        "100_plus": (100, None),
+        "200_plus": (200, None),
+        "500_plus": (500, None),
+        # Legacy ranges from pre-v4.3.7 settings.
         "0_50": (0, 50),
         "50_100": (50, 100),
         "100_200": (100, 200),
         "200_500": (200, 500),
-        "500_plus": (500, None),
     }
-    return mapping.get(price_filter, (None, None))
+    if value in mapping:
+        return mapping[value]
+    if value.startswith("custom:"):
+        parts = value.split(":", 2)
+        if len(parts) == 3:
+            try:
+                lo = int(parts[1]) if parts[1] else None
+                hi = int(parts[2]) if parts[2] else None
+            except ValueError:
+                return None, None
+            if lo is not None and hi is not None and lo > hi:
+                return None, None
+            return lo, hi
+    return None, None
 
 
 def base_filter(
