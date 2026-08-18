@@ -65,6 +65,7 @@ ACCURATE_VIEW_BROWSER_CONCURRENCY = max(1, min(4, int(os.getenv("ACCURATE_VIEW_B
 # separately capped by ACCURATE_VIEW_BROWSER_CONCURRENCY.
 ACCURATE_VIEW_HTTP_CONCURRENCY = max(2, min(24, int(os.getenv("ACCURATE_VIEW_HTTP_CONCURRENCY", "12"))))
 ACCURATE_VIEW_DOM_TIMEOUT_MS = max(500, min(8000, int(os.getenv("ACCURATE_VIEW_DOM_TIMEOUT_MS", "2500"))))
+ACCURATE_VIEW_BROWSER_NAV_TIMEOUT_MS = max(5_000, min(30_000, int(os.getenv("ACCURATE_VIEW_BROWSER_NAV_TIMEOUT_MS", "15000"))))
 ACCURATE_VIEW_RETRIES = max(1, min(3, int(os.getenv("ACCURATE_VIEW_RETRIES", "2"))))
 
 # v3.7.0 Hybrid Transport. A foreground scan can use one short Chromium navigation
@@ -2057,7 +2058,7 @@ class KleinanzeigenParser:
                 passive_future, passive_tasks = self._attach_passive_view_capture(page, ad_id)
 
                 async with TRAFFIC.lease("browser", traffic_priority):
-                    response = await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+                    response = await page.goto(url, wait_until="domcontentloaded", timeout=ACCURATE_VIEW_BROWSER_NAV_TIMEOUT_MS)
                 if response is not None:
                     if response.status in {403, 429}:
                         await TRAFFIC.report_refusal(response.status, "browser")
@@ -2403,7 +2404,7 @@ class KleinanzeigenParser:
             passive_future, passive_tasks = self._attach_passive_view_capture(page, ad_id)
 
             async with TRAFFIC.lease("browser", traffic_priority):
-                nav_response = await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+                nav_response = await page.goto(url, wait_until="domcontentloaded", timeout=ACCURATE_VIEW_BROWSER_NAV_TIMEOUT_MS)
             if nav_response is not None:
                 if nav_response.status in {403, 429}:
                     await TRAFFIC.report_refusal(nav_response.status, "browser")
@@ -2684,9 +2685,12 @@ class KleinanzeigenParser:
             fallback_lock = asyncio.Lock()
             phase1_started = time.monotonic()
             singleflight_hits = 0
+            direct_ok_count = 0
+            direct_unknown_count = 0
+            direct_retry_count = 0
 
             async def direct_phase(url: str):
-                nonlocal done_count, singleflight_hits
+                nonlocal done_count, singleflight_hits, direct_ok_count, direct_unknown_count, direct_retry_count
                 if not _allowed_url(url) or "/s-anzeige/" not in url:
                     results[url] = ViewCountResult(
                         None, None, "verified:invalid-url",
@@ -2703,7 +2707,32 @@ class KleinanzeigenParser:
                     )
                 if shared:
                     singleflight_hits += 1
+
+                # A single refusal/transport hiccup may be retried once through the
+                # SAME official endpoint. The adaptive TRAFFIC lease waits for the
+                # cooldown first. A refusal cluster is not retried here, otherwise
+                # thousands of tasks would pile up behind a 60-second cooldown.
+                miss_source = direct.source or ""
+                retryable_refusal = miss_source in {"direct-http:status-403", "direct-http:status-429"}
+                retryable_error = miss_source == "direct-http:error"
+                if direct.views is None and (retryable_refusal or retryable_error):
+                    snap = await TRAFFIC.snapshot()
+                    should_retry = (
+                        (retryable_refusal and snap.penalty_level <= 1 and snap.cooldown_seconds <= 20.0)
+                        or (retryable_error and snap.penalty_level == 0)
+                    )
+                    if should_retry:
+                        direct_retry_count += 1
+                        async with http_sem:
+                            direct, shared_retry = await self._direct_view_http_shared(
+                                url, traffic_priority=traffic_priority
+                            )
+                        if shared_retry:
+                            singleflight_hits += 1
+                        miss_source = direct.source or miss_source
+
                 if direct.views is not None:
+                    direct_ok_count += 1
                     results[url] = ViewCountResult(
                         int(direct.views),
                         direct.raw_text,
@@ -2717,18 +2746,34 @@ class KleinanzeigenParser:
                     await report_progress()
                     return
 
-                async with fallback_lock:
-                    fallback_urls.append(url)
-                    direct_errors[url] = direct.error or direct.source
+                # Chromium is a compatibility fallback only when the official
+                # endpoint answered HTTP 200 but its payload could not be parsed.
+                # Explicit 403/429, timeouts and other HTTP failures are honored as
+                # unknown values instead of opening hundreds of browser pages.
+                if miss_source == "direct-http:unparsed":
+                    async with fallback_lock:
+                        fallback_urls.append(url)
+                        direct_errors[url] = direct.error or direct.source
+                    return
+
+                direct_unknown_count += 1
+                results[url] = ViewCountResult(
+                    None, direct.raw_text, f"verified-official-miss:{miss_source}",
+                    direct.final_url, direct.page_title,
+                    direct.error or miss_source or "official counter unavailable",
+                )
+                async with done_lock:
+                    done_count += 1
+                await report_progress()
 
             await asyncio.gather(*(direct_phase(url) for url in urls))
             valid_total = sum(1 for url in urls if _allowed_url(url) and "/s-anzeige/" in url)
             phase1_elapsed = max(0.001, time.monotonic() - phase1_started)
             log.info(
-                "Accurate views phase1 complete total=%s http_ok=%s browser_fallback=%s "
-                "shared=%s elapsed=%.2fs rate=%.1f/s",
-                total, valid_total - len(fallback_urls), len(fallback_urls),
-                singleflight_hits, phase1_elapsed, valid_total / phase1_elapsed,
+                "Accurate views phase1 complete total=%s http_ok=%s official_unknown=%s "
+                "browser_fallback=%s retries=%s shared=%s elapsed=%.2fs rate=%.1f/s",
+                total, direct_ok_count, direct_unknown_count, len(fallback_urls),
+                direct_retry_count, singleflight_hits, phase1_elapsed, valid_total / phase1_elapsed,
             )
 
             if fallback_urls:

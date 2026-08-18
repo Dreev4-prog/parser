@@ -88,7 +88,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.9"
+APP_VERSION = "4.3.10"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -130,6 +130,11 @@ CATEGORY_PIPELINE_GLOBAL_LIMIT = max(
     min(8, int(os.getenv("CATEGORY_PIPELINE_GLOBAL_LIMIT", "6"))),
 )
 category_pipeline_sem = asyncio.Semaphore(CATEGORY_PIPELINE_GLOBAL_LIMIT)
+# v4.3.10: category crawling may stay parallel, but large public-view phases must
+# not all burst at once. Two category view batches are enough to keep the official
+# counter lane busy while avoiding 2 users x 2 categories = four huge batches.
+INLINE_VIEW_PHASE_GLOBAL_LIMIT = max(1, min(4, int(os.getenv("INLINE_VIEW_PHASE_GLOBAL_LIMIT", "2"))))
+inline_view_phase_sem = asyncio.Semaphore(INLINE_VIEW_PHASE_GLOBAL_LIMIT)
 SCAN_CATEGORY_HARD_TIMEOUT_SECONDS = max(300.0, min(3600.0, float(
     os.getenv("SCAN_CATEGORY_HARD_TIMEOUT_SECONDS", "1200")
 )))
@@ -4290,15 +4295,26 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         if need_view_counts and deferred_view_items:
             live = category_live_progress.get(progress_key)
             if live is not None:
-                live.phase = "views"
+                live.phase = "views_wait"
                 live.today_seen = today_seen
                 live.views_total = len(deferred_view_items)
                 live.page_limit = depth
+            view_slot_acquired = False
+            acquire_view_task = asyncio.create_task(inline_view_phase_sem.acquire())
             try:
+                await wait_for_task_or_stop(acquire_view_task, stop_event)
+                view_slot_acquired = True
+                if live is not None:
+                    live.phase = "views"
                 _, _, failed_views = await enrich_page_view_counts(
                     parser, list(deferred_view_items.values()), live
                 )
                 view_failures += failed_views
+            except ScanStopRequested:
+                if not acquire_view_task.done():
+                    acquire_view_task.cancel()
+                    await asyncio.gather(acquire_view_task, return_exceptions=True)
+                raise
             except Exception:
                 # A view-threshold result will naturally exclude rows without a
                 # counter.  Do not convert a successfully crawled date into a
@@ -4309,6 +4325,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     "Deferred view-count phase failed category=%s target=%s",
                     cat.name, target_date,
                 )
+            finally:
+                if view_slot_acquired:
+                    inline_view_phase_sem.release()
 
         quality_score, quality_note = _calculate_scan_quality(
             listings_parsed=listings_parsed,
@@ -4910,6 +4929,8 @@ def render_user_job_status(job: ScanJob) -> str:
         if value.phase in {"jumping", "seeking"}:
             request_steps = min(12, max(0, int(value.network_requests or 0)))
             return 0.03 + 0.15 * (request_steps / 12.0)
+        if value.phase == "views_wait":
+            return 0.945
         if value.phase == "views":
             total_views = max(1, int(value.views_total or value.today_seen or 0))
             view_ratio = min(1.0, max(0.0, float(value.views_ready) / total_views))
@@ -4947,7 +4968,7 @@ def render_user_job_status(job: ScanJob) -> str:
 
     # Date-location can use jumps and internal fallback feeds, so page numbers and
     # quality telemetry are intentionally hidden from the everyday UI.
-    if live is None or live.phase not in {"collecting", "views"}:
+    if live is None or live.phase not in {"collecting", "views", "views_wait"}:
         requests_text = ""
         if live is not None and live.network_requests:
             requests_text = f"\n🌐 Проверено запросов: <b>{live.network_requests}</b>"
@@ -4983,6 +5004,18 @@ def render_user_job_status(job: ScanJob) -> str:
             f"⏱ <b>{_human_duration(elapsed)}</b>\n"
             + transport_text + timeout_text
             + "\nСтатус обновляется автоматически."
+        )
+
+    if live.phase == "views_wait":
+        total_views = max(1, int(live.views_total or live.today_seen or 0))
+        return (
+            f"👁 <b>Очередь точных просмотров · {percent}%</b>\n"
+            f"{_progress_bar(percent)}\n\n"
+            f"🗂 <b>{category_line}</b> · {category_index_text}/{total}\n"
+            f"📦 Объявлений: <b>{live.today_seen}</b>\n"
+            f"⏳ Жду свободный слот счётчика просмотров.\n"
+            f"⏱ <b>{_human_duration(elapsed)}</b>\n\n"
+            "Скан не завис: одновременно тяжёлые просмотры собираются максимум для двух категорий."
         )
 
     if live.phase == "views":
