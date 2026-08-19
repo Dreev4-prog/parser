@@ -1,3 +1,9 @@
+# v4.3.16 AUTO SERVICE LAUNCHER
+
+Railway multi-service deployment is now automatic. `railway.json` launches `service_launcher.py`, which uses Railway's `RAILWAY_SERVICE_NAME`: a service named **View Worker** starts `view_counter_worker.py`; all other services start `bot.py`. No manual Start Command edit is required. The known-good parser/date/views core is unchanged.
+
+See `DEPLOY_V4_3_16_AUTO_SERVICE_LAUNCHER.md`.
+
 # v4.3.15 VIEW MANAGER PRO
 
 - Keeps `parser.py` and the exact v4.3.8 views/date core unchanged.
