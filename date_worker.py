@@ -22,9 +22,9 @@ os.environ.setdefault("HYBRID_DIRECT_HTTP_RETRIES", "1")
 os.environ.setdefault("HYBRID_BROWSER_FALLBACK_LIMIT", "4")
 os.environ.setdefault("SHARED_BROWSER_RUNTIME", "1")
 os.environ.setdefault("STABLE_SINGLE_SERVICE_MODE", "1")
-os.environ.setdefault("TRAFFIC_SCAN_CONCURRENCY", "4")
-os.environ.setdefault("TRAFFIC_GLOBAL_CONCURRENCY", "5")
-os.environ.setdefault("TRAFFIC_SCAN_MIN_INTERVAL_SECONDS", "0.12")
+os.environ.setdefault("TRAFFIC_SCAN_CONCURRENCY", "2")
+os.environ.setdefault("TRAFFIC_GLOBAL_CONCURRENCY", "3")
+os.environ.setdefault("TRAFFIC_SCAN_MIN_INTERVAL_SECONDS", "0.20")
 
 from parser import KleinanzeigenParser, TemporaryAccessError, profile_page_dates, shutdown_shared_browser_runtime
 from date_manager import (
@@ -59,7 +59,7 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 # v4.3.28: four HTTP-first consumers per replica. With two Railway replicas this
 # gives up to eight cheap date probes in flight, while browser confirmation stays
 # separately throttled below.
-DATE_WORKER_CONCURRENCY = _env_int("DATE_WORKER_CONCURRENCY", 4, 1, 4)
+DATE_WORKER_CONCURRENCY = _env_int("DATE_WORKER_CONCURRENCY", 2, 1, 4)
 DATE_WORKER_BROWSER_CONFIRM_CONCURRENCY = _env_int("DATE_WORKER_BROWSER_CONFIRM_CONCURRENCY", 1, 1, 2)
 DATE_WORKER_HEARTBEAT_SECONDS = _env_int("DATE_WORKER_HEARTBEAT_SECONDS", 3, 1, 15)
 DATE_WORKER_RECLAIM_IDLE_MS = _env_int("DATE_WORKER_RECLAIM_IDLE_MS", 90_000, 30_000, 300_000)
@@ -190,7 +190,7 @@ class DateWorkerProcess:
         payload = {
             "ts": time.time(),
             "consumer": self.base_id,
-            "version": "4.3.28",
+            "version": "4.3.29",
             "replica": os.getenv("RAILWAY_REPLICA_ID", "local"),
             "concurrency": DATE_WORKER_CONCURRENCY,
             "browser_confirm_concurrency": DATE_WORKER_BROWSER_CONFIRM_CONCURRENCY,

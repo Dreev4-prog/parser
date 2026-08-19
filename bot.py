@@ -95,7 +95,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.28"
+APP_VERSION = "4.3.29"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -367,9 +367,9 @@ GERMAN_STATE_SEGMENTS = (
 # pre-warm several independent regional date locators while Page Worker is still
 # collecting the nationwide pages. This removes the visible second multi-minute
 # date-search staircase without letting remote hints become source of truth.
-HIDDEN_DATE_PREWARM_ENABLED = os.getenv("HIDDEN_DATE_PREWARM_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
-HIDDEN_DATE_PREWARM_WINDOW = max(2, min(8, int(os.getenv("HIDDEN_DATE_PREWARM_WINDOW", "6"))))
-HIDDEN_DATE_PREWARM_CONCURRENCY = max(1, min(6, int(os.getenv("HIDDEN_DATE_PREWARM_CONCURRENCY", "4"))))
+HIDDEN_DATE_PREWARM_ENABLED = os.getenv("HIDDEN_DATE_PREWARM_ENABLED", "0").strip().lower() not in {"0", "false", "no", "off"}
+HIDDEN_DATE_PREWARM_WINDOW = max(1, min(4, int(os.getenv("HIDDEN_DATE_PREWARM_WINDOW", "2"))))
+HIDDEN_DATE_PREWARM_CONCURRENCY = max(1, min(2, int(os.getenv("HIDDEN_DATE_PREWARM_CONCURRENCY", "1"))))
 
 def _regional_category_url(base_url: str, slug: str, location_id: int) -> str:
     m = re.match(r"^(https://www\.kleinanzeigen\.de/.+)/(c\d+)$", base_url.rstrip("/"))
@@ -4470,6 +4470,16 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         except Exception:
             pass
 
+    async def cancel_hidden_date_prewarm() -> None:
+        # v4.3.29: never leave speculative regional date jobs running after the
+        # category has finished. Orphan prewarm traffic can collide with Page/View
+        # phases and turn a healthy scan into a transient partial.
+        pending = [task for task in hidden_prewarm_tasks.values() if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
     async def hidden_fill(remaining_virtual_pages: int) -> tuple[bool, bool]:
         """Fill remaining depth from independent location feeds.
 
@@ -4818,6 +4828,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             cards_seen, listings_parsed, missing_date_count, promoted_filtered, duplicate_count,
             invalid_pages, repeated_pages, low_quality_pages, view_failures, reason,
         )
+        await cancel_hidden_date_prewarm()
         return result
 
     except Exception as exc:
@@ -4874,6 +4885,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 )
             except Exception:
                 log.debug("Could not persist failed stable category job", exc_info=True)
+        await cancel_hidden_date_prewarm()
         raise
 
 def job_keyboard(job_id: str) -> InlineKeyboardMarkup:

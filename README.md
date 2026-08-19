@@ -1,6 +1,6 @@
-# DT PARSER v4.3.28 — COLD DATE TURBO + PARALLEL HIDDEN FILL
+# DT PARSER v4.3.29 — COLD DATE TURBO + PARALLEL HIDDEN FILL
 
-v4.3.28 targets the slowest remaining date scenario: the **first cold scan of an old date** (especially day 5–6 of the allowed 7-day window) and the second regional date-search phase that can appear after nationwide pages are exhausted.
+v4.3.29 targets the slowest remaining date scenario: the **first cold scan of an old date** (especially day 5–6 of the allowed 7-day window) and the second regional date-search phase that can appear after nationwide pages are exhausted.
 
 ## What changed
 

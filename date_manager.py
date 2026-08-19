@@ -81,7 +81,10 @@ def cold_date_probe_pages(target_date: str) -> list[int]:
         # The 5th/6th previous day is normally the expensive cold path. Spread
         # probes nearly uniformly over the public 50-page window so the first
         # round brackets the date instead of walking 1/2/4/8/16/32/50.
-        pages = (1, 8, 14, 20, 26, 32, 38, 44, 50)
+        # v4.3.29 SAFE Cold Turbo: seven wide probes are enough to bracket an
+        # old date while keeping the first cold pass below the request burst that
+        # caused transient page verification failures in v4.3.28.
+        pages = (1, 9, 17, 25, 33, 41, 50)
     return list(dict.fromkeys(max(1, min(50, int(page))) for page in pages))
 
 # v4.3.26: confirmed boundary predictor. Unlike the short 180s probe cache,
