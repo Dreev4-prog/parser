@@ -11,6 +11,8 @@ def _normalized(value: str) -> str:
 def _role() -> str:
     # Optional explicit override. Useful if another worker service is added later.
     explicit = _normalized(os.getenv("DT_SERVICE_ROLE", ""))
+    if explicit in {"pageworker", "pagesworker", "pagefetchworker"}:
+        return "page-worker"
     if explicit in {"viewworker", "viewcounterworker", "viewsworker"}:
         return "view-worker"
     if explicit in {"bot", "main", "parserbot", "telegrambot"}:
@@ -20,6 +22,10 @@ def _role() -> str:
     # name and any future variant that clearly contains VIEW + WORKER.
     service_name = os.getenv("RAILWAY_SERVICE_NAME", "")
     normalized = _normalized(service_name)
+    if normalized in {"pageworker", "pagesworker", "pagefetchworker"} or (
+        "page" in normalized and "worker" in normalized
+    ):
+        return "page-worker"
     if normalized in {"viewworker", "viewcounterworker"} or (
         "view" in normalized and "worker" in normalized
     ):
@@ -42,7 +48,10 @@ def _role() -> str:
 def main() -> None:
     role = _role()
     service_name = os.getenv("RAILWAY_SERVICE_NAME", "local")
-    target = "view_counter_worker.py" if role == "view-worker" else "bot.py"
+    target = {
+        "view-worker": "view_counter_worker.py",
+        "page-worker": "page_worker.py",
+    }.get(role, "bot.py")
 
     print(
         "[service-launcher] "

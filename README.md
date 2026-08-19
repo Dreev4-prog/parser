@@ -1,3 +1,18 @@
+# v4.3.21 — PAGE WORKER + 180s SCAN CACHE
+
+- Основной стабильный parser по-прежнему сам ищет выбранную дату.
+- После нахождения даты upcoming category pages прогреваются отдельными Railway **Page Worker** replicas.
+- Рекомендуемый старт: **2 replicas × 2 BrowserContext = 4 параллельных page lanes**.
+- Redis хранит page result **180 секунд** и объединяет одинаковые одновременные запросы через page-level single-flight.
+- Повтор похожего скана в течение 2–3 минут переиспользует свежие страницы вместо повторной загрузки.
+- Любой timeout/offline/error Page Worker автоматически оставляет страницу прежнему локальному fallback.
+- `/admin → 📄 Page Worker` показывает workers, queue, pages/sec, cache и 403/429.
+- `parser.py`, `traffic.py`, `view_counter_worker.py`, `view_manager.py` и View Sharding v4.3.20 не изменены.
+
+Подробности: `DEPLOY_V4_3_21_PAGE_WORKER_CACHE.md`.
+
+---
+
 # v4.3.20 — VIEW SHARDING
 
 - Один большой замер просмотров теперь дробится на Redis shards и может одновременно выполняться несколькими Railway View Worker replicas.

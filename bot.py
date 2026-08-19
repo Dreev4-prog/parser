@@ -79,6 +79,9 @@ from parser import (
     private_provider_url,
 )
 from view_manager import REMOTE_VIEW_MANAGER, REMOTE_VIEW_WORKER_ENABLED
+from page_manager import (
+    PAGE_PREFETCH_EXTRA_PAGES, REMOTE_PAGE_MANAGER, REMOTE_PAGE_WORKER_ENABLED,
+)
 from stable_engine import (
     load_date_index, load_page_checkpoint, mark_category_job, record_page_failure,
     save_date_index, save_page_checkpoint,
@@ -89,7 +92,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.20"
+APP_VERSION = "4.3.21"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -3512,6 +3515,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 "status": status, "reason": reason_text, "fetch": page_fetch,
                 "limit": effective_limit, "site_max_page": site_max_page,
                 "candidate": candidate_page, "shards": list(discovered_shards),
+                "base_url": base_url,
             }
 
         async def fetch(page: int, phase: str):
@@ -3539,40 +3543,64 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                             live_req.transport_stage = "postgres-checkpoint"
 
                 if info is None:
-                    checkpoint_before = int(getattr(parser, "scan_page_checkpoint_hits", 0) or 0)
-                    req_started = time.monotonic()
-                    if live_req is not None:
-                        live_req.request_started_at_ts = time.time()
-                        live_req.current_request_page = page
+                    requested_url = page_url(base_url, page)
+                    remote_page = False
+                    # v4.3.21 Page Worker. Date-location probes stay on the proven
+                    # local parser. Only the post-locator collection phase may consume
+                    # the 180-second Redis page cache warmed by dedicated workers.
+                    if phase == "collecting" and REMOTE_PAGE_WORKER_ENABLED:
                         try:
-                            live_req.transport_stage = parser.scan_transport_status()
+                            info = await REMOTE_PAGE_MANAGER.get_cached(requested_url, page)
+                            remote_page = info is not None
+                            if remote_page and live_req is not None:
+                                live_req.transport_stage = "page-worker-cache"
                         except Exception:
-                            live_req.transport_stage = getattr(parser, "scan_transport", "http")
-                    try:
-                        info = await parser.parse_category_page_info(page_url(base_url, page), page)
-                    except Exception as exc:
-                        if STABLE_SCAN_ENGINE:
-                            try:
-                                await record_page_failure(cat.key, target_date, base_url, page, f"{type(exc).__name__}: {exc}")
-                            except Exception:
-                                log.debug("Could not persist failed page checkpoint", exc_info=True)
-                        if live_req is not None and (
-                            isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in str(exc).lower()
-                        ):
-                            live_req.request_timeouts += 1
-                        raise
-                    finally:
+                            info = None
+                            remote_page = False
+                            log.debug(
+                                "Remote Page Worker cache failed category=%s page=%s",
+                                cat.key, page, exc_info=True,
+                            )
+
+                    if info is None:
+                        checkpoint_before = int(getattr(parser, "scan_page_checkpoint_hits", 0) or 0)
+                        req_started = time.monotonic()
                         if live_req is not None:
-                            live_req.last_request_ms = max(0, int((time.monotonic() - req_started) * 1000))
-                            live_req.request_started_at_ts = 0.0
+                            live_req.request_started_at_ts = time.time()
+                            live_req.current_request_page = page
                             try:
                                 live_req.transport_stage = parser.scan_transport_status()
                             except Exception:
-                                pass
-                    checkpoint_after = int(getattr(parser, "scan_page_checkpoint_hits", 0) or 0)
-                    from_checkpoint = checkpoint_after > checkpoint_before
-                    if live_req is not None and from_checkpoint:
-                        live_req.checkpoint_hits += 1
+                                live_req.transport_stage = getattr(parser, "scan_transport", "http")
+                        try:
+                            info = await parser.parse_category_page_info(requested_url, page)
+                        except Exception as exc:
+                            if STABLE_SCAN_ENGINE:
+                                try:
+                                    await record_page_failure(cat.key, target_date, base_url, page, f"{type(exc).__name__}: {exc}")
+                                except Exception:
+                                    log.debug("Could not persist failed page checkpoint", exc_info=True)
+                            if live_req is not None and (
+                                isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in str(exc).lower()
+                            ):
+                                live_req.request_timeouts += 1
+                            raise
+                        finally:
+                            if live_req is not None:
+                                live_req.last_request_ms = max(0, int((time.monotonic() - req_started) * 1000))
+                                live_req.request_started_at_ts = 0.0
+                                try:
+                                    live_req.transport_stage = parser.scan_transport_status()
+                                except Exception:
+                                    pass
+                        checkpoint_after = int(getattr(parser, "scan_page_checkpoint_hits", 0) or 0)
+                        from_checkpoint = checkpoint_after > checkpoint_before
+                        if live_req is not None and from_checkpoint:
+                            live_req.checkpoint_hits += 1
+                    elif remote_page and live_req is not None:
+                        # Keep normal quality/accounting below; the only difference is
+                        # that another Railway service performed the network navigation.
+                        live_req.request_started_at_ts = 0.0
 
                 cache[page] = info
                 promoted_ids = list(getattr(info, "promoted_ids", None) or [])
@@ -4056,6 +4084,36 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             return locator_result("ambiguous_absent", "large feed requires independent sub-feed verification")
         return locator_result("unknown", "could not verify date boundary")
 
+    async def prefetch_collection_range(base_url: str, start_page: int, end_page: int) -> None:
+        """Warm post-locator pages on dedicated Railway Page Worker replicas.
+
+        This helper is acceleration-only: any worker outage, timeout or partial
+        batch leaves missing pages to the original local fetch() path. The date
+        locator itself is never delegated.
+        """
+        if not REMOTE_PAGE_WORKER_ENABLED or end_page < start_page:
+            return
+        requests = [
+            (page, page_url(base_url, page))
+            for page in range(max(1, int(start_page)), max(1, int(end_page)) + 1)
+        ]
+        if not requests:
+            return
+        live = category_live_progress.get(progress_key)
+        previous_stage = getattr(live, "transport_stage", "") if live is not None else ""
+        if live is not None:
+            live.transport_stage = "page-worker-prefetch"
+        try:
+            await REMOTE_PAGE_MANAGER.prefetch(requests)
+        except Exception:
+            log.debug(
+                "Page Worker prefetch failed category=%s pages=%s-%s; local fallback stays active",
+                cat.key, start_page, end_page, exc_info=True,
+            )
+        finally:
+            if live is not None and getattr(live, "transport_stage", "") == "page-worker-prefetch":
+                live.transport_stage = previous_stage or "browser"
+
     async def collect_direct(locator) -> tuple[str, int]:
         """Collect nationwide pages without turning isolated weak pages into deep fallback.
 
@@ -4074,6 +4132,16 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             live.phase = "collecting"
             live.collection_start_page = candidate
             live.collection_index = 0
+
+        # Fetch upcoming target-window pages on separate Railway power. Keep a
+        # small look-ahead for sparse timestamp pages; the normal chronology loop
+        # below still decides which pages actually count toward 15/25/50.
+        prefetch_count = depth + PAGE_PREFETCH_EXTRA_PAGES
+        prefetch_start = min(limit + 1, candidate + 1)  # candidate was fetched by the locator
+        prefetch_end = min(limit, candidate + max(1, prefetch_count) - 1)
+        await prefetch_collection_range(
+            str(locator.get("base_url") or cat.url), prefetch_start, prefetch_end
+        )
 
         page = candidate
         weak_streak = 0
@@ -4250,6 +4318,14 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             fetch = loc["fetch"]
             page = candidate
             state_exhausted = False
+            remaining_goal = max(1, goal_pages - hidden_pages_collected)
+            prefetch_end = min(
+                feed_limit,
+                candidate + remaining_goal + PAGE_PREFETCH_EXTRA_PAGES - 1,
+            )
+            await prefetch_collection_range(
+                str(loc.get("base_url") or feed_url), candidate + 1, prefetch_end
+            )
             while page <= feed_limit and hidden_pages_collected < goal_pages:
                 try:
                     items, relation, pairs, days = await fetch(page, "collecting")
@@ -6161,8 +6237,9 @@ def payment_invoice_keyboard(payment: SubscriptionPayment) -> InlineKeyboardMark
 
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="adminstats"),
-         InlineKeyboardButton(text="👁 View Worker", callback_data="adminviews")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="adminstats")],
+        [InlineKeyboardButton(text="👁 View Worker", callback_data="adminviews"),
+         InlineKeyboardButton(text="📄 Page Worker", callback_data="adminpages")],
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="adminusers"),
          InlineKeyboardButton(text="💳 Платежи", callback_data="adminpayments")],
         [InlineKeyboardButton(text="🎟 Тарифы", callback_data="adminplans"),
@@ -6181,6 +6258,13 @@ def admin_back_keyboard() -> InlineKeyboardMarkup:
 def admin_view_worker_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminviews")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
+    ])
+
+
+def admin_page_worker_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminpages")],
         [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
     ])
 
@@ -6628,6 +6712,57 @@ async def check_payment_handler(callback: CallbackQuery) -> None:
     )
 
 
+async def _admin_page_worker_text() -> str:
+    status = await REMOTE_PAGE_MANAGER.status()
+    if not status.get("enabled"):
+        return (
+            "<b>📄 Page Worker</b>\n\n"
+            "Статус: <b>▫️ выключен</b>\n"
+            "REDIS_URL не задан или REMOTE_PAGE_WORKER_ENABLED=0."
+        )
+    if not status.get("alive"):
+        err = html.escape(str(status.get("error") or "heartbeat не найден"))
+        return (
+            "<b>📄 Page Worker</b>\n\n"
+            "Статус: <b>🔴 offline</b>\n"
+            f"Redis queue: <b>{int(status.get('queue_depth', 0) or 0)}</b>\n"
+            f"Кэш страниц: <b>{int(status.get('cache_ttl', 180) or 180)} сек.</b>\n"
+            f"Причина: <code>{err[:300]}</code>\n\n"
+            "Основной бот автоматически использует локальный сбор страниц."
+        )
+
+    workers = list(status.get("workers") or [])
+    lines = [
+        "<b>📄 PAGE MANAGER</b>",
+        "",
+        f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b>",
+        f"Redis queue: <b>{int(status.get('queue_depth', 0) or 0)}</b> · активных: <b>{int(status.get('active_total', 0) or 0)}</b>",
+        f"Кэш страниц: <b>{int(status.get('cache_ttl', 180) or 180)} сек.</b>",
+        f"Общая скорость: <b>{float(status.get('rate_total', 0.0) or 0.0):.2f} pages/sec</b>",
+        f"Обработано worker'ами: <b>{int(status.get('processed_total', 0) or 0)}</b> · ошибок: <b>{int(status.get('errors_total', 0) or 0)}</b>",
+    ]
+    last_pages = int(status.get("last_batch_pages", 0) or 0)
+    if last_pages:
+        lines.extend([
+            "",
+            f"Последний prefetch: <b>{last_pages}</b> страниц · workers: <b>{int(status.get('last_batch_workers', 0) or 0)}</b>",
+            f"Из кэша: <b>{int(status.get('last_batch_cached', 0) or 0)}</b> · отправлено: <b>{int(status.get('last_batch_remote', 0) or 0)}</b> · fallback: <b>{int(status.get('last_batch_failed', 0) or 0)}</b>",
+            f"Время prefetch: <b>{float(status.get('last_batch_seconds', 0.0) or 0.0):.1f} сек.</b>",
+        ])
+    for idx, worker in enumerate(workers[:4], start=1):
+        lines.extend([
+            "",
+            f"<b>Worker {idx}</b> · concurrency <b>{int(worker.get('concurrency', 0) or 0)}</b> · active <b>{int(worker.get('active', 0) or 0)}</b>",
+            f"pages: <b>{int(worker.get('processed', 0) or 0)}</b> · cache-hit worker: <b>{int(worker.get('cache_served', 0) or 0)}</b> · speed <b>{float(worker.get('rate_ema', 0.0) or 0.0):.2f}/s</b>",
+            f"403/429: <b>{int(worker.get('http_403', 0) or 0)}/{int(worker.get('http_429', 0) or 0)}</b> · penalty <b>{int(worker.get('penalty', 0) or 0)}</b>",
+        ])
+    lines.extend([
+        "",
+        "<i>Поиск даты остаётся в основном стабильном parser. Page Worker ускоряет только сбор страниц после нахождения даты.</i>",
+    ])
+    return "\n".join(lines)
+
+
 @dp.message(Command("admin"))
 async def admin_command(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -6666,6 +6801,19 @@ async def admin_views_handler(callback: CallbackQuery) -> None:
         callback.message,
         await _admin_view_worker_text(),
         reply_markup=admin_view_worker_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "adminpages")
+async def admin_pages_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message,
+        await _admin_page_worker_text(),
+        reply_markup=admin_page_worker_keyboard(),
     )
 
 
@@ -9563,6 +9711,10 @@ async def main() -> None:
                 await _stable_parser_module.shutdown_shared_browser_runtime()
             except Exception:
                 log.debug("Shared local Chromium shutdown failed", exc_info=True)
+        try:
+            await REMOTE_PAGE_MANAGER.close()
+        except Exception:
+            log.debug("Page Manager Redis shutdown failed", exc_info=True)
         await bot.session.close()
 
 
