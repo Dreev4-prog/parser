@@ -329,6 +329,22 @@ class RemotePageManager:
             log.debug("Page Worker cache wait failed", exc_info=True)
             return None
 
+    async def invalidate_cached(self, url: str, requested_page: int) -> None:
+        """Drop a remote page that failed the foreground stable quality gate.
+
+        A weak/challenge page must never be replayed through stable_fetch retries.
+        Removing it here guarantees the next attempt uses the proven local parser
+        unless a worker later produces a new healthy page.
+        """
+        if not self.enabled:
+            return
+        try:
+            redis = await self.connect()
+            cache_id = page_cache_id(url, requested_page)
+            await redis.delete(self.cache_key(cache_id), self.pending_key(cache_id))
+        except Exception:
+            log.debug("Could not invalidate weak Page Worker cache entry", exc_info=True)
+
     async def store_cached(self, url: str, requested_page: int, info: CategoryPageInfo) -> None:
         """Publish a locally-fetched page into the same 180-second shared cache.
 

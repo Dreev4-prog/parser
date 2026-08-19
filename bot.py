@@ -3553,8 +3553,44 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                         try:
                             info = await REMOTE_PAGE_MANAGER.get_cached_wait(requested_url, page)
                             remote_page = info is not None
-                            if remote_page and live_req is not None:
-                                live_req.transport_stage = "page-worker-cache"
+                            if remote_page:
+                                # v4.3.23 strict remote gate. Stable retries must never
+                                # replay one weak Redis response. Validate both page
+                                # identity and target-date chronology before accepting
+                                # Page Worker output; otherwise discard it and use the
+                                # original local stable parser immediately.
+                                remote_relation, _rpairs, _rdays, _rprofile = classify(info.items)
+                                remote_dated = max(
+                                    0,
+                                    len(info.items) - int(getattr(info, "missing_date_count", 0) or 0),
+                                )
+                                remote_safe = (
+                                    bool(getattr(info, "request_matches_page", True))
+                                    and bool(getattr(info, "page_verified", False))
+                                    and not bool(getattr(info, "suspicious", False))
+                                    and remote_relation not in {"unknown", "invalid"}
+                                    and (
+                                        not info.items
+                                        or remote_dated >= 2
+                                        or remote_relation == "target"
+                                    )
+                                )
+                                if not remote_safe:
+                                    log.warning(
+                                        "Rejected weak Page Worker cache category=%s page=%s relation=%s verified=%s matches=%s suspicious=%s",
+                                        cat.key, page, remote_relation,
+                                        bool(getattr(info, "page_verified", False)),
+                                        bool(getattr(info, "request_matches_page", True)),
+                                        bool(getattr(info, "suspicious", False)),
+                                    )
+                                    try:
+                                        await REMOTE_PAGE_MANAGER.invalidate_cached(requested_url, page)
+                                    except Exception:
+                                        pass
+                                    info = None
+                                    remote_page = False
+                                elif live_req is not None:
+                                    live_req.transport_stage = "page-worker-cache"
                         except Exception:
                             info = None
                             remote_page = False

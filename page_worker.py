@@ -134,7 +134,7 @@ class PageWorkerProcess:
         payload = {
             "ts": time.time(),
             "consumer": self.base_id,
-            "version": "4.3.21",
+            "version": "4.3.23",
             "replica": os.getenv("RAILWAY_REPLICA_ID", "local"),
             "concurrency": PAGE_WORKER_CONCURRENCY,
             "active": self.active,
@@ -244,6 +244,34 @@ class PageWorkerProcess:
                             parser.parse_category_page_info(url, requested_page),
                             timeout=PAGE_WORKER_JOB_TIMEOUT_SECONDS,
                         )
+                        # v4.3.23: Redis is acceleration, never truth. A worker may
+                        # hit a cold-browser challenge or a normalized/wrong page on
+                        # its first navigation. Do not poison the shared cache with
+                        # such a response; the foreground stable parser will retry it.
+                        structurally_safe = (
+                            bool(getattr(info, "request_matches_page", True))
+                            and bool(getattr(info, "page_verified", False))
+                            and not bool(getattr(info, "suspicious", False))
+                        )
+                        if not structurally_safe:
+                            self.errors += 1
+                            pipe = self.redis.pipeline(transaction=False)
+                            pipe.set(
+                                self.error_key(cache_id),
+                                "weak-page-not-cached",
+                                ex=PAGE_ERROR_TTL_SECONDS,
+                            )
+                            pipe.delete(self.pending_key(cache_id), self.cache_key(cache_id))
+                            await pipe.execute()
+                            log.warning(
+                                "Page Worker rejected weak page page=%s verified=%s matches=%s suspicious=%s",
+                                requested_page,
+                                bool(getattr(info, "page_verified", False)),
+                                bool(getattr(info, "request_matches_page", True)),
+                                bool(getattr(info, "suspicious", False)),
+                            )
+                            continue
+
                         raw = serialize_page_info(info)
                         pipe = self.redis.pipeline(transaction=False)
                         pipe.set(self.cache_key(cache_id), raw, ex=PAGE_CACHE_TTL_SECONDS)
