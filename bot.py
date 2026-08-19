@@ -95,7 +95,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.26"
+APP_VERSION = "4.3.27"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -3817,7 +3817,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             return last
 
         async def remember_confirmed_date_hint(page: int) -> None:
-            # v4.3.26 predictor learns only from pages the foreground stable
+            # v4.3.27 predictor still learns only from pages the foreground stable
             # parser has already confirmed. Remote Date Worker guesses never
             # become training data by themselves.
             if not REMOTE_DATE_WORKER_ENABLED:
@@ -6936,6 +6936,7 @@ async def _admin_date_worker_text() -> str:
         f"Общая скорость: <b>{float(status.get('rate_total', 0.0) or 0.0):.2f} probes/sec</b>",
         f"Проб отправлено: <b>{int(status.get('probes_queued_total', 0) or 0)}</b> · cache hits: <b>{int(status.get('cache_hits_total', 0) or 0)}</b>",
         f"Predictor hits/miss: <b>{int(status.get('predictor_hits_total', 0) or 0)}/{int(status.get('predictor_misses_total', 0) or 0)}</b> · подтверждений: <b>{int(status.get('predictor_writes_total', 0) or 0)}</b>",
+        f"Continue search: <b>{int(status.get('predictor_continue_success_total', 0) or 0)}/{int(status.get('predictor_continue_total', 0) or 0)}</b> успешных продолжений от hint",
     ]
     last_probes = int(status.get("last_batch_probes", 0) or 0)
     if last_probes:
@@ -6945,6 +6946,7 @@ async def _admin_date_worker_text() -> str:
             f"Проб: <b>{last_probes}</b> · из кэша: <b>{int(status.get('last_batch_cached', 0) or 0)}</b> · отправлено: <b>{int(status.get('last_batch_queued', 0) or 0)}</b>",
             f"Время remote-поиска: <b>{float(status.get('last_batch_seconds', 0.0) or 0.0):.2f} сек.</b>",
             f"Predictor: <b>{html.escape(str(status.get('last_predictor_source') or 'cold'))}</b> → page <b>{int(status.get('last_predictor_page', 0) or 0) or '—'}</b> · learned points: <b>{int(status.get('last_predictor_points', 0) or 0)}</b>",
+            f"Продолжение от hint: rounds <b>{int(status.get('last_predictor_continue_rounds', 0) or 0)}</b> · новых pages <b>{int(status.get('last_predictor_continue_pages', 0) or 0)}</b> · полный fallback <b>{'ДА' if status.get('last_predictor_fallback') else 'нет'}</b>",
         ])
     for idx, worker in enumerate(workers[:4], start=1):
         lines.extend([
@@ -6956,7 +6958,7 @@ async def _admin_date_worker_text() -> str:
         ])
     lines.extend([
         "",
-        "<i>Predictor хранит только локально подтверждённые границы и использует их как стартовую точку. HTTP-first ускоряет пробы, а финальная граница всегда перепроверяется стабильным локальным parser.</i>",
+        "<i>Predictor хранит только локально подтверждённые границы. Если граница уехала, поиск расширяется от hint, а не начинается заново с page 1. Финальная граница всегда перепроверяется стабильным локальным parser.</i>",
     ])
     return "\n".join(lines)
 

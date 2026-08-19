@@ -56,6 +56,12 @@ DATE_INITIAL_PROBES = (1, 2, 4, 8, 16, 32, 50)
 DATE_PREDICTOR_TTL_SECONDS = _env_int("DATE_PREDICTOR_TTL_SECONDS", 3600, 300, 21600)
 DATE_PREDICTOR_EXACT_RADIUS = _env_int("DATE_PREDICTOR_EXACT_RADIUS", 3, 1, 8)
 DATE_PREDICTOR_ESTIMATE_RADIUS = _env_int("DATE_PREDICTOR_ESTIMATE_RADIUS", 6, 2, 12)
+# v4.3.27: when a learned boundary drifts outside the first predictor window,
+# keep expanding from that learned position instead of throwing the work away
+# and restarting at page 1.  These are acceleration limits only; the foreground
+# stable parser still owns final date verification.
+DATE_PREDICTOR_CONTINUE_MAX_ROUNDS = _env_int("DATE_PREDICTOR_CONTINUE_MAX_ROUNDS", 4, 1, 6)
+DATE_PREDICTOR_CONTINUE_TIMEOUT_SECONDS = _env_int("DATE_PREDICTOR_CONTINUE_TIMEOUT_SECONDS", 5, 3, 12)
 
 
 @dataclass(slots=True)
@@ -154,6 +160,11 @@ class RemoteDateManager:
         self.last_predictor_page = 0
         self.last_predictor_source = ""
         self.last_predictor_points = 0
+        self.predictor_continue_total = 0
+        self.predictor_continue_success_total = 0
+        self.last_predictor_continue_rounds = 0
+        self.last_predictor_continue_pages = 0
+        self.last_predictor_fallback = False
 
     async def connect(self):
         if not self.enabled:
@@ -487,12 +498,91 @@ class RemoteDateManager:
         self.last_batch_seconds = max(0.0, time.monotonic() - started)
         return results
 
+    @staticmethod
+    def _predictor_continue_direction(results: dict[int, DateProbeResult]) -> str:
+        """Choose the useful side of a stale predictor without trusting it as truth.
+
+        Page order is newest -> oldest.  If every reliable probe is newer than the
+        requested date, the boundary can only be deeper (right).  If every probe is
+        already older/mixed/empty, it can only be shallower (left).  Contradictory
+        evidence expands both ways and lets the normal chronology bracket decide.
+        """
+        if not results:
+            return "both"
+        if any(item.relation == "target" for item in results.values()):
+            return "done"
+        newer = [page for page, item in results.items() if item.relation == "newer"]
+        non_newer = [
+            page for page, item in results.items()
+            if item.relation in {"older", "mixed", "empty"}
+        ]
+        if newer and not non_newer:
+            return "right"
+        if non_newer and not newer:
+            return "left"
+        return "both"
+
+    async def _continue_from_predictor(
+        self,
+        base_url: str,
+        target_date: str,
+        *,
+        center: int,
+        radius: int,
+        merged: dict[int, DateProbeResult],
+    ) -> tuple[tuple[int, int] | None, int, int, int]:
+        """Expand outward from a learned page until chronology brackets the date.
+
+        This is the v4.3.27 fast path.  It never creates a final verdict: returned
+        pages are still only remote hints and the foreground parser revalidates
+        them locally before accepting a date.
+        """
+        total_cached = 0
+        total_queued = 0
+        rounds = 0
+        distance = max(1, int(radius))
+
+        for _ in range(DATE_PREDICTOR_CONTINUE_MAX_ROUNDS):
+            bracket = self._boundary_from(merged)
+            if bracket is not None:
+                break
+
+            rounds += 1
+            distance = min(50, max(distance + 1, distance * 2))
+            direction = self._predictor_continue_direction(merged)
+            candidates: list[int] = []
+            if direction in {"left", "both"}:
+                candidates.append(max(1, center - distance))
+            if direction in {"right", "both"}:
+                candidates.append(min(50, center + distance))
+            candidates = [p for p in sorted(set(candidates)) if p not in merged]
+            if not candidates:
+                # We reached page 1/50 on the useful side.  There is no more
+                # remote search space to expand without repeating old requests.
+                break
+
+            extra = await self._probe_set(
+                base_url,
+                target_date,
+                candidates,
+                stop_on_boundary=True,
+                timeout_seconds=float(DATE_PREDICTOR_CONTINUE_TIMEOUT_SECONDS),
+            )
+            total_cached += self.last_batch_cached
+            total_queued += self.last_batch_queued
+            merged.update(extra)
+
+        bracket = self._boundary_from(merged)
+        return bracket, total_cached, total_queued, rounds
+
     async def locate_hint(self, base_url: str, target_date: str) -> dict[str, Any] | None:
         """Return a remote boundary hint, never a final date verdict.
 
-        Seven exponential probes are queued in parallel. Once a chronology bracket
-        is visible, one optional quartile refinement round narrows the window. The
-        main stable parser must still verify the returned boundary locally.
+        v4.3.27 first probes around a learned boundary.  If that boundary drifted,
+        the search expands outward from the learned page instead of restarting the
+        old 1/2/4/8/... ladder.  The exponential locator is now only an emergency
+        fallback for a cold category or unusable predictor evidence.  The main
+        stable parser still verifies the returned boundary locally.
         """
         if not self.enabled:
             return None
@@ -503,6 +593,12 @@ class RemoteDateManager:
             total_cached = 0
             total_queued = 0
             bracket: tuple[int, int] | None = None
+            continue_rounds = 0
+            continue_pages = 0
+            used_cold_fallback = False
+            self.last_predictor_continue_rounds = 0
+            self.last_predictor_continue_pages = 0
+            self.last_predictor_fallback = False
 
             if predictor is not None:
                 center = max(1, min(50, int(predictor["page"])))
@@ -511,9 +607,8 @@ class RemoteDateManager:
                     if predictor.get("source") == "exact"
                     else DATE_PREDICTOR_ESTIMATE_RADIUS
                 )
-                # Probe around the learned boundary in both directions. A target
-                # hit or newer/non-newer bracket can finish date discovery without
-                # touching the old 1/2/4/8/... ladder.
+                # First, check a tight window around the last confirmed/estimated
+                # location.  This is still the common 2-5 request fast path.
                 predicted_pages = sorted(set(
                     max(1, min(50, center + delta))
                     for delta in (-radius, -(max(1, radius // 2)), 0, max(1, radius // 2), radius)
@@ -527,28 +622,61 @@ class RemoteDateManager:
                 merged.update(predicted)
                 bracket = self._boundary_from(merged)
 
-            # Cold category, stale predictor, or a prediction that moved too far:
-            # fall back to the proven parallel exponential locator unchanged.
+                # v4.3.27: do NOT discard the predictor work when the boundary
+                # shifted by more than the first radius.  Expand 2x from the hint
+                # and, where chronology is clear, only in the useful direction.
+                if bracket is None and merged:
+                    self.predictor_continue_total += 1
+                    before = set(merged)
+                    bracket, c_cached, c_queued, continue_rounds = await self._continue_from_predictor(
+                        base_url,
+                        target_date,
+                        center=center,
+                        radius=radius,
+                        merged=merged,
+                    )
+                    total_cached += c_cached
+                    total_queued += c_queued
+                    continue_pages = len(set(merged) - before)
+                    self.last_predictor_continue_rounds = continue_rounds
+                    self.last_predictor_continue_pages = continue_pages
+                    if bracket is not None:
+                        self.predictor_continue_success_total += 1
+
+            # Only cold categories, totally weak predictor evidence, or a target
+            # outside the reachable predictor expansion use the old proven ladder.
+            # Already probed pages are omitted so this fallback never re-queues
+            # work completed earlier in the same locate call.
             if bracket is None:
-                first = await self._probe_set(
-                    base_url,
-                    target_date,
-                    list(DATE_INITIAL_PROBES),
-                    stop_on_boundary=True,
-                )
-                total_cached += self.last_batch_cached
-                total_queued += self.last_batch_queued
-                merged.update(first)
+                used_cold_fallback = True
+                self.last_predictor_fallback = bool(predictor is not None)
+                fallback_pages = [page for page in DATE_INITIAL_PROBES if page not in merged]
+                if fallback_pages:
+                    first = await self._probe_set(
+                        base_url,
+                        target_date,
+                        fallback_pages,
+                        stop_on_boundary=True,
+                    )
+                    total_cached += self.last_batch_cached
+                    total_queued += self.last_batch_queued
+                    merged.update(first)
                 bracket = self._boundary_from(merged)
             if bracket is None:
                 return None
+
             low, high = bracket
-            # If a learned probe already landed on the target date, extra quartile
-            # refinement is wasted work: the foreground parser will verify that
-            # page and its immediate neighbours anyway. Refine only chronology
-            # brackets without a direct target hit.
+            # If any learned/continued probe landed directly on the target date,
+            # foreground verification can start there immediately.  Otherwise use
+            # a tiny quartile refinement for a wide newer/non-newer bracket.
             has_direct_target = any(item.relation == "target" for item in merged.values())
-            if high - low > 6 and not has_direct_target:
+            # Keep the remote bracket tight enough that foreground verification
+            # cannot miss a target page merely because the high side is several
+            # pages away.  Two tiny refinement rounds are still much cheaper than
+            # falling all the way back to the local 1/2/4/8/... locator.
+            for _refine_round in range(2):
+                if has_direct_target or high - low <= 3:
+                    break
                 width = high - low
                 refinement = sorted(set(
                     max(low + 1, min(high - 1, low + round(width * ratio)))
@@ -556,20 +684,23 @@ class RemoteDateManager:
                     if high - low > 1
                 ))
                 refinement = [page for page in refinement if page not in merged and low < page < high]
-                if refinement:
-                    extra = await self._probe_set(
-                        base_url,
-                        target_date,
-                        refinement,
-                        stop_on_boundary=False,
-                        timeout_seconds=max(3.0, DATE_PROBE_TIMEOUT_SECONDS * 0.65),
-                    )
-                    total_cached += self.last_batch_cached
-                    total_queued += self.last_batch_queued
-                    merged.update(extra)
-                    refined = self._boundary_from(merged)
-                    if refined is not None:
-                        low, high = refined
+                if not refinement:
+                    break
+                extra = await self._probe_set(
+                    base_url,
+                    target_date,
+                    refinement,
+                    stop_on_boundary=False,
+                    timeout_seconds=max(3.0, DATE_PROBE_TIMEOUT_SECONDS * 0.60),
+                )
+                total_cached += self.last_batch_cached
+                total_queued += self.last_batch_queued
+                merged.update(extra)
+                refined = self._boundary_from(merged)
+                if refined is None:
+                    break
+                low, high = refined
+                has_direct_target = any(item.relation == "target" for item in merged.values())
 
             direct_targets = sorted(page for page, item in merged.items() if item.relation == "target")
             boundary = direct_targets[0] if direct_targets else high
@@ -587,6 +718,9 @@ class RemoteDateManager:
                 "predictor_page": int((predictor or {}).get("page") or 0),
                 "predictor_source": str((predictor or {}).get("source") or ""),
                 "predictor_points": int((predictor or {}).get("points") or 0),
+                "predictor_continue_rounds": int(continue_rounds),
+                "predictor_continue_pages": int(continue_pages),
+                "cold_fallback": bool(used_cold_fallback),
                 "probes": {page: item.as_dict() for page, item in sorted(merged.items())},
             }
         except Exception:
@@ -606,6 +740,11 @@ class RemoteDateManager:
             "predictor_hits_total": self.predictor_hits_total,
             "predictor_misses_total": self.predictor_misses_total,
             "predictor_writes_total": self.predictor_writes_total,
+            "predictor_continue_total": self.predictor_continue_total,
+            "predictor_continue_success_total": self.predictor_continue_success_total,
+            "last_predictor_continue_rounds": self.last_predictor_continue_rounds,
+            "last_predictor_continue_pages": self.last_predictor_continue_pages,
+            "last_predictor_fallback": self.last_predictor_fallback,
             "last_predictor_page": self.last_predictor_page,
             "last_predictor_source": self.last_predictor_source,
             "last_predictor_points": self.last_predictor_points,

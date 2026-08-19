@@ -1,26 +1,25 @@
-# DT PARSER v4.3.26 — FAST DATE PREDICTOR
+# DT PARSER v4.3.27 — PREDICTOR CONTINUE SEARCH
 
-v4.3.26 adds a learned date-boundary predictor on top of the conservative HTTP-first Date Worker from v4.3.25.
+v4.3.27 fixes the expensive second date-search path seen after v4.3.26.
 
-```text
-FAST DATE PREDICTOR
-        ↓
-Date Worker x2 (HTTP-first -> browser confirm when weak)
-        ↓
-Page Worker x2
-        ↓
-View Worker x2
-```
+## What changed
 
-Key rules:
+- FAST DATE PREDICTOR remains the first date-search layer.
+- If the remembered/estimated boundary moved outside the first predictor window, Date Manager now **continues from the hint** instead of discarding it and restarting from page 1.
+- Expansion grows outward from the learned page (`radius → 2x → 4x...`) and follows chronology direction when reliable evidence says the target is only deeper or only shallower.
+- Already probed pages are not queued again if the emergency exponential fallback is ever needed.
+- Remote chronology brackets are tightened to <=3 pages (or a direct target hit) before foreground verification, reducing the chance of a second local locator pass.
+- Final date truth is unchanged: the foreground stable parser still revalidates the Date Worker hint locally before accepting a date.
 
-- only **locally confirmed** date boundaries are learned;
-- exact predictor hints live 60 minutes by default;
-- after two confirmed dates, the manager may interpolate/extrapolate another date's likely page;
-- learned pages are only starting points, never final answers;
-- bad/stale predictions automatically fall back to the v4.3.25 parallel exponential locator;
-- final date boundary is still locally verified by the stable parser;
-- date selection remains limited to today + previous six days;
-- Page Worker, View Worker, View Sharding, parser.py and traffic.py are unchanged.
+## Unchanged
 
-No new Railway variables are required. See `DEPLOY_V4_3_26_FAST_DATE_PREDICTOR.md`.
+- `parser.py` / stable page/date parsing core
+- `traffic.py`
+- Date Worker HTTP/browser transport (`date_worker.py`)
+- Page Worker / Page cache
+- View Worker / View Sharding
+- Railway service layout
+
+No new Railway variables or services are required.
+
+See `DEPLOY_V4_3_27_PREDICTOR_CONTINUE_SEARCH.md`.
