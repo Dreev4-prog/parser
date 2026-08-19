@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import socket
 import time
@@ -45,6 +46,16 @@ VIEW_REMOTE_TIMEOUT_SECONDS = _env_int("VIEW_REMOTE_TIMEOUT_SECONDS", 1800, 60, 
 VIEW_HEARTBEAT_STALE_SECONDS = _env_int("VIEW_HEARTBEAT_STALE_SECONDS", 20, 8, 120)
 VIEW_PROGRESS_POLL_MS = _env_int("VIEW_PROGRESS_POLL_MS", 500, 100, 3000)
 
+# v4.3.20 — View Sharding. Large remote batches are split into independent
+# Redis jobs so multiple Railway View Worker replicas can process one scan at
+# the same time. The exact view extraction algorithm remains inside the same
+# known-good worker/parser code.
+VIEW_SHARDING_ENABLED = _env_bool("VIEW_SHARDING_ENABLED", True)
+VIEW_SHARD_MIN_URLS = _env_int("VIEW_SHARD_MIN_URLS", 300, 100, 5000)
+VIEW_SHARD_SIZE = _env_int("VIEW_SHARD_SIZE", 250, 50, 1000)
+VIEW_SHARD_MAX_COUNT = _env_int("VIEW_SHARD_MAX_COUNT", 16, 2, 64)
+VIEW_SHARDS_PER_WORKER = _env_int("VIEW_SHARDS_PER_WORKER", 2, 1, 4)
+
 
 @dataclass
 class RemoteViewResult:
@@ -69,6 +80,12 @@ class RemoteViewManager:
         self.enabled = bool(REMOTE_VIEW_WORKER_ENABLED and self.url)
         self._redis: Any | None = None
         self._lock = asyncio.Lock()
+        # Local telemetry for the admin panel. This is intentionally not stored
+        # in Redis because only the main bot creates/shards view batches.
+        self.last_shard_count = 0
+        self.last_shard_total = 0
+        self.last_shard_workers = 0
+        self.last_shard_at = 0.0
 
     async def connect(self):
         if not self.enabled:
@@ -131,6 +148,15 @@ class RemoteViewManager:
         base: dict[str, Any] = {
             "enabled": self.enabled, "alive": False, "queue_depth": 0,
             "workers": [], "error": None,
+            "sharding_enabled": VIEW_SHARDING_ENABLED,
+            "shard_min_urls": VIEW_SHARD_MIN_URLS,
+            "shard_size": VIEW_SHARD_SIZE,
+            "shard_max_count": VIEW_SHARD_MAX_COUNT,
+            "shards_per_worker": VIEW_SHARDS_PER_WORKER,
+            "last_shard_count": self.last_shard_count,
+            "last_shard_total": self.last_shard_total,
+            "last_shard_workers": self.last_shard_workers,
+            "last_shard_at": self.last_shard_at,
         }
         if not self.enabled:
             return base
@@ -186,22 +212,39 @@ class RemoteViewManager:
             base["error"] = str(exc)[:300]
             return base
 
-    async def fetch(
+    @staticmethod
+    def _split_balanced(urls: list[str], shard_count: int) -> list[list[str]]:
+        """Split a batch into similarly-sized interleaved shards.
+
+        Interleaving is deliberate: URLs often arrive grouped by category/page.
+        Round-robin distribution prevents one shard from accidentally receiving
+        most of the slow/browser-fallback URLs while the other replica goes idle.
+        """
+        shard_count = max(1, min(int(shard_count), len(urls)))
+        shards = [urls[index::shard_count] for index in range(shard_count)]
+        return [shard for shard in shards if shard]
+
+    async def _fetch_single_batch(
         self,
         urls: list[str],
         *,
         progress_cb: Callable[[int, int], Awaitable[None] | None] | None = None,
         traffic_priority: str = "scan_inline",
+        parent_job_id: str | None = None,
+        shard_index: int | None = None,
+        shard_count: int | None = None,
+        skip_alive_check: bool = False,
     ) -> dict[str, RemoteViewResult] | None:
-        """Return None only when the remote path is unavailable/aborted.
+        """Queue and wait for one Redis view job.
 
-        The caller can then execute the unchanged v4.3.8 local path. A normal
-        remote result may still contain per-URL failures exactly like parser.py.
+        This is the original v4.3.19 remote-job contract, kept intact and moved
+        behind a helper so the public fetch() method can fan a large batch out to
+        several workers without changing the worker/parser extraction logic.
         """
         if not urls or not self.enabled:
             return None
         urls = list(dict.fromkeys(urls))
-        if not await self.worker_alive():
+        if not skip_alive_check and not await self.worker_alive():
             return None
 
         redis = await self.connect()
@@ -217,14 +260,31 @@ class RemoteViewManager:
             "created_at": time.time(),
             "requester": socket.gethostname(),
         }
+        if parent_job_id:
+            payload["parent_job_id"] = parent_job_id
+        if shard_index is not None:
+            payload["shard_index"] = int(shard_index)
+        if shard_count is not None:
+            payload["shard_count"] = int(shard_count)
+
         pipe = redis.pipeline(transaction=False)
         pipe.set(payload_key, json.dumps(payload, ensure_ascii=False), ex=VIEW_JOB_TTL_SECONDS)
         pipe.hset(progress_key, mapping={"done": 0, "total": len(urls), "state": "queued", "updated_at": time.time()})
         pipe.expire(progress_key, VIEW_JOB_TTL_SECONDS)
-        pipe.xadd(VIEW_STREAM, {"job_id": job_id, "queued_at": str(time.time())})
+        stream_fields = {"job_id": job_id, "queued_at": str(time.time())}
+        if parent_job_id:
+            stream_fields["parent_job_id"] = parent_job_id
+        if shard_index is not None:
+            stream_fields["shard_index"] = str(int(shard_index))
+        if shard_count is not None:
+            stream_fields["shard_count"] = str(int(shard_count))
+        pipe.xadd(VIEW_STREAM, stream_fields)
         await pipe.execute()
 
-        log.info("Remote view batch queued job=%s total=%s", job_id[:10], len(urls))
+        shard_label = ""
+        if shard_index is not None and shard_count:
+            shard_label = f" shard={int(shard_index) + 1}/{int(shard_count)}"
+        log.info("Remote view batch queued job=%s total=%s%s", job_id[:10], len(urls), shard_label)
         started = time.monotonic()
         last_done = -1
         heartbeat_missing_since: float | None = None
@@ -253,7 +313,7 @@ class RemoteViewManager:
                         maybe = progress_cb(len(urls), len(urls))
                         if asyncio.iscoroutine(maybe):
                             await maybe
-                    log.info("Remote view batch complete job=%s total=%s", job_id[:10], len(out))
+                    log.info("Remote view batch complete job=%s total=%s%s", job_id[:10], len(out), shard_label)
                     return out
 
                 progress = await redis.hgetall(progress_key)
@@ -304,6 +364,162 @@ class RemoteViewManager:
             except Exception:
                 pass
             return None
+
+    async def fetch(
+        self,
+        urls: list[str],
+        *,
+        progress_cb: Callable[[int, int], Awaitable[None] | None] | None = None,
+        traffic_priority: str = "scan_inline",
+    ) -> dict[str, RemoteViewResult] | None:
+        """Fetch exact views remotely, sharding large batches across replicas.
+
+        Safety rules:
+        * one worker or a small batch -> original single-job behavior;
+        * 2+ healthy workers + a large batch -> several independent Redis jobs;
+        * if any shard asks for fallback, cancel the rest and return None so the
+          caller executes the unchanged local v4.3.8 path for correctness.
+        """
+        if not urls or not self.enabled:
+            return None
+        urls = list(dict.fromkeys(urls))
+        if not await self.worker_alive():
+            return None
+
+        # Count currently healthy replicas. If the second replica is down, stay
+        # on the proven single-job path instead of introducing shard overhead.
+        worker_count = 1
+        if VIEW_SHARDING_ENABLED and len(urls) >= VIEW_SHARD_MIN_URLS:
+            try:
+                live_status = await self.status()
+                worker_count = max(1, len(live_status.get("workers") or []))
+            except Exception:
+                worker_count = 1
+
+        should_shard = (
+            VIEW_SHARDING_ENABLED
+            and worker_count >= 2
+            and len(urls) >= VIEW_SHARD_MIN_URLS
+        )
+        if not should_shard:
+            self.last_shard_count = 1
+            self.last_shard_total = len(urls)
+            self.last_shard_workers = worker_count
+            self.last_shard_at = time.time()
+            return await self._fetch_single_batch(
+                urls,
+                progress_cb=progress_cb,
+                traffic_priority=traffic_priority,
+                skip_alive_check=True,
+            )
+
+        natural_shards = max(2, math.ceil(len(urls) / VIEW_SHARD_SIZE))
+        worker_shards = max(2, worker_count * VIEW_SHARDS_PER_WORKER)
+        shard_count = min(VIEW_SHARD_MAX_COUNT, len(urls), max(natural_shards, worker_shards))
+        shards = self._split_balanced(urls, shard_count)
+        shard_count = len(shards)
+        parent_job_id = uuid.uuid4().hex
+
+        self.last_shard_count = shard_count
+        self.last_shard_total = len(urls)
+        self.last_shard_workers = worker_count
+        self.last_shard_at = time.time()
+
+        log.info(
+            "Remote view sharding parent=%s total=%s workers=%s shards=%s target_size=%s",
+            parent_job_id[:10], len(urls), worker_count, shard_count, VIEW_SHARD_SIZE,
+        )
+
+        progress_lock = asyncio.Lock()
+        shard_done = [0 for _ in shards]
+        last_combined_done = -1
+
+        async def report_shard_progress(index: int, done: int, shard_total: int) -> None:
+            nonlocal last_combined_done
+            if progress_cb is None:
+                return
+            async with progress_lock:
+                shard_done[index] = max(0, min(int(done), int(shard_total)))
+                combined_done = min(len(urls), sum(shard_done))
+                if combined_done == last_combined_done:
+                    return
+                last_combined_done = combined_done
+                maybe = progress_cb(combined_done, len(urls))
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+
+        def shard_progress_cb(index: int):
+            async def _cb(done: int, total: int) -> None:
+                await report_shard_progress(index, done, total)
+            return _cb
+
+        tasks: list[asyncio.Task] = []
+        task_index: dict[asyncio.Task, int] = {}
+        for index, shard in enumerate(shards):
+            task = asyncio.create_task(
+                self._fetch_single_batch(
+                    shard,
+                    progress_cb=shard_progress_cb(index),
+                    traffic_priority=traffic_priority,
+                    parent_job_id=parent_job_id,
+                    shard_index=index,
+                    shard_count=shard_count,
+                    skip_alive_check=True,
+                ),
+                name=f"view-shard-{parent_job_id[:8]}-{index + 1}",
+            )
+            tasks.append(task)
+            task_index[task] = index
+
+        shard_results: list[dict[str, RemoteViewResult] | None] = [None] * shard_count
+        pending: set[asyncio.Task] = set(tasks)
+        try:
+            while pending:
+                done_tasks, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done_tasks:
+                    index = task_index[task]
+                    try:
+                        result = task.result()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.warning(
+                            "Remote view shard crashed parent=%s shard=%s/%s; using local fallback",
+                            parent_job_id[:10], index + 1, shard_count, exc_info=True,
+                        )
+                        result = None
+                    if result is None:
+                        for other in pending:
+                            other.cancel()
+                        if pending:
+                            await asyncio.gather(*pending, return_exceptions=True)
+                        log.warning(
+                            "Remote view sharding aborted parent=%s shard=%s/%s; using local fallback",
+                            parent_job_id[:10], index + 1, shard_count,
+                        )
+                        return None
+                    shard_results[index] = result
+        except asyncio.CancelledError:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        merged: dict[str, RemoteViewResult] = {}
+        for result in shard_results:
+            if result:
+                merged.update(result)
+        # Restore original URL order for deterministic downstream behavior.
+        ordered = {url: merged[url] for url in urls if url in merged}
+        if progress_cb is not None and last_combined_done != len(urls):
+            maybe = progress_cb(len(urls), len(urls))
+            if asyncio.iscoroutine(maybe):
+                await maybe
+        log.info(
+            "Remote view sharding complete parent=%s shards=%s results=%s/%s",
+            parent_job_id[:10], shard_count, len(ordered), len(urls),
+        )
+        return ordered
 
 
 REMOTE_VIEW_MANAGER = RemoteViewManager()

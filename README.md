@@ -1,3 +1,16 @@
+# v4.3.20 — VIEW SHARDING
+
+- Один большой замер просмотров теперь дробится на Redis shards и может одновременно выполняться несколькими Railway View Worker replicas.
+- При 2 живых workers большой batch создаёт минимум 4 jobs; одна реплика ограничена 2 active jobs, поэтому работа распределяется между обеими.
+- Общий прогресс и результаты shards автоматически объединяются.
+- При сбое любого shard сохраняется безопасный локальный v4.3.8 fallback.
+- `parser.py`, `traffic.py`, `view_counter_worker.py`, поиск даты и алгоритм точных просмотров не изменены.
+- Автозамеры ВКЛ/ВЫКЛ и лимиты страниц 15/25/50 из v4.3.19 сохранены.
+
+Подробности: `DEPLOY_V4_3_20_VIEW_SHARDING.md`.
+
+---
+
 # v4.3.19 — OPTIONAL AUTO-MEASUREMENTS + 15/25/50 PAGES
 
 - Automatic +3/+6/+12h view checkpoints are now **opt-in per user** and are OFF by default.

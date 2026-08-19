@@ -89,7 +89,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.19"
+APP_VERSION = "4.3.20"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -6417,6 +6417,11 @@ async def _admin_view_worker_text() -> str:
     pool_total = int(status.get("pool_total", 0) or 0)
     browser_total = int(status.get("browser_total", 0) or 0)
     rate_total = float(status.get("rate_total", 0.0) or 0.0)
+    sharding_enabled = bool(status.get("sharding_enabled"))
+    shard_size = int(status.get("shard_size", 0) or 0)
+    last_shard_count = int(status.get("last_shard_count", 0) or 0)
+    last_shard_total = int(status.get("last_shard_total", 0) or 0)
+    last_shard_workers = int(status.get("last_shard_workers", 0) or 0)
     lines = [
         "<b>👁 VIEW MANAGER PRO</b>",
         "",
@@ -6424,7 +6429,13 @@ async def _admin_view_worker_text() -> str:
         f"Redis queue: <b>{queue_depth}</b> · активных jobs: <b>{active_jobs}</b>",
         f"Общий HTTP pool: <b>{pool_total}</b> · Browser: <b>{browser_total}</b>",
         f"Скорость: <b>{rate_total:.1f} views/sec</b>",
+        f"View Sharding: <b>{'✅ ВКЛ' if sharding_enabled else '⛔ ВЫКЛ'}</b> · цель ≈ <b>{shard_size}</b> URL/job",
     ]
+    if last_shard_count:
+        lines.append(
+            f"Последний batch: <b>{last_shard_total}</b> URL → <b>{last_shard_count}</b> jobs "
+            f"· workers: <b>{last_shard_workers}</b>"
+        )
     for idx, worker in enumerate(workers[:4], start=1):
         processed = int(worker.get("processed_total", 0) or 0)
         exact_pct = float(worker.get("exact_pct", 0.0) or 0.0)
