@@ -89,7 +89,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.18"
+APP_VERSION = "4.3.19"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -320,15 +320,15 @@ def parse_scan_price_input(text: str | None) -> str | None:
         return f"custom:{int(m.group(1))}:"
     return None
 SORT_LABELS = {"newest": "Сначала новые", "price_asc": "Цена ↑", "price_desc": "Цена ↓"}
-PAGE_LIMIT_CHOICES = (25, 50, 100)
-# Conservative baseline for user-facing ETA. A full 100-page category starts
-# around 3 minutes, then the estimate is recalculated from the real page rate.
-PAGE_LIMIT_BASE_ETA_SECONDS = {25: 60, 50: 120, 100: 180}
+PAGE_LIMIT_CHOICES = (15, 25, 50)
+# Conservative baseline for user-facing ETA. A full 50-page category starts
+# around 2 minutes, then the estimate is recalculated from the real page rate.
+PAGE_LIMIT_BASE_ETA_SECONDS = {15: 45, 25: 60, 50: 120}
 
 # v3.0.6 exact-date mode. Kleinanzeigen's public search feed only exposes a
 # limited pagination window. Requests above that window may normalize to/repeat
 # another page, so a single nationwide feed cannot be used to jump arbitrarily
-# deep. We keep the user's simple 25/50/100 depth, but when the chosen date is
+# deep. We keep the user's simple 15/25/50 depth, but when the chosen date is
 # beyond the public window we transparently use disjoint federal-state feeds and
 # merge unique target-day listings until the requested depth-equivalent is filled.
 PUBLIC_SEARCH_PAGE_CAP = max(10, min(50, int(os.getenv("PUBLIC_SEARCH_PAGE_CAP", "50"))))
@@ -336,7 +336,7 @@ DATE_JUMP_PROBE_DELAY_SECONDS = max(0.0, min(1.0, float(os.getenv("DATE_JUMP_PRO
 
 # Hidden implementation detail: these location shards cover Germany without
 # intentionally overlapping. They are not shown to end users; the UI remains
-# category + date + 25/50/100 pages. Smaller feeds are tried first because older
+# category + date + 15/25/50 pages. Smaller feeds are tried first because older
 # dates are more likely to remain inside the public 50-page window.
 GERMAN_STATE_SEGMENTS = (
     ("Bremen", "bremen", 1),
@@ -386,14 +386,23 @@ def allowed(user_id: int) -> bool:
     return has_access(int(user_id), ADMIN_IDS)
 
 
-def main_keyboard(selected_count: int = 0, *, admin: bool = False) -> InlineKeyboardMarkup:
+def main_keyboard(
+    selected_count: int = 0, *, admin: bool = False, auto_observations: bool | None = None
+) -> InlineKeyboardMarkup:
     """Product-style home screen with one clear primary action."""
+    if auto_observations is True:
+        auto_label = "⏱ Автозамеры · ✅ ВКЛ"
+    elif auto_observations is False:
+        auto_label = "⏱ Автозамеры · ⛔ ВЫКЛ"
+    else:
+        auto_label = "⏱ Автозамеры"
     rows = [
         [InlineKeyboardButton(text="▶️ Новый скан", callback_data="start_scan")],
         [InlineKeyboardButton(text="🔥 Популярное", callback_data="popular_now"),
          InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
         [InlineKeyboardButton(text=f"🗂 Категории · {selected_count}/{MAX_SELECTED_CATEGORIES}", callback_data="groups"),
          InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
+        [InlineKeyboardButton(text=auto_label, callback_data="auto_obs_menu")],
         [InlineKeyboardButton(text="💎 Подписка", callback_data="subscription")],
     ]
     if admin:
@@ -620,9 +629,9 @@ def scan_price_keyboard() -> InlineKeyboardMarkup:
 
 def page_limit_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="25 стр.", callback_data="scanpages:25"),
-         InlineKeyboardButton(text="50 стр.", callback_data="scanpages:50"),
-         InlineKeyboardButton(text="100 стр.", callback_data="scanpages:100")],
+        [InlineKeyboardButton(text="15 стр.", callback_data="scanpages:15"),
+         InlineKeyboardButton(text="25 стр.", callback_data="scanpages:25"),
+         InlineKeyboardButton(text="50 стр.", callback_data="scanpages:50")],
         [InlineKeyboardButton(text="💶 Изменить цену", callback_data="scanprice_menu")],
         [InlineKeyboardButton(text="⬅️ Другая дата", callback_data="start_scan"),
          InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
@@ -695,6 +704,33 @@ async def update_setting(user_id: int, field: str, value) -> UserSettings:
         await session.commit()
         await session.refresh(s)
         return s
+
+
+async def set_auto_observations(user_id: int, enabled: bool) -> UserSettings:
+    """Enable/disable future +3/+6/+12h checkpoints for one user.
+
+    Turning the feature off also removes every unfinished automatic checkpoint
+    already queued for that user's saved scans. Completed history is preserved.
+    Manual view refreshes are independent and always remain available.
+    """
+    s = await update_setting(user_id, "auto_observations", bool(enabled))
+    if not enabled:
+        async with db_write_lock:
+            async with SessionLocal() as session:
+                user_scan_ids = select(UserScan.id).where(UserScan.user_id == user_id)
+                await session.execute(
+                    delete(ScanObservation).where(
+                        ScanObservation.scan_id.in_(user_scan_ids),
+                        ScanObservation.status != "done",
+                    )
+                )
+                await session.commit()
+    return s
+
+
+async def auto_observations_enabled(user_id: int) -> bool:
+    s = await get_settings(user_id)
+    return bool(getattr(s, "auto_observations", False))
 
 
 async def reset_user_settings(user_id: int) -> UserSettings:
@@ -1072,6 +1108,9 @@ async def ensure_scan_observation_plan(
             scan = await session.get(UserScan, scan_id)
             if scan is None or scan.status not in {"done", "partial"}:
                 return
+            scan_settings = await session.get(UserSettings, int(scan.user_id))
+            if scan_settings is None or not bool(getattr(scan_settings, "auto_observations", False)):
+                return
             base = finished_at or scan.finished_at or scan.created_at
             # Drop obsolete unfinished +1h/+24h checkpoints left by older versions.
             # Completed history remains available, but it is no longer scheduled or shown.
@@ -1119,6 +1158,25 @@ async def cleanup_obsolete_observation_plans() -> int:
             result = await session.execute(
                 delete(ScanObservation).where(
                     ScanObservation.target_hours.notin_(OBSERVATION_SCHEDULE_HOURS),
+                    ScanObservation.status != "done",
+                )
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
+
+
+async def cleanup_disabled_observation_plans() -> int:
+    """Remove unfinished automatic checkpoints for users who keep auto-measurements off."""
+    async with db_write_lock:
+        async with SessionLocal() as session:
+            disabled_scan_ids = (
+                select(UserScan.id)
+                .join(UserSettings, UserSettings.user_id == UserScan.user_id)
+                .where(UserSettings.auto_observations.is_(False))
+            )
+            result = await session.execute(
+                delete(ScanObservation).where(
+                    ScanObservation.scan_id.in_(disabled_scan_ids),
                     ScanObservation.status != "done",
                 )
             )
@@ -2561,6 +2619,10 @@ async def recover_running_observations() -> int:
 async def process_observation(bot: Bot, obs: ScanObservation) -> None:
     async with SessionLocal() as session:
         scan = await session.get(UserScan, obs.scan_id)
+        scan_settings = await session.get(UserSettings, int(scan.user_id)) if scan is not None else None
+    if scan is not None and (scan_settings is None or not bool(getattr(scan_settings, "auto_observations", False))):
+        await mark_observation_result(obs.id, status="cancelled", error_text="auto measurements disabled by user")
+        return
     if scan is None or scan.status not in {"done", "partial"}:
         await mark_observation_result(obs.id, status="error", error_text="scan not available")
         return
@@ -2775,7 +2837,7 @@ def settings_text(s: UserSettings) -> str:
         f"🔎 Ключевые слова: <b>{include}</b>\n"
         f"🚫 Исключения: <b>{exclude}</b>\n\n"
         "💡 Не знаешь, что выбрать? Нажми <b>«ℹ️ Что выбрать?»</b>.\n"
-        "<i>Дата, цена и глубина 25/50/100 страниц выбираются отдельно при каждом новом скане.</i>"
+        "<i>Дата, цена и глубина 15/25/50 страниц выбираются отдельно при каждом новом скане.</i>"
     )
 
 
@@ -3007,7 +3069,7 @@ class ScanJob:
     current_category_key: str = ""
     current_category_index: int = 0
     started_running_monotonic: float = 0.0
-    page_limit: int = 100
+    page_limit: int = 50
     current_progress_key: str = ""
     scan_id: int | None = None
     target_date: str = ""
@@ -3040,7 +3102,7 @@ class CategoryLiveProgress:
     views_failed: int = 0
     estimated_pages: int = 10
     started_monotonic: float = 0.0
-    page_limit: int = 100
+    page_limit: int = 50
     oldest_date_seen: str = ""
     current_page_date: str = ""
     phase: str = "seeking"
@@ -3083,7 +3145,7 @@ job_guard = asyncio.Lock()
 category_inflight: dict[str, asyncio.Task[ScanResult]] = {}
 category_inflight_waiters: dict[str, int] = {}
 category_inflight_guard = asyncio.Lock()
-# Exact-date cache must preserve the exact 25/50/100-page result set, so v3.0.6
+# Exact-date cache must preserve the exact 15/25/50-page result set, so v3.0.6
 # caches ScanResult (including matched IDs) in memory instead of reconstructing a
 # result from every listing ever seen for that date.
 category_result_cache: dict[str, tuple[float, ScanResult]] = {}
@@ -3268,7 +3330,7 @@ async def record_parser_run(
 
 
 async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page_limit: int, target_date: str) -> ScanResult:
-    """Reliably locate the selected Moscow date and collect 25/50/100-page depth.
+    """Reliably locate the selected Moscow date and collect 15/25/50-page depth.
 
     v3.1 treats page identity and publication-date coverage as data-quality signals.
     A weak/normalized/repeated page may contribute diagnostics, but it is never used
@@ -4017,14 +4079,14 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         weak_streak = 0
         weak_pages = 0
         # Small look-ahead compensates for weak card-template pages without
-        # silently reducing the requested 25/50/100-page depth.
+        # silently reducing the requested 15/25/50-page depth.
         # Recent dates may start many pages below page 1. For them the requested
-        # 25/50/100 depth is measured from the first target-date page, not from page 1,
+        # 15/25/50 depth is measured from the first target-date page, not from page 1,
         # so allow the deterministic stream to walk the whole public window.
         # Universal stream may need to skip many newer pages before reaching an
         # arbitrary historical date, so the search/collection walk may use the
         # entire verified public window. Only confirmed target pages count toward
-        # the user's requested 25/50/100 depth.
+        # the user's requested 15/25/50 depth.
         hard_stop = limit
         while page <= hard_stop:
             items, relation, pairs, days = await fetch(page, "collecting")
@@ -5116,7 +5178,11 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
         lines.append(f"🛡 Качество: <b>{quality_avg}/100</b>")
     lines.append(f"⏱ Время: <b>{elapsed_text}</b>")
     if not job.incomplete_categories:
-        lines.append("🔔 Автозамеры: <b>3 · 6 · 12 ч</b>")
+        auto_enabled = await auto_observations_enabled(job.user_id)
+        if auto_enabled:
+            lines.append("🔔 Автозамеры: <b>✅ ВКЛ · 3 · 6 · 12 ч</b>")
+        else:
+            lines.append("🔔 Автозамеры: <b>⛔ ВЫКЛ</b> · ручное обновление доступно всегда")
     if job.incomplete_categories:
         result_tail = (
             "Подтверждённые данные сохранены. Нулевой результат не считается окончательным, "
@@ -7169,13 +7235,13 @@ def onboarding_text(step: int) -> str:
             "<b>1/2 · Как запустить первый скан</b>\n\n"
             "1. 🗂 Выбери одну или несколько категорий.\n"
             "2. ⚙️ В «Настройках» выбери режим результата и фильтры. Если сомневаешься — открой «Что выбрать?».\n"
-            "3. ▶️ Нажми «Новый скан» и выбери дату, цену и глубину 25 / 50 / 100 страниц.\n\n"
+            "3. ▶️ Нажми «Новый скан» и выбери дату, цену и глубину 15 / 25 / 50 страниц.\n\n"
             "Во время работы парсер можно полностью остановить кнопкой ⏹."
         )
     return (
         "<b>2/2 · Что будет после скана</b>\n\n"
         "📊 Скан сохранится в «Мои сканы».\n"
-        "👁 Бот сделает автозамеры через 3 / 6 / 12 часов.\n"
+        "⏱ Автозамеры 3 / 6 / 12 ч выключены по умолчанию — включи их на главном экране, если нужны.\n"
         "🔥 В «Популярное» появятся лидеры по просмотрам и росту.\n"
         "📦 Через 24 часа карточка уйдёт в Архив, но данные не удалятся.\n\n"
         "Готово — можно выбирать категории."
@@ -7191,28 +7257,36 @@ async def _show_onboarding(message: Message, user_id: int, step: int = 1) -> Non
     )
 
 
-def home_text(selected_count: int) -> str:
+def home_text(selected_count: int, auto_observations: bool = False) -> str:
     if selected_count:
         state_line = f"🗂 Категории: <b>{selected_count}/{MAX_SELECTED_CATEGORIES}</b> · выбраны"
     else:
         state_line = "🗂 Категории: <b>не выбраны</b>"
+    auto_line = (
+        "⏱ Автозамеры: <b>✅ ВКЛ</b> · 3 / 6 / 12 ч"
+        if auto_observations else
+        "⏱ Автозамеры: <b>⛔ ВЫКЛ</b> · ручное обновление доступно всегда"
+    )
     return (
         "<b>🔎 Kleinanzeigen Analytics</b>\n\n"
         "Находи объявления, которые быстрее остальных набирают просмотры.\n\n"
         "<b>Перед новым сканом:</b>\n"
         "1️⃣ <b>Категории</b> — что искать\n"
         "2️⃣ <b>Настройки</b> — что попадёт в результат и TOP\n"
-        "3️⃣ <b>Новый скан</b> — дата, цена и 25/50/100 страниц\n\n"
+        "3️⃣ <b>Новый скан</b> — дата, цена и 15/25/50 страниц\n\n"
         f"{state_line}\n"
-        "💡 Первый раз? В Настройках нажми <b>«Что выбрать?»</b>."
+        f"{auto_line}\n"
+        "💡 Автозамеры можно включить или выключить прямо из главного меню."
     )
 
 
 async def _send_home_message(message: Message, user_id: int, *, intro: bool = False) -> None:
     """Send the branded DT PARSER home card with navigation buttons below it."""
     selected = await get_selected(user_id)
-    markup = main_keyboard(len(selected), admin=_is_admin(user_id))
-    caption = home_text(len(selected))
+    user_settings = await get_settings(user_id)
+    auto_enabled = bool(getattr(user_settings, "auto_observations", False))
+    markup = main_keyboard(len(selected), admin=_is_admin(user_id), auto_observations=auto_enabled)
+    caption = home_text(len(selected), auto_enabled)
 
     if MENU_IMAGE_PATH.exists():
         await message.answer_photo(
@@ -7239,7 +7313,7 @@ async def _send_popular_message(message: Message, user_id: int) -> None:
         text = (
             "🔥 <b>Популярное</b>\n\n"
             "Выбери категорию — показываем только её <b>последний успешный скан</b>.\n"
-            "TOP роста доступен по замерам 3 / 6 / 12 часов."
+            "TOP роста доступен по замерам 3 / 6 / 12 часов; автозамеры включаются по желанию."
         )
     await message.answer(
         text,
@@ -7418,6 +7492,7 @@ async def help_command(message: Message, state: FSMContext) -> None:
         "📊 Мои сканы — свежие запуски и архив\n"
         "🗂 Категории — что анализировать\n"
         "⚙️ Настройки — фильтры результата\n"
+        "⏱ Автозамеры — включить/выключить контрольные 3/6/12 ч\n"
         "💎 Подписка — доступ и платежи",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -7457,6 +7532,56 @@ async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True); return
     await callback.answer()
     await _send_home_message(callback.message, callback.from_user.id)
+
+
+def auto_observations_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    toggle_text = "⛔ Выключить автозамеры" if enabled else "✅ Включить автозамеры"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle_text, callback_data="toggle_auto_obs")],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
+    ])
+
+
+def auto_observations_text(enabled: bool) -> str:
+    status = "✅ <b>ВКЛЮЧЕНЫ</b>" if enabled else "⛔ <b>ВЫКЛЮЧЕНЫ</b>"
+    return (
+        "<b>⏱ Автозамеры просмотров</b>\n\n"
+        f"Сейчас: {status}\n\n"
+        "Если включить, после <b>каждого нового завершённого скана</b> бот автоматически "
+        "сделает контрольные замеры через <b>3 / 6 / 12 часов</b>.\n\n"
+        "Если выключить, новые автоматические замеры не создаются, а уже ожидающие "
+        "3/6/12ч отменяются. Готовая история не удаляется.\n\n"
+        "👁 <b>Ручное «Обновить» работает всегда</b> — независимо от этой настройки."
+    )
+
+
+@dp.callback_query(F.data == "auto_obs_menu")
+async def auto_obs_menu(callback: CallbackQuery) -> None:
+    if not allowed(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    s = await get_settings(callback.from_user.id)
+    enabled = bool(getattr(s, "auto_observations", False))
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message, auto_observations_text(enabled),
+        reply_markup=auto_observations_keyboard(enabled),
+    )
+
+
+@dp.callback_query(F.data == "toggle_auto_obs")
+async def toggle_auto_obs(callback: CallbackQuery) -> None:
+    if not allowed(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    current = await get_settings(callback.from_user.id)
+    enabled = not bool(getattr(current, "auto_observations", False))
+    await set_auto_observations(callback.from_user.id, enabled)
+    await callback.answer("Автозамеры включены" if enabled else "Автозамеры выключены")
+    await _edit_or_answer(
+        callback.message, auto_observations_text(enabled),
+        reply_markup=auto_observations_keyboard(enabled),
+    )
 
 
 @dp.callback_query(F.data == "settings")
@@ -7792,7 +7917,7 @@ async def popular_now(callback: CallbackQuery) -> None:
         text = (
             "🔥 <b>Популярное</b>\n\n"
             "Выбери категорию — показываем только её <b>последний успешный скан</b>.\n"
-            "TOP роста доступен по замерам 3 / 6 / 12 часов."
+            "TOP роста доступен по замерам 3 / 6 / 12 часов; автозамеры включаются по желанию."
         )
     try:
         await callback.message.edit_text(
@@ -7909,7 +8034,7 @@ async def popular_category_growth(callback: CallbackQuery) -> None:
             f"🚀 <b>TOP роста · {html.escape(cat.name)} · {period_label}</b>\n\n"
             "Проверен последний успешный скан категории. "
             "Контрольные замеры для этого периода ещё не готовы или прироста пока нет. "
-            "Автоматические замеры выполняются через 3 / 6 / 12 часов после каждого скана."
+            "Автозамеры 3 / 6 / 12 часов выполняются только если они включены в главном меню."
         )
     else:
         lines = [
@@ -8029,10 +8154,17 @@ async def render_scan_detail(scan: UserScan) -> str:
 
     history_rounds = await get_scan_history_rounds(scan.id, limit=50)
     observation_statuses = await get_scan_observation_statuses(scan.id)
-    status_icons = {"done": "✅", "pending": "⏳", "running": "🔄", "missed": "▫️", "error": "⚠️"}
-    observation_line = " · ".join(
-        f"{hours}ч{status_icons.get(observation_statuses.get(hours, 'pending'), '⏳')}"
-        for hours in OBSERVATION_HOURS
+    auto_enabled = bool(getattr(scan_settings, "auto_observations", False))
+    status_icons = {
+        "done": "✅", "pending": "⏳", "running": "🔄", "missed": "▫️",
+        "error": "⚠️", "cancelled": "⛔",
+    }
+    observation_line = (
+        " · ".join(
+            f"{hours}ч{status_icons.get(observation_statuses.get(hours, 'pending'), '⏳')}"
+            for hours in OBSERVATION_HOURS
+        )
+        if auto_enabled else "⛔ выключены"
     )
 
     quality_value = int(getattr(scan, "quality_score", 0) or 0)
@@ -8271,7 +8403,7 @@ async def scan_growth(callback: CallbackQuery) -> None:
         text = (
             f"🚀 <b>TOP роста за {period_label}</b>\n\n"
             "Контрольный замер для этого периода ещё не готов или прироста пока нет. "
-            "Бот автоматически делает замеры через 3 / 6 / 12 часов после первого скана."
+            "Автозамеры 3 / 6 / 12 часов выполняются только если они включены в главном меню."
         )
     else:
         lines = [
@@ -9185,7 +9317,7 @@ async def start_scan_with_pages(callback: CallbackQuery, state: FSMContext) -> N
         await callback.answer("Некорректный лимит", show_alert=True)
         return
     if page_limit not in PAGE_LIMIT_CHOICES:
-        await callback.answer("Выбери 25, 50 или 100 страниц", show_alert=True)
+        await callback.answer("Выбери 15, 25 или 50 страниц", show_alert=True)
         return
 
     data = await state.get_data()
@@ -9244,7 +9376,7 @@ async def _start_embedded_fleet_fallback(bot: Bot) -> tuple[list[asyncio.Task], 
     worker_id = f"parser-embedded-{os.getenv('RAILWAY_SERVICE_ID', 'service')}-{os.getpid()}"
 
     # Register synchronously before Telegram polling starts. This closes the small
-    # race where the user could press 25/50/100 before the heartbeat task got its
+    # race where the user could press 15/25/50 before the heartbeat task got its
     # first event-loop turn.
     await COORDINATOR.heartbeat(worker_id, "parser")
 
@@ -9293,19 +9425,20 @@ async def main() -> None:
     if DISTRIBUTED_WORKERS:
         # The dedicated views-worker owns observation recovery/scheduling. Running
         # those routines in the Telegram service too can reset a live checkpoint.
-        obsolete_observations = recovered_observations = planned = 0
+        obsolete_observations = recovered_observations = planned = disabled_observations = 0
     else:
         obsolete_observations = await cleanup_obsolete_observation_plans()
+        disabled_observations = await cleanup_disabled_observation_plans()
         recovered_observations = await recover_running_observations()
         # After the one-time Accurate Views reset, old scans no longer have a
         # trustworthy baseline. Do not schedule new growth points for them; only
         # scans completed under v4.2.2 create fresh 0/+3/+6/+12 plans.
         planned = 0 if invalidated_views else await backfill_recent_observation_plans()
     archived = await archive_expired_scans()
-    if recovered_observations or planned or obsolete_observations:
+    if recovered_observations or planned or obsolete_observations or disabled_observations:
         log.info(
-            "v3.3.0 observations: removed_old=%s recovered=%s recent_scans_planned=%s",
-            obsolete_observations, recovered_observations, planned,
+            "v4.3.19 observations: removed_old=%s disabled_removed=%s recovered=%s recent_scans_planned=%s",
+            obsolete_observations, disabled_observations, recovered_observations, planned,
         )
     if archived:
         log.info("v3.3.0 initial scan archive: %s moved", archived)

@@ -88,7 +88,9 @@ class UserSettings(Base):
     include_words: Mapped[str] = mapped_column(String(1000), default="")
     exclude_words: Mapped[str] = mapped_column(String(1000), default="")
     # Maximum number of result pages the user wants refreshed per category.
-    page_limit: Mapped[int] = mapped_column(Integer, default=100)
+    page_limit: Mapped[int] = mapped_column(Integer, default=50)
+    # v4.3.19: +3/+6/+12h control measurements are opt-in.
+    auto_observations: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class CategoryScanState(Base):

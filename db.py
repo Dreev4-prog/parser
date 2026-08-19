@@ -195,9 +195,11 @@ async def init_db() -> None:
 
         settings_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "user_settings"))
         if settings_columns and "page_limit" not in settings_columns:
-            await conn.execute(text("ALTER TABLE user_settings ADD COLUMN page_limit INTEGER DEFAULT 100"))
+            await conn.execute(text("ALTER TABLE user_settings ADD COLUMN page_limit INTEGER DEFAULT 50"))
         if settings_columns and "min_views" not in settings_columns:
             await conn.execute(text("ALTER TABLE user_settings ADD COLUMN min_views INTEGER DEFAULT 0"))
+        if settings_columns and "auto_observations" not in settings_columns:
+            await conn.execute(text("ALTER TABLE user_settings ADD COLUMN auto_observations BOOLEAN DEFAULT FALSE"))
 
         scan_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "category_scan_state"))
         if scan_columns and "day_seed_capped" not in scan_columns:

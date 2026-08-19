@@ -1,3 +1,12 @@
+# v4.3.19 — OPTIONAL AUTO-MEASUREMENTS + 15/25/50 PAGES
+
+- Automatic +3/+6/+12h view checkpoints are now **opt-in per user** and are OFF by default.
+- Main screen always shows `Автозамеры: ВКЛ/ВЫКЛ` and has a dedicated toggle button.
+- Turning auto-measurements off cancels unfinished scheduled checkpoints; completed history is preserved.
+- Manual `👁 Обновить` remains available regardless of the toggle.
+- New scan depth choices are now **15 / 25 / 50 pages**; 100 pages was removed from the UI to reduce load and wait time.
+- v4.3.18 dual View Worker architecture and known-good parser/view core are unchanged.
+
 # v4.3.18 — DUAL VIEW WORKER (2 Railway replicas)
 
 This release is tuned for **2 replicas** of the dedicated View Worker while keeping the known-good v4.3.8 parser/view extraction core untouched.
