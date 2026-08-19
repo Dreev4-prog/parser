@@ -7,6 +7,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import Any
 
 from parser import page_url, private_provider_url
@@ -48,6 +49,13 @@ DATE_PROBE_TIMEOUT_SECONDS = _env_int("DATE_PROBE_TIMEOUT_SECONDS", 10, 3, 45)
 DATE_PROBE_POLL_MS = _env_int("DATE_PROBE_POLL_MS", 120, 50, 1000)
 DATE_MAX_AGE_DAYS = 6  # hard product limit: today + previous six days = seven calendar dates
 DATE_INITIAL_PROBES = (1, 2, 4, 8, 16, 32, 50)
+
+# v4.3.26: confirmed boundary predictor. Unlike the short 180s probe cache,
+# predictor hints live longer because they are only starting points. The main bot
+# still locally revalidates the final boundary before accepting a date.
+DATE_PREDICTOR_TTL_SECONDS = _env_int("DATE_PREDICTOR_TTL_SECONDS", 3600, 300, 21600)
+DATE_PREDICTOR_EXACT_RADIUS = _env_int("DATE_PREDICTOR_EXACT_RADIUS", 3, 1, 8)
+DATE_PREDICTOR_ESTIMATE_RADIUS = _env_int("DATE_PREDICTOR_ESTIMATE_RADIUS", 6, 2, 12)
 
 
 @dataclass(slots=True)
@@ -140,6 +148,12 @@ class RemoteDateManager:
         self.last_batch_workers = 0
         self.last_boundary = 0
         self.last_target_date = ""
+        self.predictor_hits_total = 0
+        self.predictor_misses_total = 0
+        self.predictor_writes_total = 0
+        self.last_predictor_page = 0
+        self.last_predictor_source = ""
+        self.last_predictor_points = 0
 
     async def connect(self):
         if not self.enabled:
@@ -169,6 +183,127 @@ class RemoteDateManager:
 
     def error_key(self, cache_id: str) -> str:
         return f"{DATE_REDIS_PREFIX}:error:{cache_id}"
+
+    @staticmethod
+    def _predictor_namespace(base_url: str) -> str:
+        normalized = private_provider_url(base_url).strip()
+        return hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest()[:24]
+
+    def predictor_key(self, base_url: str, target_date: str) -> str:
+        return f"{DATE_REDIS_PREFIX}:predict:{self._predictor_namespace(base_url)}:{target_date}"
+
+    @staticmethod
+    def _decode_predictor(raw: str | bytes | None) -> dict[str, Any] | None:
+        if not raw:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        try:
+            item = json.loads(raw)
+            page = int(item.get("page") or 0)
+            target = str(item.get("target_date") or "")
+            if page < 1 or page > 50 or not target:
+                return None
+            return {
+                "page": page,
+                "target_date": target,
+                "confirmed_at": float(item.get("confirmed_at") or 0.0),
+            }
+        except Exception:
+            return None
+
+    async def record_confirmed_hint(self, base_url: str, target_date: str, page: int) -> None:
+        """Remember a locally confirmed boundary as a future starting point.
+
+        Only the foreground stable parser calls this method after exact local
+        verification. Date Worker guesses are never promoted into predictor data.
+        """
+        if not self.enabled:
+            return
+        try:
+            page = max(1, min(50, int(page)))
+            # Validate date shape before it becomes part of an interpolation set.
+            date.fromisoformat(str(target_date))
+            redis = await self.connect()
+            raw = json.dumps({
+                "page": page,
+                "target_date": str(target_date),
+                "confirmed_at": time.time(),
+            }, ensure_ascii=False, separators=(",", ":"))
+            await redis.set(
+                self.predictor_key(base_url, str(target_date)),
+                raw,
+                ex=DATE_PREDICTOR_TTL_SECONDS,
+            )
+            self.predictor_writes_total += 1
+        except Exception:
+            log.debug("Date predictor write failed", exc_info=True)
+
+    @staticmethod
+    def _estimate_from_confirmed_points(
+        target: date, points: list[tuple[date, int]],
+    ) -> tuple[int, str] | None:
+        exact = [page for day, page in points if day == target]
+        if exact:
+            return max(1, min(50, int(exact[-1]))), "exact"
+
+        # A single neighbouring day does not reveal category density. Using it
+        # could add work instead of removing it, so interpolation starts only
+        # after this category has at least two confirmed calendar boundaries.
+        unique: dict[date, int] = {}
+        for day, page in points:
+            unique[day] = page
+        ordered = sorted(unique.items())
+        if len(ordered) < 2:
+            return None
+
+        nearest = sorted(ordered, key=lambda item: abs((item[0] - target).days))[:2]
+        (d1, p1), (d2, p2) = sorted(nearest)
+        day_span = (d2 - d1).days
+        if day_span == 0:
+            return None
+        slope = (float(p2) - float(p1)) / float(day_span)
+        # Newer calendar dates should be closer to page 1. Reject contradictory
+        # history rather than trying to be clever with noisy points.
+        if slope >= -0.25 or slope < -50.0:
+            return None
+        predicted = round(float(p1) + slope * float((target - d1).days))
+        predicted = max(1, min(50, int(predicted)))
+        inside = min(d1, d2) <= target <= max(d1, d2)
+        return predicted, "interpolated" if inside else "extrapolated"
+
+    async def predictor_hint(self, base_url: str, target_date: str) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
+        try:
+            target = date.fromisoformat(str(target_date))
+            redis = await self.connect()
+            # Exact target plus six days on either side is enough for the product's
+            # seven-day selection window and avoids Redis key scans.
+            days = [target + timedelta(days=offset) for offset in range(-6, 7)]
+            keys = [self.predictor_key(base_url, day.isoformat()) for day in days]
+            raws = await redis.mget(keys)
+            points: list[tuple[date, int]] = []
+            for day, raw in zip(days, raws):
+                item = self._decode_predictor(raw)
+                if item is not None:
+                    points.append((day, int(item["page"])))
+            estimate = self._estimate_from_confirmed_points(target, points)
+            self.last_predictor_points = len(points)
+            if estimate is None:
+                self.predictor_misses_total += 1
+                self.last_predictor_page = 0
+                self.last_predictor_source = ""
+                return None
+            page, source = estimate
+            self.predictor_hits_total += 1
+            self.last_predictor_page = int(page)
+            self.last_predictor_source = source
+            return {"page": int(page), "source": source, "points": len(points)}
+        except Exception:
+            self.predictor_misses_total += 1
+            log.debug("Date predictor read failed", exc_info=True)
+            return None
 
     async def worker_count(self) -> int:
         if not self.enabled:
@@ -363,20 +498,57 @@ class RemoteDateManager:
             return None
         try:
             locate_started = time.monotonic()
-            first = await self._probe_set(
-                base_url,
-                target_date,
-                list(DATE_INITIAL_PROBES),
-                stop_on_boundary=True,
-            )
-            total_cached = self.last_batch_cached
-            total_queued = self.last_batch_queued
-            bracket = self._boundary_from(first)
+            predictor = await self.predictor_hint(base_url, target_date)
+            merged: dict[int, DateProbeResult] = {}
+            total_cached = 0
+            total_queued = 0
+            bracket: tuple[int, int] | None = None
+
+            if predictor is not None:
+                center = max(1, min(50, int(predictor["page"])))
+                radius = (
+                    DATE_PREDICTOR_EXACT_RADIUS
+                    if predictor.get("source") == "exact"
+                    else DATE_PREDICTOR_ESTIMATE_RADIUS
+                )
+                # Probe around the learned boundary in both directions. A target
+                # hit or newer/non-newer bracket can finish date discovery without
+                # touching the old 1/2/4/8/... ladder.
+                predicted_pages = sorted(set(
+                    max(1, min(50, center + delta))
+                    for delta in (-radius, -(max(1, radius // 2)), 0, max(1, radius // 2), radius)
+                ))
+                predicted = await self._probe_set(
+                    base_url, target_date, predicted_pages, stop_on_boundary=True,
+                    timeout_seconds=max(3.0, DATE_PROBE_TIMEOUT_SECONDS * 0.70),
+                )
+                total_cached += self.last_batch_cached
+                total_queued += self.last_batch_queued
+                merged.update(predicted)
+                bracket = self._boundary_from(merged)
+
+            # Cold category, stale predictor, or a prediction that moved too far:
+            # fall back to the proven parallel exponential locator unchanged.
+            if bracket is None:
+                first = await self._probe_set(
+                    base_url,
+                    target_date,
+                    list(DATE_INITIAL_PROBES),
+                    stop_on_boundary=True,
+                )
+                total_cached += self.last_batch_cached
+                total_queued += self.last_batch_queued
+                merged.update(first)
+                bracket = self._boundary_from(merged)
             if bracket is None:
                 return None
             low, high = bracket
-            merged = dict(first)
-            if high - low > 6:
+            # If a learned probe already landed on the target date, extra quartile
+            # refinement is wasted work: the foreground parser will verify that
+            # page and its immediate neighbours anyway. Refine only chronology
+            # brackets without a direct target hit.
+            has_direct_target = any(item.relation == "target" for item in merged.values())
+            if high - low > 6 and not has_direct_target:
                 width = high - low
                 refinement = sorted(set(
                     max(low + 1, min(high - 1, low + round(width * ratio)))
@@ -412,6 +584,9 @@ class RemoteDateManager:
                 "high_non_newer": int(high),
                 "direct_target": bool(direct_targets),
                 "workers": int(self.last_batch_workers),
+                "predictor_page": int((predictor or {}).get("page") or 0),
+                "predictor_source": str((predictor or {}).get("source") or ""),
+                "predictor_points": int((predictor or {}).get("points") or 0),
                 "probes": {page: item.as_dict() for page, item in sorted(merged.items())},
             }
         except Exception:
@@ -427,6 +602,13 @@ class RemoteDateManager:
             "queue_depth": 0,
             "cache_ttl": DATE_CACHE_TTL_SECONDS,
             "max_age_days": DATE_MAX_AGE_DAYS,
+            "predictor_ttl": DATE_PREDICTOR_TTL_SECONDS,
+            "predictor_hits_total": self.predictor_hits_total,
+            "predictor_misses_total": self.predictor_misses_total,
+            "predictor_writes_total": self.predictor_writes_total,
+            "last_predictor_page": self.last_predictor_page,
+            "last_predictor_source": self.last_predictor_source,
+            "last_predictor_points": self.last_predictor_points,
             "probe_batches_total": self.probe_batches_total,
             "probes_queued_total": self.probes_queued_total,
             "cache_hits_total": self.cache_hits_total,

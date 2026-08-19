@@ -1,22 +1,26 @@
-# DT PARSER v4.3.25 — HTTP-FIRST DATE WORKER
+# DT PARSER v4.3.26 — FAST DATE PREDICTOR
 
-This release accelerates Date Worker probes with a conservative HTTP-first path.
+v4.3.26 adds a learned date-boundary predictor on top of the conservative HTTP-first Date Worker from v4.3.25.
 
 ```text
+FAST DATE PREDICTOR
+        ↓
 Date Worker x2 (HTTP-first -> browser confirm when weak)
-        -> Page Worker x2
-        -> View Worker x2
+        ↓
+Page Worker x2
+        ↓
+View Worker x2
 ```
 
-Accuracy rules:
+Key rules:
 
-- HTTP never decides the final date boundary.
-- Only high-confidence HTTP chronology probes are cached directly.
-- Empty, mixed, low-date-evidence and single-target HTTP probes are browser-confirmed.
-- Explicit 403/429 is never bypassed with a different transport.
-- The main stable parser still locally verifies the Date Worker boundary before collection.
-- Any worker failure/inconsistency falls back to the existing stable local date locator.
+- only **locally confirmed** date boundaries are learned;
+- exact predictor hints live 60 minutes by default;
+- after two confirmed dates, the manager may interpolate/extrapolate another date's likely page;
+- learned pages are only starting points, never final answers;
+- bad/stale predictions automatically fall back to the v4.3.25 parallel exponential locator;
+- final date boundary is still locally verified by the stable parser;
+- date selection remains limited to today + previous six days;
+- Page Worker, View Worker, View Sharding, parser.py and traffic.py are unchanged.
 
-Date selection remains limited to today + previous 6 days. Page Worker, View Worker, View Sharding and the parser/traffic cores are unchanged from v4.3.24.
-
-See `DEPLOY_V4_3_25_HTTP_FIRST_DATE_WORKER.md`.
+No new Railway variables are required. See `DEPLOY_V4_3_26_FAST_DATE_PREDICTOR.md`.

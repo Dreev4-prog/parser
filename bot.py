@@ -95,7 +95,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.24"
+APP_VERSION = "4.3.26"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -3816,6 +3816,17 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     log.debug("Could not persist weak page failure", exc_info=True)
             return last
 
+        async def remember_confirmed_date_hint(page: int) -> None:
+            # v4.3.26 predictor learns only from pages the foreground stable
+            # parser has already confirmed. Remote Date Worker guesses never
+            # become training data by themselves.
+            if not REMOTE_DATE_WORKER_ENABLED:
+                return
+            try:
+                await REMOTE_DATE_MANAGER.record_confirmed_hint(base_url, target_date, int(page))
+            except Exception:
+                log.debug("Date predictor confirmation write failed", exc_info=True)
+
         if STABLE_SCAN_ENGINE:
             # v4.1.0 kept one deterministic newest-sorted locator for every date/feed.
             # Sparse/hidden timestamp templates are not a broken page: any weak
@@ -3834,6 +3845,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 try:
                     _items, relation, _pairs, _days = await stable_fetch(candidate_page, "stable_scan")
                     if relation == "target":
+                        await remember_confirmed_date_hint(candidate_page)
                         return locator_result("found", candidate_page=candidate_page)
                 except TemporaryAccessError:
                     raise
@@ -3903,10 +3915,13 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                                     )
                                 except Exception:
                                     log.debug("Stable date-index write failed", exc_info=True)
+                                await remember_confirmed_date_hint(candidate)
                                 log.info(
-                                    "Date Worker confirmed category=%s target=%s hint=%s page=%s workers=%s local_requests=%s",
+                                    "Date Worker confirmed category=%s target=%s hint=%s page=%s workers=%s local_requests=%s predictor=%s/%s",
                                     cat.name, target_date, boundary_hint, candidate,
                                     int(hint.get("workers", 0) or 0), network_requests,
+                                    str(hint.get("predictor_source") or "cold"),
+                                    int(hint.get("predictor_page", 0) or 0) or "—",
                                 )
                                 return locator_result("found", candidate_page=candidate)
                         log.info(
@@ -3937,6 +3952,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                             )
                         except Exception:
                             log.debug("Stable date-index write failed", exc_info=True)
+                        await remember_confirmed_date_hint(page)
                         return locator_result("found", candidate_page=page)
                     if relation == "newer":
                         saw_chronology = True
@@ -4116,6 +4132,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                         )
                     except Exception:
                         log.debug("Stable date-index write failed", exc_info=True)
+                    await remember_confirmed_date_hint(candidate)
                     log.info(
                         "Fast date locator found category=%s target=%s page=%s requests=%s",
                         cat.name, target_date, candidate, network_requests,
@@ -4218,6 +4235,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     return locator_result("unknown", "could not verify page immediately before target")
                 else:
                     break
+            await remember_confirmed_date_hint(candidate)
             return locator_result("found", candidate_page=candidate)
 
         # A zero is allowed only when the *whole* feed is visible inside the public
@@ -6914,9 +6932,10 @@ async def _admin_date_worker_text() -> str:
         "",
         f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b>",
         f"Redis queue: <b>{int(status.get('queue_depth', 0) or 0)}</b> · активных: <b>{int(status.get('active_total', 0) or 0)}</b>",
-        f"Date cache: <b>{int(status.get('cache_ttl', 180) or 180)} сек.</b> · окно дат: <b>{int(status.get('max_age_days', DATE_MAX_AGE_DAYS) or DATE_MAX_AGE_DAYS) + 1} дней</b>",
+        f"Date cache: <b>{int(status.get('cache_ttl', 180) or 180)} сек.</b> · Predictor: <b>{int(status.get('predictor_ttl', 3600) or 3600) // 60} мин.</b> · окно дат: <b>{int(status.get('max_age_days', DATE_MAX_AGE_DAYS) or DATE_MAX_AGE_DAYS) + 1} дней</b>",
         f"Общая скорость: <b>{float(status.get('rate_total', 0.0) or 0.0):.2f} probes/sec</b>",
         f"Проб отправлено: <b>{int(status.get('probes_queued_total', 0) or 0)}</b> · cache hits: <b>{int(status.get('cache_hits_total', 0) or 0)}</b>",
+        f"Predictor hits/miss: <b>{int(status.get('predictor_hits_total', 0) or 0)}/{int(status.get('predictor_misses_total', 0) or 0)}</b> · подтверждений: <b>{int(status.get('predictor_writes_total', 0) or 0)}</b>",
     ]
     last_probes = int(status.get("last_batch_probes", 0) or 0)
     if last_probes:
@@ -6925,6 +6944,7 @@ async def _admin_date_worker_text() -> str:
             f"Последний поиск: <b>{html.escape(str(status.get('last_target_date') or '—'))}</b> · boundary ≈ <b>{int(status.get('last_boundary', 0) or 0) or '—'}</b>",
             f"Проб: <b>{last_probes}</b> · из кэша: <b>{int(status.get('last_batch_cached', 0) or 0)}</b> · отправлено: <b>{int(status.get('last_batch_queued', 0) or 0)}</b>",
             f"Время remote-поиска: <b>{float(status.get('last_batch_seconds', 0.0) or 0.0):.2f} сек.</b>",
+            f"Predictor: <b>{html.escape(str(status.get('last_predictor_source') or 'cold'))}</b> → page <b>{int(status.get('last_predictor_page', 0) or 0) or '—'}</b> · learned points: <b>{int(status.get('last_predictor_points', 0) or 0)}</b>",
         ])
     for idx, worker in enumerate(workers[:4], start=1):
         lines.extend([
@@ -6936,7 +6956,7 @@ async def _admin_date_worker_text() -> str:
         ])
     lines.extend([
         "",
-        "<i>HTTP-first используется только для быстрых проб. Слабые HTTP-страницы подтверждаются браузером, а финальная граница всегда перепроверяется стабильным локальным parser.</i>",
+        "<i>Predictor хранит только локально подтверждённые границы и использует их как стартовую точку. HTTP-first ускоряет пробы, а финальная граница всегда перепроверяется стабильным локальным parser.</i>",
     ])
     return "\n".join(lines)
 
