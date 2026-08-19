@@ -1,9 +1,15 @@
-# v4.3.22 — STREAMING PAGE WORKER
+# DT PARSER v4.3.24 — DATE WORKER PRO
 
-This release fixes the `0/15`, `0/25`, `0/50` startup pause from v4.3.21.
+This release adds the third independent acceleration layer:
 
-Page jobs are now dispatched to Redis immediately and the stable foreground collector starts at once. Both Page Worker replicas continue warming upcoming pages in parallel. The foreground path waits only briefly for the next already-owned remote page and otherwise falls back locally. Local fallback results are also published to the shared 180-second cache.
+```text
+Date Worker x2 -> Page Worker x2 -> View Worker x2
+```
 
-No new Railway variables are required.
+Date Worker parallelizes chronology probes and uses a 180-second Redis cache/single-flight layer. Its output is never treated as final truth: the stable main parser locally verifies the boundary before collection starts. If remote date search is unavailable or inconsistent, the known-good local date locator is used automatically.
 
-See `DEPLOY_V4_3_22_STREAMING_PAGE_WORKER.md`.
+Date selection is now limited to the last 7 calendar dates (today + previous 6 days), with all seven dates shown directly in the Telegram picker.
+
+The v4.3.23 parser core, Page Worker safety gate, View Worker, View Sharding, exact view extraction and traffic core remain unchanged.
+
+See `DEPLOY_V4_3_24_DATE_WORKER_PRO.md`.

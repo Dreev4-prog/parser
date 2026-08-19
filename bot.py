@@ -82,6 +82,9 @@ from view_manager import REMOTE_VIEW_MANAGER, REMOTE_VIEW_WORKER_ENABLED
 from page_manager import (
     PAGE_PREFETCH_EXTRA_PAGES, REMOTE_PAGE_MANAGER, REMOTE_PAGE_WORKER_ENABLED,
 )
+from date_manager import (
+    DATE_MAX_AGE_DAYS, REMOTE_DATE_MANAGER, REMOTE_DATE_WORKER_ENABLED,
+)
 from stable_engine import (
     load_date_index, load_page_checkpoint, mark_category_job, record_page_failure,
     save_date_index, save_page_checkpoint,
@@ -92,7 +95,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.21"
+APP_VERSION = "4.3.24"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -642,14 +645,24 @@ def page_limit_keyboard() -> InlineKeyboardMarkup:
 
 
 def scan_date_keyboard() -> InlineKeyboardMarkup:
+    """Seven-day date picker. Older dates are intentionally unavailable."""
     today = datetime.now(MOSCOW).date()
-    yesterday = today - timedelta(days=1)
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"📅 Сегодня · {today:%d.%m}", callback_data="scan_date:today"),
-         InlineKeyboardButton(text=f"↩️ Вчера · {yesterday:%d.%m}", callback_data="scan_date:yesterday")],
-        [InlineKeyboardButton(text="🗓 Выбрать дату", callback_data="scan_date:custom")],
-        [InlineKeyboardButton(text="⬅️ Меню", callback_data="home")],
-    ])
+    days = [today - timedelta(days=offset) for offset in range(DATE_MAX_AGE_DAYS + 1)]
+    labels: list[InlineKeyboardButton] = []
+    for offset, day in enumerate(days):
+        if offset == 0:
+            label = f"📅 Сегодня · {day:%d.%m}"
+        elif offset == 1:
+            label = f"↩️ Вчера · {day:%d.%m}"
+        else:
+            label = f"{day:%d.%m}"
+        labels.append(InlineKeyboardButton(text=label, callback_data=f"scan_date:{day.isoformat()}"))
+    rows: list[list[InlineKeyboardButton]] = []
+    for index in range(0, len(labels), 2):
+        rows.append(labels[index:index + 2])
+    rows.append([InlineKeyboardButton(text="⌨️ Ввести дату", callback_data="scan_date:custom")])
+    rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def choice_keyboard(prefix: str, options: list[tuple[str, str]]) -> InlineKeyboardMarkup:
@@ -1876,6 +1889,8 @@ def _parse_scan_date_input(text: str | None) -> str | None:
     except ValueError:
         return None
     if value > today:
+        return None
+    if value < today - timedelta(days=DATE_MAX_AGE_DAYS):
         return None
     return value.isoformat()
 
@@ -3824,6 +3839,87 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     raise
                 except Exception:
                     log.debug("Stored date index could not be revalidated", exc_info=True)
+
+            # v4.3.24 Date Worker PRO. Dedicated Railway replicas probe the
+            # exponential chronology checkpoints in parallel and return only a
+            # boundary hint. The stable foreground parser ALWAYS revalidates that
+            # boundary locally before accepting the selected date. If anything is
+            # weak/inconsistent/offline, execution falls through to the unchanged
+            # v4.2.4 local exponential + binary locator below.
+            if REMOTE_DATE_WORKER_ENABLED:
+                live_date = category_live_progress.get(progress_key)
+                previous_stage = getattr(live_date, "transport_stage", "") if live_date is not None else ""
+                if live_date is not None:
+                    live_date.transport_stage = "date-worker-probes"
+                    live_date.phase = "date_worker"
+                try:
+                    hint = await REMOTE_DATE_MANAGER.locate_hint(base_url, target_date)
+                    if hint and hint.get("boundary"):
+                        boundary_hint = max(1, min(effective_limit, int(hint["boundary"])))
+                        # Check the most likely page first, then immediate neighbours.
+                        # This usually turns a 7-12 request local locator into 1-3
+                        # foreground verification requests while preserving truth.
+                        verify_order: list[int] = []
+                        for candidate_page in (
+                            boundary_hint, boundary_hint - 1, boundary_hint + 1,
+                            boundary_hint - 2, boundary_hint + 2, boundary_hint + 3,
+                        ):
+                            if 1 <= candidate_page <= effective_limit and candidate_page not in verify_order:
+                                verify_order.append(candidate_page)
+                        remote_confirmed = None
+                        remote_weak = False
+                        for verify_page in verify_order:
+                            _vi, verify_relation, _vp, _vd = await stable_fetch(verify_page, "date_verify")
+                            if verify_relation == "target":
+                                remote_confirmed = verify_page
+                                break
+                            if verify_relation in {"unknown", "invalid"}:
+                                remote_weak = True
+                                break
+                        if remote_confirmed is not None:
+                            candidate = remote_confirmed
+                            while candidate > 1:
+                                prev = candidate - 1
+                                _i2, prev_relation, _p2, _d2 = await stable_fetch(prev, "date_verify")
+                                if prev_relation == "target":
+                                    candidate = prev
+                                    continue
+                                if prev_relation == "newer":
+                                    break
+                                if prev_relation == "unknown":
+                                    # Same conservative behaviour as the proven local
+                                    # locator: begin collection one page earlier so
+                                    # exact card dates, not the hint, decide inclusion.
+                                    candidate = prev
+                                    break
+                                if prev_relation == "invalid":
+                                    remote_weak = True
+                                break
+                            if not remote_weak:
+                                try:
+                                    await save_date_index(
+                                        cat.key, target_date, base_url, status="found",
+                                        candidate_page=candidate, max_page=site_max_page,
+                                    )
+                                except Exception:
+                                    log.debug("Stable date-index write failed", exc_info=True)
+                                log.info(
+                                    "Date Worker confirmed category=%s target=%s hint=%s page=%s workers=%s local_requests=%s",
+                                    cat.name, target_date, boundary_hint, candidate,
+                                    int(hint.get("workers", 0) or 0), network_requests,
+                                )
+                                return locator_result("found", candidate_page=candidate)
+                        log.info(
+                            "Date Worker hint not locally confirmed category=%s target=%s hint=%s weak=%s; local locator fallback",
+                            cat.name, target_date, boundary_hint, remote_weak,
+                        )
+                except TemporaryAccessError:
+                    raise
+                except Exception:
+                    log.debug("Date Worker acceleration failed; local locator fallback", exc_info=True)
+                finally:
+                    if live_date is not None and getattr(live_date, "transport_stage", "") == "date-worker-probes":
+                        live_date.transport_stage = previous_stage or "browser"
 
             async def sequential_locator(start_page: int = 1):
                 saw_newer = False
@@ -6026,6 +6122,21 @@ async def enqueue_user_scan(
     service is absent, misconfigured, or still booting.
     """
     category_keys = _validate_scan_category_count(category_keys)
+    try:
+        requested_day = datetime.strptime(target_date, "%Y-%m-%d").date()
+    except Exception:
+        await message.answer("⚠️ Некорректная дата скана.")
+        return None
+    today_msk = datetime.now(MOSCOW).date()
+    oldest_allowed = today_msk - timedelta(days=DATE_MAX_AGE_DAYS)
+    if requested_day > today_msk or requested_day < oldest_allowed:
+        await message.answer(
+            f"⚠️ <b>Эта дата уже недоступна для нового скана.</b>\n\n"
+            f"Можно сканировать только последние <b>{DATE_MAX_AGE_DAYS + 1} дней</b>: "
+            f"с <b>{oldest_allowed:%d.%m.%Y}</b> по <b>{today_msk:%d.%m.%Y}</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return None
     if STABLE_SINGLE_SERVICE_MODE:
         existing = await get_persisted_active_scan(user_id)
         if existing is not None:
@@ -6296,8 +6407,9 @@ def payment_invoice_keyboard(payment: SubscriptionPayment) -> InlineKeyboardMark
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adminstats")],
-        [InlineKeyboardButton(text="👁 View Worker", callback_data="adminviews"),
+        [InlineKeyboardButton(text="📅 Date Worker", callback_data="admindates"),
          InlineKeyboardButton(text="📄 Page Worker", callback_data="adminpages")],
+        [InlineKeyboardButton(text="👁 View Worker", callback_data="adminviews")],
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="adminusers"),
          InlineKeyboardButton(text="💳 Платежи", callback_data="adminpayments")],
         [InlineKeyboardButton(text="🎟 Тарифы", callback_data="adminplans"),
@@ -6323,6 +6435,13 @@ def admin_view_worker_keyboard() -> InlineKeyboardMarkup:
 def admin_page_worker_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminpages")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
+    ])
+
+
+def admin_date_worker_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admindates")],
         [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
     ])
 
@@ -6770,6 +6889,57 @@ async def check_payment_handler(callback: CallbackQuery) -> None:
     )
 
 
+async def _admin_date_worker_text() -> str:
+    status = await REMOTE_DATE_MANAGER.status()
+    if not status.get("enabled"):
+        return (
+            "<b>📅 Date Worker</b>\n\n"
+            "Статус: <b>▫️ выключен</b>\n"
+            "REDIS_URL не задан или REMOTE_DATE_WORKER_ENABLED=0."
+        )
+    if not status.get("alive"):
+        err = html.escape(str(status.get("error") or "heartbeat не найден"))
+        return (
+            "<b>📅 Date Worker</b>\n\n"
+            "Статус: <b>🔴 offline</b>\n"
+            f"Redis queue: <b>{int(status.get('queue_depth', 0) or 0)}</b>\n"
+            f"Date cache: <b>{int(status.get('cache_ttl', 180) or 180)} сек.</b>\n"
+            f"Причина: <code>{err[:300]}</code>\n\n"
+            "Основной бот автоматически использует стабильный локальный поиск даты."
+        )
+
+    workers = list(status.get("workers") or [])
+    lines = [
+        "<b>📅 DATE MANAGER</b>",
+        "",
+        f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b>",
+        f"Redis queue: <b>{int(status.get('queue_depth', 0) or 0)}</b> · активных: <b>{int(status.get('active_total', 0) or 0)}</b>",
+        f"Date cache: <b>{int(status.get('cache_ttl', 180) or 180)} сек.</b> · окно дат: <b>{int(status.get('max_age_days', DATE_MAX_AGE_DAYS) or DATE_MAX_AGE_DAYS) + 1} дней</b>",
+        f"Общая скорость: <b>{float(status.get('rate_total', 0.0) or 0.0):.2f} probes/sec</b>",
+        f"Проб отправлено: <b>{int(status.get('probes_queued_total', 0) or 0)}</b> · cache hits: <b>{int(status.get('cache_hits_total', 0) or 0)}</b>",
+    ]
+    last_probes = int(status.get("last_batch_probes", 0) or 0)
+    if last_probes:
+        lines.extend([
+            "",
+            f"Последний поиск: <b>{html.escape(str(status.get('last_target_date') or '—'))}</b> · boundary ≈ <b>{int(status.get('last_boundary', 0) or 0) or '—'}</b>",
+            f"Проб: <b>{last_probes}</b> · из кэша: <b>{int(status.get('last_batch_cached', 0) or 0)}</b> · отправлено: <b>{int(status.get('last_batch_queued', 0) or 0)}</b>",
+            f"Время remote-поиска: <b>{float(status.get('last_batch_seconds', 0.0) or 0.0):.2f} сек.</b>",
+        ])
+    for idx, worker in enumerate(workers[:4], start=1):
+        lines.extend([
+            "",
+            f"<b>Worker {idx}</b> · concurrency <b>{int(worker.get('concurrency', 0) or 0)}</b> · active <b>{int(worker.get('active', 0) or 0)}</b>",
+            f"probes: <b>{int(worker.get('processed', 0) or 0)}</b> · speed <b>{float(worker.get('rate_ema', 0.0) or 0.0):.2f}/s</b>",
+            f"403/429: <b>{int(worker.get('http_403', 0) or 0)}/{int(worker.get('http_429', 0) or 0)}</b> · errors <b>{int(worker.get('errors', 0) or 0)}</b>",
+        ])
+    lines.extend([
+        "",
+        "<i>Date Worker только находит быструю границу. Финальная страница всегда перепроверяется стабильным локальным parser.</i>",
+    ])
+    return "\n".join(lines)
+
+
 async def _admin_page_worker_text() -> str:
     status = await REMOTE_PAGE_MANAGER.status()
     if not status.get("enabled"):
@@ -6817,7 +6987,7 @@ async def _admin_page_worker_text() -> str:
         ])
     lines.extend([
         "",
-        "<i>Поиск даты остаётся в основном стабильном parser. Page Worker ускоряет только сбор страниц после нахождения даты.</i>",
+        "<i>Page Worker ускоряет сбор страниц после того, как Date Worker/локальный fallback подтвердил границу даты.</i>",
     ])
     return "\n".join(lines)
 
@@ -6860,6 +7030,19 @@ async def admin_views_handler(callback: CallbackQuery) -> None:
         callback.message,
         await _admin_view_worker_text(),
         reply_markup=admin_view_worker_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "admindates")
+async def admin_dates_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message,
+        await _admin_date_worker_text(),
+        reply_markup=admin_date_worker_keyboard(),
     )
 
 
@@ -9434,20 +9617,35 @@ async def choose_scan_date(callback: CallbackQuery, state: FSMContext) -> None:
     today = datetime.now(MOSCOW).date()
     if choice == "today":
         target_date = today.isoformat()
-    elif choice == "yesterday":
+        await callback.answer()
+        await _show_scan_price_choice(callback.message, state, callback.from_user.id, target_date)
+        return
+    if choice == "yesterday":
         target_date = (today - timedelta(days=1)).isoformat()
-    elif choice == "custom":
+        await callback.answer()
+        await _show_scan_price_choice(callback.message, state, callback.from_user.id, target_date)
+        return
+    if choice == "custom":
         await state.set_state(ScanInput.target_date)
         await callback.answer()
+        oldest = today - timedelta(days=DATE_MAX_AGE_DAYS)
         await callback.message.answer(
             "<b>🗓 Своя дата</b>\n\n"
+            f"Можно выбрать только последние <b>{DATE_MAX_AGE_DAYS + 1} дней</b>: "
+            f"с <b>{oldest:%d.%m.%Y}</b> по <b>{today:%d.%m.%Y}</b>.\n"
             "Отправь <code>10.08.2026</code>, <code>10.08</code> или просто <code>10</code>.",
             parse_mode=ParseMode.HTML,
         )
         return
-    else:
+    try:
+        parsed = datetime.strptime(choice, "%Y-%m-%d").date()
+    except ValueError:
         await callback.answer("Неизвестная дата", show_alert=True)
         return
+    if parsed > today or parsed < today - timedelta(days=DATE_MAX_AGE_DAYS):
+        await callback.answer(f"Можно выбрать только последние {DATE_MAX_AGE_DAYS + 1} дней", show_alert=True)
+        return
+    target_date = parsed.isoformat()
 
     await callback.answer()
     await _show_scan_price_choice(callback.message, state, callback.from_user.id, target_date)
@@ -9462,8 +9660,8 @@ async def receive_scan_date(message: Message, state: FSMContext) -> None:
     target_date = _parse_scan_date_input(message.text)
     if target_date is None:
         await message.answer(
-            "⚠️ Не понял дату. Отправь, например, <code>12</code>, <code>10.08</code> или <code>10.08.2026</code>. "
-            "Будущую дату выбрать нельзя.",
+            f"⚠️ Не понял дату. Можно выбрать только последние <b>{DATE_MAX_AGE_DAYS + 1} дней</b>. "
+            "Отправь, например, <code>12</code>, <code>10.08</code> или <code>10.08.2026</code>.",
             parse_mode=ParseMode.HTML,
         )
         return
