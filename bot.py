@@ -331,13 +331,16 @@ PAGE_LIMIT_CHOICES = (15, 25, 50)
 # around 2 minutes, then the estimate is recalculated from the real page rate.
 PAGE_LIMIT_BASE_ETA_SECONDS = {15: 45, 25: 60, 50: 120}
 
-# v3.0.6 exact-date mode. Kleinanzeigen's public search feed only exposes a
-# limited pagination window. Requests above that window may normalize to/repeat
-# another page, so a single nationwide feed cannot be used to jump arbitrarily
-# deep. We keep the user's simple 15/25/50 depth, but when the chosen date is
-# beyond the public window we transparently use disjoint federal-state feeds and
-# merge unique target-day listings until the requested depth-equivalent is filled.
+# Kleinanzeigen's nationwide public search feed exposes a bounded pagination
+# window. v4.3.31 changes 15/25/50 to a MAXIMUM nationwide target-date depth:
+# once the selected day ends, or the public nationwide window ends, the scan is
+# complete. Regional hidden-fill is disabled by default because it turns one old
+# date scan into many independent regional date searches and was the largest
+# remaining source of latency. It can still be re-enabled explicitly for testing.
 PUBLIC_SEARCH_PAGE_CAP = max(10, min(50, int(os.getenv("PUBLIC_SEARCH_PAGE_CAP", "50"))))
+REGIONAL_HIDDEN_FILL_ENABLED = os.getenv("REGIONAL_HIDDEN_FILL_ENABLED", "0").strip().lower() not in {
+    "0", "false", "no", "off",
+}
 DATE_JUMP_PROBE_DELAY_SECONDS = max(0.0, min(1.0, float(os.getenv("DATE_JUMP_PROBE_DELAY_SECONDS", "0.18"))))
 
 # Hidden implementation detail: these location shards cover Germany without
@@ -4694,43 +4697,69 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
 
         if nationwide is not None and not reason:
             if nationwide["status"] == "found":
-                # If the requested depth cannot fit before page 50, start regional
-                # date discovery NOW, while nationwide Page Worker collection runs.
-                # By the time hidden_fill is needed, the next state boundaries are
-                # usually already cached in Redis.
-                try:
-                    likely_hidden = (
-                        int(nationwide.get("candidate") or 1) + int(depth) - 1
-                        > int(nationwide.get("limit") or PUBLIC_SEARCH_PAGE_CAP)
-                    )
-                except Exception:
-                    likely_hidden = False
-                if likely_hidden:
-                    initial_hidden = [
-                        (state_name, _regional_category_url(cat.url, slug, location_id), 0)
-                        for state_name, slug, location_id in GERMAN_STATE_SEGMENTS
-                    ]
-                    schedule_hidden_date_prewarm(initial_hidden)
+                # v4.3.31: 15/25/50 is a maximum depth inside the nationwide feed.
+                # Do not turn a 50-page old-date request into a second multi-minute
+                # regional crawl just because the public nationwide window ends.
+                # The existing regional engine remains available behind an explicit
+                # rollback flag, but the default path is nationwide-only.
+                if REGIONAL_HIDDEN_FILL_ENABLED:
+                    try:
+                        likely_hidden = (
+                            int(nationwide.get("candidate") or 1) + int(depth) - 1
+                            > int(nationwide.get("limit") or PUBLIC_SEARCH_PAGE_CAP)
+                        )
+                    except Exception:
+                        likely_hidden = False
+                    if likely_hidden:
+                        initial_hidden = [
+                            (state_name, _regional_category_url(cat.url, slug, location_id), 0)
+                            for state_name, slug, location_id in GERMAN_STATE_SEGMENTS
+                        ]
+                        schedule_hidden_date_prewarm(initial_hidden)
+
                 outcome, direct_pages_collected = await collect_direct(nationwide)
                 if outcome == "needs_hidden" and not request_complete:
-                    remaining = max(0, depth - direct_pages_collected)
-                    await hidden_fill(remaining)
+                    if REGIONAL_HIDDEN_FILL_ENABLED:
+                        remaining = max(0, depth - direct_pages_collected)
+                        await hidden_fill(remaining)
+                    else:
+                        # The selected date is still present at the end of the public
+                        # nationwide window. Those are all target-date pages we can
+                        # verify in nationwide mode, so finish successfully instead
+                        # of fabricating the requested depth from regional feeds.
+                        request_complete = True
+                        hit_limit = False
+                        if direct_pages_collected:
+                            reason = (
+                                f"общая выдача проверена до публичного лимита; "
+                                f"собрано {direct_pages_collected} страниц выбранной даты"
+                            )
+                        else:
+                            reason = "общая выдача проверена до публичного лимита"
                 elif outcome == "invalid_stop" and not request_complete:
-                    # This is now the only normal direct-pass partial condition:
-                    # an actual page/transport identity failure after retries.
+                    # A genuine page/transport identity failure still stays partial.
                     reason = reason or "не удалось корректно получить один из участков выдачи"
             elif nationwide["status"] == "absent":
                 request_complete = True
                 reason = "выбранная дата надёжно пройдена; объявлений за неё не найдено"
             elif nationwide["status"] == "too_deep":
-                # Cold Date Turbo can reach this branch after a single local page-50
-                # verification. Fan out regional Date Worker probes immediately.
-                initial_hidden = [
-                    (state_name, _regional_category_url(cat.url, slug, location_id), 0)
-                    for state_name, slug, location_id in GERMAN_STATE_SEGMENTS
-                ]
-                schedule_hidden_date_prewarm(initial_hidden)
-                await hidden_fill(depth)
+                if REGIONAL_HIDDEN_FILL_ENABLED:
+                    initial_hidden = [
+                        (state_name, _regional_category_url(cat.url, slug, location_id), 0)
+                        for state_name, slug, location_id in GERMAN_STATE_SEGMENTS
+                    ]
+                    schedule_hidden_date_prewarm(initial_hidden)
+                    await hidden_fill(depth)
+                else:
+                    # Do not call this a false zero: the target day is simply deeper
+                    # than Kleinanzeigen exposes in the nationwide public window.
+                    request_complete = True
+                    hit_limit = False
+                    reason = (
+                        f"выбранная дата находится глубже публичных "
+                        f"{int(nationwide.get('limit') or PUBLIC_SEARCH_PAGE_CAP)} страниц общей выдачи; "
+                        "региональный добор отключён"
+                    )
             else:
                 # Unknown chronology is a parser-quality issue, not proof that the
                 # date is deep. Avoid multiplying one weak page into hundreds of
@@ -9786,7 +9815,7 @@ async def _show_scan_depth_choice(
         f"🧠 Дубли: <b>{'Вкл' if scan_settings.smart_dedupe else 'Выкл'}</b> · "
         f"🧹 Шум: <b>{'Вкл' if scan_settings.clean_noise else 'Выкл'}</b>"
         f"{extras}\n\n"
-        "Выбери количество страниц.",
+        "Выбери максимальное количество страниц общей выдачи для выбранной даты.",
         parse_mode=ParseMode.HTML,
         reply_markup=page_limit_keyboard(),
     )

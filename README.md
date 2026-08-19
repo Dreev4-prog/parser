@@ -1,3 +1,13 @@
+## v4.3.31 — NATIONWIDE MAX DEPTH
+
+This test release removes the regional hidden-fill from the default scan path.
+
+- `15 / 25 / 50` now means **maximum nationwide target-date pages**, not a mandatory depth that must be filled from regional feeds.
+- After the target date is found in the Germany-wide feed, the bot scans forward until one of three things happens: the selected date ends, the chosen max depth is reached, or Kleinanzeigen's public nationwide page window ends.
+- If the selected date itself is deeper than the public nationwide window, the bot reports that limitation explicitly instead of starting a multi-minute regional crawl.
+- Regional hidden-fill code is preserved as an opt-in rollback path: `REGIONAL_HIDDEN_FILL_ENABLED=1`. Default is OFF.
+- Date Worker / Predictor / Cold Date Turbo / Page Worker / View Worker remain unchanged.
+
 
 ## v4.3.30 — REGIONAL SHARD FIX
 
