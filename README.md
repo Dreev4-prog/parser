@@ -1,3 +1,11 @@
+# DT Parser v4.3.32 — SMART HYBRID OLD DATE
+
+- Fixes v4.3.31 where a date deeper than the nationwide public window could finish in seconds with a false zero.
+- Normal reachable dates stay nationwide-only.
+- Verified `too_deep` dates automatically fall back to regional shards for correctness.
+- `15/25/50` remains a maximum nationwide depth when the date is reachable nationwide.
+- No Railway variable changes required.
+
 ## v4.3.31 — NATIONWIDE MAX DEPTH
 
 This test release removes the regional hidden-fill from the default scan path.

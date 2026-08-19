@@ -95,7 +95,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.30"
+APP_VERSION = "4.3.32"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -339,6 +339,13 @@ PAGE_LIMIT_BASE_ETA_SECONDS = {15: 45, 25: 60, 50: 120}
 # remaining source of latency. It can still be re-enabled explicitly for testing.
 PUBLIC_SEARCH_PAGE_CAP = max(10, min(50, int(os.getenv("PUBLIC_SEARCH_PAGE_CAP", "50"))))
 REGIONAL_HIDDEN_FILL_ENABLED = os.getenv("REGIONAL_HIDDEN_FILL_ENABLED", "0").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+# v4.3.32 smart hybrid: keep ordinary nationwide scans region-free, but if the
+# requested date itself is deeper than Kleinanzeigen's public nationwide window,
+# regional sharding is required to avoid a false zero. This fallback is enabled
+# by default and only activates for a verified `too_deep` date result.
+AUTO_REGIONAL_FALLBACK_TOO_DEEP = os.getenv("AUTO_REGIONAL_FALLBACK_TOO_DEEP", "1").strip().lower() not in {
     "0", "false", "no", "off",
 }
 DATE_JUMP_PROBE_DELAY_SECONDS = max(0.0, min(1.0, float(os.getenv("DATE_JUMP_PROBE_DELAY_SECONDS", "0.18"))))
@@ -4743,22 +4750,30 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 request_complete = True
                 reason = "выбранная дата надёжно пройдена; объявлений за неё не найдено"
             elif nationwide["status"] == "too_deep":
-                if REGIONAL_HIDDEN_FILL_ENABLED:
+                # v4.3.32: a far historical date can be completely outside the
+                # nationwide 50-page public window. In that case nationwide-only
+                # mode cannot possibly return correct rows, so automatically fall
+                # back to regional shards even though ordinary hidden-fill remains
+                # disabled. This avoids the v4.3.31 false 0-result regression.
+                if REGIONAL_HIDDEN_FILL_ENABLED or AUTO_REGIONAL_FALLBACK_TOO_DEEP:
                     initial_hidden = [
                         (state_name, _regional_category_url(cat.url, slug, location_id), 0)
                         for state_name, slug, location_id in GERMAN_STATE_SEGMENTS
                     ]
+                    # Do not speculative-prewarm here unless explicitly enabled;
+                    # hidden_fill() will use the existing safe Date Worker path.
                     schedule_hidden_date_prewarm(initial_hidden)
                     await hidden_fill(depth)
                 else:
-                    # Do not call this a false zero: the target day is simply deeper
-                    # than Kleinanzeigen exposes in the nationwide public window.
-                    request_complete = True
-                    hit_limit = False
+                    # Explicit diagnostic-only mode: never turn an unreachable date
+                    # into a successful zero. Mark it incomplete so UI/recovery logic
+                    # cannot present "nothing found" as a verified result.
+                    request_complete = False
+                    hit_limit = True
                     reason = (
                         f"выбранная дата находится глубже публичных "
                         f"{int(nationwide.get('limit') or PUBLIC_SEARCH_PAGE_CAP)} страниц общей выдачи; "
-                        "региональный добор отключён"
+                        "для точного результата нужен региональный добор"
                     )
             else:
                 # Unknown chronology is a parser-quality issue, not proof that the
