@@ -35,21 +35,21 @@ def _env_float(name: str, default: float, minimum: float, maximum: float) -> flo
 
 
 # ---------------------------------------------------------------------------
-# v4.3.15 VIEW MANAGER PRO
+# v4.3.18 DUAL VIEW WORKER
 # ---------------------------------------------------------------------------
 # This process owns ONLY public view counters. parser.py is the known-good
 # v4.3.8 core and is intentionally not edited. We configure the process-wide
 # traffic controller before importing parser.py, then adjust only its exposed
 # limits from this worker as the dedicated lane learns the healthy capacity.
-VIEW_POOL_MIN = _env_int("VIEW_WORKER_POOL_MIN", 8, 2, 24)
-VIEW_POOL_MAX = _env_int("VIEW_WORKER_POOL_MAX", 16, VIEW_POOL_MIN, 24)
-VIEW_POOL_DEFAULT = _env_int("VIEW_WORKER_POOL_DEFAULT", 12, VIEW_POOL_MIN, VIEW_POOL_MAX)
+VIEW_POOL_MIN = _env_int("VIEW_WORKER_POOL_MIN", 6, 2, 24)
+VIEW_POOL_MAX = _env_int("VIEW_WORKER_POOL_MAX", 10, VIEW_POOL_MIN, 24)
+VIEW_POOL_DEFAULT = _env_int("VIEW_WORKER_POOL_DEFAULT", 8, VIEW_POOL_MIN, VIEW_POOL_MAX)
 # Backwards compatibility with v4.3.14 env. If the new DEFAULT is absent but
 # VIEW_WORKER_VIEW_POOL_SIZE exists, use the old value as the starting pool.
 if "VIEW_WORKER_POOL_DEFAULT" not in os.environ and "VIEW_WORKER_VIEW_POOL_SIZE" in os.environ:
     VIEW_POOL_DEFAULT = _env_int("VIEW_WORKER_VIEW_POOL_SIZE", VIEW_POOL_DEFAULT, VIEW_POOL_MIN, VIEW_POOL_MAX)
 
-BROWSER_POOL = _env_int("VIEW_WORKER_BROWSER_POOL_SIZE", 2, 1, 4)
+BROWSER_POOL = _env_int("VIEW_WORKER_BROWSER_POOL_SIZE", 1, 1, 4)
 VIEW_INTERVAL = _env_float("VIEW_WORKER_VIEW_MIN_INTERVAL_SECONDS", 0.05, 0.0, 2.0)
 ADAPTIVE_ENABLED = _env_bool("VIEW_WORKER_ADAPTIVE_ENABLED", True)
 ADAPTIVE_HEALTHY_ROUNDS = _env_int("VIEW_WORKER_ADAPTIVE_HEALTHY_ROUNDS", 2, 1, 20)
@@ -88,8 +88,8 @@ from view_manager import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("dtparser-view-counter-worker")
 
-ROUND_SIZE = _env_int("VIEW_WORKER_ROUND_SIZE", 48, VIEW_POOL_MAX, 200)
-MAX_ACTIVE_JOBS = _env_int("VIEW_WORKER_MAX_ACTIVE_JOBS", 8, 1, 16)
+ROUND_SIZE = _env_int("VIEW_WORKER_ROUND_SIZE", 32, VIEW_POOL_MAX, 200)
+MAX_ACTIVE_JOBS = _env_int("VIEW_WORKER_MAX_ACTIVE_JOBS", 2, 1, 16)
 BLOCK_MS = _env_int("VIEW_WORKER_QUEUE_BLOCK_MS", 250, 50, 2000)
 HEARTBEAT_SECONDS = _env_float("VIEW_WORKER_HEARTBEAT_SECONDS", 3.0, 1.0, 10.0)
 RECLAIM_IDLE_MS = _env_int("VIEW_WORKER_RECLAIM_IDLE_MS", 180_000, 30_000, 30 * 60_000)
@@ -247,7 +247,7 @@ class ViewCounterWorker:
         payload = {
             "ts": time.time(),
             "consumer": self.consumer,
-            "version": "4.3.15",
+            "version": "4.3.18",
             "view_pool": self.current_pool,
             "pool_min": VIEW_POOL_MIN,
             "pool_default": VIEW_POOL_DEFAULT,

@@ -1,3 +1,19 @@
+# v4.3.18 — DUAL VIEW WORKER (2 Railway replicas)
+
+This release is tuned for **2 replicas** of the dedicated View Worker while keeping the known-good v4.3.8 parser/view extraction core untouched.
+
+Defaults per replica:
+- HTTP pool adaptive: **6–10**, starts at **8**
+- Browser fallback: **1**
+- Active remote jobs: **2**
+- Fair round size: **32**
+
+With two replicas the expected combined HTTP capacity is about **16** at startup and up to **20** when both replicas are healthy. Redis Streams consumer groups distribute whole scan view-jobs between replicas; a single scan remains owned by one replica. The admin panel already aggregates per-consumer heartbeats, combined pool and combined views/sec.
+
+No new Railway variables are required if the service uses these defaults. Set the View Worker service to **2 replicas** and keep only `REDIS_URL` mandatory there.
+
+---
+
 # v4.3.16 AUTO SERVICE LAUNCHER
 
 Railway multi-service deployment is now automatic. `railway.json` launches `service_launcher.py`, which uses Railway's `RAILWAY_SERVICE_NAME`: a service named **View Worker** starts `view_counter_worker.py`; all other services start `bot.py`. No manual Start Command edit is required. The known-good parser/date/views core is unchanged.
