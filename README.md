@@ -1,3 +1,13 @@
+# v4.3.15 VIEW MANAGER PRO
+
+- Keeps `parser.py` and the exact v4.3.8 views/date core unchanged.
+- Dedicated Railway View Worker now uses an adaptive pool: 8 min / 12 start / 16 max.
+- Automatic 403/429/fallback backoff instead of blindly increasing concurrency.
+- Independent heartbeat, Redis Streams partial checkpoints, crash reclaim, stalled-job requeue and parser self-reset.
+- Remote failure is never treated as a successful empty result: after exhausted retries the bot falls back to local v4.3.8 views.
+- Admin panel now has `👁 View Worker` live telemetry (queue, pool, views/sec, exact/fallback %, 403/429, cooldown, requeues).
+- Deployment guide: `DEPLOY_V4_3_15_VIEW_MANAGER_PRO.md`.
+
 # v4.3.14 Dedicated View Manager + Railway View Worker
 
 - Built directly on the known-good v4.3.8 tree.

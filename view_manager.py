@@ -126,6 +126,66 @@ class RemoteViewManager:
             log.warning("Remote view worker heartbeat check failed", exc_info=True)
             return False
 
+    async def status(self) -> dict[str, Any]:
+        """Return lightweight dedicated-worker telemetry for the admin panel."""
+        base: dict[str, Any] = {
+            "enabled": self.enabled, "alive": False, "queue_depth": 0,
+            "workers": [], "error": None,
+        }
+        if not self.enabled:
+            return base
+        try:
+            redis = await self.connect()
+            try:
+                base["queue_depth"] = int(await redis.xlen(VIEW_STREAM))
+            except Exception:
+                base["queue_depth"] = -1
+
+            workers: list[dict[str, Any]] = []
+            pattern = f"{VIEW_REDIS_PREFIX}:worker:*"
+            try:
+                async for key in redis.scan_iter(match=pattern, count=50):
+                    raw = await redis.get(key)
+                    if not raw:
+                        continue
+                    try:
+                        item = json.loads(raw)
+                        ts = float(item.get("ts", 0.0))
+                    except Exception:
+                        continue
+                    age = max(0.0, time.time() - ts)
+                    if age <= VIEW_HEARTBEAT_STALE_SECONDS:
+                        item["age_seconds"] = age
+                        workers.append(item)
+            except Exception:
+                log.debug("Could not enumerate dedicated view workers", exc_info=True)
+
+            # Backwards compatibility with v4.3.14: it only wrote the global key.
+            if not workers:
+                raw = await redis.get(VIEW_HEARTBEAT_KEY)
+                if raw:
+                    try:
+                        item = json.loads(raw)
+                        ts = float(item.get("ts", 0.0))
+                        age = max(0.0, time.time() - ts)
+                        if age <= VIEW_HEARTBEAT_STALE_SECONDS:
+                            item["age_seconds"] = age
+                            workers.append(item)
+                    except Exception:
+                        pass
+
+            base["workers"] = workers
+            base["alive"] = bool(workers)
+            if workers:
+                base["active_jobs"] = sum(int(x.get("active_jobs", 0) or 0) for x in workers)
+                base["pool_total"] = sum(int(x.get("view_pool", 0) or 0) for x in workers)
+                base["browser_total"] = sum(int(x.get("browser_pool", 0) or 0) for x in workers)
+                base["rate_total"] = sum(float(x.get("rate_ema", 0.0) or 0.0) for x in workers)
+            return base
+        except Exception as exc:
+            base["error"] = str(exc)[:300]
+            return base
+
     async def fetch(
         self,
         urls: list[str],
@@ -173,6 +233,12 @@ class RemoteViewManager:
                 raw_result = await redis.get(result_key)
                 if raw_result:
                     data = json.loads(raw_result)
+                    if data.get("failed"):
+                        log.warning(
+                            "Remote view batch requested local fallback job=%s error=%s",
+                            job_id[:10], str(data.get("error") or "remote worker failed")[:300],
+                        )
+                        return None
                     out: dict[str, RemoteViewResult] = {}
                     for url, item in (data.get("results") or {}).items():
                         if not isinstance(item, dict):

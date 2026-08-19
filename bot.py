@@ -89,7 +89,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.14"
+APP_VERSION = "4.3.15"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -6095,7 +6095,8 @@ def payment_invoice_keyboard(payment: SubscriptionPayment) -> InlineKeyboardMark
 
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="adminstats")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="adminstats"),
+         InlineKeyboardButton(text="👁 View Worker", callback_data="adminviews")],
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="adminusers"),
          InlineKeyboardButton(text="💳 Платежи", callback_data="adminpayments")],
         [InlineKeyboardButton(text="🎟 Тарифы", callback_data="adminplans"),
@@ -6108,6 +6109,13 @@ def admin_keyboard() -> InlineKeyboardMarkup:
 def admin_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")]
+    ])
+
+
+def admin_view_worker_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminviews")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
     ])
 
 
@@ -6319,6 +6327,71 @@ async def _admin_dashboard_text() -> str:
     )
 
 
+async def _admin_view_worker_text() -> str:
+    status = await REMOTE_VIEW_MANAGER.status()
+    if not status.get("enabled"):
+        return (
+            "<b>👁 View Worker</b>\n\n"
+            "Статус: <b>▫️ выключен</b>\n"
+            "REMOTE_VIEW_WORKER_ENABLED=1 не активирован или REDIS_URL не задан."
+        )
+    if not status.get("alive"):
+        err = html.escape(str(status.get("error") or "heartbeat не найден"))
+        return (
+            "<b>👁 View Worker</b>\n\n"
+            "Статус: <b>🔴 offline</b>\n"
+            f"Redis queue: <b>{int(status.get('queue_depth', 0) or 0)}</b>\n"
+            f"Причина: <code>{err[:300]}</code>\n\n"
+            "Основной бот автоматически использует локальный v4.3.8 fallback."
+        )
+
+    workers = list(status.get("workers") or [])
+    queue_depth = int(status.get("queue_depth", 0) or 0)
+    active_jobs = int(status.get("active_jobs", 0) or 0)
+    pool_total = int(status.get("pool_total", 0) or 0)
+    browser_total = int(status.get("browser_total", 0) or 0)
+    rate_total = float(status.get("rate_total", 0.0) or 0.0)
+    lines = [
+        "<b>👁 VIEW MANAGER PRO</b>",
+        "",
+        f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b>",
+        f"Redis queue: <b>{queue_depth}</b> · активных jobs: <b>{active_jobs}</b>",
+        f"Общий HTTP pool: <b>{pool_total}</b> · Browser: <b>{browser_total}</b>",
+        f"Скорость: <b>{rate_total:.1f} views/sec</b>",
+    ]
+    for idx, worker in enumerate(workers[:4], start=1):
+        processed = int(worker.get("processed_total", 0) or 0)
+        exact_pct = float(worker.get("exact_pct", 0.0) or 0.0)
+        fallback_pct = float(worker.get("fallback_pct", 0.0) or 0.0)
+        pool = int(worker.get("view_pool", 0) or 0)
+        pool_min = int(worker.get("pool_min", pool) or pool)
+        pool_max = int(worker.get("pool_max", pool) or pool)
+        traffic_limit = int(worker.get("traffic_view_limit", pool) or pool)
+        browser_pool = int(worker.get("browser_pool", 0) or 0)
+        rate = float(worker.get("rate_ema", 0.0) or 0.0)
+        item_ms = float(worker.get("item_ms_ema", 0.0) or 0.0)
+        r403 = int(worker.get("http_403", 0) or 0)
+        r429 = int(worker.get("http_429", 0) or 0)
+        refusals_60 = int(worker.get("refusals_60s", 0) or 0)
+        penalty = int(worker.get("penalty", 0) or 0)
+        cooldown = float(worker.get("cooldown_seconds", 0.0) or 0.0)
+        requeues = int(worker.get("requeues_total", 0) or 0)
+        failures = int(worker.get("rounds_failed", 0) or 0)
+        reason = html.escape(str(worker.get("adaptive_reason") or "—"))[:180]
+        consumer = html.escape(str(worker.get("consumer") or f"worker-{idx}"))[:45]
+        lines.extend([
+            "",
+            f"<b>Worker {idx}</b> · <code>{consumer}</code>",
+            f"Pool: <b>{pool}</b> [{pool_min}–{pool_max}] · effective: <b>{traffic_limit}</b> · browser: <b>{browser_pool}</b>",
+            f"Rate: <b>{rate:.1f}/s</b> · ~<b>{item_ms:.0f} ms/item</b>",
+            f"Exact: <b>{exact_pct:.1f}%</b> · browser fallback: <b>{fallback_pct:.1f}%</b> · processed: <b>{processed}</b>",
+            f"403: <b>{r403}</b> · 429: <b>{r429}</b> · refusals/60s: <b>{refusals_60}</b>",
+            f"Penalty: <b>{penalty}</b> · cooldown: <b>{cooldown:.1f}s</b> · requeue: <b>{requeues}</b> · errors: <b>{failures}</b>",
+            f"Adaptive: <code>{reason}</code>",
+        ])
+    return "\n".join(lines)
+
+
 async def _edit_or_answer(target: Message, text: str, *, reply_markup=None) -> None:
     """Prefer editing inline-menu messages, but gracefully fall back to a new one."""
     try:
@@ -6504,6 +6577,19 @@ async def admin_stats_handler(callback: CallbackQuery) -> None:
         return
     await callback.answer()
     await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=admin_keyboard())
+
+
+@dp.callback_query(F.data == "adminviews")
+async def admin_views_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message,
+        await _admin_view_worker_text(),
+        reply_markup=admin_view_worker_keyboard(),
+    )
 
 
 @dp.callback_query(F.data == "adminusers")
