@@ -8,14 +8,23 @@ import socket
 import time
 from datetime import datetime
 
-# Date Worker uses the exact same category page parser as the stable bot. It only
-# returns chronology hints; the main bot locally revalidates the final boundary.
-os.environ.setdefault("SCAN_TRANSPORT", "browser")
+# Date Worker returns chronology hints only; the main bot still locally revalidates
+# the final boundary. v4.3.25 makes the remote probe path HTTP-first, but keeps a
+# strict quality gate and a browser confirmation path for any ambiguous HTTP page.
+# Explicit 403/429 refusals are never bypassed through another transport.
+DATE_WORKER_HTTP_FIRST = os.getenv("DATE_WORKER_HTTP_FIRST", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+os.environ["SCAN_TRANSPORT"] = "hybrid" if DATE_WORKER_HTTP_FIRST else "browser"
+os.environ.setdefault("HYBRID_HTTP_FIRST", "1")
+os.environ.setdefault("HYBRID_WATCHDOG_SECONDS", "8")
+os.environ.setdefault("HYBRID_DIRECT_HTTP_RETRIES", "1")
+os.environ.setdefault("HYBRID_BROWSER_FALLBACK_LIMIT", "4")
 os.environ.setdefault("SHARED_BROWSER_RUNTIME", "1")
 os.environ.setdefault("STABLE_SINGLE_SERVICE_MODE", "1")
 os.environ.setdefault("TRAFFIC_SCAN_CONCURRENCY", "2")
 os.environ.setdefault("TRAFFIC_GLOBAL_CONCURRENCY", "3")
-os.environ.setdefault("TRAFFIC_SCAN_MIN_INTERVAL_SECONDS", "0.30")
+os.environ.setdefault("TRAFFIC_SCAN_MIN_INTERVAL_SECONDS", "0.20")
 
 from parser import KleinanzeigenParser, TemporaryAccessError, profile_page_dates, shutdown_shared_browser_runtime
 from date_manager import (
@@ -54,6 +63,47 @@ DATE_WORKER_JOB_TIMEOUT_SECONDS = _env_int("DATE_WORKER_JOB_TIMEOUT_SECONDS", 45
 DATE_WORKER_STATUS_TTL_SECONDS = max(10, DATE_WORKER_HEARTBEAT_SECONDS * 5)
 
 
+def _assess_probe(info, target_day, *, strict_http: bool):
+    """Return (profile, dated_count, safe, reason).
+
+    HTTP probes are deliberately held to a stronger evidence threshold than the
+    legacy browser probe. A weak HTTP answer is never cached: the same page is
+    confirmed with the browser path. The main bot then performs its own final
+    stable boundary verification, so this worker can only accelerate, not decide.
+    """
+    profile = profile_page_dates(info.items, target_day)
+    dated_count = max(0, len(info.items) - int(getattr(info, "missing_date_count", 0) or 0))
+    base_safe = (
+        bool(getattr(info, "request_matches_page", True))
+        and bool(getattr(info, "page_verified", False))
+        and not bool(getattr(info, "suspicious", False))
+        and profile.relation in {"target", "newer", "older", "mixed", "empty"}
+        and (not info.items or dated_count >= 2 or profile.relation == "target")
+    )
+    if not base_safe:
+        return profile, dated_count, False, "structural"
+    if not strict_http:
+        return profile, dated_count, True, "browser-safe"
+
+    # Empty and mixed pages are useful chronology signals, but too important to
+    # accept from the cheap path alone. Browser-confirm them.
+    if not info.items:
+        return profile, dated_count, False, "http-empty-needs-confirm"
+    if profile.relation == "mixed":
+        return profile, dated_count, False, "http-mixed-needs-confirm"
+
+    # Directional HTTP evidence needs several exact card dates. Target evidence
+    # gets the same treatment unless there are at least two direct target hits.
+    if dated_count < 3:
+        return profile, dated_count, False, "http-low-dated-evidence"
+    if float(getattr(profile, "confidence", 0.0) or 0.0) < 0.30:
+        return profile, dated_count, False, "http-low-confidence"
+    if profile.relation == "target" and int(getattr(profile, "target_count", 0) or 0) < 2:
+        return profile, dated_count, False, "http-single-target-needs-confirm"
+
+    return profile, dated_count, True, "http-high-confidence"
+
+
 class DateWorkerProcess:
     def __init__(self) -> None:
         if not REDIS_URL:
@@ -73,6 +123,11 @@ class DateWorkerProcess:
         self.errors = 0
         self.http_403 = 0
         self.http_429 = 0
+        self.http_fast_ok = 0
+        self.http_weak = 0
+        self.browser_confirms = 0
+        self.browser_confirm_ok = 0
+        self.transport_conflicts = 0
         self.rate_ema = 0.0
         self._group_ready = False
         self._stop = asyncio.Event()
@@ -128,7 +183,7 @@ class DateWorkerProcess:
         payload = {
             "ts": time.time(),
             "consumer": self.base_id,
-            "version": "4.3.24",
+            "version": "4.3.25",
             "replica": os.getenv("RAILWAY_REPLICA_ID", "local"),
             "concurrency": DATE_WORKER_CONCURRENCY,
             "active": self.active,
@@ -138,6 +193,12 @@ class DateWorkerProcess:
             "rate_ema": round(self.rate_ema, 3),
             "http_403": self.http_403,
             "http_429": self.http_429,
+            "http_first": bool(DATE_WORKER_HTTP_FIRST),
+            "http_fast_ok": self.http_fast_ok,
+            "http_weak": self.http_weak,
+            "browser_confirms": self.browser_confirms,
+            "browser_confirm_ok": self.browser_confirm_ok,
+            "transport_conflicts": self.transport_conflicts,
             "penalty": penalty,
             "cooldown_seconds": round(cooldown, 2),
             "cache_ttl": DATE_CACHE_TTL_SECONDS,
@@ -204,6 +265,8 @@ class DateWorkerProcess:
     async def consumer_loop(self, index: int) -> None:
         consumer = f"{self.base_id}-{index}"
         parser = KleinanzeigenParser()
+        browser_parser = KleinanzeigenParser()
+        browser_parser.scan_transport = "browser"
         try:
             while not self._stop.is_set():
                 try:
@@ -231,37 +294,81 @@ class DateWorkerProcess:
                     started = time.monotonic()
                     try:
                         target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
+                        fallbacks_before = int(getattr(parser, "_hybrid_browser_fallbacks", 0) or 0)
                         info = await asyncio.wait_for(
                             parser.parse_category_page_info(url, requested_page),
                             timeout=DATE_WORKER_JOB_TIMEOUT_SECONDS,
                         )
-                        profile = profile_page_dates(info.items, target_day)
-                        dated_count = max(0, len(info.items) - int(getattr(info, "missing_date_count", 0) or 0))
-                        structurally_safe = (
-                            bool(getattr(info, "request_matches_page", True))
-                            and bool(getattr(info, "page_verified", False))
-                            and not bool(getattr(info, "suspicious", False))
-                            and profile.relation in {"target", "newer", "older", "mixed", "empty"}
-                            and (
-                                not info.items
-                                or dated_count >= 2
-                                or profile.relation == "target"
-                            )
+                        fallbacks_after = int(getattr(parser, "_hybrid_browser_fallbacks", 0) or 0)
+                        transport_mode = str(getattr(parser, "scan_transport_status", lambda: parser.scan_transport)())
+                        compatibility_browser_used = fallbacks_after > fallbacks_before
+                        strict_http = bool(
+                            DATE_WORKER_HTTP_FIRST
+                            and parser.scan_transport == "hybrid"
+                            and not compatibility_browser_used
                         )
-                        if not structurally_safe:
+                        profile, dated_count, probe_safe, safety_reason = _assess_probe(
+                            info, target_day, strict_http=strict_http
+                        )
+                        source = "http" if strict_http else ("browser-compat" if compatibility_browser_used else "browser")
+
+                        if strict_http and probe_safe:
+                            self.http_fast_ok += 1
+                        elif strict_http and not probe_safe:
+                            # Cheap HTTP evidence was ambiguous. Confirm this exact page
+                            # using the normal browser path before allowing it into Redis.
+                            # This is a compatibility/quality fallback, not a response to
+                            # 403/429 (those raise TemporaryAccessError above and never
+                            # reach this branch).
+                            self.http_weak += 1
+                            self.browser_confirms += 1
+                            http_relation = profile.relation
+                            browser_info = await asyncio.wait_for(
+                                browser_parser.parse_category_page_info(url, requested_page),
+                                timeout=DATE_WORKER_JOB_TIMEOUT_SECONDS,
+                            )
+                            browser_profile, browser_dated, browser_safe, browser_reason = _assess_probe(
+                                browser_info, target_day, strict_http=False
+                            )
+                            if not browser_safe:
+                                self.errors += 1
+                                pipe = self.redis.pipeline(transaction=False)
+                                pipe.set(
+                                    self.error_key(cache_id),
+                                    f"weak-date-probe:{safety_reason}:{browser_reason}",
+                                    ex=DATE_ERROR_TTL_SECONDS,
+                                )
+                                pipe.delete(self.pending_key(cache_id), self.cache_key(cache_id))
+                                await pipe.execute()
+                                log.warning(
+                                    "Date Worker rejected weak HTTP+browser probe page=%s http_relation=%s browser_relation=%s http_reason=%s browser_reason=%s",
+                                    requested_page, http_relation, browser_profile.relation, safety_reason, browser_reason,
+                                )
+                                continue
+                            if http_relation != browser_profile.relation:
+                                self.transport_conflicts += 1
+                                log.info(
+                                    "Date Worker HTTP/browser chronology changed page=%s http=%s browser=%s; browser hint kept and main bot will revalidate",
+                                    requested_page, http_relation, browser_profile.relation,
+                                )
+                            info = browser_info
+                            profile = browser_profile
+                            dated_count = browser_dated
+                            source = "browser-confirm"
+                            transport_mode = "browser-confirm"
+                            self.browser_confirm_ok += 1
+                        elif not probe_safe:
                             self.errors += 1
                             pipe = self.redis.pipeline(transaction=False)
-                            pipe.set(self.error_key(cache_id), "weak-date-probe", ex=DATE_ERROR_TTL_SECONDS)
+                            pipe.set(self.error_key(cache_id), f"weak-date-probe:{safety_reason}", ex=DATE_ERROR_TTL_SECONDS)
                             pipe.delete(self.pending_key(cache_id), self.cache_key(cache_id))
                             await pipe.execute()
                             log.warning(
-                                "Date Worker rejected weak probe page=%s relation=%s verified=%s matches=%s suspicious=%s dated=%s",
-                                requested_page,
-                                profile.relation,
+                                "Date Worker rejected weak probe page=%s relation=%s verified=%s matches=%s suspicious=%s dated=%s reason=%s",
+                                requested_page, profile.relation,
                                 bool(getattr(info, "page_verified", False)),
                                 bool(getattr(info, "request_matches_page", True)),
-                                bool(getattr(info, "suspicious", False)),
-                                dated_count,
+                                bool(getattr(info, "suspicious", False)), dated_count, safety_reason,
                             )
                             continue
 
@@ -277,7 +384,9 @@ class DateWorkerProcess:
                             "older_count": int(getattr(profile, "older_count", 0) or 0),
                             "newest_day": days[-1].isoformat() if days else "",
                             "oldest_day": days[0].isoformat() if days else "",
-                            "source": "date-worker",
+                            "source": f"date-worker:{source}",
+                            "transport_mode": transport_mode,
+                            "dated_count": dated_count,
                         }
                         raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
                         pipe = self.redis.pipeline(transaction=False)
@@ -315,6 +424,7 @@ class DateWorkerProcess:
                     await asyncio.sleep(1.0)
         finally:
             await parser.close()
+            await browser_parser.close()
 
     async def run(self) -> None:
         await self.redis.ping()
@@ -326,11 +436,12 @@ class DateWorkerProcess:
         ]
         await self.heartbeat()
         log.info(
-            "DT PARSER Date Worker online | id=%s | replica=%s | concurrency=%s | cache=%ss",
+            "DT PARSER Date Worker online | id=%s | replica=%s | concurrency=%s | cache=%ss | HTTP-first=%s",
             self.base_id,
             os.getenv("RAILWAY_REPLICA_ID", "local"),
             DATE_WORKER_CONCURRENCY,
             DATE_CACHE_TTL_SECONDS,
+            DATE_WORKER_HTTP_FIRST,
         )
         try:
             await asyncio.gather(*consumers)

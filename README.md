@@ -1,15 +1,22 @@
-# DT PARSER v4.3.24 — DATE WORKER PRO
+# DT PARSER v4.3.25 — HTTP-FIRST DATE WORKER
 
-This release adds the third independent acceleration layer:
+This release accelerates Date Worker probes with a conservative HTTP-first path.
 
 ```text
-Date Worker x2 -> Page Worker x2 -> View Worker x2
+Date Worker x2 (HTTP-first -> browser confirm when weak)
+        -> Page Worker x2
+        -> View Worker x2
 ```
 
-Date Worker parallelizes chronology probes and uses a 180-second Redis cache/single-flight layer. Its output is never treated as final truth: the stable main parser locally verifies the boundary before collection starts. If remote date search is unavailable or inconsistent, the known-good local date locator is used automatically.
+Accuracy rules:
 
-Date selection is now limited to the last 7 calendar dates (today + previous 6 days), with all seven dates shown directly in the Telegram picker.
+- HTTP never decides the final date boundary.
+- Only high-confidence HTTP chronology probes are cached directly.
+- Empty, mixed, low-date-evidence and single-target HTTP probes are browser-confirmed.
+- Explicit 403/429 is never bypassed with a different transport.
+- The main stable parser still locally verifies the Date Worker boundary before collection.
+- Any worker failure/inconsistency falls back to the existing stable local date locator.
 
-The v4.3.23 parser core, Page Worker safety gate, View Worker, View Sharding, exact view extraction and traffic core remain unchanged.
+Date selection remains limited to today + previous 6 days. Page Worker, View Worker, View Sharding and the parser/traffic cores are unchanged from v4.3.24.
 
-See `DEPLOY_V4_3_24_DATE_WORKER_PRO.md`.
+See `DEPLOY_V4_3_25_HTTP_FIRST_DATE_WORKER.md`.

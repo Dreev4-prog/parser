@@ -6931,11 +6931,12 @@ async def _admin_date_worker_text() -> str:
             "",
             f"<b>Worker {idx}</b> · concurrency <b>{int(worker.get('concurrency', 0) or 0)}</b> · active <b>{int(worker.get('active', 0) or 0)}</b>",
             f"probes: <b>{int(worker.get('processed', 0) or 0)}</b> · speed <b>{float(worker.get('rate_ema', 0.0) or 0.0):.2f}/s</b>",
-            f"403/429: <b>{int(worker.get('http_403', 0) or 0)}/{int(worker.get('http_429', 0) or 0)}</b> · errors <b>{int(worker.get('errors', 0) or 0)}</b>",
+            f"HTTP fast: <b>{int(worker.get('http_fast_ok', 0) or 0)}</b> · browser confirm: <b>{int(worker.get('browser_confirm_ok', 0) or 0)}/{int(worker.get('browser_confirms', 0) or 0)}</b>",
+            f"403/429: <b>{int(worker.get('http_403', 0) or 0)}/{int(worker.get('http_429', 0) or 0)}</b> · conflicts: <b>{int(worker.get('transport_conflicts', 0) or 0)}</b> · errors <b>{int(worker.get('errors', 0) or 0)}</b>",
         ])
     lines.extend([
         "",
-        "<i>Date Worker только находит быструю границу. Финальная страница всегда перепроверяется стабильным локальным parser.</i>",
+        "<i>HTTP-first используется только для быстрых проб. Слабые HTTP-страницы подтверждаются браузером, а финальная граница всегда перепроверяется стабильным локальным parser.</i>",
     ])
     return "\n".join(lines)
 
