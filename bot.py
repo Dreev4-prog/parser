@@ -381,6 +381,16 @@ HIDDEN_DATE_PREWARM_ENABLED = os.getenv("HIDDEN_DATE_PREWARM_ENABLED", "0").stri
 HIDDEN_DATE_PREWARM_WINDOW = max(1, min(4, int(os.getenv("HIDDEN_DATE_PREWARM_WINDOW", "2"))))
 HIDDEN_DATE_PREWARM_CONCURRENCY = max(1, min(2, int(os.getenv("HIDDEN_DATE_PREWARM_CONCURRENCY", "1"))))
 
+# v4.3.33 Regional Pipeline.  Old-date scans that genuinely need location shards
+# keep the trusted foreground verifier, but Date Worker starts locating the next
+# regions while Page Worker/main collection processes the current one.  Only
+# remote hints are parallel; no remote hint is accepted as truth.
+REGIONAL_DATE_PIPELINE_ENABLED = os.getenv("REGIONAL_DATE_PIPELINE_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+REGIONAL_DATE_PIPELINE_WINDOW = max(1, min(4, int(os.getenv("REGIONAL_DATE_PIPELINE_WINDOW", "4"))))
+REGIONAL_DATE_PIPELINE_CONCURRENCY = max(1, min(2, int(os.getenv("REGIONAL_DATE_PIPELINE_CONCURRENCY", "2"))))
+
 def _regional_category_url(base_url: str, slug: str, location_id: int) -> str:
     m = re.match(r"^(https://www\.kleinanzeigen\.de/.+)/(c\d+)$", base_url.rstrip("/"))
     if not m:
@@ -3520,7 +3530,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         update_quality_live()
         return len(target_items)
 
-    async def locate_feed(base_url: str, feed_name: str):
+    _REMOTE_HINT_UNSET = object()
+
+    async def locate_feed(base_url: str, feed_name: str, remote_hint_override=_REMOTE_HINT_UNSET):
         # v3.1.8: use Kleinanzeigen's official Anbieter=Privat filter at the
         # search-feed level. Commercial/store listings therefore never consume
         # scan depth and never enter snapshots, views or TOP analytics.
@@ -3885,7 +3897,14 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     live_date.transport_stage = "date-worker-probes"
                     live_date.phase = active_date_phase
                 try:
-                    hint = await REMOTE_DATE_MANAGER.locate_hint(base_url, target_date)
+                    # v4.3.33: hidden_fill may already have a Date Worker hint
+                    # running in parallel for this regional feed.  Reuse that exact
+                    # hint instead of starting a duplicate Redis/date-probe search.
+                    # The stable foreground parser below still verifies the page.
+                    if remote_hint_override is _REMOTE_HINT_UNSET:
+                        hint = await REMOTE_DATE_MANAGER.locate_hint(base_url, target_date)
+                    else:
+                        hint = remote_hint_override
                     if hint and hint.get("boundary"):
                         boundary_hint = max(1, min(effective_limit, int(hint["boundary"])))
                         # v4.3.28 Cold Date Turbo can prove remotely that even page
@@ -4467,10 +4486,24 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     # concurrently here; foreground local verification/collection stays on the
     # proven single parser path. This makes the speed-up low-risk.
     hidden_prewarm_tasks: dict[str, asyncio.Task] = {}
-    hidden_prewarm_sem = asyncio.Semaphore(HIDDEN_DATE_PREWARM_CONCURRENCY)
+    _regional_prewarm_enabled = bool(
+        REMOTE_DATE_WORKER_ENABLED
+        and (HIDDEN_DATE_PREWARM_ENABLED or REGIONAL_DATE_PIPELINE_ENABLED)
+    )
+    _regional_prewarm_window = max(
+        HIDDEN_DATE_PREWARM_WINDOW if HIDDEN_DATE_PREWARM_ENABLED else 0,
+        REGIONAL_DATE_PIPELINE_WINDOW if REGIONAL_DATE_PIPELINE_ENABLED else 0,
+        1,
+    )
+    _regional_prewarm_concurrency = max(
+        HIDDEN_DATE_PREWARM_CONCURRENCY if HIDDEN_DATE_PREWARM_ENABLED else 0,
+        REGIONAL_DATE_PIPELINE_CONCURRENCY if REGIONAL_DATE_PIPELINE_ENABLED else 0,
+        1,
+    )
+    hidden_prewarm_sem = asyncio.Semaphore(_regional_prewarm_concurrency)
 
     async def _prewarm_hidden_date(feed_url: str):
-        if not (HIDDEN_DATE_PREWARM_ENABLED and REMOTE_DATE_WORKER_ENABLED):
+        if not _regional_prewarm_enabled:
             return None
         async with hidden_prewarm_sem:
             try:
@@ -4478,17 +4511,17 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.debug("Regional Date Worker prewarm failed url=%s", feed_url, exc_info=True)
+                log.debug("Regional Date Worker pipeline hint failed url=%s", feed_url, exc_info=True)
                 return None
 
     def schedule_hidden_date_prewarm(entries: list[tuple[str, str, int]]) -> None:
-        if not (HIDDEN_DATE_PREWARM_ENABLED and REMOTE_DATE_WORKER_ENABLED):
+        if not _regional_prewarm_enabled:
             return
         scheduled = sum(1 for task in hidden_prewarm_tasks.values() if not task.done())
         for _name, feed_url, _level in entries:
             if feed_url in hidden_prewarm_tasks:
                 continue
-            if scheduled >= HIDDEN_DATE_PREWARM_WINDOW:
+            if scheduled >= _regional_prewarm_window:
                 break
             hidden_prewarm_tasks[feed_url] = asyncio.create_task(
                 _prewarm_hidden_date(feed_url),
@@ -4496,16 +4529,16 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             )
             scheduled += 1
 
-    async def await_hidden_date_prewarm(feed_url: str) -> None:
+    async def await_hidden_date_prewarm(feed_url: str):
         task = hidden_prewarm_tasks.get(feed_url)
         if task is None:
-            return
+            return _REMOTE_HINT_UNSET
         try:
-            await task
+            return await task
         except asyncio.CancelledError:
             raise
         except Exception:
-            pass
+            return None
 
     async def cancel_hidden_date_prewarm() -> None:
         # v4.3.29: never leave speculative regional date jobs running after the
@@ -4579,25 +4612,43 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 schedule_hidden_date_prewarm(queue)
             return added > 0
 
+        regional_locator_wait_seconds = 0.0
+        regional_collect_seconds = 0.0
+
         while queue and hidden_pages_collected < goal_pages and feeds_processed < max_hidden_feeds:
-            state_name, feed_url, level = queue.pop(0)
+            # v4.3.33: prefer a region whose remote Date Worker hint is already
+            # ready.  This prevents the foreground parser from idling behind the
+            # first state in list order while another state has already finished.
+            selected_index = 0
+            if _regional_prewarm_enabled:
+                for idx, (_n, queued_url, _l) in enumerate(queue):
+                    task = hidden_prewarm_tasks.get(queued_url)
+                    if task is not None and task.done():
+                        selected_index = idx
+                        break
+            state_name, feed_url, level = queue.pop(selected_index)
             if feed_url in visited:
                 continue
-            # Keep a rolling window of future regional locators warm while this
-            # feed is being locally verified/collected.
+            # Keep the next regional Date Worker window busy while this feed is
+            # locally verified and then collected through Page Worker/cache.
             schedule_hidden_date_prewarm(queue)
             visited.add(feed_url)
             feeds_processed += 1
             if live is not None:
                 live.phase = "regional_date"
-                live.transport_stage = "date-worker-regional-prewarm"
+                live.transport_stage = "date-worker-regional-pipeline"
                 live.segment_name = state_name
                 live.segments_done = feeds_processed - 1
                 live.segments_total = max(feeds_processed, feeds_processed + len(queue))
 
             try:
-                await await_hidden_date_prewarm(feed_url)
-                loc = await locate_feed(feed_url, f"hidden:{state_name}")
+                locator_wait_started = time.monotonic()
+                precomputed_hint = await await_hidden_date_prewarm(feed_url)
+                regional_locator_wait_seconds += max(0.0, time.monotonic() - locator_wait_started)
+                loc = await locate_feed(
+                    feed_url, f"hidden:{state_name}",
+                    remote_hint_override=precomputed_hint,
+                )
             except TemporaryAccessError as exc:
                 unresolved = True
                 log.warning("hidden date shard temporary limit category=%s state=%s http=%s", cat.name, state_name, exc.status_code)
@@ -4620,6 +4671,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 # `absent` exclusively for a fully visible feed.
                 continue
 
+            collect_started = time.monotonic()
             candidate = int(loc["candidate"])
             feed_limit = int(loc["limit"])
             fetch = loc["fetch"]
@@ -4672,6 +4724,14 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 # down again instead of declaring the category empty/skipped.
                 if not add_children(state_name, loc, level):
                     unresolved = True
+            regional_collect_seconds += max(0.0, time.monotonic() - collect_started)
+
+        log.info(
+            "Regional pipeline category=%s target=%s feeds=%s pages=%s locator_wait=%.2fs collect=%.2fs prewarm_window=%s prewarm_concurrency=%s",
+            cat.name, target_date, feeds_processed, hidden_pages_collected,
+            regional_locator_wait_seconds, regional_collect_seconds,
+            _regional_prewarm_window, _regional_prewarm_concurrency,
+        )
 
         if hidden_pages_collected >= goal_pages:
             request_complete = True
@@ -5452,6 +5512,7 @@ def render_user_job_status(job: ScanJob) -> str:
                 "browser-seed": "Browser fallback",
                 "postgres-checkpoint": "PostgreSQL checkpoint",
                 "date-worker-regional-prewarm": "Date Worker · регионы параллельно",
+                "date-worker-regional-pipeline": "Date Worker ×2 · региональный pipeline",
             }
             transport_text = f"⚡ <b>{labels.get(stage, 'HTTP-first hybrid')}</b>\n"
         timeout_text = ""

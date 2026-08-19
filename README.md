@@ -63,3 +63,16 @@ HIDDEN_DATE_PREWARM_CONCURRENCY=4
 The defaults above are already built in; you do not need to add them unless you want to tune or disable a feature.
 
 See `DEPLOY_V4_3_28_COLD_DATE_TURBO.md`.
+
+## v4.3.33 — Parallel Regional Locator + Regional/Page Pipeline
+
+For old dates that are deeper than the nationwide 50-page window, regional fallback now pipelines work instead of waiting for every region serially:
+
+- Date Worker pre-locates upcoming regional feeds in a rolling window while the current region is being verified/collected.
+- Ready regional hints are consumed first, reducing foreground idle time.
+- A precomputed remote hint is reused instead of launching the same Date Worker search twice.
+- Every remote hint remains acceleration-only: the foreground stable parser still verifies the candidate boundary before any page is accepted.
+- Page Worker/cache continues to prefetch the verified region while Date Worker works on the next regions.
+- Regional pipeline timing is logged (`locator_wait`, `collect`) for real bottleneck measurement.
+
+No new Railway variables are required. Defaults are conservative: 4 queued regional hints, at most 2 regional locator jobs running concurrently. Optional rollback: `REGIONAL_DATE_PIPELINE_ENABLED=0`.
