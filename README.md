@@ -1,3 +1,8 @@
+
+## v4.3.30 — REGIONAL SHARD FIX
+
+Fixes the Cold Date Turbo regional recursion regression from v4.3.28/v4.3.29.
+When a regional feed is proven deeper than page 50, the main stable parser now verifies page 1 first so Kleinanzeigen child-location shards are discovered before returning `too_deep`. The remote Date Worker remains a hint only and all page/date truth is still locally verified. Page Worker and View Worker logic are unchanged.
 # DT PARSER v4.3.29 — COLD DATE TURBO + PARALLEL HIDDEN FILL
 
 v4.3.29 targets the slowest remaining date scenario: the **first cold scan of an old date** (especially day 5–6 of the allowed 7-day window) and the second regional date-search phase that can appear after nationwide pages are exhausted.

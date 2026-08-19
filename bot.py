@@ -95,7 +95,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.29"
+APP_VERSION = "4.3.30"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -3885,21 +3885,48 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                         if bool(hint.get("beyond_public")):
                             _bi, beyond_relation, _bp, _bd = await stable_fetch(effective_limit, "date_verify")
                             if beyond_relation == "newer":
-                                try:
-                                    await save_date_index(
-                                        cat.key, target_date, base_url, status="too_deep",
-                                        max_page=site_max_page,
+                                # v4.3.30: a hidden/regional feed that is itself deeper
+                                # than the public 50-page window MUST expose its child
+                                # location shards before we return `too_deep`. Those
+                                # shards are discovered from page 1. v4.3.28/29 skipped
+                                # page 1 on the Cold Turbo shortcut, so hidden_fill()
+                                # could not recurse and incorrectly marked the category
+                                # partial even though the chronology was valid.
+                                if str(feed_name).startswith("hidden:") and not discovered_shards:
+                                    _si, shard_relation, _sp, _sd = await stable_fetch(1, "date_verify")
+                                    if shard_relation in {"unknown", "invalid"}:
+                                        log.warning(
+                                            "Cold Date Turbo shard discovery weak; falling back to local locator category=%s feed=%s target=%s relation=%s",
+                                            cat.name, feed_name, target_date, shard_relation,
+                                        )
+                                    else:
+                                        log.info(
+                                            "Cold Date Turbo discovered %s child shards before regional too_deep category=%s feed=%s",
+                                            len(discovered_shards), cat.name, feed_name,
+                                        )
+                                # If page 1 itself was weak, do not accept the shortcut:
+                                # let the proven local locator continue and recover it.
+                                if not (
+                                    str(feed_name).startswith("hidden:")
+                                    and not discovered_shards
+                                    and shard_relation in {"unknown", "invalid"}
+                                ):
+                                    try:
+                                        await save_date_index(
+                                            cat.key, target_date, base_url, status="too_deep",
+                                            max_page=site_max_page,
+                                        )
+                                    except Exception:
+                                        log.debug("Stable date-index too_deep write failed", exc_info=True)
+                                    log.info(
+                                        "Cold Date Turbo verified target beyond public window category=%s target=%s page=%s workers=%s shards=%s",
+                                        cat.name, target_date, effective_limit, int(hint.get("workers", 0) or 0),
+                                        len(discovered_shards),
                                     )
-                                except Exception:
-                                    log.debug("Stable date-index too_deep write failed", exc_info=True)
-                                log.info(
-                                    "Cold Date Turbo verified target beyond public window category=%s target=%s page=%s workers=%s",
-                                    cat.name, target_date, effective_limit, int(hint.get("workers", 0) or 0),
-                                )
-                                return locator_result(
-                                    "too_deep",
-                                    "дата глубже публичного окна; региональный поиск уже прогревается",
-                                )
+                                    return locator_result(
+                                        "too_deep",
+                                        "дата глубже публичного окна; региональная структура подтверждена",
+                                    )
                         # Check the most likely page first, then immediate neighbours.
                         # This usually turns a 7-12 request local locator into 1-3
                         # foreground verification requests while preserving truth.
