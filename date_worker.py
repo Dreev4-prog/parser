@@ -10,7 +10,7 @@ from datetime import datetime
 
 # Date Worker returns chronology hints only; the main bot still locally revalidates
 # the final boundary. v4.3.25 makes the remote probe path HTTP-first, but keeps a
-# strict quality gate and a browser confirmation path for any ambiguous HTTP page.
+# wider HTTP concurrency while preserving the strict browser confirmation gate.
 # Explicit 403/429 refusals are never bypassed through another transport.
 DATE_WORKER_HTTP_FIRST = os.getenv("DATE_WORKER_HTTP_FIRST", "1").strip().lower() not in {
     "0", "false", "no", "off",
@@ -22,9 +22,9 @@ os.environ.setdefault("HYBRID_DIRECT_HTTP_RETRIES", "1")
 os.environ.setdefault("HYBRID_BROWSER_FALLBACK_LIMIT", "4")
 os.environ.setdefault("SHARED_BROWSER_RUNTIME", "1")
 os.environ.setdefault("STABLE_SINGLE_SERVICE_MODE", "1")
-os.environ.setdefault("TRAFFIC_SCAN_CONCURRENCY", "2")
-os.environ.setdefault("TRAFFIC_GLOBAL_CONCURRENCY", "3")
-os.environ.setdefault("TRAFFIC_SCAN_MIN_INTERVAL_SECONDS", "0.20")
+os.environ.setdefault("TRAFFIC_SCAN_CONCURRENCY", "4")
+os.environ.setdefault("TRAFFIC_GLOBAL_CONCURRENCY", "5")
+os.environ.setdefault("TRAFFIC_SCAN_MIN_INTERVAL_SECONDS", "0.12")
 
 from parser import KleinanzeigenParser, TemporaryAccessError, profile_page_dates, shutdown_shared_browser_runtime
 from date_manager import (
@@ -56,7 +56,11 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
 
-DATE_WORKER_CONCURRENCY = _env_int("DATE_WORKER_CONCURRENCY", 2, 1, 4)
+# v4.3.28: four HTTP-first consumers per replica. With two Railway replicas this
+# gives up to eight cheap date probes in flight, while browser confirmation stays
+# separately throttled below.
+DATE_WORKER_CONCURRENCY = _env_int("DATE_WORKER_CONCURRENCY", 4, 1, 4)
+DATE_WORKER_BROWSER_CONFIRM_CONCURRENCY = _env_int("DATE_WORKER_BROWSER_CONFIRM_CONCURRENCY", 1, 1, 2)
 DATE_WORKER_HEARTBEAT_SECONDS = _env_int("DATE_WORKER_HEARTBEAT_SECONDS", 3, 1, 15)
 DATE_WORKER_RECLAIM_IDLE_MS = _env_int("DATE_WORKER_RECLAIM_IDLE_MS", 90_000, 30_000, 300_000)
 DATE_WORKER_JOB_TIMEOUT_SECONDS = _env_int("DATE_WORKER_JOB_TIMEOUT_SECONDS", 45, 15, 120)
@@ -131,6 +135,9 @@ class DateWorkerProcess:
         self.rate_ema = 0.0
         self._group_ready = False
         self._stop = asyncio.Event()
+        # HTTP probes are cheap and parallel. Chromium confirmation is deliberately
+        # narrow: default one per replica (two total with the recommended x2 setup).
+        self._browser_confirm_sem = asyncio.Semaphore(DATE_WORKER_BROWSER_CONFIRM_CONCURRENCY)
 
         TRAFFIC.base_scan_limit = max(1, DATE_WORKER_CONCURRENCY)
         TRAFFIC.base_global_limit = max(2, DATE_WORKER_CONCURRENCY + 1)
@@ -183,9 +190,10 @@ class DateWorkerProcess:
         payload = {
             "ts": time.time(),
             "consumer": self.base_id,
-            "version": "4.3.25",
+            "version": "4.3.28",
             "replica": os.getenv("RAILWAY_REPLICA_ID", "local"),
             "concurrency": DATE_WORKER_CONCURRENCY,
+            "browser_confirm_concurrency": DATE_WORKER_BROWSER_CONFIRM_CONCURRENCY,
             "active": self.active,
             "queue_depth": queue_depth,
             "processed": self.processed,
@@ -323,10 +331,11 @@ class DateWorkerProcess:
                             self.http_weak += 1
                             self.browser_confirms += 1
                             http_relation = profile.relation
-                            browser_info = await asyncio.wait_for(
-                                browser_parser.parse_category_page_info(url, requested_page),
-                                timeout=DATE_WORKER_JOB_TIMEOUT_SECONDS,
-                            )
+                            async with self._browser_confirm_sem:
+                                browser_info = await asyncio.wait_for(
+                                    browser_parser.parse_category_page_info(url, requested_page),
+                                    timeout=DATE_WORKER_JOB_TIMEOUT_SECONDS,
+                                )
                             browser_profile, browser_dated, browser_safe, browser_reason = _assess_probe(
                                 browser_info, target_day, strict_http=False
                             )
@@ -436,10 +445,11 @@ class DateWorkerProcess:
         ]
         await self.heartbeat()
         log.info(
-            "DT PARSER Date Worker online | id=%s | replica=%s | concurrency=%s | cache=%ss | HTTP-first=%s",
+            "DT PARSER Date Worker online | id=%s | replica=%s | http_concurrency=%s | browser_confirm=%s | cache=%ss | HTTP-first=%s",
             self.base_id,
             os.getenv("RAILWAY_REPLICA_ID", "local"),
             DATE_WORKER_CONCURRENCY,
+            DATE_WORKER_BROWSER_CONFIRM_CONCURRENCY,
             DATE_CACHE_TTL_SECONDS,
             DATE_WORKER_HTTP_FIRST,
         )

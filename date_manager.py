@@ -7,8 +7,9 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from parser import page_url, private_provider_url
 
@@ -49,6 +50,39 @@ DATE_PROBE_TIMEOUT_SECONDS = _env_int("DATE_PROBE_TIMEOUT_SECONDS", 10, 3, 45)
 DATE_PROBE_POLL_MS = _env_int("DATE_PROBE_POLL_MS", 120, 50, 1000)
 DATE_MAX_AGE_DAYS = 6  # hard product limit: today + previous six days = seven calendar dates
 DATE_INITIAL_PROBES = (1, 2, 4, 8, 16, 32, 50)
+
+# v4.3.28 Cold Date Turbo. A first-ever search has no predictor history, so
+# probing the old exponential ladder wastes wall-clock time on the oldest allowed
+# dates. Queue a broad age-aware grid in one Redis batch; two Date Worker replicas
+# can consume the probes concurrently. These are hints only: the foreground parser
+# still locally verifies the boundary before it becomes truth.
+DATE_COLD_TURBO_ENABLED = _env_bool("DATE_COLD_TURBO_ENABLED", True)
+DATE_COLD_TURBO_TIMEOUT_SECONDS = _env_int("DATE_COLD_TURBO_TIMEOUT_SECONDS", 8, 3, 20)
+MOSCOW = ZoneInfo("Europe/Moscow")
+
+def cold_date_probe_pages(target_date: str) -> list[int]:
+    try:
+        target = date.fromisoformat(str(target_date))
+        today = datetime.now(MOSCOW).date()
+        age = max(0, min(DATE_MAX_AGE_DAYS, (today - target).days))
+    except Exception:
+        age = 0
+    if age <= 0:
+        pages = (1, 2, 4, 7, 11, 17, 26, 38, 50)
+    elif age == 1:
+        pages = (1, 3, 6, 10, 15, 22, 31, 40, 50)
+    elif age == 2:
+        pages = (1, 4, 8, 13, 19, 26, 34, 42, 50)
+    elif age == 3:
+        pages = (1, 6, 11, 17, 24, 31, 38, 44, 50)
+    elif age == 4:
+        pages = (1, 7, 14, 21, 28, 35, 41, 46, 50)
+    else:
+        # The 5th/6th previous day is normally the expensive cold path. Spread
+        # probes nearly uniformly over the public 50-page window so the first
+        # round brackets the date instead of walking 1/2/4/8/16/32/50.
+        pages = (1, 8, 14, 20, 26, 32, 38, 44, 50)
+    return list(dict.fromkeys(max(1, min(50, int(page))) for page in pages))
 
 # v4.3.26: confirmed boundary predictor. Unlike the short 180s probe cache,
 # predictor hints live longer because they are only starting points. The main bot
@@ -165,6 +199,11 @@ class RemoteDateManager:
         self.last_predictor_continue_rounds = 0
         self.last_predictor_continue_pages = 0
         self.last_predictor_fallback = False
+        self.cold_turbo_total = 0
+        self.cold_turbo_public_beyond_total = 0
+        self.last_cold_turbo = False
+        self.last_cold_age_days = 0
+        self.last_cold_probe_pages: list[int] = []
 
     async def connect(self):
         if not self.enabled:
@@ -643,26 +682,71 @@ class RemoteDateManager:
                     if bracket is not None:
                         self.predictor_continue_success_total += 1
 
-            # Only cold categories, totally weak predictor evidence, or a target
-            # outside the reachable predictor expansion use the old proven ladder.
-            # Already probed pages are omitted so this fallback never re-queues
-            # work completed earlier in the same locate call.
+            # v4.3.28: a truly cold category gets one broad, age-aware batch.
+            # This changes wall-clock shape from a ladder of dependent rounds into
+            # one parallel fan-out. Predictor failures keep the proven emergency
+            # ladder because they already carry useful local evidence.
+            self.last_cold_turbo = False
+            self.last_cold_probe_pages = []
             if bracket is None:
                 used_cold_fallback = True
                 self.last_predictor_fallback = bool(predictor is not None)
-                fallback_pages = [page for page in DATE_INITIAL_PROBES if page not in merged]
+                if predictor is None and DATE_COLD_TURBO_ENABLED:
+                    try:
+                        target = date.fromisoformat(str(target_date))
+                        self.last_cold_age_days = max(0, min(DATE_MAX_AGE_DAYS, (datetime.now(MOSCOW).date() - target).days))
+                    except Exception:
+                        self.last_cold_age_days = 0
+                    fallback_pages = [page for page in cold_date_probe_pages(target_date) if page not in merged]
+                    self.last_cold_turbo = True
+                    self.last_cold_probe_pages = list(fallback_pages)
+                    self.cold_turbo_total += 1
+                    cold_timeout = float(DATE_COLD_TURBO_TIMEOUT_SECONDS)
+                else:
+                    fallback_pages = [page for page in DATE_INITIAL_PROBES if page not in merged]
+                    cold_timeout = None
                 if fallback_pages:
                     first = await self._probe_set(
                         base_url,
                         target_date,
                         fallback_pages,
                         stop_on_boundary=True,
+                        timeout_seconds=cold_timeout,
                     )
                     total_cached += self.last_batch_cached
                     total_queued += self.last_batch_queued
                     merged.update(first)
                 bracket = self._boundary_from(merged)
+
+            # A reliable page-50 `newer` result proves the requested date is beyond
+            # the nationwide public window. Returning this as a special hint lets
+            # the foreground parser verify page 50 once and jump straight to the
+            # regional sharder instead of repeating 1/2/4/8/16/32/50 locally.
             if bracket is None:
+                page50 = merged.get(50)
+                if page50 is not None and page50.relation == "newer":
+                    self.cold_turbo_public_beyond_total += 1
+                    self.last_boundary = 50
+                    self.last_batch_probes = len(merged)
+                    self.last_batch_cached = total_cached
+                    self.last_batch_queued = total_queued
+                    self.last_batch_seconds = max(0.0, time.monotonic() - locate_started)
+                    return {
+                        "boundary": 50,
+                        "low_newer": 50,
+                        "high_non_newer": 0,
+                        "direct_target": False,
+                        "beyond_public": True,
+                        "workers": int(self.last_batch_workers),
+                        "predictor_page": int((predictor or {}).get("page") or 0),
+                        "predictor_source": str((predictor or {}).get("source") or ""),
+                        "predictor_points": int((predictor or {}).get("points") or 0),
+                        "predictor_continue_rounds": int(continue_rounds),
+                        "predictor_continue_pages": int(continue_pages),
+                        "cold_fallback": bool(used_cold_fallback),
+                        "cold_turbo": bool(self.last_cold_turbo),
+                        "probes": {page: item.as_dict() for page, item in sorted(merged.items())},
+                    }
                 return None
 
             low, high = bracket
@@ -721,6 +805,8 @@ class RemoteDateManager:
                 "predictor_continue_rounds": int(continue_rounds),
                 "predictor_continue_pages": int(continue_pages),
                 "cold_fallback": bool(used_cold_fallback),
+                "cold_turbo": bool(self.last_cold_turbo),
+                "beyond_public": False,
                 "probes": {page: item.as_dict() for page, item in sorted(merged.items())},
             }
         except Exception:
@@ -745,6 +831,12 @@ class RemoteDateManager:
             "last_predictor_continue_rounds": self.last_predictor_continue_rounds,
             "last_predictor_continue_pages": self.last_predictor_continue_pages,
             "last_predictor_fallback": self.last_predictor_fallback,
+            "cold_turbo_enabled": DATE_COLD_TURBO_ENABLED,
+            "cold_turbo_total": self.cold_turbo_total,
+            "cold_turbo_public_beyond_total": self.cold_turbo_public_beyond_total,
+            "last_cold_turbo": self.last_cold_turbo,
+            "last_cold_age_days": self.last_cold_age_days,
+            "last_cold_probe_pages": list(self.last_cold_probe_pages),
             "last_predictor_page": self.last_predictor_page,
             "last_predictor_source": self.last_predictor_source,
             "last_predictor_points": self.last_predictor_points,

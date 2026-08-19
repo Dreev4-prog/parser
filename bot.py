@@ -95,7 +95,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.27"
+APP_VERSION = "4.3.28"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -362,6 +362,14 @@ GERMAN_STATE_SEGMENTS = (
     ("Bayern", "bayern", 5510),
     ("Nordrhein-Westfalen", "nordrhein-westfalen", 928),
 )
+
+# v4.3.28: when a historical nationwide scan is likely to need regional depth,
+# pre-warm several independent regional date locators while Page Worker is still
+# collecting the nationwide pages. This removes the visible second multi-minute
+# date-search staircase without letting remote hints become source of truth.
+HIDDEN_DATE_PREWARM_ENABLED = os.getenv("HIDDEN_DATE_PREWARM_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+HIDDEN_DATE_PREWARM_WINDOW = max(2, min(8, int(os.getenv("HIDDEN_DATE_PREWARM_WINDOW", "6"))))
+HIDDEN_DATE_PREWARM_CONCURRENCY = max(1, min(6, int(os.getenv("HIDDEN_DATE_PREWARM_CONCURRENCY", "4"))))
 
 def _regional_category_url(base_url: str, slug: str, location_id: int) -> str:
     m = re.match(r"^(https://www\.kleinanzeigen\.de/.+)/(c\d+)$", base_url.rstrip("/"))
@@ -3861,13 +3869,37 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             if REMOTE_DATE_WORKER_ENABLED:
                 live_date = category_live_progress.get(progress_key)
                 previous_stage = getattr(live_date, "transport_stage", "") if live_date is not None else ""
+                previous_phase = getattr(live_date, "phase", "") if live_date is not None else ""
+                active_date_phase = "regional_date" if str(feed_name).startswith("hidden:") else "date_worker"
                 if live_date is not None:
                     live_date.transport_stage = "date-worker-probes"
-                    live_date.phase = "date_worker"
+                    live_date.phase = active_date_phase
                 try:
                     hint = await REMOTE_DATE_MANAGER.locate_hint(base_url, target_date)
                     if hint and hint.get("boundary"):
                         boundary_hint = max(1, min(effective_limit, int(hint["boundary"])))
+                        # v4.3.28 Cold Date Turbo can prove remotely that even page
+                        # 50 is still newer than the requested day. Verify that one
+                        # exact page locally and jump straight to regional sharding;
+                        # do not repeat the entire local 1/2/4/8/16/32/50 ladder.
+                        if bool(hint.get("beyond_public")):
+                            _bi, beyond_relation, _bp, _bd = await stable_fetch(effective_limit, "date_verify")
+                            if beyond_relation == "newer":
+                                try:
+                                    await save_date_index(
+                                        cat.key, target_date, base_url, status="too_deep",
+                                        max_page=site_max_page,
+                                    )
+                                except Exception:
+                                    log.debug("Stable date-index too_deep write failed", exc_info=True)
+                                log.info(
+                                    "Cold Date Turbo verified target beyond public window category=%s target=%s page=%s workers=%s",
+                                    cat.name, target_date, effective_limit, int(hint.get("workers", 0) or 0),
+                                )
+                                return locator_result(
+                                    "too_deep",
+                                    "дата глубже публичного окна; региональный поиск уже прогревается",
+                                )
                         # Check the most likely page first, then immediate neighbours.
                         # This usually turns a 7-12 request local locator into 1-3
                         # foreground verification requests while preserving truth.
@@ -3935,6 +3967,8 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 finally:
                     if live_date is not None and getattr(live_date, "transport_stage", "") == "date-worker-probes":
                         live_date.transport_stage = previous_stage or "browser"
+                    if live_date is not None and getattr(live_date, "phase", "") == active_date_phase:
+                        live_date.phase = previous_phase or ("regional_date" if str(feed_name).startswith("hidden:") else "jumping")
 
             async def sequential_locator(start_page: int = 1):
                 saw_newer = False
@@ -4392,6 +4426,50 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         # target pages; sparse timestamp pages never cause a fake partial by themselves.
         return "needs_hidden", direct_pages_collected
 
+    # v4.3.28 rolling regional Date Worker prewarm. Only Date Worker probes run
+    # concurrently here; foreground local verification/collection stays on the
+    # proven single parser path. This makes the speed-up low-risk.
+    hidden_prewarm_tasks: dict[str, asyncio.Task] = {}
+    hidden_prewarm_sem = asyncio.Semaphore(HIDDEN_DATE_PREWARM_CONCURRENCY)
+
+    async def _prewarm_hidden_date(feed_url: str):
+        if not (HIDDEN_DATE_PREWARM_ENABLED and REMOTE_DATE_WORKER_ENABLED):
+            return None
+        async with hidden_prewarm_sem:
+            try:
+                return await REMOTE_DATE_MANAGER.locate_hint(feed_url, target_date)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("Regional Date Worker prewarm failed url=%s", feed_url, exc_info=True)
+                return None
+
+    def schedule_hidden_date_prewarm(entries: list[tuple[str, str, int]]) -> None:
+        if not (HIDDEN_DATE_PREWARM_ENABLED and REMOTE_DATE_WORKER_ENABLED):
+            return
+        scheduled = sum(1 for task in hidden_prewarm_tasks.values() if not task.done())
+        for _name, feed_url, _level in entries:
+            if feed_url in hidden_prewarm_tasks:
+                continue
+            if scheduled >= HIDDEN_DATE_PREWARM_WINDOW:
+                break
+            hidden_prewarm_tasks[feed_url] = asyncio.create_task(
+                _prewarm_hidden_date(feed_url),
+                name=f"date-prewarm-{cat.key}-{len(hidden_prewarm_tasks)+1}",
+            )
+            scheduled += 1
+
+    async def await_hidden_date_prewarm(feed_url: str) -> None:
+        task = hidden_prewarm_tasks.get(feed_url)
+        if task is None:
+            return
+        try:
+            await task
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
     async def hidden_fill(remaining_virtual_pages: int) -> tuple[bool, bool]:
         """Fill remaining depth from independent location feeds.
 
@@ -4419,7 +4497,8 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
 
         live = category_live_progress.get(progress_key)
         if live is not None:
-            live.phase = "jumping"
+            live.phase = "regional_date"
+            live.transport_stage = "date-worker-regional-prewarm"
             live.collection_start_page = 0
             live.segment_name = ""
             live.segments_done = 0
@@ -4429,6 +4508,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             (state_name, _regional_category_url(cat.url, slug, location_id), 0)
             for state_name, slug, location_id in GERMAN_STATE_SEGMENTS
         ]
+        schedule_hidden_date_prewarm(queue)
 
         def add_children(parent_name: str, loc: dict, level: int) -> bool:
             if level >= max_shard_depth:
@@ -4448,20 +4528,28 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 added += 1
                 if added >= 60:
                     break
+            if added:
+                schedule_hidden_date_prewarm(queue)
             return added > 0
 
         while queue and hidden_pages_collected < goal_pages and feeds_processed < max_hidden_feeds:
             state_name, feed_url, level = queue.pop(0)
             if feed_url in visited:
                 continue
+            # Keep a rolling window of future regional locators warm while this
+            # feed is being locally verified/collected.
+            schedule_hidden_date_prewarm(queue)
             visited.add(feed_url)
             feeds_processed += 1
             if live is not None:
+                live.phase = "regional_date"
+                live.transport_stage = "date-worker-regional-prewarm"
                 live.segment_name = state_name
                 live.segments_done = feeds_processed - 1
                 live.segments_total = max(feeds_processed, feeds_processed + len(queue))
 
             try:
+                await await_hidden_date_prewarm(feed_url)
                 loc = await locate_feed(feed_url, f"hidden:{state_name}")
             except TemporaryAccessError as exc:
                 unresolved = True
@@ -4569,6 +4657,23 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
 
         if nationwide is not None and not reason:
             if nationwide["status"] == "found":
+                # If the requested depth cannot fit before page 50, start regional
+                # date discovery NOW, while nationwide Page Worker collection runs.
+                # By the time hidden_fill is needed, the next state boundaries are
+                # usually already cached in Redis.
+                try:
+                    likely_hidden = (
+                        int(nationwide.get("candidate") or 1) + int(depth) - 1
+                        > int(nationwide.get("limit") or PUBLIC_SEARCH_PAGE_CAP)
+                    )
+                except Exception:
+                    likely_hidden = False
+                if likely_hidden:
+                    initial_hidden = [
+                        (state_name, _regional_category_url(cat.url, slug, location_id), 0)
+                        for state_name, slug, location_id in GERMAN_STATE_SEGMENTS
+                    ]
+                    schedule_hidden_date_prewarm(initial_hidden)
                 outcome, direct_pages_collected = await collect_direct(nationwide)
                 if outcome == "needs_hidden" and not request_complete:
                     remaining = max(0, depth - direct_pages_collected)
@@ -4581,8 +4686,13 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 request_complete = True
                 reason = "выбранная дата надёжно пройдена; объявлений за неё не найдено"
             elif nationwide["status"] == "too_deep":
-                # Deep regional work is justified only when the selected date is
-                # genuinely beyond the public nationwide window.
+                # Cold Date Turbo can reach this branch after a single local page-50
+                # verification. Fan out regional Date Worker probes immediately.
+                initial_hidden = [
+                    (state_name, _regional_category_url(cat.url, slug, location_id), 0)
+                    for state_name, slug, location_id in GERMAN_STATE_SEGMENTS
+                ]
+                schedule_hidden_date_prewarm(initial_hidden)
                 await hidden_fill(depth)
             else:
                 # Unknown chronology is a parser-quality issue, not proof that the
@@ -5215,6 +5325,11 @@ def render_user_job_status(job: ScanJob) -> str:
         elif live.phase in {"jumping", "seeking"}:
             request_steps = min(12, max(0, int(live.network_requests or 0)))
             current_fraction = 0.03 + 0.15 * (request_steps / 12.0)
+        elif live.phase == "regional_date" and depth > 0:
+            # Do not visually reset progress when nationwide collection hands off
+            # to regional depth. Keep the already confirmed page count visible.
+            collected = min(1.0, max(0.0, float(live.collection_index or 0) / depth))
+            current_fraction = 0.18 + 0.77 * collected
         elif live.phase == "views":
             total_views = max(1, int(live.today_seen or 0))
             view_ratio = min(1.0, max(0.0, float(live.views_ready) / total_views))
@@ -5253,12 +5368,18 @@ def render_user_job_status(job: ScanJob) -> str:
                 "browser-fallback": "Browser fallback",
                 "browser-seed": "Browser fallback",
                 "postgres-checkpoint": "PostgreSQL checkpoint",
+                "date-worker-regional-prewarm": "Date Worker · регионы параллельно",
             }
             transport_text = f"⚡ <b>{labels.get(stage, 'HTTP-first hybrid')}</b>\n"
         timeout_text = ""
         if live is not None and live.request_timeouts:
             timeout_text = f"⚠️ Автоповторов по таймауту: <b>{live.request_timeouts}</b>\n"
-        stage_title = "Стабильный проход" if live is not None and live.phase == "stable_scan" else "Поиск даты"
+        if live is not None and live.phase == "stable_scan":
+            stage_title = "Стабильный проход"
+        elif live is not None and live.phase == "regional_date":
+            stage_title = "Региональный добор даты"
+        else:
+            stage_title = "Поиск даты"
         return (
             f"🔎 <b>{stage_title} · {percent}%</b>\n"
             f"{_progress_bar(percent)}\n\n"
@@ -6937,6 +7058,7 @@ async def _admin_date_worker_text() -> str:
         f"Проб отправлено: <b>{int(status.get('probes_queued_total', 0) or 0)}</b> · cache hits: <b>{int(status.get('cache_hits_total', 0) or 0)}</b>",
         f"Predictor hits/miss: <b>{int(status.get('predictor_hits_total', 0) or 0)}/{int(status.get('predictor_misses_total', 0) or 0)}</b> · подтверждений: <b>{int(status.get('predictor_writes_total', 0) or 0)}</b>",
         f"Continue search: <b>{int(status.get('predictor_continue_success_total', 0) or 0)}/{int(status.get('predictor_continue_total', 0) or 0)}</b> успешных продолжений от hint",
+        f"Cold Date Turbo: <b>{'ВКЛ' if status.get('cold_turbo_enabled') else 'ВЫКЛ'}</b> · запусков: <b>{int(status.get('cold_turbo_total', 0) or 0)}</b> · сразу глубже 50: <b>{int(status.get('cold_turbo_public_beyond_total', 0) or 0)}</b>",
     ]
     last_probes = int(status.get("last_batch_probes", 0) or 0)
     if last_probes:
@@ -6947,6 +7069,7 @@ async def _admin_date_worker_text() -> str:
             f"Время remote-поиска: <b>{float(status.get('last_batch_seconds', 0.0) or 0.0):.2f} сек.</b>",
             f"Predictor: <b>{html.escape(str(status.get('last_predictor_source') or 'cold'))}</b> → page <b>{int(status.get('last_predictor_page', 0) or 0) or '—'}</b> · learned points: <b>{int(status.get('last_predictor_points', 0) or 0)}</b>",
             f"Продолжение от hint: rounds <b>{int(status.get('last_predictor_continue_rounds', 0) or 0)}</b> · новых pages <b>{int(status.get('last_predictor_continue_pages', 0) or 0)}</b> · полный fallback <b>{'ДА' if status.get('last_predictor_fallback') else 'нет'}</b>",
+            f"Cold turbo last: <b>{'ДА' if status.get('last_cold_turbo') else 'нет'}</b> · age <b>{int(status.get('last_cold_age_days', 0) or 0)}</b> · grid <code>{html.escape(str(status.get('last_cold_probe_pages') or []))}</code>",
         ])
     for idx, worker in enumerate(workers[:4], start=1):
         lines.extend([
