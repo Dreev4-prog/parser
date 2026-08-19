@@ -3526,6 +3526,8 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             page = max(1, min(effective_limit, int(page)))
             fresh = page not in cache
             from_checkpoint = False
+            remote_page = False
+            local_page_fetched = False
             if not fresh:
                 info = cache[page]
             else:
@@ -3544,13 +3546,12 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
 
                 if info is None:
                     requested_url = page_url(base_url, page)
-                    remote_page = False
                     # v4.3.21 Page Worker. Date-location probes stay on the proven
                     # local parser. Only the post-locator collection phase may consume
                     # the 180-second Redis page cache warmed by dedicated workers.
                     if phase == "collecting" and REMOTE_PAGE_WORKER_ENABLED:
                         try:
-                            info = await REMOTE_PAGE_MANAGER.get_cached(requested_url, page)
+                            info = await REMOTE_PAGE_MANAGER.get_cached_wait(requested_url, page)
                             remote_page = info is not None
                             if remote_page and live_req is not None:
                                 live_req.transport_stage = "page-worker-cache"
@@ -3595,6 +3596,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                                     pass
                         checkpoint_after = int(getattr(parser, "scan_page_checkpoint_hits", 0) or 0)
                         from_checkpoint = checkpoint_after > checkpoint_before
+                        local_page_fetched = not from_checkpoint
                         if live_req is not None and from_checkpoint:
                             live_req.checkpoint_hits += 1
                     elif remote_page and live_req is not None:
@@ -3662,6 +3664,23 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     )
                 except Exception:
                     log.debug("Stable checkpoint write failed category=%s page=%s", cat.key, page, exc_info=True)
+
+            # v4.3.22 cooperative fallback: publish only a page that passed the same
+            # stable quality gate used for PostgreSQL checkpoints. Weak/challenge
+            # responses are never allowed into the shared 180-second cache.
+            if (
+                phase == "collecting"
+                and REMOTE_PAGE_WORKER_ENABLED
+                and local_page_fetched
+                and strong_page
+            ):
+                try:
+                    await REMOTE_PAGE_MANAGER.store_cached(requested_url, page, info)
+                except Exception:
+                    log.debug(
+                        "Could not publish local collecting page category=%s page=%s",
+                        cat.key, page, exc_info=True,
+                    )
 
             update_live(page, days, phase)
             if relation == "unknown":
@@ -4104,7 +4123,10 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         if live is not None:
             live.transport_stage = "page-worker-prefetch"
         try:
-            await REMOTE_PAGE_MANAGER.prefetch(requests)
+            # v4.3.22 streaming dispatch: enqueue the range and immediately start
+            # foreground collection. The previous v4.3.21 path awaited the entire
+            # remote batch here, which was the visible 0/N pause before progress.
+            await REMOTE_PAGE_MANAGER.prefetch(requests, wait_for_results=False)
         except Exception:
             log.debug(
                 "Page Worker prefetch failed category=%s pages=%s-%s; local fallback stays active",
@@ -6738,6 +6760,7 @@ async def _admin_page_worker_text() -> str:
         f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b>",
         f"Redis queue: <b>{int(status.get('queue_depth', 0) or 0)}</b> · активных: <b>{int(status.get('active_total', 0) or 0)}</b>",
         f"Кэш страниц: <b>{int(status.get('cache_ttl', 180) or 180)} сек.</b>",
+        f"Streaming: <b>✅ ВКЛ</b> · ожидание следующей страницы ≤ <b>{int(status.get('cache_wait_ms', 0) or 0)} мс</b>",
         f"Общая скорость: <b>{float(status.get('rate_total', 0.0) or 0.0):.2f} pages/sec</b>",
         f"Обработано worker'ами: <b>{int(status.get('processed_total', 0) or 0)}</b> · ошибок: <b>{int(status.get('errors_total', 0) or 0)}</b>",
     ]
@@ -6747,7 +6770,7 @@ async def _admin_page_worker_text() -> str:
             "",
             f"Последний prefetch: <b>{last_pages}</b> страниц · workers: <b>{int(status.get('last_batch_workers', 0) or 0)}</b>",
             f"Из кэша: <b>{int(status.get('last_batch_cached', 0) or 0)}</b> · отправлено: <b>{int(status.get('last_batch_remote', 0) or 0)}</b> · fallback: <b>{int(status.get('last_batch_failed', 0) or 0)}</b>",
-            f"Время prefetch: <b>{float(status.get('last_batch_seconds', 0.0) or 0.0):.1f} сек.</b>",
+            f"Постановка batch в Redis: <b>{float(status.get('last_batch_seconds', 0.0) or 0.0):.2f} сек.</b>",
         ])
     for idx, worker in enumerate(workers[:4], start=1):
         lines.extend([

@@ -50,6 +50,11 @@ PAGE_REMOTE_TIMEOUT_SECONDS = _env_int("PAGE_REMOTE_TIMEOUT_SECONDS", 150, 20, 6
 PAGE_REMOTE_STALL_SECONDS = _env_int("PAGE_REMOTE_STALL_SECONDS", 25, 8, 120)
 PAGE_HEARTBEAT_STALE_SECONDS = _env_int("PAGE_HEARTBEAT_STALE_SECONDS", 20, 8, 120)
 PAGE_PROGRESS_POLL_MS = _env_int("PAGE_PROGRESS_POLL_MS", 250, 100, 2000)
+# v4.3.22 streaming Page Worker: the foreground scan never waits for the whole
+# 15/25/50-page batch. It may wait briefly for only the *next* page when a worker
+# already owns it, which avoids duplicate local+remote fetches without a 0/N pause.
+PAGE_CACHE_WAIT_MS = _env_int("PAGE_CACHE_WAIT_MS", 1800, 0, 5000)
+PAGE_CACHE_WAIT_POLL_MS = _env_int("PAGE_CACHE_WAIT_POLL_MS", 100, 50, 500)
 PAGE_PREFETCH_ENABLED = _env_bool("PAGE_PREFETCH_ENABLED", True)
 PAGE_PREFETCH_MIN_PAGES = _env_int("PAGE_PREFETCH_MIN_PAGES", 4, 1, 50)
 PAGE_PREFETCH_EXTRA_PAGES = _env_int("PAGE_PREFETCH_EXTRA_PAGES", 3, 0, 10)
@@ -284,11 +289,72 @@ class RemotePageManager:
             log.debug("Page Worker cache read failed", exc_info=True)
         return None
 
+    async def get_cached_wait(
+        self, url: str, requested_page: int, *, wait_ms: int | None = None
+    ) -> CategoryPageInfo | None:
+        """Return a warmed page, briefly waiting only when a worker owns it.
+
+        v4.3.21 waited for the entire prefetch batch before collection could start,
+        which produced the visible 0/50 pause. v4.3.22 streams instead: the scan
+        starts immediately and only the next required page gets a tiny bounded wait.
+        If no Page Worker currently owns that page, return immediately so the stable
+        local parser remains the fallback.
+        """
+        if not self.enabled:
+            return None
+        budget_ms = PAGE_CACHE_WAIT_MS if wait_ms is None else max(0, int(wait_ms))
+        try:
+            redis = await self.connect()
+            cache_id = page_cache_id(url, requested_page)
+            deadline = time.monotonic() + (budget_ms / 1000.0)
+            counted_miss = False
+            while True:
+                pipe = redis.pipeline(transaction=False)
+                pipe.get(self.cache_key(cache_id))
+                pipe.exists(self.pending_key(cache_id))
+                pipe.get(self.error_key(cache_id))
+                raw, pending, error = await pipe.execute()
+                info = deserialize_page_info(raw)
+                if info is not None:
+                    self.cache_hits_total += 1
+                    return info
+                if not counted_miss:
+                    self.cache_misses_total += 1
+                    counted_miss = True
+                # No owner (or an explicit worker error) means local fallback now.
+                if error or not pending or budget_ms <= 0 or time.monotonic() >= deadline:
+                    return None
+                await asyncio.sleep(min(PAGE_CACHE_WAIT_POLL_MS / 1000.0, max(0.0, deadline - time.monotonic())))
+        except Exception:
+            log.debug("Page Worker cache wait failed", exc_info=True)
+            return None
+
+    async def store_cached(self, url: str, requested_page: int, info: CategoryPageInfo) -> None:
+        """Publish a locally-fetched page into the same 180-second shared cache.
+
+        This makes the fallback cooperative: if the foreground parser beats the Page
+        Worker to a page, simultaneous users can reuse that result instead of fetching
+        the page yet again.
+        """
+        if not self.enabled or info is None:
+            return
+        try:
+            redis = await self.connect()
+            cache_id = page_cache_id(url, requested_page)
+            raw = serialize_page_info(info)
+            pipe = redis.pipeline(transaction=False)
+            pipe.set(self.cache_key(cache_id), raw, ex=PAGE_CACHE_TTL_SECONDS)
+            pipe.delete(self.pending_key(cache_id), self.error_key(cache_id))
+            await pipe.execute()
+        except Exception:
+            log.debug("Could not publish local page into Page Worker cache", exc_info=True)
+
     async def prefetch(
         self,
         requests: list[tuple[int, str]],
         *,
         progress_cb: Callable[[int, int], Awaitable[None] | None] | None = None,
+        wait_for_results: bool = True,
     ) -> dict[int, CategoryPageInfo]:
         """Warm and return a page range through Redis Page Worker replicas.
 
@@ -340,33 +406,55 @@ class RemotePageManager:
             self.last_batch_cached += 1
             self.cache_hits_total += 1
 
-        # Single-flight enqueue: exactly one caller owns a missing page while every
-        # other simultaneous scan just waits for the same cache key to appear.
+        # Single-flight enqueue in two Redis round trips instead of one round trip
+        # per page. This removes dispatch latency for 25/50-page scans and ensures
+        # both replicas see work immediately.
         enqueued = 0
-        for cid, (page, url, _cid) in pending.items():
-            token = f"{os.getpid()}:{time.time_ns()}"
-            owner = False
+        owned: list[tuple[str, int, str]] = []
+        if pending:
+            ids_to_claim = list(pending)
+            claim_pipe = redis.pipeline(transaction=False)
+            tokens: dict[str, str] = {}
+            for cid in ids_to_claim:
+                token = f"{os.getpid()}:{time.time_ns()}:{cid[:8]}"
+                tokens[cid] = token
+                claim_pipe.set(self.pending_key(cid), token, ex=PAGE_PENDING_TTL_SECONDS, nx=True)
             try:
-                owner = bool(await redis.set(
-                    self.pending_key(cid), token, ex=PAGE_PENDING_TTL_SECONDS, nx=True
-                ))
-                if owner:
-                    await redis.delete(self.error_key(cid))
-                    await redis.xadd(PAGE_STREAM, {
+                ownership = await claim_pipe.execute()
+            except Exception:
+                ownership = [False] * len(ids_to_claim)
+                self.prefetch_errors_total += len(ids_to_claim)
+                log.debug("Could not claim Page Worker batch", exc_info=True)
+
+            for cid, is_owner in zip(ids_to_claim, ownership):
+                if not is_owner:
+                    continue
+                page, url, _cid = pending[cid]
+                owned.append((cid, page, url))
+
+            if owned:
+                enqueue_pipe = redis.pipeline(transaction=False)
+                for cid, page, url in owned:
+                    enqueue_pipe.delete(self.error_key(cid))
+                    enqueue_pipe.xadd(PAGE_STREAM, {
                         "cache_id": cid,
                         "url": url,
                         "page": str(page),
                         "queued_at": str(int(time.time())),
                     })
-                    enqueued += 1
-            except Exception:
-                if owner:
+                try:
+                    await enqueue_pipe.execute()
+                    enqueued = len(owned)
+                except Exception:
+                    self.prefetch_errors_total += len(owned)
+                    cleanup = redis.pipeline(transaction=False)
+                    for cid, _page, _url in owned:
+                        cleanup.delete(self.pending_key(cid))
                     try:
-                        await redis.delete(self.pending_key(cid))
+                        await cleanup.execute()
                     except Exception:
                         pass
-                self.prefetch_errors_total += 1
-                log.debug("Could not enqueue Page Worker page=%s", page, exc_info=True)
+                    log.debug("Could not enqueue Page Worker batch", exc_info=True)
         self.prefetch_remote_total += enqueued
         self.last_batch_remote = enqueued
 
@@ -378,6 +466,13 @@ class RemotePageManager:
                     await maybe
             except Exception:
                 pass
+
+        # Streaming mode: scheduling is complete, so hand control back to the stable
+        # foreground collector immediately. Workers continue warming cache entries in
+        # parallel and fetch() consumes each page as soon as it becomes available.
+        if not wait_for_results:
+            self.last_batch_seconds = max(0.0, time.monotonic() - started)
+            return results
 
         deadline = time.monotonic() + PAGE_REMOTE_TIMEOUT_SECONDS
         last_progress_at = time.monotonic()
@@ -434,6 +529,8 @@ class RemotePageManager:
             "workers": [],
             "cache_ttl": PAGE_CACHE_TTL_SECONDS,
             "prefetch_enabled": PAGE_PREFETCH_ENABLED,
+            "streaming": True,
+            "cache_wait_ms": PAGE_CACHE_WAIT_MS,
             "cache_hits_total": self.cache_hits_total,
             "cache_misses_total": self.cache_misses_total,
             "prefetch_batches_total": self.prefetch_batches_total,
