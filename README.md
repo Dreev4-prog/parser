@@ -64,6 +64,12 @@ The defaults above are already built in; you do not need to add them unless you 
 
 See `DEPLOY_V4_3_28_COLD_DATE_TURBO.md`.
 
+
+## v4.3.34 — Triple Worker Fleet
+
+Recommended Railway replicas: Date Worker ×3, Page Worker ×3, View Worker ×3.
+The bot defaults to 4 simultaneous local scan slots; regional Date pipeline can keep 3 locators in flight with a 6-region look-ahead. Per-worker concurrency remains unchanged for safety.
+
 ## v4.3.33 — Parallel Regional Locator + Regional/Page Pipeline
 
 For old dates that are deeper than the nationwide 50-page window, regional fallback now pipelines work instead of waiting for every region serially:

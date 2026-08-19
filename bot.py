@@ -117,7 +117,7 @@ STABLE_PAGE_RETRY_SECONDS = max(0.2, min(10.0, float(os.getenv("STABLE_PAGE_RETR
 MULTIUSER_STABLE_MODE = os.getenv("MULTIUSER_STABLE_MODE", "1").strip().lower() not in {
     "0", "false", "no", "off",
 }
-MULTIUSER_LOCAL_WORKERS = max(1, min(5, int(os.getenv("MULTIUSER_LOCAL_WORKERS", "3"))))
+MULTIUSER_LOCAL_WORKERS = max(1, min(5, int(os.getenv("MULTIUSER_LOCAL_WORKERS", "4"))))
 # v4.3.3: process-wide foreground public-view lane. v4.3.0 still inherited the
 # old global traffic limit of three view requests, so three simultaneous scans
 # were forced to share only three slots. Six keeps two fast official-counter
@@ -381,15 +381,17 @@ HIDDEN_DATE_PREWARM_ENABLED = os.getenv("HIDDEN_DATE_PREWARM_ENABLED", "0").stri
 HIDDEN_DATE_PREWARM_WINDOW = max(1, min(4, int(os.getenv("HIDDEN_DATE_PREWARM_WINDOW", "2"))))
 HIDDEN_DATE_PREWARM_CONCURRENCY = max(1, min(2, int(os.getenv("HIDDEN_DATE_PREWARM_CONCURRENCY", "1"))))
 
-# v4.3.33 Regional Pipeline.  Old-date scans that genuinely need location shards
-# keep the trusted foreground verifier, but Date Worker starts locating the next
-# regions while Page Worker/main collection processes the current one.  Only
-# remote hints are parallel; no remote hint is accepted as truth.
+# v4.3.34 Triple Worker Fleet profile. Old-date scans still use the trusted
+# foreground verifier, but a three-replica Date Worker fleet can now keep three
+# independent regional locators in flight. This increases capacity by adding
+# Railway replicas instead of raising per-worker request concurrency. Remote
+# hints remain hints only; every accepted page still goes through exact local
+# verification/fallback.
 REGIONAL_DATE_PIPELINE_ENABLED = os.getenv("REGIONAL_DATE_PIPELINE_ENABLED", "1").strip().lower() not in {
     "0", "false", "no", "off",
 }
-REGIONAL_DATE_PIPELINE_WINDOW = max(1, min(4, int(os.getenv("REGIONAL_DATE_PIPELINE_WINDOW", "4"))))
-REGIONAL_DATE_PIPELINE_CONCURRENCY = max(1, min(2, int(os.getenv("REGIONAL_DATE_PIPELINE_CONCURRENCY", "2"))))
+REGIONAL_DATE_PIPELINE_WINDOW = max(1, min(8, int(os.getenv("REGIONAL_DATE_PIPELINE_WINDOW", "6"))))
+REGIONAL_DATE_PIPELINE_CONCURRENCY = max(1, min(4, int(os.getenv("REGIONAL_DATE_PIPELINE_CONCURRENCY", "3"))))
 
 def _regional_category_url(base_url: str, slug: str, location_id: int) -> str:
     m = re.match(r"^(https://www\.kleinanzeigen\.de/.+)/(c\d+)$", base_url.rstrip("/"))
@@ -5512,7 +5514,7 @@ def render_user_job_status(job: ScanJob) -> str:
                 "browser-seed": "Browser fallback",
                 "postgres-checkpoint": "PostgreSQL checkpoint",
                 "date-worker-regional-prewarm": "Date Worker · регионы параллельно",
-                "date-worker-regional-pipeline": "Date Worker ×2 · региональный pipeline",
+                "date-worker-regional-pipeline": "Date Worker · региональный pipeline",
             }
             transport_text = f"⚡ <b>{labels.get(stage, 'HTTP-first hybrid')}</b>\n"
         timeout_text = ""
