@@ -48,7 +48,7 @@ DATE_ERROR_TTL_SECONDS = _env_int("DATE_ERROR_TTL_SECONDS", 45, 10, 180)
 DATE_HEARTBEAT_STALE_SECONDS = _env_int("DATE_HEARTBEAT_STALE_SECONDS", 20, 8, 120)
 DATE_PROBE_TIMEOUT_SECONDS = _env_int("DATE_PROBE_TIMEOUT_SECONDS", 10, 3, 45)
 DATE_PROBE_POLL_MS = _env_int("DATE_PROBE_POLL_MS", 120, 50, 1000)
-DATE_MAX_AGE_DAYS = 6  # hard product limit: today + previous six days = seven calendar dates
+DATE_MAX_AGE_DAYS = 4  # hard product limit: today + previous four days = five calendar dates
 DATE_INITIAL_PROBES = (1, 2, 4, 8, 16, 32, 50)
 
 # v4.3.28 Cold Date Turbo. A first-ever search has no predictor history, so
@@ -78,7 +78,7 @@ def cold_date_probe_pages(target_date: str) -> list[int]:
     elif age == 4:
         pages = (1, 7, 14, 21, 28, 35, 41, 46, 50)
     else:
-        # The 5th/6th previous day is normally the expensive cold path. Spread
+        # Defensive fallback for any future wider date window. Spread
         # probes nearly uniformly over the public 50-page window so the first
         # round brackets the date instead of walking 1/2/4/8/16/32/50.
         # v4.3.29 SAFE Cold Turbo: seven wide probes are enough to bracket an
@@ -332,7 +332,7 @@ class RemoteDateManager:
             target = date.fromisoformat(str(target_date))
             redis = await self.connect()
             # Exact target plus six days on either side is enough for the product's
-            # seven-day selection window and avoids Redis key scans.
+            # bounded five-day selection window and avoids Redis key scans.
             days = [target + timedelta(days=offset) for offset in range(-6, 7)]
             keys = [self.predictor_key(base_url, day.isoformat()) for day in days]
             raws = await redis.mget(keys)

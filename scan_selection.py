@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MAX_SELECTED_CATEGORIES = 5
+MAX_SELECTED_CATEGORIES = 2
 
 
 def toggle_selection(
@@ -39,7 +39,7 @@ def bulk_group_selection(
     *,
     root_key: str,
 ) -> tuple[set[str], bool]:
-    """Clear selected children or fill only the remaining slots up to five."""
+    """Clear selected children or fill only the remaining slots up to two."""
     selected_children = [key for key in child_keys if key in selected]
     if selected_children:
         return set(selected) - set(selected_children), False

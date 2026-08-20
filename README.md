@@ -1,3 +1,7 @@
+# DT Parser v4.3.38 — STABILITY LIMITS
+
+**Новые лимиты:** максимум **2 категории** на скан и только **5 дат** (сегодня + 4 предыдущих дня). Ручной ввод даты убран. Worker fleet: Date ×4 / Page ×4 / View ×4.
+
 # DT Parser v4.3.36 — Four-User Fleet
 
 Production profile: Date Worker ×4, Page Worker ×4, View Worker ×4. View replicas share a fleet-wide Redis budget of 16 official-counter HTTP requests and take one shard at a time for fair distribution/recovery. Regional old-date locator can keep four independent regions in flight. No new Railway variables are required.

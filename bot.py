@@ -680,7 +680,7 @@ def page_limit_keyboard() -> InlineKeyboardMarkup:
 
 
 def scan_date_keyboard() -> InlineKeyboardMarkup:
-    """Seven-day date picker. Older dates are intentionally unavailable."""
+    """Five-day date picker. Manual/older dates are intentionally unavailable."""
     today = datetime.now(MOSCOW).date()
     days = [today - timedelta(days=offset) for offset in range(DATE_MAX_AGE_DAYS + 1)]
     labels: list[InlineKeyboardButton] = []
@@ -695,7 +695,6 @@ def scan_date_keyboard() -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for index in range(0, len(labels), 2):
         rows.append(labels[index:index + 2])
-    rows.append([InlineKeyboardButton(text="⌨️ Ввести дату", callback_data="scan_date:custom")])
     rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1655,7 +1654,7 @@ async def _replace_selected_categories(user_id: int, keys: set[str]) -> set[str]
 
 
 async def toggle_category(user_id: int, key: str) -> tuple[set[str], bool]:
-    """Toggle one category without ever allowing a new selection above 5.
+    """Toggle one category without ever allowing a new selection above 2.
 
     Returns (selected, limit_reached). Removing a category is always allowed.
     Choosing a group-root replaces its child selections; choosing a child replaces
@@ -8071,7 +8070,8 @@ async def _begin_scan_from_message(message: Message, state: FSMContext) -> None:
     await message.answer(
         "<b>▶️ Новый скан</b>\n\n"
         "<b>1/3 · Дата объявлений</b>\n"
-        "Выбери день. Время считаем по Москве.",
+        "Выбери одну из 5 доступных дат: сегодня или один из 4 предыдущих дней. "
+        "Время считаем по Москве.",
         parse_mode=ParseMode.HTML,
         reply_markup=scan_date_keyboard(),
     )
@@ -9845,7 +9845,8 @@ async def start_scan(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.answer(
         "<b>▶️ Новый скан</b>\n\n"
         "<b>1/3 · Дата объявлений</b>\n"
-        "Выбери день. Время считаем по Москве.",
+        "Выбери одну из 5 доступных дат: сегодня или один из 4 предыдущих дней. "
+        "Время считаем по Москве.",
         parse_mode=ParseMode.HTML,
         reply_markup=scan_date_keyboard(),
     )
@@ -9936,15 +9937,15 @@ async def choose_scan_date(callback: CallbackQuery, state: FSMContext) -> None:
         await _show_scan_price_choice(callback.message, state, callback.from_user.id, target_date)
         return
     if choice == "custom":
-        await state.set_state(ScanInput.target_date)
-        await callback.answer()
-        oldest = today - timedelta(days=DATE_MAX_AGE_DAYS)
+        # v4.3.38: manual date entry is no longer part of the product flow.
+        # Keep this guard for stale Telegram callback buttons from older messages.
+        await state.set_state(None)
+        await callback.answer("Выбери одну из 5 доступных дат", show_alert=True)
         await callback.message.answer(
-            "<b>🗓 Своя дата</b>\n\n"
-            f"Можно выбрать только последние <b>{DATE_MAX_AGE_DAYS + 1} дней</b>: "
-            f"с <b>{oldest:%d.%m.%Y}</b> по <b>{today:%d.%m.%Y}</b>.\n"
-            "Отправь <code>10.08.2026</code>, <code>10.08</code> или просто <code>10</code>.",
+            "<b>📅 Выбор даты</b>\n\n"
+            "Доступны только 5 дат: сегодня и 4 предыдущих дня.",
             parse_mode=ParseMode.HTML,
+            reply_markup=scan_date_keyboard(),
         )
         return
     try:
@@ -9963,19 +9964,19 @@ async def choose_scan_date(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(ScanInput.target_date)
 async def receive_scan_date(message: Message, state: FSMContext) -> None:
+    # v4.3.38: typed dates are deliberately disabled. This handler only catches
+    # stale FSM state left by a pre-upgrade message and returns the bounded picker.
     if not allowed(message.from_user.id):
         await state.clear()
         await message.answer("Нет доступа.")
         return
-    target_date = _parse_scan_date_input(message.text)
-    if target_date is None:
-        await message.answer(
-            f"⚠️ Не понял дату. Можно выбрать только последние <b>{DATE_MAX_AGE_DAYS + 1} дней</b>. "
-            "Отправь, например, <code>12</code>, <code>10.08</code> или <code>10.08.2026</code>.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    await _show_scan_price_choice(message, state, message.from_user.id, target_date)
+    await state.set_state(None)
+    await message.answer(
+        "<b>📅 Выбери дату кнопкой</b>\n\n"
+        "Доступны только 5 дат: сегодня и 4 предыдущих дня.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=scan_date_keyboard(),
+    )
 
 
 @dp.callback_query(F.data == "scanprice_menu")
