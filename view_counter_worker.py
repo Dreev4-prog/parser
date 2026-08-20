@@ -34,6 +34,23 @@ def _env_float(name: str, default: float, minimum: float, maximum: float) -> flo
     return max(minimum, min(maximum, value))
 
 
+# v4.4.0 ignores stale safety-critical worker tuning unless explicitly opted in.
+# This prevents old Railway variables from silently undoing the four-replica
+# fleet guard after a deployment.
+_ALLOW_LEGACY_TUNING = _env_bool("DT_ALLOW_LEGACY_WORKER_TUNING", False)
+if not _ALLOW_LEGACY_TUNING:
+    for _name, _value in {
+        "VIEW_WORKER_POOL_MIN": "4",
+        "VIEW_WORKER_POOL_DEFAULT": "5",
+        "VIEW_WORKER_POOL_MAX": "6",
+        "VIEW_WORKER_BROWSER_POOL_SIZE": "1",
+        "VIEW_WORKER_ROUND_SIZE": "24",
+        "VIEW_WORKER_MAX_ACTIVE_JOBS": "1",
+        "VIEW_WORKER_ROUND_TIMEOUT_SECONDS": "120",
+        "VIEW_JOB_TIMEOUT_SECONDS": "120",
+    }.items():
+        os.environ[_name] = _value
+
 # ---------------------------------------------------------------------------
 # v4.3.18 DUAL VIEW WORKER
 # ---------------------------------------------------------------------------
@@ -62,10 +79,14 @@ ADAPTIVE_UNKNOWN_WARN_RATIO = _env_float("VIEW_WORKER_ADAPTIVE_UNKNOWN_WARN_RATI
 # fourth replica increases distribution/recovery capacity, not request pressure:
 # the fleet-wide view budget stays capped at 16 and 403/429 cooldown is shared.
 # Main bot / Date / Page workers keep their existing proven traffic modes.
-os.environ.setdefault("STABLE_SINGLE_SERVICE_MODE", "0")
-os.environ.setdefault("DIST_TRAFFIC_VIEW_LIMIT", "16")
-os.environ.setdefault("DIST_TRAFFIC_GLOBAL_LIMIT", "16")
-os.environ.setdefault("DIST_TRAFFIC_BROWSER_LIMIT", "1")
+os.environ["STABLE_SINGLE_SERVICE_MODE"] = "0"
+os.environ["DIST_TRAFFIC_VIEW_BUCKET"] = "view"
+os.environ["DIST_TRAFFIC_BROWSER_BUCKET"] = "view-browser"
+os.environ["DIST_TRAFFIC_GLOBAL_BUCKET"] = "view-fleet"
+os.environ["DIST_TRAFFIC_COOLDOWN_BUCKET"] = "view-fleet"
+os.environ["DIST_TRAFFIC_VIEW_LIMIT"] = "16"
+os.environ["DIST_TRAFFIC_GLOBAL_LIMIT"] = "16"
+os.environ["DIST_TRAFFIC_BROWSER_LIMIT"] = "1"
 
 # The TrafficManager is created during parser import. Give it the physical MAX;
 # the worker later lowers base_view_limit to current_pool before every round.
@@ -83,6 +104,7 @@ try:
 except Exception as exc:  # pragma: no cover
     raise RuntimeError("redis package is required for view worker") from exc
 
+from app_version import APP_VERSION
 from parser import KleinanzeigenParser, shutdown_shared_browser_runtime
 from traffic import TRAFFIC
 from view_manager import (
@@ -257,13 +279,16 @@ class ViewCounterWorker:
         payload = {
             "ts": time.time(),
             "consumer": self.consumer,
-            "version": "4.3.18",
+            "version": APP_VERSION,
             "view_pool": self.current_pool,
             "pool_min": VIEW_POOL_MIN,
             "pool_default": VIEW_POOL_DEFAULT,
             "pool_max": VIEW_POOL_MAX,
             "traffic_view_limit": traffic_view_limit,
             "browser_pool": BROWSER_POOL,
+            "fleet_view_limit": int(os.environ.get("DIST_TRAFFIC_VIEW_LIMIT", "16")),
+            "fleet_global_limit": int(os.environ.get("DIST_TRAFFIC_GLOBAL_LIMIT", "16")),
+            "fleet_bucket": os.environ.get("DIST_TRAFFIC_GLOBAL_BUCKET", "view-fleet"),
             "active_jobs": len(self.active),
             "round_size": ROUND_SIZE,
             "processing_round": self._processing_round,

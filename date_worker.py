@@ -15,17 +15,41 @@ from datetime import datetime
 DATE_WORKER_HTTP_FIRST = os.getenv("DATE_WORKER_HTTP_FIRST", "1").strip().lower() not in {
     "0", "false", "no", "off",
 }
+_ALLOW_LEGACY_TUNING = os.getenv("DT_ALLOW_LEGACY_WORKER_TUNING", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 os.environ["SCAN_TRANSPORT"] = "hybrid" if DATE_WORKER_HTTP_FIRST else "browser"
 os.environ.setdefault("HYBRID_HTTP_FIRST", "1")
 os.environ.setdefault("HYBRID_WATCHDOG_SECONDS", "8")
 os.environ.setdefault("HYBRID_DIRECT_HTTP_RETRIES", "1")
 os.environ.setdefault("HYBRID_BROWSER_FALLBACK_LIMIT", "4")
 os.environ.setdefault("SHARED_BROWSER_RUNTIME", "1")
-os.environ.setdefault("STABLE_SINGLE_SERVICE_MODE", "1")
-os.environ.setdefault("TRAFFIC_SCAN_CONCURRENCY", "2")
-os.environ.setdefault("TRAFFIC_GLOBAL_CONCURRENCY", "3")
-os.environ.setdefault("TRAFFIC_SCAN_MIN_INTERVAL_SECONDS", "0.20")
 
+# v4.4.0 production fleet profile. Date replicas now participate in the Redis
+# traffic governor instead of multiplying process-local limits. Old Railway
+# tuning variables are ignored by default so a forgotten v4.3 experiment cannot
+# silently make four replicas aggressive again.
+if not _ALLOW_LEGACY_TUNING:
+    os.environ["DATE_WORKER_CONCURRENCY"] = "2"
+    os.environ["DATE_WORKER_BROWSER_CONFIRM_CONCURRENCY"] = "1"
+    os.environ["TRAFFIC_SCAN_CONCURRENCY"] = "2"
+    os.environ["TRAFFIC_GLOBAL_CONCURRENCY"] = "3"
+    os.environ["TRAFFIC_SCAN_MIN_INTERVAL_SECONDS"] = "0.20"
+else:
+    os.environ.setdefault("TRAFFIC_SCAN_CONCURRENCY", "2")
+    os.environ.setdefault("TRAFFIC_GLOBAL_CONCURRENCY", "3")
+    os.environ.setdefault("TRAFFIC_SCAN_MIN_INTERVAL_SECONDS", "0.20")
+os.environ["STABLE_SINGLE_SERVICE_MODE"] = "0"
+os.environ["DIST_TRAFFIC_SCAN_BUCKET"] = "date"
+os.environ["DIST_TRAFFIC_BROWSER_BUCKET"] = "date-browser"
+os.environ["DIST_TRAFFIC_GLOBAL_BUCKET"] = "search-fleet"
+os.environ["DIST_TRAFFIC_COOLDOWN_BUCKET"] = "search-fleet"
+os.environ["DIST_TRAFFIC_SCAN_LIMIT"] = "4"
+os.environ["DIST_TRAFFIC_BROWSER_LIMIT"] = "2"
+os.environ["DIST_TRAFFIC_GLOBAL_LIMIT"] = "8"
+os.environ["DIST_TRAFFIC_SHARED_COOLDOWN"] = "1"
+
+from app_version import APP_VERSION
 from parser import KleinanzeigenParser, TemporaryAccessError, profile_page_dates, shutdown_shared_browser_runtime
 from date_manager import (
     DATE_CACHE_TTL_SECONDS,
@@ -56,9 +80,8 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
 
-# v4.3.28: four HTTP-first consumers per replica. With two Railway replicas this
-# gives up to eight cheap date probes in flight, while browser confirmation stays
-# separately throttled below.
+# v4.4.0: two local consumers per replica, with Redis fleet guards across four
+# Railway replicas. This preserves distribution without multiplying site pressure.
 DATE_WORKER_CONCURRENCY = _env_int("DATE_WORKER_CONCURRENCY", 2, 1, 4)
 DATE_WORKER_BROWSER_CONFIRM_CONCURRENCY = _env_int("DATE_WORKER_BROWSER_CONFIRM_CONCURRENCY", 1, 1, 2)
 DATE_WORKER_HEARTBEAT_SECONDS = _env_int("DATE_WORKER_HEARTBEAT_SECONDS", 3, 1, 15)
@@ -136,7 +159,7 @@ class DateWorkerProcess:
         self._group_ready = False
         self._stop = asyncio.Event()
         # HTTP probes are cheap and parallel. Chromium confirmation is deliberately
-        # narrow: default one per replica (two total with the recommended x2 setup).
+        # narrow and also protected by the Redis date-browser fleet bucket.
         self._browser_confirm_sem = asyncio.Semaphore(DATE_WORKER_BROWSER_CONFIRM_CONCURRENCY)
 
         TRAFFIC.base_scan_limit = max(1, DATE_WORKER_CONCURRENCY)
@@ -190,10 +213,14 @@ class DateWorkerProcess:
         payload = {
             "ts": time.time(),
             "consumer": self.base_id,
-            "version": "4.3.29",
+            "version": APP_VERSION,
             "replica": os.getenv("RAILWAY_REPLICA_ID", "local"),
             "concurrency": DATE_WORKER_CONCURRENCY,
             "browser_confirm_concurrency": DATE_WORKER_BROWSER_CONFIRM_CONCURRENCY,
+            "fleet_scan_limit": int(os.environ.get("DIST_TRAFFIC_SCAN_LIMIT", "4")),
+            "fleet_browser_limit": int(os.environ.get("DIST_TRAFFIC_BROWSER_LIMIT", "2")),
+            "fleet_global_limit": int(os.environ.get("DIST_TRAFFIC_GLOBAL_LIMIT", "8")),
+            "fleet_bucket": os.environ.get("DIST_TRAFFIC_GLOBAL_BUCKET", "search-fleet"),
             "active": self.active,
             "queue_depth": queue_depth,
             "processed": self.processed,

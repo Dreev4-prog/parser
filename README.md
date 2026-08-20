@@ -1,3 +1,29 @@
+# DT Parser v4.4.0 — STABILITY HARDENING
+
+Большое обновление стабильности поверх v4.3.38. Product limits остаются: **до 2 категорий**, **5 дат** (сегодня + 4 предыдущих), **15/25/50 страниц**, Worker fleet **Date ×4 / Page ×4 / View ×4**.
+
+## Что изменено
+
+- **Date/Page Fleet Guard:** четыре реплики теперь делят Redis-лимиты по ролям и общий search-fleet budget; добавление реплик больше не умножает сетевое давление.
+- **Rolling Page Prefetch:** Page Worker прогревает небольшое окно впереди и подкидывает новые страницы только пока выбранная дата реально продолжается.
+- **DB write safety:** `upsert_page_items()` сам владеет `db_write_lock`, поэтому будущий/параллельный вызов не сможет забыть сериализацию `SELECT → INSERT`.
+- **Partial View Recovery:** если один view-shard падает, результаты остальных сохраняются; локально пересчитываются только отсутствующие URL, а не весь batch.
+- **Единая версия:** Date/Page/View heartbeat и service launcher читают общий `VERSION=4.4.0`; старые номера worker-версий больше не вводят в заблуждение.
+- **Чистый production profile:** safety-critical старые Railway tuning variables игнорируются по умолчанию.
+- **Regression tests:** добавлены тесты на rolling prefetch, 2-category limit, traffic buckets, view partial-shard recovery и ключевые release invariants.
+
+## Что специально НЕ менялось
+
+- Текущая московская логика определения/выбора даты оставлена как есть.
+- `SCAN_CATEGORY_HARD_TIMEOUT_SECONDS=1200` (20 минут) оставлен как есть.
+- Финальная точная проверка даты основным parser, строгий Page Worker quality gate и exact views semantics не ослаблялись.
+
+## Railway
+
+Оставить **Date Worker ×4, Page Worker ×4, View Worker ×4**. Новых обязательных Variables нет. После деплоя `v4.4.0` worker-сервисы сами применяют безопасный fleet profile.
+
+---
+
 # DT Parser v4.3.38 — STABILITY LIMITS
 
 **Новые лимиты:** максимум **2 категории** на скан и только **5 дат** (сегодня + 4 предыдущих дня). Ручной ввод даты убран. Worker fleet: Date ×4 / Page ×4 / View ×4.

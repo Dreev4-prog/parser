@@ -11,11 +11,32 @@ import time
 # in the stable main service, but move page navigation to separate Railway power.
 os.environ.setdefault("SCAN_TRANSPORT", "browser")
 os.environ.setdefault("SHARED_BROWSER_RUNTIME", "1")
-os.environ.setdefault("STABLE_SINGLE_SERVICE_MODE", "1")
-os.environ.setdefault("TRAFFIC_SCAN_CONCURRENCY", "2")
-os.environ.setdefault("TRAFFIC_GLOBAL_CONCURRENCY", "3")
-os.environ.setdefault("TRAFFIC_SCAN_MIN_INTERVAL_SECONDS", "0.35")
+_ALLOW_LEGACY_TUNING = os.getenv("DT_ALLOW_LEGACY_WORKER_TUNING", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 
+# v4.4.0 production fleet profile. Four Page Worker replicas share bounded
+# Redis lanes instead of behaving like four unrelated two-context processes.
+if not _ALLOW_LEGACY_TUNING:
+    os.environ["PAGE_WORKER_CONCURRENCY"] = "2"
+    os.environ["TRAFFIC_SCAN_CONCURRENCY"] = "2"
+    os.environ["TRAFFIC_GLOBAL_CONCURRENCY"] = "3"
+    os.environ["TRAFFIC_SCAN_MIN_INTERVAL_SECONDS"] = "0.35"
+else:
+    os.environ.setdefault("TRAFFIC_SCAN_CONCURRENCY", "2")
+    os.environ.setdefault("TRAFFIC_GLOBAL_CONCURRENCY", "3")
+    os.environ.setdefault("TRAFFIC_SCAN_MIN_INTERVAL_SECONDS", "0.35")
+os.environ["STABLE_SINGLE_SERVICE_MODE"] = "0"
+os.environ["DIST_TRAFFIC_SCAN_BUCKET"] = "page"
+os.environ["DIST_TRAFFIC_BROWSER_BUCKET"] = "page-browser"
+os.environ["DIST_TRAFFIC_GLOBAL_BUCKET"] = "search-fleet"
+os.environ["DIST_TRAFFIC_COOLDOWN_BUCKET"] = "search-fleet"
+os.environ["DIST_TRAFFIC_SCAN_LIMIT"] = "6"
+os.environ["DIST_TRAFFIC_BROWSER_LIMIT"] = "4"
+os.environ["DIST_TRAFFIC_GLOBAL_LIMIT"] = "8"
+os.environ["DIST_TRAFFIC_SHARED_COOLDOWN"] = "1"
+
+from app_version import APP_VERSION
 from parser import KleinanzeigenParser, TemporaryAccessError, shutdown_shared_browser_runtime
 from page_manager import (
     PAGE_CACHE_TTL_SECONDS,
@@ -78,8 +99,8 @@ class PageWorkerProcess:
         self._group_ready = False
         self._stop = asyncio.Event()
 
-        # Keep category pressure bounded per Page Worker replica. Two replicas with
-        # the default local concurrency produce four isolated browser contexts.
+        # Keep local category pressure bounded; Redis fleet guards cap the aggregate
+        # across all four Page Worker replicas.
         TRAFFIC.base_scan_limit = max(1, PAGE_WORKER_CONCURRENCY)
         TRAFFIC.base_global_limit = max(2, PAGE_WORKER_CONCURRENCY + 1)
 
@@ -134,9 +155,13 @@ class PageWorkerProcess:
         payload = {
             "ts": time.time(),
             "consumer": self.base_id,
-            "version": "4.3.23",
+            "version": APP_VERSION,
             "replica": os.getenv("RAILWAY_REPLICA_ID", "local"),
             "concurrency": PAGE_WORKER_CONCURRENCY,
+            "fleet_scan_limit": int(os.environ.get("DIST_TRAFFIC_SCAN_LIMIT", "6")),
+            "fleet_browser_limit": int(os.environ.get("DIST_TRAFFIC_BROWSER_LIMIT", "4")),
+            "fleet_global_limit": int(os.environ.get("DIST_TRAFFIC_GLOBAL_LIMIT", "8")),
+            "fleet_bucket": os.environ.get("DIST_TRAFFIC_GLOBAL_BUCKET", "search-fleet"),
             "active": self.active,
             "queue_depth": queue_depth,
             "processed": self.processed,

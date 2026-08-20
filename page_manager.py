@@ -58,6 +58,34 @@ PAGE_CACHE_WAIT_POLL_MS = _env_int("PAGE_CACHE_WAIT_POLL_MS", 100, 50, 500)
 PAGE_PREFETCH_ENABLED = _env_bool("PAGE_PREFETCH_ENABLED", True)
 PAGE_PREFETCH_MIN_PAGES = _env_int("PAGE_PREFETCH_MIN_PAGES", 4, 1, 50)
 PAGE_PREFETCH_EXTRA_PAGES = _env_int("PAGE_PREFETCH_EXTRA_PAGES", 3, 0, 10)
+# v4.4.0 Rolling Prefetch. Never enqueue all 50 pages up front. Keep a small
+# warm window and top it up only while chronology says the selected date
+# continues. This cuts wasted Page Worker traffic when the day ends early.
+PAGE_PREFETCH_WINDOW_PAGES = _env_int("PAGE_PREFETCH_WINDOW_PAGES", 10, 4, 20)
+PAGE_PREFETCH_LOW_WATER_PAGES = _env_int("PAGE_PREFETCH_LOW_WATER_PAGES", 4, 1, 10)
+
+
+def rolling_prefetch_range(
+    current_page: int,
+    last_scheduled_page: int,
+    limit: int,
+    *,
+    window_pages: int = PAGE_PREFETCH_WINDOW_PAGES,
+    low_water_pages: int = PAGE_PREFETCH_LOW_WATER_PAGES,
+) -> tuple[int, int] | None:
+    """Return the next non-overlapping prefetch slice, or None when still warm."""
+    current = max(1, int(current_page))
+    last = max(0, int(last_scheduled_page))
+    cap = max(1, int(limit))
+    if current >= cap:
+        return None
+    if last > current and (last - current) > max(0, int(low_water_pages)):
+        return None
+    start = max(current + 1, last + 1)
+    end = min(cap, current + max(1, int(window_pages)))
+    if start > end:
+        return None
+    return start, end
 
 
 def page_cache_id(url: str, requested_page: int) -> str:
@@ -546,6 +574,9 @@ class RemotePageManager:
             "cache_ttl": PAGE_CACHE_TTL_SECONDS,
             "prefetch_enabled": PAGE_PREFETCH_ENABLED,
             "streaming": True,
+            "rolling_prefetch": True,
+            "prefetch_window_pages": PAGE_PREFETCH_WINDOW_PAGES,
+            "prefetch_low_water_pages": PAGE_PREFETCH_LOW_WATER_PAGES,
             "cache_wait_ms": PAGE_CACHE_WAIT_MS,
             "cache_hits_total": self.cache_hits_total,
             "cache_misses_total": self.cache_misses_total,

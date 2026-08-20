@@ -31,6 +31,7 @@ from sqlalchemy import delete, func, select, update
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
+from app_version import APP_VERSION
 from categories import CATEGORIES, GROUPS, categories_for_group, group_root_key
 from db import DATABASE_BACKEND, SessionLocal, init_db
 from filters import (
@@ -80,7 +81,8 @@ from parser import (
 )
 from view_manager import REMOTE_VIEW_MANAGER, REMOTE_VIEW_WORKER_ENABLED
 from page_manager import (
-    PAGE_PREFETCH_EXTRA_PAGES, REMOTE_PAGE_MANAGER, REMOTE_PAGE_WORKER_ENABLED,
+    PAGE_PREFETCH_EXTRA_PAGES, PAGE_PREFETCH_LOW_WATER_PAGES, PAGE_PREFETCH_WINDOW_PAGES,
+    REMOTE_PAGE_MANAGER, REMOTE_PAGE_WORKER_ENABLED, rolling_prefetch_range,
 )
 from date_manager import (
     DATE_MAX_AGE_DAYS, REMOTE_DATE_MANAGER, REMOTE_DATE_WORKER_ENABLED,
@@ -95,7 +97,6 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.37"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -1740,64 +1741,67 @@ async def upsert_page_items(
         return [], 0, 0
     unique = {item.external_id: item for item in items}
     ids = list(unique)
-    async with SessionLocal() as session:
-        result = await session.execute(select(Listing).where(Listing.external_id.in_(ids)))
-        existing = {row.external_id: row for row in result.scalars().all()}
-        now = datetime.utcnow()
-        new_items: list[ParsedListing] = []
-        enriched_count = 0
-        for external_id, item in unique.items():
-            row = existing.get(external_id)
-            if row is None:
-                _identity, identity_values = _identity_kwargs(item.title, category_name)
-                session.add(Listing(
-                    external_id=item.external_id, category_key=category_key, category=category_name,
-                    title=item.title, price_text=item.price_text, price_eur=item.price_eur,
-                    posted_text=item.posted_text, posted_date_msk=(posted_date_moscow(item.posted_text).isoformat() if posted_date_moscow(item.posted_text) else None),
-                    url=item.url, first_seen_at=now, last_seen_at=now,
-                    is_active=True, is_promoted=False, disappeared_at=None,
-                    **identity_values,
-                ))
-                if item.price_text:
-                    session.add(PriceHistory(
-                        external_id=item.external_id, price_text=item.price_text,
-                        price_eur=item.price_eur, recorded_at=now,
+    # v4.4.0: serialize this invariant at the function boundary. The previous
+    # caller-side lock was easy for a future code path to forget, allowing two
+    # simultaneous scans to race SELECT -> INSERT on Listing.external_id.
+    async with db_write_lock:
+        async with SessionLocal() as session:
+            result = await session.execute(select(Listing).where(Listing.external_id.in_(ids)))
+            existing = {row.external_id: row for row in result.scalars().all()}
+            now = datetime.utcnow()
+            new_items: list[ParsedListing] = []
+            enriched_count = 0
+            for external_id, item in unique.items():
+                row = existing.get(external_id)
+                if row is None:
+                    _identity, identity_values = _identity_kwargs(item.title, category_name)
+                    session.add(Listing(
+                        external_id=item.external_id, category_key=category_key, category=category_name,
+                        title=item.title, price_text=item.price_text, price_eur=item.price_eur,
+                        posted_text=item.posted_text, posted_date_msk=(posted_date_moscow(item.posted_text).isoformat() if posted_date_moscow(item.posted_text) else None),
+                        url=item.url, first_seen_at=now, last_seen_at=now,
+                        is_active=True, is_promoted=False, disappeared_at=None,
+                        **identity_values,
                     ))
-                new_items.append(item)
-            else:
-                old_price_text = row.price_text
-                old_price_eur = row.price_eur
-                # Never erase a previously parsed price because of one weak HTML response.
-                if item.price_text is not None:
-                    if old_price_text is None and item.price_text:
-                        enriched_count += 1
-                    if (old_price_text, old_price_eur) != (item.price_text, item.price_eur):
-                        if old_price_text is not None or old_price_eur is not None:
-                            session.add(PriceHistory(
-                                external_id=external_id, price_text=old_price_text,
-                                price_eur=old_price_eur, recorded_at=now - timedelta(microseconds=1),
-                            ))
+                    if item.price_text:
                         session.add(PriceHistory(
-                            external_id=external_id, price_text=item.price_text,
+                            external_id=item.external_id, price_text=item.price_text,
                             price_eur=item.price_eur, recorded_at=now,
                         ))
-                    row.price_text = item.price_text
-                    row.price_eur = item.price_eur
-                row.category_key = category_key
-                row.category = category_name
-                row.title = item.title
-                _apply_identity(row, item.title, category_name)
-                row.posted_text = item.posted_text
-                parsed_day = posted_date_moscow(item.posted_text)
-                row.posted_date_msk = parsed_day.isoformat() if parsed_day else row.posted_date_msk
-                row.url = item.url
-                row.last_seen_at = now
-                row.is_active = True
-                row.is_promoted = False
-                row.disappeared_at = None
-        await session.commit()
-        return new_items, len(unique) - len(new_items), enriched_count
-
+                    new_items.append(item)
+                else:
+                    old_price_text = row.price_text
+                    old_price_eur = row.price_eur
+                    # Never erase a previously parsed price because of one weak HTML response.
+                    if item.price_text is not None:
+                        if old_price_text is None and item.price_text:
+                            enriched_count += 1
+                        if (old_price_text, old_price_eur) != (item.price_text, item.price_eur):
+                            if old_price_text is not None or old_price_eur is not None:
+                                session.add(PriceHistory(
+                                    external_id=external_id, price_text=old_price_text,
+                                    price_eur=old_price_eur, recorded_at=now - timedelta(microseconds=1),
+                                ))
+                            session.add(PriceHistory(
+                                external_id=external_id, price_text=item.price_text,
+                                price_eur=item.price_eur, recorded_at=now,
+                            ))
+                        row.price_text = item.price_text
+                        row.price_eur = item.price_eur
+                    row.category_key = category_key
+                    row.category = category_name
+                    row.title = item.title
+                    _apply_identity(row, item.title, category_name)
+                    row.posted_text = item.posted_text
+                    parsed_day = posted_date_moscow(item.posted_text)
+                    row.posted_date_msk = parsed_day.isoformat() if parsed_day else row.posted_date_msk
+                    row.url = item.url
+                    row.last_seen_at = now
+                    row.is_active = True
+                    row.is_promoted = False
+                    row.disappeared_at = None
+            await session.commit()
+            return new_items, len(unique) - len(new_items), enriched_count
 
 async def mark_promoted_listings(external_ids: list[str] | set[str]) -> int:
     """Hide paid-visibility ads that were already stored by an older parser run.
@@ -2331,22 +2335,64 @@ async def fetch_exact_views_v438_compatible(
     progress_cb=None,
     traffic_priority: str,
 ) -> dict[str, ViewCountResult]:
-    """Use a dedicated view service when healthy, else run unchanged v4.3.8 locally.
+    """Use the remote fleet first and locally recover only missing shards.
 
-    The parser algorithm is not duplicated or modified. The worker imports the same
-    parser.py; this wrapper changes only where the batch executes.
+    v4.4.0 keeps every exact result already produced by healthy View Workers.
+    If one Redis shard times out or gets handed back after refusals, only URLs
+    absent from the remote merge run through the proven local view path.
     """
+    urls = list(dict.fromkeys(urls))
     if REMOTE_VIEW_WORKER_ENABLED:
+        remote_reported = 0
+
+        async def remote_progress(done: int, total: int) -> None:
+            nonlocal remote_reported
+            remote_reported = max(remote_reported, min(len(urls), max(0, int(done))))
+            if progress_cb is not None:
+                maybe = progress_cb(remote_reported, len(urls))
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+
         remote = await REMOTE_VIEW_MANAGER.fetch(
-            urls, progress_cb=progress_cb, traffic_priority=traffic_priority,
+            urls, progress_cb=remote_progress, traffic_priority=traffic_priority,
         )
         if remote is not None:
-            return {
+            converted = {
                 url: ViewCountResult(
                     item.views, item.raw_text, item.source, item.final_url, item.page_title, item.error
                 )
                 for url, item in remote.items()
             }
+            missing = [url for url in urls if url not in converted]
+            if not missing:
+                return {url: converted[url] for url in urls if url in converted}
+
+            log.warning(
+                "Dedicated view partial fallback remote=%s/%s missing=%s; retrying only missing URLs locally",
+                len(converted), len(urls), len(missing),
+            )
+
+            async def local_progress(done: int, total: int) -> None:
+                # Keep Telegram progress monotonic even if a failed remote shard
+                # had reported partial work before being retried locally.
+                combined = max(remote_reported, min(len(urls), len(converted) + max(0, int(done))))
+                if progress_cb is not None:
+                    maybe = progress_cb(combined, len(urls))
+                    if asyncio.iscoroutine(maybe):
+                        await maybe
+
+            local = await parser.fetch_public_view_counts(
+                missing, concurrency=concurrency, progress_cb=local_progress,
+                traffic_priority=traffic_priority, browser_fallback=True,
+                direct_http_only=False, accurate=True,
+            )
+            converted.update(local)
+            if progress_cb is not None:
+                maybe = progress_cb(len(urls), len(urls))
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+            return {url: converted[url] for url in urls if url in converted}
+
         log.warning("Dedicated view worker unavailable; using local v4.3.8 view path")
     return await parser.fetch_public_view_counts(
         urls, concurrency=concurrency, progress_cb=progress_cb,
@@ -3519,8 +3565,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         today_seen += len(target_items)
         if not first_page_head_ids:
             first_page_head_ids = [item.external_id for item in target_items[:INCREMENTAL_HEAD_SIZE]]
-        async with db_write_lock:
-            new_items, known_count, enriched_count = await upsert_page_items(cat.key, cat.name, target_items)
+        new_items, known_count, enriched_count = await upsert_page_items(cat.key, cat.name, target_items)
         live = category_live_progress.get(progress_key)
         if need_view_counts:
             for item in target_items:
@@ -4414,15 +4459,26 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             live.collection_start_page = candidate
             live.collection_index = 0
 
-        # Fetch upcoming target-window pages on separate Railway power. Keep a
-        # small look-ahead for sparse timestamp pages; the normal chronology loop
-        # below still decides which pages actually count toward 15/25/50.
-        prefetch_count = depth + PAGE_PREFETCH_EXTRA_PAGES
-        prefetch_start = min(limit + 1, candidate + 1)  # candidate was fetched by the locator
-        prefetch_end = min(limit, candidate + max(1, prefetch_count) - 1)
-        await prefetch_collection_range(
-            str(locator.get("base_url") or cat.url), prefetch_start, prefetch_end
-        )
+        # v4.4.0 rolling Page Worker prefetch. Warm only a short window and top
+        # it up while the target day continues, instead of scheduling the whole
+        # 15/25/50-page request before chronology proves those pages are needed.
+        direct_base_url = str(locator.get("base_url") or cat.url)
+        direct_prefetch_last = candidate
+
+        async def top_up_direct_prefetch(current_page: int) -> None:
+            nonlocal direct_prefetch_last
+            next_range = rolling_prefetch_range(
+                current_page, direct_prefetch_last, limit,
+                window_pages=PAGE_PREFETCH_WINDOW_PAGES + PAGE_PREFETCH_EXTRA_PAGES,
+                low_water_pages=PAGE_PREFETCH_LOW_WATER_PAGES,
+            )
+            if next_range is None:
+                return
+            start_page, end_page = next_range
+            await prefetch_collection_range(direct_base_url, start_page, end_page)
+            direct_prefetch_last = max(direct_prefetch_last, end_page)
+
+        await top_up_direct_prefetch(candidate)
 
         page = candidate
         weak_streak = 0
@@ -4463,6 +4519,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                         request_complete = True
                         reason = f"собрано {depth} подтверждённых страниц выбранной даты"
                         return "done", direct_pages_collected
+                await top_up_direct_prefetch(page)
                 page += 1
                 continue
 
@@ -4488,6 +4545,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     reason = f"собрано {depth} страниц от начала выбранной даты"
                     return "done", direct_pages_collected
 
+            await top_up_direct_prefetch(page)
             page += 1
             if PAGE_DELAY_SECONDS:
                 await asyncio.sleep(min(PAGE_DELAY_SECONDS, 0.25))
@@ -4697,13 +4755,26 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             page = candidate
             state_exhausted = False
             remaining_goal = max(1, goal_pages - hidden_pages_collected)
-            prefetch_end = min(
-                feed_limit,
-                candidate + remaining_goal + PAGE_PREFETCH_EXTRA_PAGES - 1,
-            )
-            await prefetch_collection_range(
-                str(loc.get("base_url") or feed_url), candidate + 1, prefetch_end
-            )
+            hidden_base_url = str(loc.get("base_url") or feed_url)
+            hidden_prefetch_last = candidate
+
+            async def top_up_hidden_prefetch(current_page: int) -> None:
+                nonlocal hidden_prefetch_last
+                next_range = rolling_prefetch_range(
+                    current_page, hidden_prefetch_last, feed_limit,
+                    window_pages=min(
+                        PAGE_PREFETCH_WINDOW_PAGES + PAGE_PREFETCH_EXTRA_PAGES,
+                        max(1, remaining_goal + PAGE_PREFETCH_EXTRA_PAGES),
+                    ),
+                    low_water_pages=PAGE_PREFETCH_LOW_WATER_PAGES,
+                )
+                if next_range is None:
+                    return
+                start_page, end_page = next_range
+                await prefetch_collection_range(hidden_base_url, start_page, end_page)
+                hidden_prefetch_last = max(hidden_prefetch_last, end_page)
+
+            await top_up_hidden_prefetch(candidate)
             while page <= feed_limit and hidden_pages_collected < goal_pages:
                 try:
                     items, relation, pairs, days = await fetch(page, "collecting")
@@ -4716,6 +4787,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 if relation == "unknown":
                     # Same universal rule as the nationwide stream: sparse dates are
                     # not a transport failure. Continue until target/older evidence.
+                    await top_up_hidden_prefetch(page)
                     page += 1
                     continue
                 if relation == "empty":
@@ -4734,6 +4806,8 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                         page, days, "collecting",
                         direct_pages_collected + hidden_pages_collected,
                     )
+                if hidden_pages_collected < goal_pages:
+                    await top_up_hidden_prefetch(page)
                 page += 1
                 if PAGE_DELAY_SECONDS:
                     await asyncio.sleep(min(PAGE_DELAY_SECONDS, 0.15))
@@ -6985,6 +7059,7 @@ async def _admin_view_worker_text() -> str:
     last_shard_count = int(status.get("last_shard_count", 0) or 0)
     last_shard_total = int(status.get("last_shard_total", 0) or 0)
     last_shard_workers = int(status.get("last_shard_workers", 0) or 0)
+    last_shard_failed = int(status.get("last_shard_failed", 0) or 0)
     lines = [
         "<b>👁 VIEW MANAGER PRO</b>",
         "",
@@ -6997,7 +7072,7 @@ async def _admin_view_worker_text() -> str:
     if last_shard_count:
         lines.append(
             f"Последний batch: <b>{last_shard_total}</b> URL → <b>{last_shard_count}</b> jobs "
-            f"· workers: <b>{last_shard_workers}</b>"
+            f"· workers: <b>{last_shard_workers}</b> · failed shards: <b>{last_shard_failed}</b>"
         )
     for idx, worker in enumerate(workers[:4], start=1):
         processed = int(worker.get("processed_total", 0) or 0)
@@ -7021,7 +7096,8 @@ async def _admin_view_worker_text() -> str:
         consumer = html.escape(str(worker.get("consumer") or f"worker-{idx}"))[:45]
         lines.extend([
             "",
-            f"<b>Worker {idx}</b> · <code>{consumer}</code>",
+            f"<b>Worker {idx}</b> · v<b>{html.escape(str(worker.get('version') or '—'))}</b> · <code>{consumer}</code>",
+            f"Fleet: <b>{html.escape(str(worker.get('fleet_bucket') or '—'))}</b> · view/global <b>{int(worker.get('fleet_view_limit', 0) or 0)}/{int(worker.get('fleet_global_limit', 0) or 0)}</b>",
             f"Pool: <b>{pool}</b> [{pool_min}–{pool_max}] · effective: <b>{traffic_limit}</b> · browser: <b>{browser_pool}</b>",
             f"Rate: <b>{rate:.1f}/s</b> · ~<b>{item_ms:.0f} ms/item</b>",
             f"Exact: <b>{exact_pct:.1f}%</b> · browser fallback: <b>{fallback_pct:.1f}%</b> · processed: <b>{processed}</b>",
@@ -7237,7 +7313,8 @@ async def _admin_date_worker_text() -> str:
     for idx, worker in enumerate(workers[:4], start=1):
         lines.extend([
             "",
-            f"<b>Worker {idx}</b> · concurrency <b>{int(worker.get('concurrency', 0) or 0)}</b> · active <b>{int(worker.get('active', 0) or 0)}</b>",
+            f"<b>Worker {idx}</b> · v<b>{html.escape(str(worker.get('version') or '—'))}</b> · concurrency <b>{int(worker.get('concurrency', 0) or 0)}</b> · active <b>{int(worker.get('active', 0) or 0)}</b>",
+            f"Fleet: <b>{html.escape(str(worker.get('fleet_bucket') or '—'))}</b> · scan/browser/global <b>{int(worker.get('fleet_scan_limit', 0) or 0)}/{int(worker.get('fleet_browser_limit', 0) or 0)}/{int(worker.get('fleet_global_limit', 0) or 0)}</b>",
             f"probes: <b>{int(worker.get('processed', 0) or 0)}</b> · speed <b>{float(worker.get('rate_ema', 0.0) or 0.0):.2f}/s</b>",
             f"HTTP fast: <b>{int(worker.get('http_fast_ok', 0) or 0)}</b> · browser confirm: <b>{int(worker.get('browser_confirm_ok', 0) or 0)}/{int(worker.get('browser_confirms', 0) or 0)}</b>",
             f"403/429: <b>{int(worker.get('http_403', 0) or 0)}/{int(worker.get('http_429', 0) or 0)}</b> · conflicts: <b>{int(worker.get('transport_conflicts', 0) or 0)}</b> · errors <b>{int(worker.get('errors', 0) or 0)}</b>",
@@ -7275,7 +7352,9 @@ async def _admin_page_worker_text() -> str:
         f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b>",
         f"Redis queue: <b>{int(status.get('queue_depth', 0) or 0)}</b> · активных: <b>{int(status.get('active_total', 0) or 0)}</b>",
         f"Кэш страниц: <b>{int(status.get('cache_ttl', 180) or 180)} сек.</b>",
-        f"Streaming: <b>✅ ВКЛ</b> · ожидание следующей страницы ≤ <b>{int(status.get('cache_wait_ms', 0) or 0)} мс</b>",
+        f"Streaming: <b>✅ ВКЛ</b> · Rolling: <b>{'✅' if status.get('rolling_prefetch') else '—'}</b> "
+        f"окно <b>{int(status.get('prefetch_window_pages', 0) or 0)}</b> / low-water <b>{int(status.get('prefetch_low_water_pages', 0) or 0)}</b> · "
+        f"ожидание следующей страницы ≤ <b>{int(status.get('cache_wait_ms', 0) or 0)} мс</b>",
         f"Общая скорость: <b>{float(status.get('rate_total', 0.0) or 0.0):.2f} pages/sec</b>",
         f"Обработано worker'ами: <b>{int(status.get('processed_total', 0) or 0)}</b> · ошибок: <b>{int(status.get('errors_total', 0) or 0)}</b>",
     ]
@@ -7290,7 +7369,8 @@ async def _admin_page_worker_text() -> str:
     for idx, worker in enumerate(workers[:4], start=1):
         lines.extend([
             "",
-            f"<b>Worker {idx}</b> · concurrency <b>{int(worker.get('concurrency', 0) or 0)}</b> · active <b>{int(worker.get('active', 0) or 0)}</b>",
+            f"<b>Worker {idx}</b> · v<b>{html.escape(str(worker.get('version') or '—'))}</b> · concurrency <b>{int(worker.get('concurrency', 0) or 0)}</b> · active <b>{int(worker.get('active', 0) or 0)}</b>",
+            f"Fleet: <b>{html.escape(str(worker.get('fleet_bucket') or '—'))}</b> · scan/browser/global <b>{int(worker.get('fleet_scan_limit', 0) or 0)}/{int(worker.get('fleet_browser_limit', 0) or 0)}/{int(worker.get('fleet_global_limit', 0) or 0)}</b>",
             f"pages: <b>{int(worker.get('processed', 0) or 0)}</b> · cache-hit worker: <b>{int(worker.get('cache_served', 0) or 0)}</b> · speed <b>{float(worker.get('rate_ema', 0.0) or 0.0):.2f}/s</b>",
             f"403/429: <b>{int(worker.get('http_403', 0) or 0)}/{int(worker.get('http_429', 0) or 0)}</b> · penalty <b>{int(worker.get('penalty', 0) or 0)}</b>",
         ])

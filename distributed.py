@@ -72,6 +72,23 @@ DIST_TRAFFIC_GLOBAL_LIMIT = _env_int("DIST_TRAFFIC_GLOBAL_LIMIT", 8, 2, 40)
 DIST_TRAFFIC_TOKEN_SECONDS = _env_int("DIST_TRAFFIC_TOKEN_SECONDS", 90, 10, 180)
 DIST_TRAFFIC_SHARED_COOLDOWN = _env_bool("DIST_TRAFFIC_SHARED_COOLDOWN", True)
 
+# v4.4.0 Fleet Hardening: traffic tokens can be separated by worker role while
+# still sharing a higher-level fleet budget. Date/Page workers therefore no
+# longer multiply their local limits by the number of Railway replicas.
+def _traffic_bucket_env(name: str, default: str) -> str:
+    value = (os.getenv(name) or default).strip().lower()
+    clean = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in value)
+    return clean.strip("-") or default
+
+
+DIST_TRAFFIC_SCAN_BUCKET = _traffic_bucket_env("DIST_TRAFFIC_SCAN_BUCKET", "scan")
+DIST_TRAFFIC_VIEW_BUCKET = _traffic_bucket_env("DIST_TRAFFIC_VIEW_BUCKET", "view")
+DIST_TRAFFIC_BROWSER_BUCKET = _traffic_bucket_env("DIST_TRAFFIC_BROWSER_BUCKET", "browser")
+DIST_TRAFFIC_GLOBAL_BUCKET = _traffic_bucket_env("DIST_TRAFFIC_GLOBAL_BUCKET", "global")
+DIST_TRAFFIC_COOLDOWN_BUCKET = _traffic_bucket_env(
+    "DIST_TRAFFIC_COOLDOWN_BUCKET", DIST_TRAFFIC_GLOBAL_BUCKET
+)
+
 
 class DistributedUnavailable(RuntimeError):
     pass
@@ -290,11 +307,24 @@ class DistributedCoordinator:
             count += 1
         return count
 
+    @staticmethod
+    def _traffic_bucket(kind: str) -> str:
+        return {
+            "scan": DIST_TRAFFIC_SCAN_BUCKET,
+            "view": DIST_TRAFFIC_VIEW_BUCKET,
+            "browser": DIST_TRAFFIC_BROWSER_BUCKET,
+        }[kind]
+
     def _traffic_kind_key(self, kind: str) -> str:
-        return f"{REDIS_PREFIX}:traffic:active:{kind}"
+        return f"{REDIS_PREFIX}:traffic:active:{self._traffic_bucket(kind)}"
 
     def _traffic_global_key(self) -> str:
-        return f"{REDIS_PREFIX}:traffic:active:global"
+        # Keep the old key name for the default bucket so existing deployments
+        # naturally drain into the new scheme without a migration. Dedicated
+        # worker fleets use named buckets (search-fleet / view-fleet).
+        if DIST_TRAFFIC_GLOBAL_BUCKET == "global":
+            return f"{REDIS_PREFIX}:traffic:active:global"
+        return f"{REDIS_PREFIX}:traffic:active:global:{DIST_TRAFFIC_GLOBAL_BUCKET}"
 
     def _traffic_lane_id(self) -> str:
         # Each Railway replica/process owns its pacing lane. Concurrency counters
@@ -306,11 +336,11 @@ class DistributedCoordinator:
         return f"{socket.gethostname()}:{os.getpid()}"
 
     def _traffic_next_key(self, kind: str) -> str:
-        return f"{REDIS_PREFIX}:traffic:next:{kind}:{self._traffic_lane_id()}"
+        return f"{REDIS_PREFIX}:traffic:next:{self._traffic_bucket(kind)}:{self._traffic_lane_id()}"
 
     def _traffic_cooldown_key(self) -> str:
         if DIST_TRAFFIC_SHARED_COOLDOWN:
-            return f"{REDIS_PREFIX}:traffic:cooldown_until_ms"
+            return f"{REDIS_PREFIX}:traffic:cooldown:{DIST_TRAFFIC_COOLDOWN_BUCKET}:until_ms"
         # Browser-isolated workers should not all freeze because one independent
         # browser session received a temporary refusal. Keep the cooldown key local
         # to this worker process while still sharing the global concurrency tokens.
@@ -398,7 +428,7 @@ class DistributedCoordinator:
         if int(status_code) not in {403, 429}:
             return
         redis = await self.connect()
-        count_key = f"{REDIS_PREFIX}:traffic:refusals_60s"
+        count_key = f"{REDIS_PREFIX}:traffic:refusals:{DIST_TRAFFIC_COOLDOWN_BUCKET}:60s"
         count = int(await redis.incr(count_key))
         if count == 1:
             await redis.expire(count_key, 60)

@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import sys
 
+from app_version import APP_VERSION
+
 
 def _normalized(value: str) -> str:
     return "".join(ch for ch in (value or "").strip().lower() if ch.isalnum())
@@ -62,7 +64,7 @@ def main() -> None:
 
     print(
         "[service-launcher] "
-        f"service={service_name!r} role={role} target={target} "
+        f"version={APP_VERSION} service={service_name!r} role={role} target={target} "
         f"redis={'yes' if os.getenv('REDIS_URL', '').strip() else 'no'} "
         f"database={'yes' if os.getenv('DATABASE_URL', '').strip() else 'no'} "
         f"bot_token={'yes' if os.getenv('BOT_TOKEN', '').strip() else 'no'}",
