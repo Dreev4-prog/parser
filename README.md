@@ -89,3 +89,7 @@ For old dates that are deeper than the nationwide 50-page window, regional fallb
 - Regional pipeline timing is logged (`locator_wait`, `collect`) for real bottleneck measurement.
 
 No new Railway variables are required. Defaults are conservative: 4 queued regional hints, at most 2 regional locator jobs running concurrently. Optional rollback: `REGIONAL_DATE_PIPELINE_ENABLED=0`.
+
+
+## v4.3.37 DATE BOUNDARY RACE FIX
+Prevents a deep Date Worker target hint from causing a 40+ page linear walk-back when several Date Worker replicas race. Wide brackets are remotely refined and foreground linear walk-back is bounded before falling back to the exact local locator.

@@ -95,7 +95,7 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-APP_VERSION = "4.3.32"
+APP_VERSION = "4.3.37"
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -390,6 +390,12 @@ REGIONAL_DATE_PIPELINE_ENABLED = os.getenv("REGIONAL_DATE_PIPELINE_ENABLED", "1"
     "0", "false", "no", "off",
 }
 REGIONAL_DATE_PIPELINE_WINDOW = max(1, min(10, int(os.getenv("REGIONAL_DATE_PIPELINE_WINDOW", "8"))))
+# v4.3.37 safety net: even a stale/wide remote hint must never make the
+# foreground verifier walk tens of target pages backwards one-by-one.  The
+# Date Manager now refines wide direct-target brackets first; if a pathological
+# hint still survives, stop the linear walk-back after a few exact pages and
+# fall through to the proven local exponential/binary locator.
+REMOTE_DATE_MAX_LINEAR_WALKBACK = max(2, min(12, int(os.getenv("REMOTE_DATE_MAX_LINEAR_WALKBACK", "6"))))
 REGIONAL_DATE_PIPELINE_CONCURRENCY = max(1, min(4, int(os.getenv("REGIONAL_DATE_PIPELINE_CONCURRENCY", "4"))))
 
 def _regional_category_url(base_url: str, slug: str, location_id: int) -> str:
@@ -3979,11 +3985,24 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                                 break
                         if remote_confirmed is not None:
                             candidate = remote_confirmed
+                            walkback_steps = 0
                             while candidate > 1:
                                 prev = candidate - 1
                                 _i2, prev_relation, _p2, _d2 = await stable_fetch(prev, "date_verify")
                                 if prev_relation == "target":
                                     candidate = prev
+                                    walkback_steps += 1
+                                    if walkback_steps >= REMOTE_DATE_MAX_LINEAR_WALKBACK:
+                                        # A remote hint landed deep inside a long target-day
+                                        # run.  Do not keep walking page-by-page: reject the
+                                        # acceleration hint and let the local exponential /
+                                        # binary locator find the exact first target page.
+                                        remote_weak = True
+                                        log.warning(
+                                            "Date Worker wide target hint capped category=%s target=%s hint=%s walkback=%s; local locator fallback",
+                                            cat.name, target_date, boundary_hint, walkback_steps,
+                                        )
+                                        break
                                     continue
                                 if prev_relation == "newer":
                                     break

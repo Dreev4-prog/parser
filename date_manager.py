@@ -757,12 +757,17 @@ class RemoteDateManager:
             # foreground verification can start there immediately.  Otherwise use
             # a tiny quartile refinement for a wide newer/non-newer bracket.
             has_direct_target = any(item.relation == "target" for item in merged.values())
-            # Keep the remote bracket tight enough that foreground verification
-            # cannot miss a target page merely because the high side is several
-            # pages away.  Two tiny refinement rounds are still much cheaper than
-            # falling all the way back to the local 1/2/4/8/... locator.
+            # v4.3.37 DATE BOUNDARY RACE FIX.
+            # With several Date Worker replicas, a deep target page (for example
+            # page 50) can finish before the earlier probes.  A target proves that
+            # the requested day exists, but it does NOT prove that this is the
+            # first page of that day.  Older builds stopped refining as soon as any
+            # target arrived, which could make the foreground verifier walk back
+            # 40+ pages one-by-one.  Always tighten a wide bracket, even when a
+            # direct target is already present.  Remote results are still hints;
+            # the foreground stable parser remains the final source of truth.
             for _refine_round in range(2):
-                if has_direct_target or high - low <= 3:
+                if high - low <= 3:
                     break
                 width = high - low
                 refinement = sorted(set(
