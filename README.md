@@ -1,3 +1,6 @@
+## v4.3.35 VIEW FLEET GUARD
+Shared Redis view limiter/cooldown for View Worker ×3; smaller pools/shards; exact parser unchanged.
+
 # DT Parser v4.3.32 — SMART HYBRID OLD DATE
 
 - Fixes v4.3.31 where a date deeper than the nationwide public window could finish in seconds with a false zero.

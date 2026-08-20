@@ -41,9 +41,9 @@ def _env_float(name: str, default: float, minimum: float, maximum: float) -> flo
 # v4.3.8 core and is intentionally not edited. We configure the process-wide
 # traffic controller before importing parser.py, then adjust only its exposed
 # limits from this worker as the dedicated lane learns the healthy capacity.
-VIEW_POOL_MIN = _env_int("VIEW_WORKER_POOL_MIN", 6, 2, 24)
-VIEW_POOL_MAX = _env_int("VIEW_WORKER_POOL_MAX", 10, VIEW_POOL_MIN, 24)
-VIEW_POOL_DEFAULT = _env_int("VIEW_WORKER_POOL_DEFAULT", 8, VIEW_POOL_MIN, VIEW_POOL_MAX)
+VIEW_POOL_MIN = _env_int("VIEW_WORKER_POOL_MIN", 4, 2, 24)
+VIEW_POOL_MAX = _env_int("VIEW_WORKER_POOL_MAX", 6, VIEW_POOL_MIN, 24)
+VIEW_POOL_DEFAULT = _env_int("VIEW_WORKER_POOL_DEFAULT", 5, VIEW_POOL_MIN, VIEW_POOL_MAX)
 # Backwards compatibility with v4.3.14 env. If the new DEFAULT is absent but
 # VIEW_WORKER_VIEW_POOL_SIZE exists, use the old value as the starting pool.
 if "VIEW_WORKER_POOL_DEFAULT" not in os.environ and "VIEW_WORKER_VIEW_POOL_SIZE" in os.environ:
@@ -56,6 +56,17 @@ ADAPTIVE_HEALTHY_ROUNDS = _env_int("VIEW_WORKER_ADAPTIVE_HEALTHY_ROUNDS", 2, 1, 
 ADAPTIVE_BACKOFF_SECONDS = _env_float("VIEW_WORKER_ADAPTIVE_BACKOFF_SECONDS", 8.0, 1.0, 120.0)
 ADAPTIVE_FALLBACK_WARN_RATIO = _env_float("VIEW_WORKER_ADAPTIVE_FALLBACK_WARN_RATIO", 0.12, 0.01, 1.0)
 ADAPTIVE_UNKNOWN_WARN_RATIO = _env_float("VIEW_WORKER_ADAPTIVE_UNKNOWN_WARN_RATIO", 0.05, 0.0, 1.0)
+
+# v4.3.35 TRIPLE VIEW FLEET GUARD.
+# With 3 Railway replicas the old per-process limiter lets every replica ramp to
+# its own maximum independently.  That can create a 3x burst against the public
+# counter endpoint.  Enable the existing Redis distributed traffic coordinator
+# only inside View Worker processes so all replicas share one view budget and one
+# 403/429 cooldown.  Main bot / Date / Page workers keep their existing modes.
+os.environ.setdefault("STABLE_SINGLE_SERVICE_MODE", "0")
+os.environ.setdefault("DIST_TRAFFIC_VIEW_LIMIT", "16")
+os.environ.setdefault("DIST_TRAFFIC_GLOBAL_LIMIT", "16")
+os.environ.setdefault("DIST_TRAFFIC_BROWSER_LIMIT", "1")
 
 # The TrafficManager is created during parser import. Give it the physical MAX;
 # the worker later lowers base_view_limit to current_pool before every round.
@@ -88,13 +99,13 @@ from view_manager import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("dtparser-view-counter-worker")
 
-ROUND_SIZE = _env_int("VIEW_WORKER_ROUND_SIZE", 32, VIEW_POOL_MAX, 200)
+ROUND_SIZE = _env_int("VIEW_WORKER_ROUND_SIZE", 24, VIEW_POOL_MAX, 200)
 MAX_ACTIVE_JOBS = _env_int("VIEW_WORKER_MAX_ACTIVE_JOBS", 2, 1, 16)
 BLOCK_MS = _env_int("VIEW_WORKER_QUEUE_BLOCK_MS", 250, 50, 2000)
 HEARTBEAT_SECONDS = _env_float("VIEW_WORKER_HEARTBEAT_SECONDS", 3.0, 1.0, 10.0)
-RECLAIM_IDLE_MS = _env_int("VIEW_WORKER_RECLAIM_IDLE_MS", 180_000, 30_000, 30 * 60_000)
-ROUND_TIMEOUT_SECONDS = _env_int("VIEW_WORKER_ROUND_TIMEOUT_SECONDS", 180, 30, 900)
-JOB_STALL_SECONDS = _env_int("VIEW_JOB_TIMEOUT_SECONDS", 180, 60, 1800)
+RECLAIM_IDLE_MS = _env_int("VIEW_WORKER_RECLAIM_IDLE_MS", 120_000, 30_000, 30 * 60_000)
+ROUND_TIMEOUT_SECONDS = _env_int("VIEW_WORKER_ROUND_TIMEOUT_SECONDS", 120, 30, 900)
+JOB_STALL_SECONDS = _env_int("VIEW_JOB_TIMEOUT_SECONDS", 120, 60, 1800)
 JOB_REQUEUE_ENABLED = _env_bool("VIEW_JOB_REQUEUE_ENABLED", True)
 MAX_REQUEUES = _env_int("VIEW_WORKER_MAX_REQUEUES", 2, 0, 10)
 ROUND_FAILURES_BEFORE_RESET = _env_int("VIEW_WORKER_FAILURES_BEFORE_RESET", 2, 1, 10)
