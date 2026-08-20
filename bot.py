@@ -381,17 +381,16 @@ HIDDEN_DATE_PREWARM_ENABLED = os.getenv("HIDDEN_DATE_PREWARM_ENABLED", "0").stri
 HIDDEN_DATE_PREWARM_WINDOW = max(1, min(4, int(os.getenv("HIDDEN_DATE_PREWARM_WINDOW", "2"))))
 HIDDEN_DATE_PREWARM_CONCURRENCY = max(1, min(2, int(os.getenv("HIDDEN_DATE_PREWARM_CONCURRENCY", "1"))))
 
-# v4.3.34 Triple Worker Fleet profile. Old-date scans still use the trusted
-# foreground verifier, but a three-replica Date Worker fleet can now keep three
-# independent regional locators in flight. This increases capacity by adding
-# Railway replicas instead of raising per-worker request concurrency. Remote
-# hints remain hints only; every accepted page still goes through exact local
-# verification/fallback.
+# v4.3.36 Four-User Worker Fleet profile. Old-date scans still use the trusted
+# foreground verifier, while a four-replica Date Worker fleet can keep four
+# independent regional locators in flight. Capacity is added through Railway
+# replicas rather than higher per-worker request concurrency. Remote hints remain
+# hints only; every accepted page still goes through exact verification/fallback.
 REGIONAL_DATE_PIPELINE_ENABLED = os.getenv("REGIONAL_DATE_PIPELINE_ENABLED", "1").strip().lower() not in {
     "0", "false", "no", "off",
 }
-REGIONAL_DATE_PIPELINE_WINDOW = max(1, min(8, int(os.getenv("REGIONAL_DATE_PIPELINE_WINDOW", "6"))))
-REGIONAL_DATE_PIPELINE_CONCURRENCY = max(1, min(4, int(os.getenv("REGIONAL_DATE_PIPELINE_CONCURRENCY", "3"))))
+REGIONAL_DATE_PIPELINE_WINDOW = max(1, min(10, int(os.getenv("REGIONAL_DATE_PIPELINE_WINDOW", "8"))))
+REGIONAL_DATE_PIPELINE_CONCURRENCY = max(1, min(4, int(os.getenv("REGIONAL_DATE_PIPELINE_CONCURRENCY", "4"))))
 
 def _regional_category_url(base_url: str, slug: str, location_id: int) -> str:
     m = re.match(r"^(https://www\.kleinanzeigen\.de/.+)/(c\d+)$", base_url.rstrip("/"))

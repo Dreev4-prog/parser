@@ -1,3 +1,7 @@
+# DT Parser v4.3.36 — Four-User Fleet
+
+Production profile: Date Worker ×4, Page Worker ×4, View Worker ×4. View replicas share a fleet-wide Redis budget of 16 official-counter HTTP requests and take one shard at a time for fair distribution/recovery. Regional old-date locator can keep four independent regions in flight. No new Railway variables are required.
+
 ## v4.3.35 VIEW FLEET GUARD
 Shared Redis view limiter/cooldown for View Worker ×3; smaller pools/shards; exact parser unchanged.
 
