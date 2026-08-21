@@ -78,6 +78,8 @@ ADAPTIVE_UNKNOWN_WARN_RATIO = _env_float("VIEW_WORKER_ADAPTIVE_UNKNOWN_WARN_RATI
 # Four Railway View Worker replicas share one Redis traffic budget. Adding the
 # fourth replica increases distribution/recovery capacity, not request pressure:
 # the fleet-wide view budget stays capped at 16 and 403/429 cooldown is shared.
+# v4.6.9 permits two genuine Chromium fallback navigations fleet-wide; transient
+# HTTP refusals are retried before they can enter that lane.
 # Main bot / Date / Page workers keep their existing proven traffic modes.
 os.environ["STABLE_SINGLE_SERVICE_MODE"] = "0"
 os.environ["DIST_TRAFFIC_VIEW_BUCKET"] = "view"
@@ -86,7 +88,7 @@ os.environ["DIST_TRAFFIC_GLOBAL_BUCKET"] = "view-fleet"
 os.environ["DIST_TRAFFIC_COOLDOWN_BUCKET"] = "view-fleet"
 os.environ["DIST_TRAFFIC_VIEW_LIMIT"] = "16"
 os.environ["DIST_TRAFFIC_GLOBAL_LIMIT"] = "16"
-os.environ["DIST_TRAFFIC_BROWSER_LIMIT"] = "1"
+os.environ["DIST_TRAFFIC_BROWSER_LIMIT"] = "2"
 
 # The TrafficManager is created during parser import. Give it the physical MAX;
 # the worker later lowers base_view_limit to current_pool before every round.
@@ -112,6 +114,7 @@ from view_manager import (
     REDIS_URL,
     VIEW_GROUP,
     VIEW_HEARTBEAT_KEY,
+    VIEW_PREWARM_KEY,
     VIEW_JOB_TTL_SECONDS,
     VIEW_REDIS_PREFIX,
     VIEW_RESULT_TTL_SECONDS,
@@ -190,6 +193,10 @@ class ViewCounterWorker:
         self.last_round_rate = 0.0
         self.last_round_seconds = 0.0
         self.last_adaptive_reason = "startup"
+        self.prewarm_total = 0
+        self.prewarm_success_total = 0
+        self.last_prewarm_at = 0.0
+        self._last_prewarm_token: str | None = None
 
         # Count 403/429 without modifying parser.py/traffic.py. parser.py uses the
         # same process-wide TRAFFIC object, so this tiny wrapper only observes the
@@ -315,6 +322,10 @@ class ViewCounterWorker:
             "rounds_failed": self.rounds_failed,
             "requeues_total": self.requeues_total,
             "adaptive_reason": self.last_adaptive_reason,
+            "prewarm_total": self.prewarm_total,
+            "prewarm_success_total": self.prewarm_success_total,
+            "last_prewarm_at": self.last_prewarm_at,
+            "last_view_batch_stats": getattr(self.parser, "last_view_batch_stats", {}) or {},
             "uptime_seconds": int(now - self._started_at),
         }
         raw = json.dumps(payload, ensure_ascii=False)
@@ -336,6 +347,35 @@ class ViewCounterWorker:
                 log.warning("Dedicated view heartbeat failed", exc_info=True)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=HEARTBEAT_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+
+    async def prewarm_loop(self) -> None:
+        """Warm the cheap HTTP lane on a broadcast hint; never start Chromium."""
+        while not self._stop.is_set():
+            try:
+                token = await self.redis.get(VIEW_PREWARM_KEY)
+                if token and token != self._last_prewarm_token:
+                    self._last_prewarm_token = str(token)
+                    self.prewarm_total += 1
+                    started = time.monotonic()
+                    ok = await asyncio.wait_for(
+                        self.parser.warm_view_http_session(force=False, traffic_priority="normal"),
+                        timeout=20.0,
+                    )
+                    if ok:
+                        self.prewarm_success_total += 1
+                    self.last_prewarm_at = time.time()
+                    log.info(
+                        "View Worker HTTP prewarm token=%s ok=%s elapsed=%.2fs",
+                        str(token)[:24], ok, time.monotonic() - started,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("View Worker lightweight prewarm skipped", exc_info=True)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=1.0)
             except asyncio.TimeoutError:
                 pass
 
@@ -768,6 +808,7 @@ class ViewCounterWorker:
         await self.ensure_group()
         await self.heartbeat(force=True)
         hb_task = asyncio.create_task(self.heartbeat_loop(), name="view-worker-heartbeat")
+        prewarm_task = asyncio.create_task(self.prewarm_loop(), name="view-worker-http-prewarm")
         idle_guard = BrowserIdleShutdownGuard(
             redis=self.redis,
             stream=VIEW_STREAM,
@@ -827,8 +868,9 @@ class ViewCounterWorker:
         finally:
             self._stop.set()
             hb_task.cancel()
+            prewarm_task.cancel()
             idle_task.cancel()
-            await asyncio.gather(hb_task, idle_task, return_exceptions=True)
+            await asyncio.gather(hb_task, prewarm_task, idle_task, return_exceptions=True)
             try:
                 await self.parser.close()
             finally:

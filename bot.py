@@ -203,6 +203,55 @@ if not MENU_IMAGE_PATH.exists():
 # v4.6.7: after the first upload Telegram gives us a reusable file_id. Reusing
 # it avoids re-uploading the menu image every time the user returns home.
 _MENU_IMAGE_FILE_ID: str | None = None
+
+# v4.6.8 Instant UI.  Tiny process-local caches keep Telegram navigation off
+# the PostgreSQL critical path. They cache presentation state only; parser/worker
+# source-of-truth remains PostgreSQL/Redis. Writes update or invalidate the cache
+# immediately, and short TTLs cover changes made by another process.
+UI_STATE_CACHE_TTL_SECONDS = max(1.0, min(60.0, float(os.getenv("UI_STATE_CACHE_TTL_SECONDS", "20"))))
+UI_SCAN_MENU_CACHE_TTL_SECONDS = max(0.5, min(15.0, float(os.getenv("UI_SCAN_MENU_CACHE_TTL_SECONDS", "3"))))
+_ui_selected_cache: dict[int, tuple[float, frozenset[str]]] = {}
+_ui_settings_cache: dict[int, tuple[float, tuple]] = {}
+_ui_scan_overview_cache: dict[tuple[int, int], tuple[float, tuple[list[UserScan], int]]] = {}
+_ui_popular_cache: dict[tuple[int, int], tuple[float, list[tuple[str, UserScan]]]] = {}
+_background_ui_tasks: set[asyncio.Task] = set()
+
+_SETTINGS_CACHE_FIELDS = (
+    "output_mode", "smart_dedupe", "clean_noise", "period", "price_filter",
+    "min_views", "sort_mode", "include_words", "exclude_words", "page_limit",
+    "auto_observations",
+)
+
+def _settings_snapshot(settings: UserSettings) -> tuple:
+    return tuple(getattr(settings, field, None) for field in _SETTINGS_CACHE_FIELDS)
+
+def _settings_from_snapshot(user_id: int, snapshot: tuple) -> UserSettings:
+    values = dict(zip(_SETTINGS_CACHE_FIELDS, snapshot))
+    return UserSettings(user_id=int(user_id), **values)
+
+def _cache_settings(settings: UserSettings) -> None:
+    _ui_settings_cache[int(settings.user_id)] = (time.monotonic(), _settings_snapshot(settings))
+
+def _invalidate_scan_menu_cache(user_id: int) -> None:
+    uid = int(user_id)
+    for key in [key for key in _ui_scan_overview_cache if key[0] == uid]:
+        _ui_scan_overview_cache.pop(key, None)
+    for key in [key for key in _ui_popular_cache if key[0] == uid]:
+        _ui_popular_cache.pop(key, None)
+
+def _background_task_done(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        log.debug("Background UI task failed", exc_info=True)
+
+def _run_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_ui_tasks.add(task)
+    task.add_done_callback(_background_ui_tasks.discard)
+    task.add_done_callback(_background_task_done)
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
@@ -348,7 +397,7 @@ OBSERVATION_LATE_GRACE_MINUTES = max(5, int(os.getenv("OBSERVATION_LATE_GRACE_MI
 # intact for Popular Now, exports and future analytics.
 SCAN_ARCHIVE_AFTER_HOURS = 24
 SCAN_ARCHIVE_PAGE_SIZE = 8
-SCAN_ARCHIVE_SWEEP_SECONDS = 15 * 60
+SCAN_ARCHIVE_SWEEP_SECONDS = 60
 ARCHIVABLE_SCAN_STATUSES = ("done", "partial", "cancelled", "failed")
 
 GROWTH_TOP_LIMIT = 50
@@ -829,6 +878,13 @@ def min_views_keyboard(current: int = 0) -> InlineKeyboardMarkup:
 
 
 async def get_settings(user_id: int) -> UserSettings:
+    user_id = int(user_id)
+    now = time.monotonic()
+    cached = _ui_settings_cache.get(user_id)
+    if cached is not None and now - cached[0] <= UI_STATE_CACHE_TTL_SECONDS:
+        # Return a fresh transient object because get_settings_for_scan() adjusts
+        # price_filter for historical scans and must never mutate the cache.
+        return _settings_from_snapshot(user_id, cached[1])
     async with SessionLocal() as session:
         s = await session.get(UserSettings, user_id)
         if s is None:
@@ -836,6 +892,7 @@ async def get_settings(user_id: int) -> UserSettings:
             session.add(s)
             await session.commit()
             await session.refresh(s)
+        _cache_settings(s)
         return s
 
 
@@ -857,6 +914,7 @@ async def update_setting(user_id: int, field: str, value) -> UserSettings:
         setattr(s, field, value)
         await session.commit()
         await session.refresh(s)
+        _cache_settings(s)
         return s
 
 
@@ -888,6 +946,7 @@ async def auto_observations_enabled(user_id: int) -> bool:
 
 
 async def reset_user_settings(user_id: int) -> UserSettings:
+    _ui_settings_cache.pop(int(user_id), None)
     async with SessionLocal() as session:
         old = await session.get(UserSettings, user_id)
         if old:
@@ -897,15 +956,22 @@ async def reset_user_settings(user_id: int) -> UserSettings:
 
 
 async def get_selected(user_id: int) -> set[str]:
+    user_id = int(user_id)
+    now = time.monotonic()
+    cached = _ui_selected_cache.get(user_id)
+    if cached is not None and now - cached[0] <= UI_STATE_CACHE_TTL_SECONDS:
+        return set(cached[1])
     async with SessionLocal() as session:
         result = await session.execute(select(SelectedCategory.category_key).where(SelectedCategory.user_id == user_id))
         # v4.3.4: root/"whole section" categories remain in CATEGORIES only for
         # backwards compatibility with old saved scans. They are no longer a
         # selectable user option and therefore must not leak back into a new run.
-        return {
+        selected = {
             x for x in result.scalars().all()
             if x in CATEGORIES and not CATEGORIES[x].is_group
         }
+    _ui_selected_cache[user_id] = (now, frozenset(selected))
+    return selected
 
 
 def _scan_category_keys(scan: UserScan) -> list[str]:
@@ -955,6 +1021,7 @@ async def create_user_scan(user_id: int, job_uid: str, category_keys: list[str],
         session.add(scan)
         await session.commit()
         await session.refresh(scan)
+        _invalidate_scan_menu_cache(user_id)
         return scan
 
 
@@ -1170,17 +1237,28 @@ async def get_archive_count(user_id: int, *, archive: bool = True) -> int:
 
 
 async def get_user_scans_overview(user_id: int, limit: int = 10) -> tuple[list[UserScan], int]:
-    """One archive sweep, then load inbox + archive count in parallel."""
-    await archive_expired_scans(user_id)
+    """Fast UI overview; archival itself is handled by the background sweeper."""
+    key = (int(user_id), int(limit))
+    now = time.monotonic()
+    cached = _ui_scan_overview_cache.get(key)
+    if cached is not None and now - cached[0] <= UI_SCAN_MENU_CACHE_TTL_SECONDS:
+        scans, archive_count = cached[1]
+        return list(scans), int(archive_count)
     scans, archive_count = await asyncio.gather(
         get_user_scans(user_id, limit, archive=False),
         get_archive_count(user_id, archive=False),
     )
+    _ui_scan_overview_cache[key] = (now, (list(scans), int(archive_count)))
     return scans, archive_count
 
 
 async def get_user_popular_categories(user_id: int, limit_scans: int = 100) -> list[tuple[str, UserScan]]:
     """Return one menu entry per category using its latest successful scan only."""
+    cache_key = (int(user_id), int(limit_scans))
+    now = time.monotonic()
+    cached = _ui_popular_cache.get(cache_key)
+    if cached is not None and now - cached[0] <= UI_SCAN_MENU_CACHE_TTL_SECONDS:
+        return list(cached[1])
     async with SessionLocal() as session:
         result = await session.execute(
             select(UserScan)
@@ -1197,7 +1275,9 @@ async def get_user_popular_categories(user_id: int, limit_scans: int = 100) -> l
         for key in _scan_category_keys(scan):
             if key in CATEGORIES and key not in latest:
                 latest[key] = scan
-    return list(latest.items())
+    items = list(latest.items())
+    _ui_popular_cache[cache_key] = (now, list(items))
+    return items
 
 
 async def get_user_category_scans(user_id: int, category_key: str) -> list[UserScan]:
@@ -1394,6 +1474,7 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
                 scan.last_error = None
             if cancelled:
                 await session.commit()
+                _invalidate_scan_menu_cache(job.user_id)
                 return
 
             matched_ids = sorted(job.matched_ids or set())
@@ -1449,6 +1530,7 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
                     ))
             await session.commit()
 
+    _invalidate_scan_menu_cache(job.user_id)
     if not cancelled:
         await ensure_scan_observation_plan(job.scan_id, now)
 
@@ -1766,7 +1848,9 @@ async def _replace_selected_categories(user_id: int, keys: set[str]) -> set[str]
         await session.execute(delete(SelectedCategory).where(SelectedCategory.user_id == user_id))
         session.add_all([SelectedCategory(user_id=user_id, category_key=key) for key in clean])
         await session.commit()
-    return set(clean)
+    selected = set(clean)
+    _ui_selected_cache[int(user_id)] = (time.monotonic(), frozenset(selected))
+    return selected
 
 
 async def toggle_category(user_id: int, key: str) -> tuple[set[str], bool]:
@@ -1804,6 +1888,7 @@ async def clear_selected(user_id: int) -> None:
     async with SessionLocal() as session:
         await session.execute(delete(SelectedCategory).where(SelectedCategory.user_id == user_id))
         await session.commit()
+    _ui_selected_cache[int(user_id)] = (time.monotonic(), frozenset())
 
 
 def _identity_kwargs(title: str, category: str) -> tuple[ProductIdentity, dict]:
@@ -6614,6 +6699,24 @@ async def enqueue_user_scan(
             parse_mode=ParseMode.HTML,
         )
 
+    # v4.7.1 SCAN FLEET WAKE-UP. Wake all foreground worker fleets together as
+    # soon as a real scan is accepted. Date only refreshes readiness (no site
+    # request), Page starts process-local Chromium without opening a page, and
+    # View warms only its cheap HTTP session. All managers debounce simultaneous
+    # users, so four users starting together still create one warmup wave.
+    async def _wake_scan_fleets() -> None:
+        tasks = []
+        if REMOTE_DATE_WORKER_ENABLED:
+            tasks.append(REMOTE_DATE_MANAGER.request_prewarm())
+        if REMOTE_PAGE_WORKER_ENABLED:
+            tasks.append(REMOTE_PAGE_MANAGER.request_prewarm())
+        if REMOTE_VIEW_WORKER_ENABLED:
+            tasks.append(REMOTE_VIEW_MANAGER.request_prewarm())
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    _run_background(_wake_scan_fleets())
+
     job_uid = uuid.uuid4().hex[:12]
     scan = await create_user_scan(user_id, job_uid, category_keys, page_limit, target_date, price_filter=price_filter)
     status = await message.answer("⏳ <b>Подготавливаю скан…</b>", parse_mode=ParseMode.HTML)
@@ -7137,10 +7240,13 @@ class ActivityAccessMiddleware(BaseMiddleware):
         tg_user = getattr(event, "from_user", None)
         if tg_user is None:
             return await handler(event, data)
-        try:
-            await touch_user(tg_user)
-        except Exception:
-            log.exception("Could not update user activity user=%s", tg_user.id)
+        # v4.6.8: last_seen/profile refresh is bookkeeping, not a prerequisite for
+        # opening a tab. Running it in the background removes an occasional DB
+        # commit from the button-to-screen critical path. /start still performs
+        # its explicit force=True write before onboarding/registration logic.
+        event_text = (event.text or "").strip() if isinstance(event, Message) else ""
+        if not event_text.startswith("/start"):
+            _run_background(touch_user(tg_user))
 
         uid = int(tg_user.id)
         if uid in ADMIN_IDS or allowed(uid):
@@ -7378,11 +7484,14 @@ async def _admin_view_worker_text() -> str:
     last_shard_total = int(status.get("last_shard_total", 0) or 0)
     last_shard_workers = int(status.get("last_shard_workers", 0) or 0)
     last_shard_failed = int(status.get("last_shard_failed", 0) or 0)
+    expected_replicas = int(status.get("expected_replicas", 0) or 0)
+    prewarm_ready = int(status.get("prewarm_ready_total", 0) or 0)
     lines = [
         "<b>👁 VIEW MANAGER PRO</b>",
         "",
-        f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b>",
+        f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b> / ожидается <b>{expected_replicas or len(workers)}</b>",
         f"Redis queue: <b>{queue_depth}</b> · активных jobs: <b>{active_jobs}</b>",
+        f"Scan wake-up HTTP: <b>{prewarm_ready}/{len(workers)}</b> replicas готовы",
         f"Общий HTTP pool: <b>{pool_total}</b> · Browser: <b>{browser_total}</b>",
         f"Скорость: <b>{rate_total:.1f} views/sec</b>",
         f"View Sharding: <b>{'✅ ВКЛ' if sharding_enabled else '⛔ ВЫКЛ'}</b> · цель ≈ <b>{shard_size}</b> URL/job",
@@ -7390,7 +7499,7 @@ async def _admin_view_worker_text() -> str:
     if last_shard_count:
         lines.append(
             f"Последний batch: <b>{last_shard_total}</b> URL → <b>{last_shard_count}</b> jobs "
-            f"· workers: <b>{last_shard_workers}</b> · failed shards: <b>{last_shard_failed}</b>"
+            f"· live при старте: <b>{last_shard_workers}</b> · failed shards: <b>{last_shard_failed}</b>"
         )
     for idx, worker in enumerate(workers[:4], start=1):
         processed = int(worker.get("processed_total", 0) or 0)
@@ -7412,6 +7521,14 @@ async def _admin_view_worker_text() -> str:
         failures = int(worker.get("rounds_failed", 0) or 0)
         reason = html.escape(str(worker.get("adaptive_reason") or "—"))[:180]
         consumer = html.escape(str(worker.get("consumer") or f"worker-{idx}"))[:45]
+        prewarm_total = int(worker.get("prewarm_total", 0) or 0)
+        prewarm_ok = int(worker.get("prewarm_success_total", 0) or 0)
+        batch_stats = worker.get("last_view_batch_stats") or {}
+        if not isinstance(batch_stats, dict):
+            batch_stats = {}
+        initial_misses = int(batch_stats.get("initial_misses", 0) or 0)
+        session_recovered = int(batch_stats.get("session_recovered", 0) or 0)
+        batch_browser = int(batch_stats.get("browser_fallback", 0) or 0)
         lines.extend([
             "",
             f"<b>Worker {idx}</b> · v<b>{html.escape(str(worker.get('version') or '—'))}</b> · <code>{consumer}</code>",
@@ -7421,6 +7538,8 @@ async def _admin_view_worker_text() -> str:
             f"Exact: <b>{exact_pct:.1f}%</b> · browser fallback: <b>{fallback_pct:.1f}%</b> · processed: <b>{processed}</b>",
             f"403: <b>{r403}</b> · 429: <b>{r429}</b> · refusals/60s: <b>{refusals_60}</b>",
             f"Penalty: <b>{penalty}</b> · cooldown: <b>{cooldown:.1f}s</b> · requeue: <b>{requeues}</b> · errors: <b>{failures}</b>",
+            f"Fast path: initial misses <b>{initial_misses}</b> · session recovered <b>{session_recovered}</b> · Chromium <b>{batch_browser}</b>",
+            f"Prewarm HTTP: <b>{prewarm_ok}/{prewarm_total}</b>",
             f"Adaptive: <code>{reason}</code>",
         ])
     return "\n".join(lines)
@@ -7893,6 +8012,7 @@ async def subscription_handler(callback: CallbackQuery, state: FSMContext) -> No
 @dp.callback_query(F.data == "mypayments")
 async def my_payments_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
+    await callback.answer()
     payments = await user_payments(callback.from_user.id, 15)
     lines = ["<b>💳 Мои платежи</b>", ""]
     if not payments:
@@ -7907,7 +8027,6 @@ async def my_payments_handler(callback: CallbackQuery, state: FSMContext) -> Non
                 f"{p.amount_usdt:g} USDT · {_provider_label(p.provider)}\n"
                 f"#{p.id} · {date_text} МСК"
             )
-    await callback.answer()
     await _edit_or_answer(callback.message, "\n\n".join(lines), reply_markup=user_payments_keyboard(payments))
 
 
@@ -8050,11 +8169,14 @@ async def _admin_date_worker_text() -> str:
         )
 
     workers = list(status.get("workers") or [])
+    expected_replicas = int(status.get("expected_replicas", 0) or 0)
+    prewarm_ready = int(status.get("prewarm_ready_total", 0) or 0)
     lines = [
         "<b>📅 DATE MANAGER</b>",
         "",
-        f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b>",
+        f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b> / ожидается <b>{expected_replicas or len(workers)}</b>",
         f"Redis queue: <b>{int(status.get('queue_depth', 0) or 0)}</b> · активных: <b>{int(status.get('active_total', 0) or 0)}</b>",
+        f"Scan wake-up: <b>{prewarm_ready}/{len(workers)}</b> replicas подтвердили готовность",
         f"Date cache: <b>{int(status.get('cache_ttl', 180) or 180)} сек.</b> · Predictor: <b>{int(status.get('predictor_ttl', 3600) or 3600) // 60} мин.</b> · окно дат: <b>{int(status.get('max_age_days', DATE_MAX_AGE_DAYS) or DATE_MAX_AGE_DAYS) + 1} дней</b>",
         f"Общая скорость: <b>{float(status.get('rate_total', 0.0) or 0.0):.2f} probes/sec</b>",
         f"Проб отправлено: <b>{int(status.get('probes_queued_total', 0) or 0)}</b> · cache hits: <b>{int(status.get('cache_hits_total', 0) or 0)}</b>",
@@ -8081,6 +8203,7 @@ async def _admin_date_worker_text() -> str:
             f"probes: <b>{int(worker.get('processed', 0) or 0)}</b> · speed <b>{float(worker.get('rate_ema', 0.0) or 0.0):.2f}/s</b>",
             f"HTTP fast: <b>{int(worker.get('http_fast_ok', 0) or 0)}</b> · browser confirm: <b>{int(worker.get('browser_confirm_ok', 0) or 0)}/{int(worker.get('browser_confirms', 0) or 0)}</b>",
             f"403/429: <b>{int(worker.get('http_403', 0) or 0)}/{int(worker.get('http_429', 0) or 0)}</b> · conflicts: <b>{int(worker.get('transport_conflicts', 0) or 0)}</b> · errors <b>{int(worker.get('errors', 0) or 0)}</b>",
+            f"Wake-up: <b>{int(worker.get('prewarm_total', 0) or 0)}</b> · last <b>{_human_duration(max(0, int(time.time() - float(worker.get('last_prewarm_at', 0.0) or 0.0)))) if float(worker.get('last_prewarm_at', 0.0) or 0.0) > 0 else '—'}</b> назад",
         ])
     lines.extend([
         "",
@@ -8109,11 +8232,15 @@ async def _admin_page_worker_text() -> str:
         )
 
     workers = list(status.get("workers") or [])
+    expected_replicas = int(status.get("expected_replicas", 0) or 0)
+    browser_ready = int(status.get("browser_ready_total", 0) or 0)
+    prewarm_ready = int(status.get("prewarm_ready_total", 0) or 0)
     lines = [
         "<b>📄 PAGE MANAGER</b>",
         "",
-        f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b>",
+        f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b> / ожидается <b>{expected_replicas or len(workers)}</b>",
         f"Redis queue: <b>{int(status.get('queue_depth', 0) or 0)}</b> · активных: <b>{int(status.get('active_total', 0) or 0)}</b>",
+        f"Scan wake-up: <b>{prewarm_ready}/{len(workers)}</b> · Chromium готов: <b>{browser_ready}/{len(workers)}</b>",
         f"Кэш страниц: <b>{int(status.get('cache_ttl', 180) or 180)} сек.</b>",
         f"Streaming: <b>✅ ВКЛ</b> · Rolling: <b>{'✅' if status.get('rolling_prefetch') else '—'}</b> "
         f"окно <b>{int(status.get('prefetch_window_pages', 0) or 0)}</b> / low-water <b>{int(status.get('prefetch_low_water_pages', 0) or 0)}</b> · "
@@ -8136,6 +8263,7 @@ async def _admin_page_worker_text() -> str:
             f"Fleet: <b>{html.escape(str(worker.get('fleet_bucket') or '—'))}</b> · scan/browser/global <b>{int(worker.get('fleet_scan_limit', 0) or 0)}/{int(worker.get('fleet_browser_limit', 0) or 0)}/{int(worker.get('fleet_global_limit', 0) or 0)}</b>",
             f"pages: <b>{int(worker.get('processed', 0) or 0)}</b> · cache-hit worker: <b>{int(worker.get('cache_served', 0) or 0)}</b> · speed <b>{float(worker.get('rate_ema', 0.0) or 0.0):.2f}/s</b>",
             f"403/429: <b>{int(worker.get('http_403', 0) or 0)}/{int(worker.get('http_429', 0) or 0)}</b> · penalty <b>{int(worker.get('penalty', 0) or 0)}</b>",
+            f"Chromium: <b>{'готов' if worker.get('browser_ready') else 'cold'}</b> · prewarm <b>{int(worker.get('prewarm_success_total', 0) or 0)}/{int(worker.get('prewarm_total', 0) or 0)}</b>",
         ])
     lines.extend([
         "",
@@ -10596,8 +10724,8 @@ async def scan_recheck_partial(callback: CallbackQuery) -> None:
 async def groups(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     if not allowed(callback.from_user.id): await callback.answer("Нет доступа", show_alert=True); return
-    selected = await get_selected(callback.from_user.id)
     await callback.answer()
+    selected = await get_selected(callback.from_user.id)
     await _edit_or_answer(
         callback.message,
         f"<b>🗂 Категории</b>\n\nВыбери до <b>{MAX_SELECTED_CATEGORIES}</b> категорий на один скан.",
@@ -10609,9 +10737,9 @@ async def groups(callback: CallbackQuery, state: FSMContext) -> None:
 async def open_group(callback: CallbackQuery) -> None:
     group_key = callback.data.split(":", 1)[1]
     if group_key not in GROUPS: await callback.answer("Раздел не найден", show_alert=True); return
+    await callback.answer()
     selected = await get_selected(callback.from_user.id)
     group = GROUPS[group_key]
-    await callback.answer()
     await callback.message.edit_text(
         f"<b>{group.icon} {html.escape(group.name)}</b>\n\n"
         f"Отметь нужные подкатегории. Максимум за один запуск: <b>{MAX_SELECTED_CATEGORIES}</b>.",

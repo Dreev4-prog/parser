@@ -42,12 +42,17 @@ DATE_REDIS_PREFIX = os.getenv("DATE_REDIS_PREFIX", "dtparser:dateworker").strip(
 DATE_STREAM = f"{DATE_REDIS_PREFIX}:jobs"
 DATE_GROUP = f"{DATE_REDIS_PREFIX}:workers"
 DATE_HEARTBEAT_KEY = f"{DATE_REDIS_PREFIX}:heartbeat"
+DATE_PREWARM_KEY = f"{DATE_REDIS_PREFIX}:prewarm:event"
+DATE_PREWARM_GATE_KEY = f"{DATE_REDIS_PREFIX}:prewarm:gate"
+DATE_PREWARM_EVENT_TTL_SECONDS = _env_int("DATE_PREWARM_EVENT_TTL_SECONDS", 600, 60, 3600)
+DATE_PREWARM_DEBOUNCE_SECONDS = _env_int("DATE_PREWARM_DEBOUNCE_SECONDS", 90, 15, 600)
 DATE_CACHE_TTL_SECONDS = _env_int("DATE_CACHE_TTL_SECONDS", 180, 30, 900)
 DATE_PENDING_TTL_SECONDS = _env_int("DATE_PENDING_TTL_SECONDS", 90, 20, 300)
 DATE_ERROR_TTL_SECONDS = _env_int("DATE_ERROR_TTL_SECONDS", 45, 10, 180)
 DATE_HEARTBEAT_STALE_SECONDS = _env_int("DATE_HEARTBEAT_STALE_SECONDS", 20, 8, 120)
 DATE_PROBE_TIMEOUT_SECONDS = _env_int("DATE_PROBE_TIMEOUT_SECONDS", 10, 3, 45)
 DATE_PROBE_POLL_MS = _env_int("DATE_PROBE_POLL_MS", 120, 50, 1000)
+DATE_EXPECTED_REPLICAS = _env_int("DATE_EXPECTED_REPLICAS", 4, 1, 16)
 DATE_MAX_AGE_DAYS = 4  # hard product limit: today + previous four days = five calendar dates
 DATE_INITIAL_PROBES = (1, 2, 4, 8, 16, 32, 50)
 
@@ -207,6 +212,8 @@ class RemoteDateManager:
         self.last_cold_turbo = False
         self.last_cold_age_days = 0
         self.last_cold_probe_pages: list[int] = []
+        self.prewarm_requests_total = 0
+        self.last_prewarm_at = 0.0
 
     async def connect(self):
         if not self.enabled:
@@ -357,6 +364,32 @@ class RemoteDateManager:
             self.predictor_misses_total += 1
             log.debug("Date predictor read failed", exc_info=True)
             return None
+
+    async def request_prewarm(self) -> bool:
+        """Broadcast a cheap readiness pulse to Date Worker replicas.
+
+        Date is HTTP-first and its httpx clients already exist at worker startup,
+        so this intentionally performs no Kleinanzeigen request and never launches
+        Chromium. Workers acknowledge the token through their heartbeat.
+        """
+        if not self.enabled:
+            return False
+        try:
+            redis = await self.connect()
+            gate = await redis.set(
+                DATE_PREWARM_GATE_KEY, str(time.time()), ex=DATE_PREWARM_DEBOUNCE_SECONDS, nx=True
+            )
+            if not gate:
+                return False
+            token = f"{int(time.time())}:{os.getpid()}:{time.time_ns()}"
+            await redis.set(DATE_PREWARM_KEY, token, ex=DATE_PREWARM_EVENT_TTL_SECONDS)
+            self.prewarm_requests_total += 1
+            self.last_prewarm_at = time.time()
+            log.info("Date fleet readiness prewarm requested token=%s", token[:32])
+            return True
+        except Exception:
+            log.debug("Could not request Date Worker prewarm", exc_info=True)
+            return False
 
     async def worker_count(self) -> int:
         if not self.enabled:
@@ -830,6 +863,7 @@ class RemoteDateManager:
             "queue_depth": 0,
             "cache_ttl": DATE_CACHE_TTL_SECONDS,
             "max_age_days": DATE_MAX_AGE_DAYS,
+            "expected_replicas": DATE_EXPECTED_REPLICAS,
             "predictor_ttl": DATE_PREDICTOR_TTL_SECONDS,
             "predictor_hits_total": self.predictor_hits_total,
             "predictor_misses_total": self.predictor_misses_total,
@@ -860,6 +894,8 @@ class RemoteDateManager:
             "last_batch_workers": self.last_batch_workers,
             "last_boundary": self.last_boundary,
             "last_target_date": self.last_target_date,
+            "prewarm_requests_total": self.prewarm_requests_total,
+            "last_prewarm_at": self.last_prewarm_at,
         }
         if not self.enabled:
             return base
@@ -886,6 +922,11 @@ class RemoteDateManager:
                 base["processed_total"] = sum(int(x.get("processed", 0) or 0) for x in workers)
                 base["errors_worker_total"] = sum(int(x.get("errors", 0) or 0) for x in workers)
                 base["rate_total"] = sum(float(x.get("rate_ema", 0.0) or 0.0) for x in workers)
+                event_at = float(self.last_prewarm_at or 0.0)
+                base["prewarm_ready_total"] = (
+                    sum(1 for x in workers if float(x.get("last_prewarm_at", 0.0) or 0.0) >= event_at - 2.0)
+                    if event_at > 0 else 0
+                )
             return base
         except Exception as exc:
             base["error"] = str(exc)[:300]

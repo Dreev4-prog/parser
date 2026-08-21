@@ -43,6 +43,16 @@ class BrowserIdleShutdownGuard:
         self.label = str(label)
         self.log = logger or logging.getLogger("dtparser-browser-idle")
         self._idle_since: float | None = None
+        self._activity_generation = 0
+
+    def touch(self) -> None:
+        """Reset the idle timer for non-job warmup activity.
+
+        The generation also closes a subtle race where a prewarm starts while
+        tick() is already waiting to enter the final shutdown lock.
+        """
+        self._activity_generation += 1
+        self._idle_since = None
 
     async def _queue_depth(self) -> int | None:
         try:
@@ -87,9 +97,14 @@ class BrowserIdleShutdownGuard:
 
         closed = False
         # Serialize the final transition with job activation. Re-check both local
-        # work and the Redis stream while holding the lock.
+        # work and the Redis stream while holding the lock. A prewarm can happen
+        # while this task is waiting for the lock, so also verify its generation.
+        activity_generation = self._activity_generation
         async with self.activity_lock:
             depth = await self._queue_depth()
+            if self._activity_generation != activity_generation:
+                self._idle_since = None
+                return False
             if (
                 int(self.active_count() or 0) == 0
                 and depth == 0

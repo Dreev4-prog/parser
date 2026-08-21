@@ -57,6 +57,7 @@ from date_manager import (
     DATE_ERROR_TTL_SECONDS,
     DATE_GROUP,
     DATE_HEARTBEAT_KEY,
+    DATE_PREWARM_KEY,
     DATE_PENDING_TTL_SECONDS,
     DATE_REDIS_PREFIX,
     DATE_STREAM,
@@ -161,6 +162,9 @@ class DateWorkerProcess:
         self._group_ready = False
         self._stop = asyncio.Event()
         self._activity_lock = asyncio.Lock()
+        self.prewarm_total = 0
+        self.last_prewarm_at = 0.0
+        self._last_prewarm_token: str | None = None
         # HTTP probes are cheap and parallel. Chromium confirmation is deliberately
         # narrow and also protected by the Redis date-browser fleet bucket.
         self._browser_confirm_sem = asyncio.Semaphore(DATE_WORKER_BROWSER_CONFIRM_CONCURRENCY)
@@ -240,6 +244,8 @@ class DateWorkerProcess:
             "penalty": penalty,
             "cooldown_seconds": round(cooldown, 2),
             "cache_ttl": DATE_CACHE_TTL_SECONDS,
+            "prewarm_total": self.prewarm_total,
+            "last_prewarm_at": self.last_prewarm_at,
             "uptime_seconds": int(time.monotonic() - self.started),
         }
         raw = json.dumps(payload, ensure_ascii=False)
@@ -258,6 +264,29 @@ class DateWorkerProcess:
                 log.warning("Date Worker heartbeat failed", exc_info=True)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=DATE_WORKER_HEARTBEAT_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+
+    async def prewarm_loop(self) -> None:
+        """Acknowledge scan-start readiness without external site traffic."""
+        while not self._stop.is_set():
+            try:
+                token = await self.redis.get(DATE_PREWARM_KEY)
+                if token and token != self._last_prewarm_token:
+                    self._last_prewarm_token = str(token)
+                    self.prewarm_total += 1
+                    # Redis + parser/httpx are already alive; force a fresh heartbeat
+                    # so the manager/admin sees this replica as ready immediately.
+                    await self.redis.ping()
+                    self.last_prewarm_at = time.time()
+                    await self.heartbeat()
+                    log.info("Date Worker readiness prewarm token=%s", str(token)[:24])
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("Date Worker readiness prewarm skipped", exc_info=True)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=1.0)
             except asyncio.TimeoutError:
                 pass
 
@@ -471,6 +500,7 @@ class DateWorkerProcess:
         await self.redis.ping()
         await self.ensure_group()
         hb = asyncio.create_task(self.heartbeat_loop(), name="date-worker-heartbeat")
+        prewarm_task = asyncio.create_task(self.prewarm_loop(), name="date-worker-prewarm")
         idle_guard = BrowserIdleShutdownGuard(
             redis=self.redis,
             stream=DATE_STREAM,
@@ -502,10 +532,11 @@ class DateWorkerProcess:
         finally:
             self._stop.set()
             hb.cancel()
+            prewarm_task.cancel()
             idle_task.cancel()
             for task in consumers:
                 task.cancel()
-            await asyncio.gather(hb, idle_task, *consumers, return_exceptions=True)
+            await asyncio.gather(hb, prewarm_task, idle_task, *consumers, return_exceptions=True)
             try:
                 await self.redis.delete(self.worker_key())
             except Exception:

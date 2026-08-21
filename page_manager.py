@@ -43,6 +43,10 @@ PAGE_REDIS_PREFIX = os.getenv("PAGE_REDIS_PREFIX", "dtparser:pageworker").strip(
 PAGE_STREAM = f"{PAGE_REDIS_PREFIX}:jobs"
 PAGE_GROUP = f"{PAGE_REDIS_PREFIX}:workers"
 PAGE_HEARTBEAT_KEY = f"{PAGE_REDIS_PREFIX}:heartbeat"
+PAGE_PREWARM_KEY = f"{PAGE_REDIS_PREFIX}:prewarm:event"
+PAGE_PREWARM_GATE_KEY = f"{PAGE_REDIS_PREFIX}:prewarm:gate"
+PAGE_PREWARM_EVENT_TTL_SECONDS = _env_int("PAGE_PREWARM_EVENT_TTL_SECONDS", 600, 60, 3600)
+PAGE_PREWARM_DEBOUNCE_SECONDS = _env_int("PAGE_PREWARM_DEBOUNCE_SECONDS", 90, 15, 600)
 PAGE_CACHE_TTL_SECONDS = _env_int("PAGE_CACHE_TTL_SECONDS", 180, 30, 900)
 PAGE_PENDING_TTL_SECONDS = _env_int("PAGE_PENDING_TTL_SECONDS", 180, 30, 900)
 PAGE_ERROR_TTL_SECONDS = _env_int("PAGE_ERROR_TTL_SECONDS", 45, 10, 300)
@@ -63,6 +67,7 @@ PAGE_PREFETCH_EXTRA_PAGES = _env_int("PAGE_PREFETCH_EXTRA_PAGES", 3, 0, 10)
 # continues. This cuts wasted Page Worker traffic when the day ends early.
 PAGE_PREFETCH_WINDOW_PAGES = _env_int("PAGE_PREFETCH_WINDOW_PAGES", 10, 4, 20)
 PAGE_PREFETCH_LOW_WATER_PAGES = _env_int("PAGE_PREFETCH_LOW_WATER_PAGES", 4, 1, 10)
+PAGE_EXPECTED_REPLICAS = _env_int("PAGE_EXPECTED_REPLICAS", 4, 1, 16)
 
 
 def rolling_prefetch_range(
@@ -227,6 +232,8 @@ class RemotePageManager:
         self.last_batch_workers = 0
         self.last_batch_seconds = 0.0
         self.last_batch_at = 0.0
+        self.prewarm_requests_total = 0
+        self.last_prewarm_at = 0.0
 
     async def connect(self):
         if not self.enabled:
@@ -265,6 +272,32 @@ class RemotePageManager:
 
     def error_key(self, cache_id: str) -> str:
         return f"{PAGE_REDIS_PREFIX}:error:{cache_id}"
+
+    async def request_prewarm(self) -> bool:
+        """Broadcast a no-navigation Chromium warmup to every Page replica.
+
+        Workers only launch their process-local shared Chromium. No page is opened
+        and no Kleinanzeigen request is made. A short debounce collapses multiple
+        simultaneous scan starts into one fleet wake-up.
+        """
+        if not self.enabled:
+            return False
+        try:
+            redis = await self.connect()
+            gate = await redis.set(
+                PAGE_PREWARM_GATE_KEY, str(time.time()), ex=PAGE_PREWARM_DEBOUNCE_SECONDS, nx=True
+            )
+            if not gate:
+                return False
+            token = f"{int(time.time())}:{os.getpid()}:{time.time_ns()}"
+            await redis.set(PAGE_PREWARM_KEY, token, ex=PAGE_PREWARM_EVENT_TTL_SECONDS)
+            self.prewarm_requests_total += 1
+            self.last_prewarm_at = time.time()
+            log.info("Page fleet Chromium prewarm requested token=%s", token[:32])
+            return True
+        except Exception:
+            log.debug("Could not request Page Worker prewarm", exc_info=True)
+            return False
 
     async def worker_count(self) -> int:
         if not self.enabled:
@@ -577,6 +610,7 @@ class RemotePageManager:
             "rolling_prefetch": True,
             "prefetch_window_pages": PAGE_PREFETCH_WINDOW_PAGES,
             "prefetch_low_water_pages": PAGE_PREFETCH_LOW_WATER_PAGES,
+            "expected_replicas": PAGE_EXPECTED_REPLICAS,
             "cache_wait_ms": PAGE_CACHE_WAIT_MS,
             "cache_hits_total": self.cache_hits_total,
             "cache_misses_total": self.cache_misses_total,
@@ -591,6 +625,8 @@ class RemotePageManager:
             "last_batch_workers": self.last_batch_workers,
             "last_batch_seconds": self.last_batch_seconds,
             "last_batch_at": self.last_batch_at,
+            "prewarm_requests_total": self.prewarm_requests_total,
+            "last_prewarm_at": self.last_prewarm_at,
             "error": None,
         }
         if not self.enabled:
@@ -622,6 +658,12 @@ class RemotePageManager:
                 base["cache_served_total"] = sum(int(x.get("cache_served", 0) or 0) for x in workers)
                 base["errors_total"] = sum(int(x.get("errors", 0) or 0) for x in workers)
                 base["rate_total"] = sum(float(x.get("rate_ema", 0.0) or 0.0) for x in workers)
+                base["browser_ready_total"] = sum(1 for x in workers if x.get("browser_ready"))
+                event_at = float(self.last_prewarm_at or 0.0)
+                base["prewarm_ready_total"] = (
+                    sum(1 for x in workers if float(x.get("last_prewarm_at", 0.0) or 0.0) >= event_at - 2.0)
+                    if event_at > 0 else 0
+                )
             return base
         except Exception as exc:
             base["error"] = str(exc)[:300]
