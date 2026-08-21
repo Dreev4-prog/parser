@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from functools import lru_cache
 from datetime import datetime
 from typing import Optional
 
@@ -1229,9 +1228,10 @@ WORD_MAP: dict[str, str] = {
 _WORD_RE = re.compile(r"(?iu)\b(" + "|".join(re.escape(k) for k in sorted(WORD_MAP, key=len, reverse=True)) + r")\b")
 
 
-@lru_cache(maxsize=4096)
-def _translate_english_cached(text: str) -> str:
-    out = text
+def translate_text(text: str | None, language: str | None) -> str | None:
+    if not text or normalize_language(language) != LANG_EN:
+        return text
+    out = str(text)
     for source, target in ALL_PHRASES:
         if source not in out:
             continue
@@ -1254,9 +1254,3 @@ def _translate_english_cached(text: str) -> str:
     out = re.sub(r"(?<=\d)\s*мин\.?\b", " min", out, flags=re.I)
     out = re.sub(r"(?<=\d)\s*ч\b", "h", out, flags=re.I)
     return out
-
-
-def translate_text(text: str | None, language: str | None) -> str | None:
-    if not text or normalize_language(language) != LANG_EN:
-        return text
-    return _translate_english_cached(str(text))

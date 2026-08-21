@@ -68,7 +68,7 @@ ACCURATE_VIEW_HTTP_CONCURRENCY = max(2, min(24, int(os.getenv("ACCURATE_VIEW_HTT
 # must not immediately turn into a Chromium storm. Retry only transient transport
 # failures (403/429/5xx/timeouts) through the same adaptive HTTP lane. A normal
 # HTTP 200 whose payload genuinely has no explicit counter may still use Chromium.
-ACCURATE_VIEW_TRANSIENT_HTTP_RETRIES = max(0, min(2, int(os.getenv("ACCURATE_VIEW_TRANSIENT_HTTP_RETRIES", "1"))))
+ACCURATE_VIEW_TRANSIENT_HTTP_RETRIES = max(0, min(2, int(os.getenv("ACCURATE_VIEW_TRANSIENT_HTTP_RETRIES", "0"))))
 ACCURATE_VIEW_TRANSIENT_RETRY_JITTER_MS = max(0, min(1000, int(os.getenv("ACCURATE_VIEW_TRANSIENT_RETRY_JITTER_MS", "150"))))
 # v4.7.0 Fast Session Recovery. When many cheap counter calls miss at once, warm
 # one normal Kleinanzeigen HTTP session and retry the official endpoint before
@@ -76,6 +76,7 @@ ACCURATE_VIEW_TRANSIENT_RETRY_JITTER_MS = max(0, min(1000, int(os.getenv("ACCURA
 VIEW_HTTP_WARM_TTL_SECONDS = max(30.0, min(900.0, float(os.getenv("VIEW_HTTP_WARM_TTL_SECONDS", "300"))))
 ACCURATE_VIEW_SESSION_RECOVERY_MIN_MISSES = max(2, min(200, int(os.getenv("ACCURATE_VIEW_SESSION_RECOVERY_MIN_MISSES", "8"))))
 ACCURATE_VIEW_SESSION_RECOVERY_MIN_RATIO = max(0.01, min(1.0, float(os.getenv("ACCURATE_VIEW_SESSION_RECOVERY_MIN_RATIO", "0.08"))))
+ACCURATE_VIEW_SESSION_RECOVERY_ENABLED = os.getenv("ACCURATE_VIEW_SESSION_RECOVERY_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 ACCURATE_VIEW_DOM_TIMEOUT_MS = max(500, min(8000, int(os.getenv("ACCURATE_VIEW_DOM_TIMEOUT_MS", "2500"))))
 ACCURATE_VIEW_RETRIES = max(1, min(3, int(os.getenv("ACCURATE_VIEW_RETRIES", "2"))))
 
@@ -2907,7 +2908,8 @@ class KleinanzeigenParser:
             session_warmed = False
             session_recovered = 0
             if (
-                phase1_misses >= ACCURATE_VIEW_SESSION_RECOVERY_MIN_MISSES
+                ACCURATE_VIEW_SESSION_RECOVERY_ENABLED
+                and phase1_misses >= ACCURATE_VIEW_SESSION_RECOVERY_MIN_MISSES
                 and miss_ratio >= ACCURATE_VIEW_SESSION_RECOVERY_MIN_RATIO
             ):
                 # A broad miss pattern normally means the cheap client is cold or

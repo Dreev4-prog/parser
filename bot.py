@@ -204,54 +204,15 @@ if not MENU_IMAGE_PATH.exists():
 # it avoids re-uploading the menu image every time the user returns home.
 _MENU_IMAGE_FILE_ID: str | None = None
 
-# v4.6.8 Instant UI.  Tiny process-local caches keep Telegram navigation off
-# the PostgreSQL critical path. They cache presentation state only; parser/worker
-# source-of-truth remains PostgreSQL/Redis. Writes update or invalidate the cache
-# immediately, and short TTLs cover changes made by another process.
-UI_STATE_CACHE_TTL_SECONDS = max(1.0, min(60.0, float(os.getenv("UI_STATE_CACHE_TTL_SECONDS", "20"))))
-UI_SCAN_MENU_CACHE_TTL_SECONDS = max(0.5, min(15.0, float(os.getenv("UI_SCAN_MENU_CACHE_TTL_SECONDS", "3"))))
-_ui_selected_cache: dict[int, tuple[float, frozenset[str]]] = {}
-_ui_settings_cache: dict[int, tuple[float, tuple]] = {}
-_ui_scan_overview_cache: dict[tuple[int, int], tuple[float, tuple[list[UserScan], int]]] = {}
-_ui_popular_cache: dict[tuple[int, int], tuple[float, list[tuple[str, UserScan]]]] = {}
-_background_ui_tasks: set[asyncio.Task] = set()
+# v4.7.2: dedicated task holder for scan-fleet wake-up. This is intentionally
+# separate from the reverted v4.6.8 UI background/caching layer.
+_scan_wakeup_tasks: set[asyncio.Task] = set()
 
-_SETTINGS_CACHE_FIELDS = (
-    "output_mode", "smart_dedupe", "clean_noise", "period", "price_filter",
-    "min_views", "sort_mode", "include_words", "exclude_words", "page_limit",
-    "auto_observations",
-)
-
-def _settings_snapshot(settings: UserSettings) -> tuple:
-    return tuple(getattr(settings, field, None) for field in _SETTINGS_CACHE_FIELDS)
-
-def _settings_from_snapshot(user_id: int, snapshot: tuple) -> UserSettings:
-    values = dict(zip(_SETTINGS_CACHE_FIELDS, snapshot))
-    return UserSettings(user_id=int(user_id), **values)
-
-def _cache_settings(settings: UserSettings) -> None:
-    _ui_settings_cache[int(settings.user_id)] = (time.monotonic(), _settings_snapshot(settings))
-
-def _invalidate_scan_menu_cache(user_id: int) -> None:
-    uid = int(user_id)
-    for key in [key for key in _ui_scan_overview_cache if key[0] == uid]:
-        _ui_scan_overview_cache.pop(key, None)
-    for key in [key for key in _ui_popular_cache if key[0] == uid]:
-        _ui_popular_cache.pop(key, None)
-
-def _background_task_done(task: asyncio.Task) -> None:
-    try:
-        task.result()
-    except asyncio.CancelledError:
-        pass
-    except Exception:
-        log.debug("Background UI task failed", exc_info=True)
-
-def _run_background(coro) -> None:
+def _start_scan_wakeup(coro) -> None:
     task = asyncio.create_task(coro)
-    _background_ui_tasks.add(task)
-    task.add_done_callback(_background_ui_tasks.discard)
-    task.add_done_callback(_background_task_done)
+    _scan_wakeup_tasks.add(task)
+    task.add_done_callback(_scan_wakeup_tasks.discard)
+
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
@@ -397,7 +358,7 @@ OBSERVATION_LATE_GRACE_MINUTES = max(5, int(os.getenv("OBSERVATION_LATE_GRACE_MI
 # intact for Popular Now, exports and future analytics.
 SCAN_ARCHIVE_AFTER_HOURS = 24
 SCAN_ARCHIVE_PAGE_SIZE = 8
-SCAN_ARCHIVE_SWEEP_SECONDS = 60
+SCAN_ARCHIVE_SWEEP_SECONDS = 15 * 60
 ARCHIVABLE_SCAN_STATUSES = ("done", "partial", "cancelled", "failed")
 
 GROWTH_TOP_LIMIT = 50
@@ -878,13 +839,6 @@ def min_views_keyboard(current: int = 0) -> InlineKeyboardMarkup:
 
 
 async def get_settings(user_id: int) -> UserSettings:
-    user_id = int(user_id)
-    now = time.monotonic()
-    cached = _ui_settings_cache.get(user_id)
-    if cached is not None and now - cached[0] <= UI_STATE_CACHE_TTL_SECONDS:
-        # Return a fresh transient object because get_settings_for_scan() adjusts
-        # price_filter for historical scans and must never mutate the cache.
-        return _settings_from_snapshot(user_id, cached[1])
     async with SessionLocal() as session:
         s = await session.get(UserSettings, user_id)
         if s is None:
@@ -892,7 +846,6 @@ async def get_settings(user_id: int) -> UserSettings:
             session.add(s)
             await session.commit()
             await session.refresh(s)
-        _cache_settings(s)
         return s
 
 
@@ -914,7 +867,6 @@ async def update_setting(user_id: int, field: str, value) -> UserSettings:
         setattr(s, field, value)
         await session.commit()
         await session.refresh(s)
-        _cache_settings(s)
         return s
 
 
@@ -946,7 +898,6 @@ async def auto_observations_enabled(user_id: int) -> bool:
 
 
 async def reset_user_settings(user_id: int) -> UserSettings:
-    _ui_settings_cache.pop(int(user_id), None)
     async with SessionLocal() as session:
         old = await session.get(UserSettings, user_id)
         if old:
@@ -956,22 +907,15 @@ async def reset_user_settings(user_id: int) -> UserSettings:
 
 
 async def get_selected(user_id: int) -> set[str]:
-    user_id = int(user_id)
-    now = time.monotonic()
-    cached = _ui_selected_cache.get(user_id)
-    if cached is not None and now - cached[0] <= UI_STATE_CACHE_TTL_SECONDS:
-        return set(cached[1])
     async with SessionLocal() as session:
         result = await session.execute(select(SelectedCategory.category_key).where(SelectedCategory.user_id == user_id))
         # v4.3.4: root/"whole section" categories remain in CATEGORIES only for
         # backwards compatibility with old saved scans. They are no longer a
         # selectable user option and therefore must not leak back into a new run.
-        selected = {
+        return {
             x for x in result.scalars().all()
             if x in CATEGORIES and not CATEGORIES[x].is_group
         }
-    _ui_selected_cache[user_id] = (now, frozenset(selected))
-    return selected
 
 
 def _scan_category_keys(scan: UserScan) -> list[str]:
@@ -1021,7 +965,6 @@ async def create_user_scan(user_id: int, job_uid: str, category_keys: list[str],
         session.add(scan)
         await session.commit()
         await session.refresh(scan)
-        _invalidate_scan_menu_cache(user_id)
         return scan
 
 
@@ -1237,28 +1180,17 @@ async def get_archive_count(user_id: int, *, archive: bool = True) -> int:
 
 
 async def get_user_scans_overview(user_id: int, limit: int = 10) -> tuple[list[UserScan], int]:
-    """Fast UI overview; archival itself is handled by the background sweeper."""
-    key = (int(user_id), int(limit))
-    now = time.monotonic()
-    cached = _ui_scan_overview_cache.get(key)
-    if cached is not None and now - cached[0] <= UI_SCAN_MENU_CACHE_TTL_SECONDS:
-        scans, archive_count = cached[1]
-        return list(scans), int(archive_count)
+    """One archive sweep, then load inbox + archive count in parallel."""
+    await archive_expired_scans(user_id)
     scans, archive_count = await asyncio.gather(
         get_user_scans(user_id, limit, archive=False),
         get_archive_count(user_id, archive=False),
     )
-    _ui_scan_overview_cache[key] = (now, (list(scans), int(archive_count)))
     return scans, archive_count
 
 
 async def get_user_popular_categories(user_id: int, limit_scans: int = 100) -> list[tuple[str, UserScan]]:
     """Return one menu entry per category using its latest successful scan only."""
-    cache_key = (int(user_id), int(limit_scans))
-    now = time.monotonic()
-    cached = _ui_popular_cache.get(cache_key)
-    if cached is not None and now - cached[0] <= UI_SCAN_MENU_CACHE_TTL_SECONDS:
-        return list(cached[1])
     async with SessionLocal() as session:
         result = await session.execute(
             select(UserScan)
@@ -1275,9 +1207,7 @@ async def get_user_popular_categories(user_id: int, limit_scans: int = 100) -> l
         for key in _scan_category_keys(scan):
             if key in CATEGORIES and key not in latest:
                 latest[key] = scan
-    items = list(latest.items())
-    _ui_popular_cache[cache_key] = (now, list(items))
-    return items
+    return list(latest.items())
 
 
 async def get_user_category_scans(user_id: int, category_key: str) -> list[UserScan]:
@@ -1474,7 +1404,6 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
                 scan.last_error = None
             if cancelled:
                 await session.commit()
-                _invalidate_scan_menu_cache(job.user_id)
                 return
 
             matched_ids = sorted(job.matched_ids or set())
@@ -1530,7 +1459,6 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
                     ))
             await session.commit()
 
-    _invalidate_scan_menu_cache(job.user_id)
     if not cancelled:
         await ensure_scan_observation_plan(job.scan_id, now)
 
@@ -1848,9 +1776,7 @@ async def _replace_selected_categories(user_id: int, keys: set[str]) -> set[str]
         await session.execute(delete(SelectedCategory).where(SelectedCategory.user_id == user_id))
         session.add_all([SelectedCategory(user_id=user_id, category_key=key) for key in clean])
         await session.commit()
-    selected = set(clean)
-    _ui_selected_cache[int(user_id)] = (time.monotonic(), frozenset(selected))
-    return selected
+    return set(clean)
 
 
 async def toggle_category(user_id: int, key: str) -> tuple[set[str], bool]:
@@ -1888,7 +1814,6 @@ async def clear_selected(user_id: int) -> None:
     async with SessionLocal() as session:
         await session.execute(delete(SelectedCategory).where(SelectedCategory.user_id == user_id))
         await session.commit()
-    _ui_selected_cache[int(user_id)] = (time.monotonic(), frozenset())
 
 
 def _identity_kwargs(title: str, category: str) -> tuple[ProductIdentity, dict]:
@@ -6715,7 +6640,7 @@ async def enqueue_user_scan(
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    _run_background(_wake_scan_fleets())
+    _start_scan_wakeup(_wake_scan_fleets())
 
     job_uid = uuid.uuid4().hex[:12]
     scan = await create_user_scan(user_id, job_uid, category_keys, page_limit, target_date, price_filter=price_filter)
@@ -7240,13 +7165,10 @@ class ActivityAccessMiddleware(BaseMiddleware):
         tg_user = getattr(event, "from_user", None)
         if tg_user is None:
             return await handler(event, data)
-        # v4.6.8: last_seen/profile refresh is bookkeeping, not a prerequisite for
-        # opening a tab. Running it in the background removes an occasional DB
-        # commit from the button-to-screen critical path. /start still performs
-        # its explicit force=True write before onboarding/registration logic.
-        event_text = (event.text or "").strip() if isinstance(event, Message) else ""
-        if not event_text.startswith("/start"):
-            _run_background(touch_user(tg_user))
+        try:
+            await touch_user(tg_user)
+        except Exception:
+            log.exception("Could not update user activity user=%s", tg_user.id)
 
         uid = int(tg_user.id)
         if uid in ADMIN_IDS or allowed(uid):
@@ -8012,7 +7934,6 @@ async def subscription_handler(callback: CallbackQuery, state: FSMContext) -> No
 @dp.callback_query(F.data == "mypayments")
 async def my_payments_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await callback.answer()
     payments = await user_payments(callback.from_user.id, 15)
     lines = ["<b>💳 Мои платежи</b>", ""]
     if not payments:
@@ -8027,6 +7948,7 @@ async def my_payments_handler(callback: CallbackQuery, state: FSMContext) -> Non
                 f"{p.amount_usdt:g} USDT · {_provider_label(p.provider)}\n"
                 f"#{p.id} · {date_text} МСК"
             )
+    await callback.answer()
     await _edit_or_answer(callback.message, "\n\n".join(lines), reply_markup=user_payments_keyboard(payments))
 
 
@@ -10724,8 +10646,8 @@ async def scan_recheck_partial(callback: CallbackQuery) -> None:
 async def groups(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     if not allowed(callback.from_user.id): await callback.answer("Нет доступа", show_alert=True); return
-    await callback.answer()
     selected = await get_selected(callback.from_user.id)
+    await callback.answer()
     await _edit_or_answer(
         callback.message,
         f"<b>🗂 Категории</b>\n\nВыбери до <b>{MAX_SELECTED_CATEGORIES}</b> категорий на один скан.",
@@ -10737,9 +10659,9 @@ async def groups(callback: CallbackQuery, state: FSMContext) -> None:
 async def open_group(callback: CallbackQuery) -> None:
     group_key = callback.data.split(":", 1)[1]
     if group_key not in GROUPS: await callback.answer("Раздел не найден", show_alert=True); return
-    await callback.answer()
     selected = await get_selected(callback.from_user.id)
     group = GROUPS[group_key]
+    await callback.answer()
     await callback.message.edit_text(
         f"<b>{group.icon} {html.escape(group.name)}</b>\n\n"
         f"Отметь нужные подкатегории. Максимум за один запуск: <b>{MAX_SELECTED_CATEGORIES}</b>.",

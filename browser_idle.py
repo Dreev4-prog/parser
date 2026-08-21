@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import Callable
 
@@ -9,11 +10,11 @@ from parser import shared_browser_runtime_running, shutdown_shared_browser_runti
 
 
 class BrowserIdleShutdownGuard:
-    """Close process-local shared Chromium only after the whole worker fleet is idle.
+    """Close process-local shared Chromium only after the whole parser is idle.
 
-    Redis stream entries remain present while queued *and* while claimed/processing,
-    because workers XDEL them only after acknowledgement. Therefore xlen(stream)==0
-    plus local active==0 is a conservative signal that this worker type has no work.
+    Both the local worker stream and the global foreground scan stream must be empty.
+    The global scan entry is deleted only after the full user scan finishes, preventing
+    a Page/View browser from shutting down merely because another scan stage is active.
 
     The activity_lock closes the last race: a consumer cannot begin a new browser job
     between the final idle check and Chromium shutdown. If a job arrives during the
@@ -32,9 +33,12 @@ class BrowserIdleShutdownGuard:
         poll_seconds: float = 5.0,
         label: str = "worker",
         logger: logging.Logger | None = None,
+        global_scan_stream: str | None = None,
     ) -> None:
         self.redis = redis
         self.stream = str(stream)
+        redis_prefix = (os.getenv("REDIS_PREFIX", "dtparser").strip() or "dtparser")
+        self.global_scan_stream = str(global_scan_stream or f"{redis_prefix}:scan_jobs")
         self.active_count = active_count
         self.activity_lock = activity_lock
         self.stop_event = stop_event
@@ -54,12 +58,24 @@ class BrowserIdleShutdownGuard:
         self._activity_generation += 1
         self._idle_since = None
 
-    async def _queue_depth(self) -> int | None:
+    async def _queue_depths(self) -> tuple[int | None, int | None]:
+        """Return local worker depth and global foreground-scan depth in one RTT.
+
+        The original v4.6.1 guard only watched the worker's own stream. That meant
+        Page/View Chromium could enter its 10-minute countdown while a user scan was
+        still busy in another stage. The global scan stream keeps its entry until the
+        parser worker finishes the whole scan, so it is the correct system-wide busy
+        signal for memory shutdown.
+        """
         try:
-            return int(await self.redis.xlen(self.stream))
+            pipe = self.redis.pipeline(transaction=False)
+            pipe.xlen(self.stream)
+            pipe.xlen(self.global_scan_stream)
+            local_depth, global_depth = await pipe.execute()
+            return int(local_depth), int(global_depth)
         except Exception:
-            # Safety first: an unknown queue state must never trigger browser close.
-            return None
+            # Safety first: unknown queue state must never trigger browser close.
+            return None, None
 
     async def _wait(self) -> None:
         try:
@@ -77,8 +93,8 @@ class BrowserIdleShutdownGuard:
             self._idle_since = None
             return False
 
-        depth = await self._queue_depth()
-        if depth is None or depth > 0:
+        depth, global_depth = await self._queue_depths()
+        if depth is None or global_depth is None or depth > 0 or global_depth > 0:
             self._idle_since = None
             return False
 
@@ -101,13 +117,14 @@ class BrowserIdleShutdownGuard:
         # while this task is waiting for the lock, so also verify its generation.
         activity_generation = self._activity_generation
         async with self.activity_lock:
-            depth = await self._queue_depth()
+            depth, global_depth = await self._queue_depths()
             if self._activity_generation != activity_generation:
                 self._idle_since = None
                 return False
             if (
                 int(self.active_count() or 0) == 0
                 and depth == 0
+                and global_depth == 0
                 and shared_browser_runtime_running()
             ):
                 await shutdown_shared_browser_runtime()
