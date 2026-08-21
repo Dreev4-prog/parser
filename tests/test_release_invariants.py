@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ReleaseInvariantTests(unittest.TestCase):
     def test_release_version(self):
-        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.4.0")
+        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.5.1")
 
     def test_date_window_and_timezone_semantics_were_not_changed(self):
         source = (ROOT / "date_manager.py").read_text(encoding="utf-8")
@@ -28,6 +28,30 @@ class ReleaseInvariantTests(unittest.TestCase):
         source = (ROOT / "date_manager.py").read_text(encoding="utf-8")
         self.assertIn("v4.3.37 DATE BOUNDARY RACE FIX", source)
         self.assertIn("for _refine_round in range(2):", source)
+
+    def test_ai_worker_never_opens_parser_browser(self):
+        source = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
+        self.assertNotIn("KleinanzeigenParser", source)
+        self.assertIn('REMOTE_VIEW_MANAGER.fetch', source)
+        self.assertIn('AI_PAUSE_DURING_USER_SCANS', source)
+
+    def test_everyday_scan_ui_hides_transport_and_regional_internals(self):
+        source = (ROOT / "bot.py").read_text(encoding="utf-8")
+        start = source.index("def render_user_job_status")
+        end = source.index("async def progress_ticker", start)
+        block = source[start:end]
+        self.assertNotIn("Отдельная Chromium-сессия", block)
+        self.assertNotIn("Региональный добор даты", block)
+        self.assertNotIn("Поиск даты", block)
+        self.assertIn("Сканирование · {percent}%", block)
+        self.assertIn("Собираю просмотры · {percent}%", block)
+
+    def test_ai_shadow_is_independent_from_user_auto_measurements(self):
+        source = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
+        self.assertNotIn("UserSettings", source)
+        self.assertNotIn("ScanObservation", source)
+        self.assertIn("AI_CHECKPOINT_HOURS", source)
+
 
 
 if __name__ == "__main__":

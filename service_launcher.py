@@ -19,6 +19,8 @@ def _role() -> str:
         return "page-worker"
     if explicit in {"viewworker", "viewcounterworker", "viewsworker"}:
         return "view-worker"
+    if explicit in {"aiworker", "earlywinnerworker", "dtaiworker"}:
+        return "ai-worker"
     if explicit in {"bot", "main", "parserbot", "telegrambot"}:
         return "bot"
 
@@ -38,6 +40,10 @@ def _role() -> str:
         "view" in normalized and "worker" in normalized
     ):
         return "view-worker"
+    if normalized in {"aiworker", "earlywinnerworker", "dtaiworker"} or (
+        ("ai" in normalized or "earlywinner" in normalized) and "worker" in normalized
+    ):
+        return "ai-worker"
 
     # v4.3.17 safety net for Railway services created from the same repo:
     # the dedicated View Worker intentionally needs Redis only, while the main
@@ -56,10 +62,16 @@ def _role() -> str:
 def main() -> None:
     role = _role()
     service_name = os.getenv("RAILWAY_SERVICE_NAME", "local")
+    if role == "ai-worker":
+        # The AI worker delegates tiny +1/+3/+6 candidate checks to the existing
+        # exact View Worker fleet; it never opens its own browser.
+        os.environ.setdefault("REMOTE_VIEW_WORKER_ENABLED", "1")
+        os.environ.setdefault("DISTRIBUTED_WORKERS", "1")
     target = {
         "view-worker": "view_counter_worker.py",
         "page-worker": "page_worker.py",
         "date-worker": "date_worker.py",
+        "ai-worker": "ai_worker.py",
     }.get(role, "bot.py")
 
     print(

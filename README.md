@@ -1,3 +1,23 @@
+# DT Parser v4.5.1 — OPPORTUNITY DISCOVERY / CLEAN SCAN UI
+
+DT AI Lab now searches for **demand/supply opportunities**, not simply high-view products. `ew-opportunity-v2` adds a supply sweet spot, up to −35 mass-market penalty, family-balanced category baselines, unknown-product family cohorts, and max 2 visible candidates per product family. Product recognition confidence no longer adds Score. v4.5.0 scan-starvation after the first 20 AI runs is fixed.
+
+The ordinary Telegram scan card is also simplified: users see only scan %, pages, listings and exact-view progress. Chromium/HTTP/regional/date-worker/recovery internals stay in logs/admin.
+
+Railway topology remains Main Bot ×1, Date/Page/View ×4, AI Worker ×1, Redis/PostgreSQL ×1. No DB migration. See `DEPLOY_V4_5_1_OPPORTUNITY_DISCOVERY.md`.
+
+---
+
+# DT Parser v4.5.0 — DT AI LAB / EARLY WINNER ENGINE
+
+**Admin-only shadow AI.** A separate AI Worker scores fresh listings after normal scans, tracks only a small candidate set at +1/+3/+6 hours, reuses existing exact view measurements whenever possible, and pauses new AI network checks while user scans are active. Users do not see AI controls yet.
+
+`/admin -> 🧠 DT AI Lab` now contains the WATCH / RISING / EARLY WINNER / CONFIRMED / REJECTED funnel, candidate details, forecasts, real checkpoints, control-group calibration and accuracy statistics. Existing user `Автозамеры` remain independent.
+
+Railway: keep Main Bot ×1, Date/Page/View ×4, Redis/PostgreSQL ×1 and add **AI Worker ×1** with the same repository, `DATABASE_URL` and `REDIS_URL`. See `DEPLOY_V4_5_0_DT_AI_LAB.md`.
+
+---
+
 # DT Parser v4.4.0 — STABILITY HARDENING
 
 Большое обновление стабильности поверх v4.3.38. Product limits остаются: **до 2 категорий**, **5 дат** (сегодня + 4 предыдущих), **15/25/50 страниц**, Worker fleet **Date ×4 / Page ×4 / View ×4**.

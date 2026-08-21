@@ -240,6 +240,104 @@ class ScanObservation(Base):
     error_text: Mapped[str | None] = mapped_column(String(1000), nullable=True)
 
 
+class AIEarlyWinnerRun(Base):
+    """One shadow-mode Early Winner analysis for a completed user scan."""
+
+    __tablename__ = "ai_early_winner_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scan_id: Mapped[int] = mapped_column(unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    model_version: Mapped[str] = mapped_column(String(40), default="ew-stat-v1", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    listing_count: Mapped[int] = mapped_column(Integer, default=0)
+    eligible_count: Mapped[int] = mapped_column(Integer, default=0)
+    candidate_count: Mapped[int] = mapped_column(Integer, default=0)
+    control_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_text: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+
+class AIEarlyWinnerCandidate(Base):
+    """Admin-only Early Winner candidate tracked after a normal parser scan."""
+
+    __tablename__ = "ai_early_winner_candidates"
+    __table_args__ = (UniqueConstraint("scan_id", "external_id", name="uq_ai_ew_scan_listing"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(index=True)
+    scan_id: Mapped[int] = mapped_column(index=True)
+    external_id: Mapped[str] = mapped_column(String(64), index=True)
+    category_key: Mapped[str] = mapped_column(String(80), default="", index=True)
+    identity_key: Mapped[str | None] = mapped_column(String(500), nullable=True, index=True)
+    is_control: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    baseline_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    baseline_views: Mapped[int] = mapped_column(Integer, default=0)
+    age_minutes: Mapped[float] = mapped_column(Float, default=0.0)
+    initial_views_per_hour: Mapped[float] = mapped_column(Float, default=0.0)
+    latest_views: Mapped[int] = mapped_column(Integer, default=0)
+    latest_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    initial_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    current_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    confidence: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    stage: Mapped[str] = mapped_column(String(24), default="watch", index=True)
+    outcome: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    velocity_percentile: Mapped[float] = mapped_column(Float, default=0.0)
+    peer_count: Mapped[int] = mapped_column(Integer, default=0)
+    peer_vph_median: Mapped[float] = mapped_column(Float, default=0.0)
+    peer_vph_p85: Mapped[float] = mapped_column(Float, default=0.0)
+    peer_vph_p90: Mapped[float] = mapped_column(Float, default=0.0)
+    market_median_eur: Mapped[float | None] = mapped_column(Float, nullable=True)
+    market_cohort_size: Mapped[int] = mapped_column(Integer, default=0)
+    price_delta_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    predicted_3h_low: Mapped[int] = mapped_column(Integer, default=0)
+    predicted_3h_high: Mapped[int] = mapped_column(Integer, default=0)
+    predicted_6h_low: Mapped[int] = mapped_column(Integer, default=0)
+    predicted_6h_high: Mapped[int] = mapped_column(Integer, default=0)
+    reasons_json: Mapped[str] = mapped_column(Text, default="[]")
+    latest_reasons_json: Mapped[str] = mapped_column(Text, default="[]")
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+
+class AIEarlyWinnerObservation(Base):
+    """Internal +1/+3/+6h control point for one Early Winner candidate."""
+
+    __tablename__ = "ai_early_winner_observations"
+    __table_args__ = (UniqueConstraint("candidate_id", "target_hours", name="uq_ai_ew_candidate_checkpoint"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    candidate_id: Mapped[int] = mapped_column(index=True)
+    target_hours: Mapped[int] = mapped_column(Integer, index=True)
+    due_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    measured_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    view_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    delta_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    observed_views_per_hour: Mapped[float | None] = mapped_column(Float, nullable=True)
+    score_after: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source: Mapped[str] = mapped_column(String(40), default="")
+    error_text: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+
+class AIEarlyWinnerEvent(Base):
+    """Admin notification outbox generated by the AI worker."""
+
+    __tablename__ = "ai_early_winner_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    candidate_id: Mapped[int] = mapped_column(index=True)
+    event_type: Mapped[str] = mapped_column(String(32), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+
 class StablePageCheckpoint(Base):
     """Persistent verified category page used by the v3.8 stable scan engine."""
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import json
 from collections import Counter
 from contextvars import ContextVar
 import html
@@ -45,7 +46,12 @@ from filters import (
     sort_rows,
     unique_rows,
 )
-from models import AppSetting, BotUser, CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing, ScanObservation, ScanViewHistory, SelectedCategory, StableCategoryJob, StablePageCheckpoint, SubscriptionPayment, SubscriptionPlan, UserScan, UserSettings, ViewHistory
+from models import (
+    AIEarlyWinnerCandidate, AIEarlyWinnerEvent, AIEarlyWinnerObservation, AIEarlyWinnerRun,
+    AppSetting, BotUser, CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing,
+    ScanObservation, ScanViewHistory, SelectedCategory, StableCategoryJob, StablePageCheckpoint,
+    SubscriptionPayment, SubscriptionPlan, UserScan, UserSettings, ViewHistory,
+)
 from product_identity import TYPE_DISPLAY, ProductIdentity, recognize_product
 from traffic import TRAFFIC
 from distributed import (
@@ -80,6 +86,7 @@ from parser import (
     private_provider_url,
 )
 from view_manager import REMOTE_VIEW_MANAGER, REMOTE_VIEW_WORKER_ENABLED
+from ai_manager import AI_MANAGER
 from page_manager import (
     PAGE_PREFETCH_EXTRA_PAGES, PAGE_PREFETCH_LOW_WATER_PAGES, PAGE_PREFETCH_WINDOW_PAGES,
     REMOTE_PAGE_MANAGER, REMOTE_PAGE_WORKER_ENABLED, rolling_prefetch_range,
@@ -2538,8 +2545,8 @@ async def refresh_view_counts(
     if status is None and message is not None:
         try:
             status = await message.answer(
-                f"👁 Собираю просмотры для <b>{len(eligible)}</b> объявлений…\n"
-                f"🔎 Точный публичный счётчик + Chromium только при необходимости · {status_note}",
+                f"👁 <b>Собираю просмотры</b>\n\n"
+                f"📦 Объявлений: <b>{len(eligible)}</b>",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
@@ -2562,10 +2569,7 @@ async def refresh_view_counts(
                 await status.edit_text(
                     f"<b>{html.escape(title)}</b>\n\n"
                     f"{_progress_bar(pct)} <b>{pct}%</b>\n"
-                    f"📦 Проверено: <b>{completed}/{len(eligible)}</b>\n"
-                    f"🔎 Обработано в текущем замере: <b>{done}/{len(targets)}</b>\n"
-                    f"🔎 Сначала точный публичный счётчик; Chromium — только если он не ответил.\n\n"
-                    "Неподтверждённое значение не заменяется нулём и не попадает в TOP.",
+                    f"👁 Проверено: <b>{completed}/{len(eligible)}</b>",
                     parse_mode=ParseMode.HTML,
                 )
             except Exception:
@@ -5519,28 +5523,6 @@ def render_user_job_status(job: ScanJob) -> str:
             + f"⏱ <b>{_human_duration(waited)}</b>"
         )
 
-    if job.recovery_note:
-        live = category_live_progress.get(job.current_progress_key) if job.current_progress_key else None
-        checkpoint_line = ""
-        if live is not None and live.checkpoint_hits:
-            checkpoint_line = f"\n💾 Готовых страниц использовано: <b>{live.checkpoint_hits}</b>"
-        return (
-            "🔧 <b>Автовосстановление скана</b>\n\n"
-            f"📂 <b>{html.escape(job.current_category or 'Категория')}</b>\n"
-            f"♻️ Попытка: <b>{job.recovery_attempt}/{max(1, job.recovery_total)}</b>\n"
-            f"{html.escape(job.recovery_note)}"
-            f"{checkpoint_line}\n\n"
-            "Проблемные участки перепроверяются автоматически."
-        )
-
-    if job.retry_note:
-        return (
-            "♻️ <b>Временный сбой — повторяю категорию</b>\n\n"
-            f"📂 <b>{html.escape(job.current_category or 'Категория')}</b>\n"
-            f"{html.escape(job.retry_note)}\n"
-            "Уже собранные данные сохранены."
-        )
-
     live = category_live_progress.get(job.current_progress_key) if job.current_progress_key else None
     current_today = live.today_seen if live is not None else 0
     live_views_ready = live.views_ready if live is not None else 0
@@ -5581,51 +5563,17 @@ def render_user_job_status(job: ScanJob) -> str:
     category_line = html.escape(job.current_category) if job.current_category else "Подготовка…"
     category_index = max(1, job.current_category_index)
 
-    # Date-location can use jumps and internal fallback feeds, so page numbers and
-    # quality telemetry are intentionally hidden from the everyday UI.
+    # v4.5.1: everyday users see one simple scan state. Date search, regional
+    # fallback, HTTP/Chromium transport, retries and worker routing stay in logs/admin.
     if live is None or live.phase not in {"collecting", "views"}:
-        requests_text = ""
-        if live is not None and live.network_requests:
-            requests_text = f"\n🌐 Проверено запросов: <b>{live.network_requests}</b>"
-        wait_text = ""
-        if live is not None and live.request_started_at_ts:
-            waiting = max(0, int(time.time() - float(live.request_started_at_ts)))
-            if waiting >= 2:
-                page_hint = f" · стр. {live.current_request_page}" if live.current_request_page else ""
-                wait_text = f"\n⏳ Ответ Kleinanzeigen: <b>{waiting} сек</b>{page_hint}"
-        transport_text = ""
-        if SCAN_TRANSPORT == "browser":
-            transport_text = "🌐 <b>Отдельная Chromium-сессия</b>\n"
-        elif SCAN_TRANSPORT == "hybrid":
-            stage = (live.transport_stage if live is not None else "") or "direct-http"
-            labels = {
-                "direct-http": "HTTP-first",
-                "api-http": "HTTP после browser-сессии",
-                "browser-fallback": "Browser fallback",
-                "browser-seed": "Browser fallback",
-                "postgres-checkpoint": "PostgreSQL checkpoint",
-                "date-worker-regional-prewarm": "Date Worker · регионы параллельно",
-                "date-worker-regional-pipeline": "Date Worker · региональный pipeline",
-            }
-            transport_text = f"⚡ <b>{labels.get(stage, 'HTTP-first hybrid')}</b>\n"
-        timeout_text = ""
-        if live is not None and live.request_timeouts:
-            timeout_text = f"⚠️ Автоповторов по таймауту: <b>{live.request_timeouts}</b>\n"
-        if live is not None and live.phase == "stable_scan":
-            stage_title = "Стабильный проход"
-        elif live is not None and live.phase == "regional_date":
-            stage_title = "Региональный добор даты"
-        else:
-            stage_title = "Поиск даты"
+        pages_done = max(0, min(depth, int(live.collection_index or 0))) if live is not None else 0
         return (
-            f"🔎 <b>{stage_title} · {percent}%</b>\n"
+            f"🔎 <b>Сканирование · {percent}%</b>\n"
             f"{_progress_bar(percent)}\n\n"
             f"🗂 <b>{category_line}</b> · {category_index}/{total}\n"
-            f"📅 За <b>{_date_label(job.target_date)}</b>"
-            f"{requests_text}{wait_text}\n"
-            f"⏱ <b>{_human_duration(elapsed)}</b>\n"
-            + transport_text + timeout_text
-            + "\nСтатус обновляется автоматически."
+            f"📄 <b>{pages_done}/{depth}</b> страниц\n"
+            f"📦 <b>{current_today}</b> объявлений\n"
+            f"⏱ <b>{_human_duration(elapsed)}</b>"
         )
 
     if live.phase == "views":
@@ -6786,6 +6734,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📅 Date Worker", callback_data="admindates"),
          InlineKeyboardButton(text="📄 Page Worker", callback_data="adminpages")],
         [InlineKeyboardButton(text="👁 View Worker", callback_data="adminviews")],
+        [InlineKeyboardButton(text="🧠 DT AI Lab", callback_data="adminai")],
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="adminusers"),
          InlineKeyboardButton(text="💳 Платежи", callback_data="adminpayments")],
         [InlineKeyboardButton(text="🎟 Тарифы", callback_data="adminplans"),
@@ -7108,6 +7057,401 @@ async def _admin_view_worker_text() -> str:
     return "\n".join(lines)
 
 
+def admin_ai_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔥 Early Winners", callback_data="adminai:winners"),
+         InlineKeyboardButton(text="⚡ Watch / Rising", callback_data="adminai:active")],
+        [InlineKeyboardButton(text="✅ Подтверждены", callback_data="adminai:confirmed"),
+         InlineKeyboardButton(text="❌ Не подтвердились", callback_data="adminai:rejected")],
+        [InlineKeyboardButton(text="📊 Точность AI", callback_data="adminai:accuracy"),
+         InlineKeyboardButton(text="🧪 Последние прогнозы", callback_data="adminai:recent")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminai")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
+    ])
+
+
+def _ai_stage_label(stage: str, outcome: str = "pending") -> str:
+    if outcome == "confirmed":
+        return "✅ CONFIRMED"
+    if outcome == "rejected":
+        return "❌ REJECTED"
+    return {
+        "early_winner": "🔥 EARLY WINNER",
+        "rising": "⚡ RISING",
+        "watch": "🟡 WATCH",
+    }.get(stage or "", "🟡 WATCH")
+
+
+def _ai_json_list(raw: str | None) -> list[str]:
+    try:
+        data = json.loads(raw or "[]")
+        if isinstance(data, list):
+            return [str(x) for x in data if str(x).strip()]
+    except Exception:
+        pass
+    return []
+
+
+def _moscow_today_start_utc_naive() -> datetime:
+    now_msk = datetime.now(MOSCOW)
+    start_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_msk.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+async def _admin_ai_dashboard_text() -> str:
+    worker = await AI_MANAGER.status()
+    today_start = _moscow_today_start_utc_naive()
+    async with SessionLocal() as session:
+        runs = (await session.execute(select(AIEarlyWinnerRun).where(
+            AIEarlyWinnerRun.created_at >= today_start
+        ))).scalars().all()
+        candidates = (await session.execute(select(AIEarlyWinnerCandidate).where(
+            AIEarlyWinnerCandidate.created_at >= today_start,
+            AIEarlyWinnerCandidate.is_control.is_(False),
+        ))).scalars().all()
+        controls = int((await session.execute(select(func.count(AIEarlyWinnerCandidate.id)).where(
+            AIEarlyWinnerCandidate.created_at >= today_start,
+            AIEarlyWinnerCandidate.is_control.is_(True),
+        ))).scalar_one() or 0)
+        pending_obs = int((await session.execute(select(func.count(AIEarlyWinnerObservation.id)).where(
+            AIEarlyWinnerObservation.status.in_(["pending", "running"])
+        ))).scalar_one() or 0)
+
+    scanned = sum(int(x.listing_count or 0) for x in runs if x.status == "done")
+    eligible = sum(int(x.eligible_count or 0) for x in runs if x.status == "done")
+    watch = sum(1 for x in candidates if x.outcome == "pending" and x.stage == "watch")
+    rising = sum(1 for x in candidates if x.outcome == "pending" and x.stage == "rising")
+    ai_candidates_total = len(candidates)
+    run_errors = sum(1 for x in runs if x.status == "error")
+    winners = sum(1 for x in candidates if x.outcome == "pending" and x.stage == "early_winner")
+    confirmed = sum(1 for x in candidates if x.outcome == "confirmed")
+    rejected = sum(1 for x in candidates if x.outcome == "rejected")
+    resolved = confirmed + rejected
+    accuracy = (confirmed / resolved * 100.0) if resolved else None
+
+    if worker.get("alive"):
+        worker_text = (
+            f"🟢 online · v{html.escape(str(worker.get('version') or '—'))} · "
+            f"model {html.escape(str(worker.get('model_version') or '—'))}"
+        )
+        if worker.get("paused_for_scans"):
+            worker_text += " · ⏸ ждёт завершения пользовательских сканов"
+    elif worker.get("enabled"):
+        worker_text = "🔴 offline · heartbeat AI Worker не найден"
+    else:
+        worker_text = "▫️ REDIS_URL недоступен в Main Bot"
+
+    lines = [
+        "<b>🧠 DT AI LAB · EARLY WINNER</b>",
+        "",
+        f"AI Worker: <b>{worker_text}</b>",
+        "Режим: <b>🔒 Shadow · только админка</b>",
+        "Пользовательский парсер и его Автозамеры не меняются.",
+        "",
+        "<b>📊 Воронка сегодня</b>",
+        f"Сканов обработано: <b>{sum(1 for x in runs if x.status == 'done')}</b>",
+        f"Объявлений в сканах: <b>{scanned}</b>",
+        f"Подходят для раннего анализа: <b>{eligible}</b>",
+        f"AI-кандидатов найдено: <b>{ai_candidates_total}</b>",
+        f"🟡 WATCH: <b>{watch}</b>",
+        f"⚡ RISING: <b>{rising}</b>",
+        f"🔥 EARLY WINNER: <b>{winners}</b>",
+        f"✅ Подтверждены: <b>{confirmed}</b>",
+        f"❌ Не подтвердились: <b>{rejected}</b>",
+        f"🧪 Контрольная группа: <b>{controls}</b>",
+        f"⏱ Ожидают +1/+3/+6: <b>{pending_obs}</b>",
+    ]
+    if run_errors:
+        lines.append(f"⚠️ Ошибок AI-анализа сегодня: <b>{run_errors}</b>")
+    if accuracy is None:
+        lines.extend(["", "📈 Точность: <b>пока накапливаем подтверждения</b>"])
+    else:
+        lines.extend(["", f"📈 Confirm rate среди завершённых наблюдений: <b>{accuracy:.1f}%</b> ({confirmed}/{resolved})"])
+    if worker.get("last_error"):
+        lines.append(f"⚠️ Последняя ошибка: <code>{html.escape(str(worker.get('last_error')))[:260]}</code>")
+    return "\n".join(lines)
+
+
+async def _ai_candidate_rows(kind: str, limit: int = 15) -> list[tuple[AIEarlyWinnerCandidate, Listing, UserScan]]:
+    async with SessionLocal() as session:
+        query = (
+            select(AIEarlyWinnerCandidate, Listing, UserScan)
+            .join(Listing, Listing.external_id == AIEarlyWinnerCandidate.external_id)
+            .join(UserScan, UserScan.id == AIEarlyWinnerCandidate.scan_id)
+            .where(AIEarlyWinnerCandidate.is_control.is_(False))
+        )
+        if kind == "winners":
+            query = query.where(
+                AIEarlyWinnerCandidate.outcome == "pending",
+                AIEarlyWinnerCandidate.stage == "early_winner",
+            ).order_by(AIEarlyWinnerCandidate.current_score.desc(), AIEarlyWinnerCandidate.latest_at.desc())
+        elif kind == "active":
+            query = query.where(
+                AIEarlyWinnerCandidate.outcome == "pending",
+                AIEarlyWinnerCandidate.stage.in_(["watch", "rising"]),
+            ).order_by(AIEarlyWinnerCandidate.current_score.desc(), AIEarlyWinnerCandidate.latest_at.desc())
+        elif kind == "confirmed":
+            query = query.where(AIEarlyWinnerCandidate.outcome == "confirmed").order_by(AIEarlyWinnerCandidate.resolved_at.desc())
+        elif kind == "rejected":
+            query = query.where(AIEarlyWinnerCandidate.outcome == "rejected").order_by(AIEarlyWinnerCandidate.resolved_at.desc())
+        else:
+            query = query.order_by(AIEarlyWinnerCandidate.created_at.desc())
+        return list((await session.execute(query.limit(max(1, min(30, limit))))).all())
+
+
+def _ai_list_keyboard(kind: str, rows: list[tuple[AIEarlyWinnerCandidate, Listing, UserScan]]) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+    for candidate, listing, _scan in rows[:15]:
+        title = " ".join((listing.title or "Объявление").split())[:27]
+        icon = "✅" if candidate.outcome == "confirmed" else "❌" if candidate.outcome == "rejected" else "🔥" if candidate.stage == "early_winner" else "⚡" if candidate.stage == "rising" else "🟡"
+        buttons.append([InlineKeyboardButton(
+            text=f"{icon} {int(candidate.current_score or 0)} · {title}",
+            callback_data=f"aic:{int(candidate.id)}:{kind[:10]}",
+        )])
+    buttons.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"adminai:{kind}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ DT AI Lab", callback_data="adminai")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _admin_ai_list_text(kind: str, rows: list[tuple[AIEarlyWinnerCandidate, Listing, UserScan]]) -> str:
+    titles = {
+        "winners": "🔥 Early Winners",
+        "active": "⚡ Watch / Rising",
+        "confirmed": "✅ Подтверждённые",
+        "rejected": "❌ Не подтвердились",
+        "recent": "🧪 Последние прогнозы",
+    }
+    lines = [f"<b>{titles.get(kind, '🧠 Early Winner')}</b>", ""]
+    if not rows:
+        lines.append("Пока нет объявлений в этом разделе.")
+        return "\n".join(lines)
+    for idx, (candidate, listing, scan) in enumerate(rows[:15], start=1):
+        price = f"{listing.price_eur} €" if listing.price_eur is not None else (listing.price_text or "—")
+        lines.append(
+            f"{idx}. {_ai_stage_label(candidate.stage, candidate.outcome)} · <b>{int(candidate.current_score or 0)}/100</b> "
+            f"(conf {int(candidate.confidence or 0)}%)\n"
+            f"   {html.escape((listing.title or 'Объявление')[:80])} · <b>{html.escape(str(price))}</b>\n"
+            f"   👁 {int(candidate.latest_views or 0)} · scan #{scan.id} · {_utc_to_msk_text(candidate.latest_at)} МСК"
+        )
+    lines.extend(["", "Нажми на объявление ниже, чтобы увидеть причины, прогноз и контрольные точки."])
+    return "\n".join(lines)
+
+
+async def _admin_ai_candidate(candidate_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    async with SessionLocal() as session:
+        row = (await session.execute(
+            select(AIEarlyWinnerCandidate, Listing, UserScan)
+            .join(Listing, Listing.external_id == AIEarlyWinnerCandidate.external_id)
+            .join(UserScan, UserScan.id == AIEarlyWinnerCandidate.scan_id)
+            .where(AIEarlyWinnerCandidate.id == int(candidate_id))
+        )).one_or_none()
+        if row is None:
+            return None
+        candidate, listing, scan = row
+        observations = list((await session.execute(
+            select(AIEarlyWinnerObservation)
+            .where(AIEarlyWinnerObservation.candidate_id == int(candidate.id))
+            .order_by(AIEarlyWinnerObservation.target_hours.asc())
+        )).scalars().all())
+
+    price = f"{listing.price_eur} €" if listing.price_eur is not None else (listing.price_text or "—")
+    cat = CATEGORIES.get(candidate.category_key)
+    cat_name = cat.name if cat is not None else (listing.category or candidate.category_key or "—")
+    reasons = _ai_json_list(candidate.reasons_json)
+    latest_reasons = _ai_json_list(candidate.latest_reasons_json)
+    lines = [
+        f"<b>{_ai_stage_label(candidate.stage, candidate.outcome)}</b>",
+        f"<b>{html.escape((listing.title or 'Объявление')[:180])}</b>",
+        "",
+        f"🚀 Score: <b>{int(candidate.current_score or 0)}/100</b> · старт {int(candidate.initial_score or 0)}",
+        f"🎯 Уверенность данных: <b>{int(candidate.confidence or 0)}%</b>",
+        f"🗂 {html.escape(cat_name)} · scan <b>#{scan.id}</b>",
+        f"💶 Цена: <b>{html.escape(str(price))}</b>",
+        f"👁 Старт: <b>{int(candidate.baseline_views or 0)}</b> · сейчас: <b>{int(candidate.latest_views or 0)}</b>",
+        f"⏱ Возраст при обнаружении: <b>{float(candidate.age_minutes or 0)/60.0:.1f} ч</b>",
+        f"⚡ Стартовый темп: <b>{float(candidate.initial_views_per_hour or 0):.1f}/ч</b> · percentile <b>{float(candidate.velocity_percentile or 0)*100:.0f}%</b>",
+    ]
+    market_n = int(candidate.market_cohort_size or 0)
+    if candidate.market_median_eur is not None:
+        delta = candidate.price_delta_pct
+        if delta is None:
+            delta_text = ""
+        elif delta >= 0:
+            delta_text = f" · цена ниже медианы на {delta:.0f}%"
+        else:
+            delta_text = f" · цена выше медианы на {abs(delta):.0f}%"
+        lines.append(
+            f"📦 Рынок 30д: <b>{market_n}</b> сопоставимых · медиана <b>{float(candidate.market_median_eur):.0f} €</b>{delta_text}"
+        )
+    else:
+        lines.append(f"📦 Рынок 30д: <b>{market_n}</b> сопоставимых публикаций")
+    lines.extend([
+        "",
+        "<b>🔮 Первичный прогноз</b>",
+        f"+3ч: <b>{int(candidate.predicted_3h_low or 0)}–{int(candidate.predicted_3h_high or 0)}</b> просмотров",
+        f"+6ч: <b>{int(candidate.predicted_6h_low or 0)}–{int(candidate.predicted_6h_high or 0)}</b> просмотров",
+    ])
+    if reasons:
+        lines.extend(["", "<b>Почему такой стартовый Score</b>"])
+        lines.extend([f"• {html.escape(reason)}" for reason in reasons[:6]])
+    if latest_reasons:
+        lines.extend(["", "<b>Что изменилось после замеров</b>"])
+        lines.extend([f"• {html.escape(reason)}" for reason in latest_reasons[:5]])
+
+    lines.extend(["", "<b>🧪 Контрольные точки</b>"])
+    for obs in observations:
+        if obs.status == "done" and obs.view_count is not None:
+            lines.append(
+                f"+{obs.target_hours}ч ✅ <b>{obs.view_count}</b> views · Δ{int(obs.delta_views or 0):+d} "
+                f"· {float(obs.observed_views_per_hour or 0):.1f}/ч · score {int(obs.score_after or 0)}"
+            )
+        elif obs.status in {"error", "missed"}:
+            lines.append(f"+{obs.target_hours}ч ⚠️ {html.escape(obs.status)}")
+        else:
+            lines.append(f"+{obs.target_hours}ч ⏳ ожидается {_utc_to_msk_text(obs.due_at)} МСК")
+
+    back_kind = "confirmed" if candidate.outcome == "confirmed" else "rejected" if candidate.outcome == "rejected" else "winners" if candidate.stage == "early_winner" else "active"
+    buttons: list[list[InlineKeyboardButton]] = []
+    if listing.url:
+        buttons.append([InlineKeyboardButton(text="🔗 Открыть объявление", url=listing.url)])
+    buttons.append([InlineKeyboardButton(text="⬅️ К списку", callback_data=f"adminai:{back_kind}")])
+    buttons.append([InlineKeyboardButton(text="🧠 DT AI Lab", callback_data="adminai")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _admin_ai_accuracy_text() -> str:
+    cutoff = datetime.utcnow() - timedelta(days=30)
+    async with SessionLocal() as session:
+        candidates = list((await session.execute(select(AIEarlyWinnerCandidate).where(
+            AIEarlyWinnerCandidate.created_at >= cutoff
+        ))).scalars().all())
+        observations = list((await session.execute(
+            select(AIEarlyWinnerObservation)
+            .join(AIEarlyWinnerCandidate, AIEarlyWinnerCandidate.id == AIEarlyWinnerObservation.candidate_id)
+            .where(
+                AIEarlyWinnerObservation.status == "done",
+                AIEarlyWinnerObservation.view_count.is_not(None),
+                AIEarlyWinnerCandidate.created_at >= cutoff,
+            )
+        )).scalars().all())
+
+    resolved = [x for x in candidates if not x.is_control and x.outcome in {"confirmed", "rejected"}]
+    confirmed = [x for x in resolved if x.outcome == "confirmed"]
+    lines = ["<b>📊 DT AI · Точность · 30 дней</b>", ""]
+    if not resolved:
+        lines.append("Пока мало завершённых +3/+6 контрольных точек. Shadow mode продолжает собирать выборку.")
+    else:
+        lines.append(f"Завершённых кандидатов: <b>{len(resolved)}</b>")
+        lines.append(f"Подтвердились: <b>{len(confirmed)}/{len(resolved)} · {len(confirmed)/len(resolved)*100:.1f}%</b>")
+        lines.extend(["", "<b>По стартовому Score</b>"])
+        for lo, hi, label in ((90, 100, "90–100"), (80, 89, "80–89"), (65, 79, "65–79")):
+            group = [x for x in resolved if lo <= int(x.initial_score or 0) <= hi]
+            hits = sum(1 for x in group if x.outcome == "confirmed")
+            rate = f"{hits/len(group)*100:.1f}%" if group else "—"
+            lines.append(f"{label}: <b>{rate}</b> · {hits}/{len(group)}")
+
+    by_candidate = {int(x.id): x for x in candidates}
+    lines.extend(["", "<b>Попадание факта в прогнозный диапазон</b>"])
+    for target in (3, 6):
+        usable = []
+        hits = 0
+        for obs in observations:
+            if int(obs.target_hours or 0) != target:
+                continue
+            cand = by_candidate.get(int(obs.candidate_id))
+            if cand is None or cand.is_control or obs.view_count is None:
+                continue
+            low = int(cand.predicted_3h_low if target == 3 else cand.predicted_6h_low)
+            high = int(cand.predicted_3h_high if target == 3 else cand.predicted_6h_high)
+            usable.append(obs)
+            if low <= int(obs.view_count) <= high:
+                hits += 1
+        rate = f"{hits/len(usable)*100:.1f}%" if usable else "—"
+        lines.append(f"+{target}ч: <b>{rate}</b> · {hits}/{len(usable)}")
+
+    controls = [x for x in candidates if x.is_control and x.outcome in {"confirmed", "rejected"}]
+    if controls:
+        control_hits = sum(1 for x in controls if x.outcome == "confirmed")
+        lines.extend([
+            "",
+            f"🧪 Контрольная группа: неожиданных winners <b>{control_hits}/{len(controls)}</b>",
+            "Она нужна, чтобы видеть не только удачные прогнозы, но и возможные пропуски модели.",
+        ])
+    return "\n".join(lines)
+
+
+async def ai_admin_notification_scheduler(bot: Bot) -> None:
+    """Deliver only high-signal AI shadow events to admins.
+
+    Rejected candidates stay visible in the funnel but do not generate push spam.
+    """
+    while True:
+        try:
+            await asyncio.sleep(12.0)
+            if not ADMIN_IDS:
+                continue
+            async with SessionLocal() as session:
+                events = list((await session.execute(
+                    select(AIEarlyWinnerEvent)
+                    .where(AIEarlyWinnerEvent.notified_at.is_(None))
+                    .order_by(AIEarlyWinnerEvent.created_at.asc())
+                    .limit(10)
+                )).scalars().all())
+            for event in events:
+                if event.event_type not in {"winner", "confirmed"}:
+                    async with SessionLocal() as session:
+                        db_event = await session.get(AIEarlyWinnerEvent, int(event.id))
+                        if db_event is not None:
+                            db_event.notified_at = datetime.utcnow()
+                            await session.commit()
+                    continue
+                async with SessionLocal() as session:
+                    row = (await session.execute(
+                        select(AIEarlyWinnerCandidate, Listing)
+                        .join(Listing, Listing.external_id == AIEarlyWinnerCandidate.external_id)
+                        .where(AIEarlyWinnerCandidate.id == int(event.candidate_id))
+                    )).one_or_none()
+                if row is None:
+                    # Do not let a stale/out-of-band event permanently occupy the
+                    # first page of the outbox and starve newer AI notifications.
+                    async with SessionLocal() as session:
+                        db_event = await session.get(AIEarlyWinnerEvent, int(event.id))
+                        if db_event is not None:
+                            db_event.notified_at = datetime.utcnow()
+                            await session.commit()
+                    continue
+                candidate, listing = row
+                title = "🔥 <b>Новый Early Winner</b>" if event.event_type == "winner" else "✅ <b>Early Winner подтверждён</b>"
+                text = (
+                    f"{title}\n\n"
+                    f"{html.escape((listing.title or 'Объявление')[:140])}\n"
+                    f"🚀 Score: <b>{int(candidate.current_score or 0)}/100</b> · уверенность данных {int(candidate.confidence or 0)}%\n"
+                    f"👁 {int(candidate.latest_views or 0)} просмотров\n"
+                    f"🧪 Shadow mode · кандидат #{candidate.id}"
+                )
+                markup_rows = [[InlineKeyboardButton(text="🧠 Разобрать в AI Lab", callback_data=f"aic:{candidate.id}:winners")]]
+                if listing.url:
+                    markup_rows.append([InlineKeyboardButton(text="🔗 Открыть объявление", url=listing.url)])
+                markup = InlineKeyboardMarkup(inline_keyboard=markup_rows)
+                delivered = False
+                for admin_id in ADMIN_IDS:
+                    try:
+                        await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+                        delivered = True
+                    except Exception:
+                        log.debug("Could not deliver AI event=%s admin=%s", event.id, admin_id, exc_info=True)
+                if delivered:
+                    async with SessionLocal() as session:
+                        db_event = await session.get(AIEarlyWinnerEvent, int(event.id))
+                        if db_event is not None:
+                            db_event.notified_at = datetime.utcnow()
+                            await session.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("AI admin notification scheduler failed")
+
+
 async def _edit_or_answer(target: Message, text: str, *, reply_markup=None) -> None:
     """Prefer editing inline-menu messages, but gracefully fall back to a new one."""
     try:
@@ -7407,6 +7751,55 @@ async def admin_stats_handler(callback: CallbackQuery) -> None:
         return
     await callback.answer()
     await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=admin_keyboard())
+
+
+@dp.callback_query(F.data == "adminai")
+async def admin_ai_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_or_answer(callback.message, await _admin_ai_dashboard_text(), reply_markup=admin_ai_keyboard())
+
+
+@dp.callback_query(F.data.startswith("adminai:"))
+async def admin_ai_section_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    kind = (callback.data.split(":", 1)[1] or "recent").strip().lower()
+    await callback.answer()
+    if kind == "accuracy":
+        await _edit_or_answer(
+            callback.message, await _admin_ai_accuracy_text(),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminai:accuracy")],
+                [InlineKeyboardButton(text="⬅️ DT AI Lab", callback_data="adminai")],
+            ]),
+        )
+        return
+    if kind not in {"winners", "active", "confirmed", "rejected", "recent"}:
+        kind = "recent"
+    rows = await _ai_candidate_rows(kind)
+    await _edit_or_answer(callback.message, await _admin_ai_list_text(kind, rows), reply_markup=_ai_list_keyboard(kind, rows))
+
+
+@dp.callback_query(F.data.startswith("aic:"))
+async def admin_ai_candidate_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        candidate_id = int(callback.data.split(":", 2)[1])
+    except Exception:
+        await callback.answer("Некорректный кандидат", show_alert=True)
+        return
+    detail = await _admin_ai_candidate(candidate_id)
+    if detail is None:
+        await callback.answer("Кандидат не найден", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_or_answer(callback.message, detail[0], reply_markup=detail[1])
 
 
 @dp.callback_query(F.data == "adminviews")
@@ -10313,6 +10706,9 @@ async def main() -> None:
         subscription_lifecycle_scheduler(bot), name="subscription-lifecycle-scheduler"
     )
     archive_task = asyncio.create_task(scan_archive_scheduler(), name="scan-archive-scheduler")
+    ai_notification_task = asyncio.create_task(
+        ai_admin_notification_scheduler(bot), name="ai-admin-notification-scheduler"
+    )
     observation_tasks = [] if DISTRIBUTED_WORKERS else [
         asyncio.create_task(observation_scheduler(bot, i), name=f"view-observation-worker-{i}")
         for i in range(1, OBSERVATION_CONCURRENCY + 1)
@@ -10327,11 +10723,12 @@ async def main() -> None:
         payment_task.cancel()
         subscription_task.cancel()
         archive_task.cancel()
+        ai_notification_task.cancel()
         for task in observation_tasks:
             task.cancel()
         for task in worker_tasks:
             task.cancel()
-        shutdown_tasks = [payment_task, subscription_task, archive_task, *observation_tasks, *worker_tasks]
+        shutdown_tasks = [payment_task, subscription_task, archive_task, ai_notification_task, *observation_tasks, *worker_tasks]
         if distributed_queue_ticker_task is not None:
             shutdown_tasks.insert(0, distributed_queue_ticker_task)
         if ticker_task is not None:
@@ -10363,6 +10760,10 @@ async def main() -> None:
             await REMOTE_PAGE_MANAGER.close()
         except Exception:
             log.debug("Page Manager Redis shutdown failed", exc_info=True)
+        try:
+            await AI_MANAGER.close()
+        except Exception:
+            log.debug("AI Manager Redis shutdown failed", exc_info=True)
         await bot.session.close()
 
 
