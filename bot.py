@@ -184,9 +184,11 @@ class LocalizedBot(Bot):
         except (TypeError, ValueError):
             numeric_chat_id = None
 
-        if numeric_chat_id in ADMIN_IDS:
-            language = LANG_RU
-        elif language is None and numeric_chat_id is not None and numeric_chat_id > 0:
+        # v4.6.6: admin accounts are normal users outside the admin surface.
+        # Do not force their entire private chat to Russian here. The language
+        # middleware below forces Russian only while an admin is actually inside
+        # /admin, admin callbacks or AdminInput FSM screens.
+        if language is None and numeric_chat_id is not None and numeric_chat_id > 0:
             try:
                 language = await get_user_language(numeric_chat_id)
             except Exception:
@@ -7051,18 +7053,44 @@ async def _send_language_picker(message: Message, current: str | None = None) ->
         _UI_LANGUAGE.reset(token)
 
 
+async def _admin_surface_requires_russian(event, data) -> bool:
+    """Return True only for the actual admin surface, not the admin user's normal UI."""
+    if isinstance(event, Message):
+        text = (event.text or "").strip().lower()
+        if text.startswith("/admin"):
+            return True
+    elif isinstance(event, CallbackQuery):
+        callback_data = (event.data or "").strip().lower()
+        if callback_data.startswith("admin") or callback_data.startswith("aic:"):
+            return True
+
+    # Admin text-entry flows (user search, custom days, plan price) do not carry
+    # an `admin*` callback while the user is typing, so preserve Russian there too.
+    state = data.get("state") if isinstance(data, dict) else None
+    if state is not None:
+        try:
+            raw_state = await state.get_state()
+        except Exception:
+            raw_state = None
+        if raw_state and str(raw_state).startswith(f"{AdminInput.__name__}:"):
+            return True
+    return False
+
+
 class LanguageContextMiddleware(BaseMiddleware):
-    """Load a user's chosen language before access checks and handlers."""
+    """Load per-user UI language; keep only the actual admin panel in Russian."""
 
     async def __call__(self, handler, event, data):
         tg_user = getattr(event, "from_user", None)
-        if tg_user is None or int(tg_user.id) in ADMIN_IDS:
+        if tg_user is None:
             return await handler(event, data)
+        uid = int(tg_user.id)
+        force_admin_ru = uid in ADMIN_IDS and await _admin_surface_requires_russian(event, data)
         try:
-            language = await get_user_language(int(tg_user.id))
+            language = LANG_RU if force_admin_ru else await get_user_language(uid)
         except Exception:
             log.exception("Could not load UI language user=%s", tg_user.id)
-            language = None
+            language = LANG_RU if force_admin_ru else None
         token = _UI_LANGUAGE.set(language)
         try:
             # Existing users from pre-v4.6.5 are gated once, too, so nobody gets

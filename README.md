@@ -1,4 +1,4 @@
-# DT Parser v4.6.5 — Russian / English UI
+# DT Parser v4.6.6 — Language Switch Fix
 
 Production-clean GitHub package.
 
@@ -21,7 +21,7 @@ A new user chooses a language on the first `/start`:
 
 The choice is saved per user and can later be changed in `⚙️ Настройки / Settings → 🌐 Язык / Language` or with `/language`.
 
-The admin panel remains Russian.
+The normal user interface follows the saved language even for admin accounts. The actual admin panel remains Russian.
 
 ## Included production features
 
