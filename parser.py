@@ -126,6 +126,21 @@ class _SharedBrowserRuntime:
         self._playwright = None
         self._browser = None
         self._contexts_created = 0
+        # Incremented whenever the shared Chromium lifetime changes. Long-lived
+        # parser objects use this to detect that an idle shutdown invalidated
+        # their old BrowserContext and recreate it lazily on the next job.
+        self._generation = 0
+
+    @property
+    def generation(self) -> int:
+        return int(self._generation)
+
+    def is_running(self) -> bool:
+        browser = self._browser
+        try:
+            return bool(browser and browser.is_connected())
+        except Exception:
+            return False
 
     async def _ensure_browser(self):
         async with self._lock:
@@ -167,9 +182,11 @@ class _SharedBrowserRuntime:
                     "--mute-audio",
                 ],
             )
+            self._generation += 1
             log.info(
-                "Railway browser fleet runtime started | replica=%s",
+                "Railway browser fleet runtime started | replica=%s | generation=%s",
                 os.getenv("RAILWAY_REPLICA_ID", "local"),
+                self._generation,
             )
             return self._browser
 
@@ -203,6 +220,7 @@ class _SharedBrowserRuntime:
 
     async def close(self) -> None:
         async with self._lock:
+            had_runtime = self._browser is not None or self._playwright is not None
             try:
                 if self._browser is not None:
                     await self._browser.close()
@@ -215,9 +233,19 @@ class _SharedBrowserRuntime:
             except Exception:
                 pass
             self._playwright = None
+            if had_runtime:
+                self._generation += 1
 
 
 _SHARED_BROWSER_FLEET = _SharedBrowserRuntime()
+
+
+def shared_browser_runtime_running() -> bool:
+    return bool(SHARED_BROWSER_RUNTIME and _SHARED_BROWSER_FLEET.is_running())
+
+
+def shared_browser_runtime_generation() -> int:
+    return int(_SHARED_BROWSER_FLEET.generation)
 
 
 async def shutdown_shared_browser_runtime() -> None:
@@ -1142,6 +1170,7 @@ class KleinanzeigenParser:
         self._browser = None
         self._browser_context = None
         self._uses_shared_browser_runtime = False
+        self._shared_browser_generation = -1
         self._browser_lock = asyncio.Lock()
         self._scan_page = None
         self._scan_page_lock = asyncio.Lock()
@@ -1196,6 +1225,7 @@ class KleinanzeigenParser:
         self._browser_context = None
         self._browser = None
         self._playwright = None
+        self._shared_browser_generation = -1
         await self.client.aclose()
 
     async def _fetch_response(
@@ -1310,6 +1340,14 @@ class KleinanzeigenParser:
         log.warning("Stable Reset: scan browser session recycled after persistent page failure")
 
     async def _ensure_scan_page(self):
+        if SHARED_BROWSER_RUNTIME and self._scan_page is not None:
+            if (
+                self._shared_browser_generation != _SHARED_BROWSER_FLEET.generation
+                or not _SHARED_BROWSER_FLEET.is_running()
+            ):
+                self._scan_page = None
+                self._browser_context = None
+                self._context_session_seeded = False
         if self._scan_page is not None and not self._scan_page.is_closed():
             return self._scan_page
         context = await self._ensure_view_browser()
@@ -1792,9 +1830,28 @@ class KleinanzeigenParser:
         return None, None
 
     async def _ensure_view_browser(self):
+        # Idle memory shutdown closes the process-local shared Chromium while
+        # worker/parser objects intentionally stay alive. Detect that lifetime
+        # change before reusing a cached BrowserContext.
+        if SHARED_BROWSER_RUNTIME and self._browser_context is not None:
+            if (
+                self._shared_browser_generation != _SHARED_BROWSER_FLEET.generation
+                or not _SHARED_BROWSER_FLEET.is_running()
+            ):
+                self._browser_context = None
+                self._scan_page = None
+                self._context_session_seeded = False
         if self._browser_context is not None:
             return self._browser_context
         async with self._browser_lock:
+            if SHARED_BROWSER_RUNTIME and self._browser_context is not None:
+                if (
+                    self._shared_browser_generation != _SHARED_BROWSER_FLEET.generation
+                    or not _SHARED_BROWSER_FLEET.is_running()
+                ):
+                    self._browser_context = None
+                    self._scan_page = None
+                    self._context_session_seeded = False
             if self._browser_context is not None:
                 return self._browser_context
             storage_state = None
@@ -1807,6 +1864,7 @@ class KleinanzeigenParser:
                     storage_state=storage_state
                 )
                 self._uses_shared_browser_runtime = True
+                self._shared_browser_generation = _SHARED_BROWSER_FLEET.generation
                 return self._browser_context
 
             if self._playwright is None:

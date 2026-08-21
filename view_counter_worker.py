@@ -105,6 +105,7 @@ except Exception as exc:  # pragma: no cover
     raise RuntimeError("redis package is required for view worker") from exc
 
 from app_version import APP_VERSION
+from browser_idle import BrowserIdleShutdownGuard
 from parser import KleinanzeigenParser, shutdown_shared_browser_runtime
 from traffic import TRAFFIC
 from view_manager import (
@@ -131,6 +132,7 @@ JOB_REQUEUE_ENABLED = _env_bool("VIEW_JOB_REQUEUE_ENABLED", True)
 MAX_REQUEUES = _env_int("VIEW_WORKER_MAX_REQUEUES", 2, 0, 10)
 ROUND_FAILURES_BEFORE_RESET = _env_int("VIEW_WORKER_FAILURES_BEFORE_RESET", 2, 1, 10)
 STATUS_TTL_SECONDS = max(10, int(HEARTBEAT_SECONDS * 5))
+VIEW_WORKER_BROWSER_IDLE_SECONDS = _env_int("VIEW_WORKER_BROWSER_IDLE_SECONDS", 600, 60, 3600)
 
 
 @dataclass
@@ -170,6 +172,7 @@ class ViewCounterWorker:
         self._started_at = time.monotonic()
         self._processing_round = False
         self._stop = asyncio.Event()
+        self._activity_lock = asyncio.Lock()
 
         # Rolling telemetry. These are diagnostics only and never influence the
         # exact value stored for an ad.
@@ -386,7 +389,8 @@ class ViewCounterWorker:
             results=partial,
             requeues=requeues,
         )
-        self.active[job_id] = job
+        async with self._activity_lock:
+            self.active[job_id] = job
         done = len(partial)
         await self.redis.hset(
             self.progress_key(job_id),
@@ -764,9 +768,20 @@ class ViewCounterWorker:
         await self.ensure_group()
         await self.heartbeat(force=True)
         hb_task = asyncio.create_task(self.heartbeat_loop(), name="view-worker-heartbeat")
+        idle_guard = BrowserIdleShutdownGuard(
+            redis=self.redis,
+            stream=VIEW_STREAM,
+            active_count=lambda: len(self.active),
+            activity_lock=self._activity_lock,
+            stop_event=self._stop,
+            idle_seconds=VIEW_WORKER_BROWSER_IDLE_SECONDS,
+            label="View Worker",
+            logger=log,
+        )
+        idle_task = asyncio.create_task(idle_guard.run(), name="view-worker-browser-idle")
         log.info(
             "DT PARSER dedicated view worker online | consumer=%s pool=%s [%s..%s] browser=%s "
-            "round=%s max_jobs=%s adaptive=%s",
+            "round=%s max_jobs=%s adaptive=%s browser_idle=%ss",
             self.consumer,
             self.current_pool,
             VIEW_POOL_MIN,
@@ -775,6 +790,7 @@ class ViewCounterWorker:
             ROUND_SIZE,
             MAX_ACTIVE_JOBS,
             ADAPTIVE_ENABLED,
+            VIEW_WORKER_BROWSER_IDLE_SECONDS,
         )
         consecutive_failures = 0
         try:
@@ -811,7 +827,8 @@ class ViewCounterWorker:
         finally:
             self._stop.set()
             hb_task.cancel()
-            await asyncio.gather(hb_task, return_exceptions=True)
+            idle_task.cancel()
+            await asyncio.gather(hb_task, idle_task, return_exceptions=True)
             try:
                 await self.parser.close()
             finally:

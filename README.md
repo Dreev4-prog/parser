@@ -1,3 +1,21 @@
+# DT Parser v4.6.1 — IDLE BROWSER MEMORY
+
+Page Worker, Date Worker and View Worker now keep Chromium warm only while it is useful. A 10-minute idle countdown starts **only when the whole corresponding Redis worker stream is empty and the local replica has zero active work**. Any queued/claimed/new task resets the countdown. After 10 uninterrupted idle minutes the worker closes only the shared Chromium/Playwright runtime; Redis/PostgreSQL, heartbeat and the worker process stay online. The next browser job recreates Chromium lazily.
+
+No replica/concurrency, parser/date/view logic, AI logic or DB schema changes. No new required Railway variables. See `DEPLOY_V4_6_1_IDLE_BROWSER_MEMORY.md`.
+
+---
+
+# DT Parser v4.6.0 — PRODUCT OPPORTUNITY ENGINE
+
+DT AI Lab now separates **Opportunity** from **Saturation**. Popularity is no longer a hard negative score: a mass-market family can become **🔥 Hot Product** when demand accelerates versus its own history, while a quiet crowded family becomes **⚫ Saturated**. The engine also identifies **💎 Hidden Gem**, **🚀 Emerging** and **⚡ Spark** signals, uses category-relative saturation, demand/supply momentum and repeatability across same-family listings.
+
+The ordinary Telegram scan UI stays clean: users see only scan %, pages, listings and view-count progress. Internal browser/date/regional/worker details remain in logs/admin.
+
+Railway topology is unchanged from v4.5.1. The additive AI candidate columns are migrated automatically; no destructive migration is required. See `DEPLOY_V4_6_0_PRODUCT_OPPORTUNITY_ENGINE.md`.
+
+---
+
 # DT Parser v4.5.1 — OPPORTUNITY DISCOVERY / CLEAN SCAN UI
 
 DT AI Lab now searches for **demand/supply opportunities**, not simply high-view products. `ew-opportunity-v2` adds a supply sweet spot, up to −35 mass-market penalty, family-balanced category baselines, unknown-product family cohorts, and max 2 visible candidates per product family. Product recognition confidence no longer adds Score. v4.5.0 scan-starvation after the first 20 AI runs is fixed.

@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ReleaseInvariantTests(unittest.TestCase):
     def test_release_version(self):
-        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.5.1")
+        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.6.1")
 
     def test_date_window_and_timezone_semantics_were_not_changed(self):
         source = (ROOT / "date_manager.py").read_text(encoding="utf-8")
@@ -51,6 +51,40 @@ class ReleaseInvariantTests(unittest.TestCase):
         self.assertNotIn("UserSettings", source)
         self.assertNotIn("ScanObservation", source)
         self.assertIn("AI_CHECKPOINT_HOURS", source)
+
+
+    def test_ai_popularity_is_separate_from_opportunity(self):
+        source = (ROOT / "early_winner.py").read_text(encoding="utf-8")
+        self.assertIn("Saturation is intentionally absent from this formula", source)
+        self.assertIn('return "hot_product"', source)
+        self.assertIn('return "saturated"', source)
+        self.assertNotIn("- mass_penalty", source)
+
+    def test_ai_v46_admin_sections_are_routable(self):
+        source = (ROOT / "bot.py").read_text(encoding="utf-8")
+        self.assertIn('callback_data="adminai:hidden"', source)
+        self.assertIn('callback_data="adminai:momentum"', source)
+        self.assertIn('{"hidden", "momentum", "winners", "active", "confirmed", "rejected", "recent"}', source)
+
+    def test_ai_v46_columns_have_additive_migration(self):
+        source = (ROOT / "db.py").read_text(encoding="utf-8")
+        self.assertIn("ai_opportunity_columns", source)
+        self.assertIn("ADD COLUMN IF NOT EXISTS", source)
+        self.assertIn('"opportunity_type"', source)
+        self.assertIn('"saturation_score"', source)
+
+
+    def test_v461_idle_browser_shutdown_is_conservative(self):
+        idle = (ROOT / "browser_idle.py").read_text(encoding="utf-8")
+        self.assertIn("depth is None or depth > 0", idle)
+        self.assertIn("async with self.activity_lock", idle)
+        self.assertIn("shutdown_shared_browser_runtime", idle)
+        parser = (ROOT / "parser.py").read_text(encoding="utf-8")
+        self.assertIn("self._shared_browser_generation != _SHARED_BROWSER_FLEET.generation", parser)
+        for worker in ("page_worker.py", "date_worker.py", "view_counter_worker.py"):
+            source = (ROOT / worker).read_text(encoding="utf-8")
+            self.assertIn("BrowserIdleShutdownGuard", source)
+            self.assertIn("600", source)
 
 
 

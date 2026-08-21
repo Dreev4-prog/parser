@@ -32,7 +32,7 @@ class EarlyWinnerTests(unittest.TestCase):
         scored = {x.external_id: x for x in score_initial_rows(rows, {"portal": (155.0, 20)})}
         self.assertGreater(scored["fast"].score, scored["slow"].score)
         self.assertGreater(scored["fast"].velocity_percentile, scored["slow"].velocity_percentile)
-        self.assertGreater(scored["fast"].confidence, 70)
+        self.assertGreater(scored["fast"].confidence, 50)
 
 
     def test_same_identity_cohort_is_preferred_when_available(self):
@@ -47,27 +47,77 @@ class EarlyWinnerTests(unittest.TestCase):
         scored = {x.external_id: x for x in score_initial_rows(rows, {})}
         self.assertEqual(scored["p1"].peer_count, 3)
         self.assertGreater(scored["p1"].peer_vph_median, scored["p3"].views_per_hour)
-        self.assertTrue(any("сопоставимых объявления" in reason for reason in scored["p1"].reasons))
+        self.assertTrue(any("повторяемость" in reason for reason in scored["p1"].reasons))
 
 
-    def test_mass_market_family_is_penalized_against_hidden_gem(self):
+    def test_popular_accelerating_family_can_be_hot_product(self):
         rows = []
-        for i, views in enumerate([180, 160, 150, 140, 130, 120, 110, 100]):
+        for i, views in enumerate([180, 170, 160, 150, 140, 130, 120, 110]):
             rows.append(FeatureRow(f"i{i}", "cat", "iphone", "iPhone", 95, 600, views, 120, title="Apple iPhone 15 128GB"))
-        for i, views in enumerate([140, 120, 105, 90]):
+        for i, views in enumerate([10, 12, 15, 18, 20, 25, 30, 35]):
+            rows.append(FeatureRow(f"o{i}", "cat", None, None, 0, 100, views, 120, title=f"Other Tool Model{i}"))
+        stats = {
+            "id:iphone": {
+                "median": 600.0, "count": 500, "supply_percentile": 0.96,
+                "supply_growth_ratio": 1.05,
+                "demand_recent_median": 70.0, "demand_previous_median": 45.0,
+                "demand_recent_samples": 10, "demand_previous_samples": 10,
+                "prior_signals": 8, "prior_confirmed": 5,
+            },
+        }
+        scored = {x.external_id: x for x in score_initial_rows(rows, stats)}
+        self.assertGreaterEqual(scored["i0"].saturation_score, 90)
+        self.assertEqual(scored["i0"].mass_penalty, 0)
+        self.assertEqual(scored["i0"].opportunity_type, "hot_product")
+        self.assertGreaterEqual(scored["i0"].score, 80)
+
+    def test_popular_family_without_new_movement_is_saturated_not_hot(self):
+        rows = [
+            FeatureRow(f"i{i}", "cat", "iphone", "iPhone", 95, 600, views, 120, title="Apple iPhone 15 128GB")
+            for i, views in enumerate([180, 170, 160, 150, 140, 130, 120, 110])
+        ] + [
+            FeatureRow(f"o{i}", "cat", None, None, 0, 100, 20 + i, 120, title=f"Other Model{i}")
+            for i in range(8)
+        ]
+        stats = {
+            "id:iphone": {
+                "median": 600.0, "count": 500, "supply_percentile": 0.96,
+                "supply_growth_ratio": 1.0,
+                "demand_recent_median": 80.0, "demand_previous_median": 80.0,
+                "demand_recent_samples": 10, "demand_previous_samples": 10,
+            },
+        }
+        scored = {x.external_id: x for x in score_initial_rows(rows, stats)}
+        self.assertEqual(scored["i0"].opportunity_type, "saturated")
+        self.assertLess(scored["i0"].score, 80)
+
+    def test_hidden_gem_and_hot_product_can_coexist(self):
+        rows = []
+        for i, views in enumerate([180, 170, 160, 150, 140, 130, 120, 110]):
+            rows.append(FeatureRow(f"i{i}", "cat", "iphone", "iPhone", 95, 600, views, 120, title="Apple iPhone 15 128GB"))
+        for i, views in enumerate([140, 125, 110, 95]):
             rows.append(FeatureRow(f"m{i}", "cat", None, None, 0, 140, views, 120, title="Makita DHP484Z Akku Bohrschrauber 18V"))
         for i, views in enumerate([10, 12, 15, 18, 20, 25, 30, 35]):
             rows.append(FeatureRow(f"o{i}", "cat", None, None, 0, 100, views, 120, title=f"Other Tool Model{i}"))
         from early_winner import opportunity_family_key
+        makita = opportunity_family_key("Makita DHP484Z Akku Bohrschrauber 18V", "cat")
         stats = {
-            "id:iphone": (600.0, 500),
-            opportunity_family_key("Makita DHP484Z Akku Bohrschrauber 18V", "cat"): (150.0, 18),
+            "id:iphone": {
+                "median": 600.0, "count": 500, "supply_percentile": 0.96, "supply_growth_ratio": 1.05,
+                "demand_recent_median": 70.0, "demand_previous_median": 45.0,
+                "demand_recent_samples": 10, "demand_previous_samples": 10,
+            },
+            makita: {
+                "median": 150.0, "count": 18, "supply_percentile": 0.30, "supply_growth_ratio": 1.15,
+                "demand_recent_median": 35.0, "demand_previous_median": 25.0,
+                "demand_recent_samples": 6, "demand_previous_samples": 5,
+                "prior_signals": 4, "prior_confirmed": 3,
+            },
         }
         scored = {x.external_id: x for x in score_initial_rows(rows, stats)}
-        self.assertGreaterEqual(scored["m0"].score, 90)
+        self.assertEqual(scored["i0"].opportunity_type, "hot_product")
         self.assertEqual(scored["m0"].opportunity_type, "hidden_gem")
-        self.assertGreater(scored["i0"].mass_penalty, 25)
-        self.assertLess(scored["i0"].score, scored["m0"].score)
+        self.assertGreater(scored["i0"].saturation_score, scored["m0"].saturation_score)
 
     def test_rarity_without_demand_is_not_a_winner(self):
         rows = [

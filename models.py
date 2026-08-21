@@ -271,6 +271,16 @@ class AIEarlyWinnerCandidate(Base):
     external_id: Mapped[str] = mapped_column(String(64), index=True)
     category_key: Mapped[str] = mapped_column(String(80), default="", index=True)
     identity_key: Mapped[str | None] = mapped_column(String(500), nullable=True, index=True)
+    # v4.6 Product Opportunity Engine: family/type/trend are persisted so the lab can
+    # learn from repeat appearances instead of treating every listing in isolation.
+    cohort_key: Mapped[str] = mapped_column(String(600), default="", index=True)
+    opportunity_type: Mapped[str] = mapped_column(String(32), default="spark", index=True)
+    saturation_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    supply_percentile: Mapped[float] = mapped_column(Float, default=0.0)
+    supply_growth_ratio: Mapped[float] = mapped_column(Float, default=1.0)
+    demand_growth_ratio: Mapped[float] = mapped_column(Float, default=1.0)
+    demand_supply_ratio: Mapped[float] = mapped_column(Float, default=1.0)
+    repeatability: Mapped[float] = mapped_column(Float, default=0.0)
     is_control: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     baseline_at: Mapped[datetime] = mapped_column(DateTime, index=True)

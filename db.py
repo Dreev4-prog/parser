@@ -268,4 +268,38 @@ async def init_db() -> None:
         if bot_user_columns and "expiry_expired_sent_for" not in bot_user_columns:
             await conn.execute(text("ALTER TABLE bot_users ADD COLUMN expiry_expired_sent_for TIMESTAMP"))
 
+        # v4.6: additive Product Opportunity Engine fields. Existing AI history is
+        # preserved; old candidates receive neutral defaults and new runs populate them.
+        ai_candidate_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "ai_early_winner_candidates"))
+        ai_opportunity_columns = {
+            "cohort_key": "VARCHAR(600) DEFAULT ''",
+            "opportunity_type": "VARCHAR(32) DEFAULT 'spark'",
+            "saturation_score": "INTEGER DEFAULT 0",
+            "supply_percentile": "FLOAT DEFAULT 0",
+            "supply_growth_ratio": "FLOAT DEFAULT 1",
+            "demand_growth_ratio": "FLOAT DEFAULT 1",
+            "demand_supply_ratio": "FLOAT DEFAULT 1",
+            "repeatability": "FLOAT DEFAULT 0",
+        }
+        for column_name, sql_type in ai_opportunity_columns.items():
+            if not ai_candidate_columns or column_name in ai_candidate_columns:
+                continue
+            if _IS_POSTGRES:
+                # Main Bot and AI Worker may start together on Railway. IF NOT EXISTS
+                # makes the additive v4.6 migration safe under that startup race.
+                await conn.execute(text(
+                    f"ALTER TABLE ai_early_winner_candidates ADD COLUMN IF NOT EXISTS {column_name} {sql_type}"
+                ))
+            else:
+                await conn.execute(text(f"ALTER TABLE ai_early_winner_candidates ADD COLUMN {column_name} {sql_type}"))
+        if _IS_POSTGRES and ai_candidate_columns:
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_ai_ew_candidate_cohort_key "
+                "ON ai_early_winner_candidates (cohort_key)"
+            ))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_ai_ew_candidate_opportunity_type "
+                "ON ai_early_winner_candidates (opportunity_type)"
+            ))
+
     log.info("Database initialized: %s", DATABASE_BACKEND)

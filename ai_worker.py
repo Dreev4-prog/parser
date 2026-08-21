@@ -64,6 +64,7 @@ AI_REPEAT_SUPPRESS_HOURS = max(1, min(72, int(os.getenv("AI_REPEAT_SUPPRESS_HOUR
 AI_MARKET_SAMPLE_LIMIT = max(5000, min(60000, int(os.getenv("AI_MARKET_SAMPLE_LIMIT", "30000"))))
 AI_CONTROL_PER_CATEGORY = max(0, min(5, int(os.getenv("AI_CONTROL_PER_CATEGORY", "2"))))
 AI_MARKET_LOOKBACK_DAYS = max(7, min(180, int(os.getenv("AI_MARKET_LOOKBACK_DAYS", "30"))))
+AI_TREND_WINDOW_DAYS = max(3, min(21, int(os.getenv("AI_TREND_WINDOW_DAYS", "7"))))
 AI_OBSERVATION_BATCH = max(1, min(50, int(os.getenv("AI_OBSERVATION_BATCH", "24"))))
 AI_REUSE_WINDOW_MINUTES = max(3, min(45, int(os.getenv("AI_REUSE_WINDOW_MINUTES", "15"))))
 AI_OBSERVATION_LATE_GRACE_MINUTES = max(30, min(240, int(os.getenv("AI_OBSERVATION_LATE_GRACE_MINUTES", "90"))))
@@ -222,12 +223,13 @@ class AIWorker:
                 session.expunge(scan)
             return scan
 
-    async def _market_stats(self, features: list[FeatureRow]) -> dict[str, tuple[float | None, int]]:
-        """Build supply/price cohorts from our own PostgreSQL history only.
+    async def _market_stats(self, features: list[FeatureRow]) -> dict[str, dict]:
+        """Build category-relative supply + demand trend profiles from our own DB.
 
-        Strict identities are used when reliable. Unknown products get a conservative
-        title-family key, allowing tools/cameras/appliances to compete without adding
-        brand-specific rules or external AI/network calls.
+        v4.5.1 treated a fixed number of listings as "mass market" in every category.
+        v4.6 instead calculates saturation percentile *inside the category*, recent vs
+        previous supply growth, and observed ViewHistory momentum when enough points exist.
+        Missing history stays neutral; it never receives a rarity bonus.
         """
         if not features:
             return {}
@@ -243,12 +245,21 @@ class AIWorker:
         if not target_keys:
             return {}
 
-        cutoff = datetime.utcnow() - timedelta(days=AI_MARKET_LOOKBACK_DAYS)
+        now = datetime.utcnow()
+        cutoff = now - timedelta(days=AI_MARKET_LOOKBACK_DAYS)
+        recent_cutoff = now - timedelta(days=AI_TREND_WINDOW_DAYS)
+        previous_cutoff = now - timedelta(days=AI_TREND_WINDOW_DAYS * 2)
+
+        def family_key(category_key, identity_key, identity_confidence, title) -> str:
+            if identity_key and int(identity_confidence or 0) >= 70:
+                return f"id:{identity_key}"
+            return opportunity_family_key(str(title or ""), str(category_key or "unknown"))
+
         async with SessionLocal() as session:
-            rows = (await session.execute(
+            listing_rows = (await session.execute(
                 select(
                     Listing.category_key, Listing.identity_key, Listing.identity_confidence,
-                    Listing.title, Listing.price_eur,
+                    Listing.title, Listing.price_eur, Listing.first_seen_at,
                 )
                 .where(
                     Listing.category_key.in_(sorted(categories)),
@@ -259,28 +270,162 @@ class AIWorker:
                 .limit(AI_MARKET_SAMPLE_LIMIT)
             )).all()
 
+            # Prior AI results add repeatability evidence across independent scans.
+            prior_rows = (await session.execute(
+                select(
+                    AIEarlyWinnerCandidate.cohort_key,
+                    AIEarlyWinnerCandidate.outcome,
+                    AIEarlyWinnerCandidate.current_score,
+                ).where(
+                    AIEarlyWinnerCandidate.created_at >= cutoff,
+                    AIEarlyWinnerCandidate.is_control.is_(False),
+                    AIEarlyWinnerCandidate.cohort_key.in_(sorted(target_keys)),
+                ).limit(AI_MARKET_SAMPLE_LIMIT)
+            )).all()
+
+            async def view_rows_for_period(start_at: datetime, end_at: datetime | None):
+                conditions = [
+                    Listing.category_key.in_(sorted(categories)),
+                    Listing.first_seen_at >= start_at,
+                    ViewHistory.recorded_at >= start_at,
+                    Listing.is_promoted.is_(False),
+                ]
+                if end_at is not None:
+                    conditions.extend([Listing.first_seen_at < end_at, ViewHistory.recorded_at < end_at + timedelta(days=2)])
+                return (await session.execute(
+                    select(
+                        ViewHistory.external_id, ViewHistory.view_count, ViewHistory.recorded_at,
+                        Listing.category_key, Listing.identity_key, Listing.identity_confidence,
+                        Listing.title, Listing.first_seen_at,
+                    )
+                    .join(Listing, Listing.external_id == ViewHistory.external_id)
+                    .where(*conditions)
+                    .order_by(ViewHistory.recorded_at.asc())
+                    .limit(AI_MARKET_SAMPLE_LIMIT)
+                )).all()
+
+            recent_view_rows = await view_rows_for_period(recent_cutoff, None)
+            previous_view_rows = await view_rows_for_period(previous_cutoff, recent_cutoff)
+
         counts: dict[str, int] = defaultdict(int)
         prices_by_key: dict[str, list[int]] = defaultdict(list)
-        for category_key, identity_key, identity_confidence, title, price in rows:
-            if identity_key and int(identity_confidence or 0) >= 70:
-                key = f"id:{identity_key}"
-            else:
-                key = opportunity_family_key(str(title or ""), str(category_key or "unknown"))
-            if not key or key not in target_keys:
+        recent_counts: dict[str, int] = defaultdict(int)
+        previous_counts: dict[str, int] = defaultdict(int)
+        category_family_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        category_recent_total: dict[str, int] = defaultdict(int)
+        category_previous_total: dict[str, int] = defaultdict(int)
+
+        for category_key, identity_key, identity_confidence, title, price, first_seen_at in listing_rows:
+            cat = str(category_key or "unknown")
+            key = family_key(cat, identity_key, identity_confidence, title)
+            if not key:
                 continue
             counts[key] += 1
+            category_family_counts[cat][key] += 1
             if price is not None and int(price) > 0:
                 prices_by_key[key].append(int(price))
+            seen = first_seen_at or cutoff
+            if seen >= recent_cutoff:
+                recent_counts[key] += 1
+                category_recent_total[cat] += 1
+            elif seen >= previous_cutoff:
+                previous_counts[key] += 1
+                category_previous_total[cat] += 1
 
-        stats: dict[str, tuple[float | None, int]] = {}
-        for key, count in counts.items():
+        def pct_rank(value: int, values: list[int]) -> float:
+            vals = sorted(int(v) for v in values if int(v) >= 0)
+            if not vals:
+                return 0.0
+            below = sum(1 for v in vals if v < value)
+            equal = sum(1 for v in vals if v == value)
+            return max(0.0, min(1.0, (below + 0.5 * equal) / len(vals)))
+
+        # Demand rate from two or more actual ViewHistory checkpoints for one listing.
+        def demand_rates(rows) -> dict[str, list[float]]:
+            points: dict[tuple[str, str], list[tuple[datetime, int]]] = defaultdict(list)
+            for external_id, view_count, recorded_at, category_key, identity_key, identity_confidence, title, _first_seen in rows:
+                key = family_key(category_key, identity_key, identity_confidence, title)
+                if not key or key not in target_keys or recorded_at is None:
+                    continue
+                points[(key, str(external_id))].append((recorded_at, int(view_count or 0)))
+            rates: dict[str, list[float]] = defaultdict(list)
+            for (key, _external_id), series in points.items():
+                if len(series) < 2:
+                    continue
+                series.sort(key=lambda x: x[0])
+                first_at, first_views = series[0]
+                last_at, last_views = series[-1]
+                hours = (last_at - first_at).total_seconds() / 3600.0
+                if hours < 0.50 or last_views < first_views:
+                    continue
+                rates[key].append((last_views - first_views) / hours)
+            return rates
+
+        recent_demand = demand_rates(recent_view_rows)
+        previous_demand = demand_rates(previous_view_rows)
+        prior_signals: dict[str, int] = defaultdict(int)
+        prior_confirmed: dict[str, int] = defaultdict(int)
+        for key, outcome, current_score in prior_rows:
+            key = str(key or "")
+            if not key:
+                continue
+            if int(current_score or 0) >= 65:
+                prior_signals[key] += 1
+            if str(outcome or "") == "confirmed":
+                prior_confirmed[key] += 1
+
+        def median(values: list[float]) -> float | None:
+            vals = sorted(float(x) for x in values if x is not None)
+            if not vals:
+                return None
+            n = len(vals)
+            mid = n // 2
+            return vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+
+        stats: dict[str, dict] = {}
+        feature_cat_by_key: dict[str, str] = {}
+        for feature in features:
+            key = f"id:{feature.identity_key}" if feature.identity_key and int(feature.identity_confidence or 0) >= 70 else (feature.family_key or opportunity_family_key(feature.title, feature.category_key))
+            if key:
+                feature_cat_by_key[key] = str(feature.category_key or "unknown")
+
+        for key in target_keys:
+            count = int(counts.get(key, 0))
             prices = sorted(prices_by_key.get(key, []))
-            median: float | None = None
-            if prices:
-                n = len(prices)
-                mid = n // 2
-                median = float(prices[mid]) if n % 2 else (prices[mid - 1] + prices[mid]) / 2.0
-            stats[key] = (median, int(count))
+            price_median = median([float(x) for x in prices])
+            cat = feature_cat_by_key.get(key, "unknown")
+            family_counts = list(category_family_counts.get(cat, {}).values())
+            supply_percentile = pct_rank(count, family_counts) if count > 0 else 0.0
+
+            recent = int(recent_counts.get(key, 0))
+            previous = int(previous_counts.get(key, 0))
+            cohort_growth = (recent + 1.0) / (previous + 1.0)
+            category_growth = (category_recent_total.get(cat, 0) + 2.0) / (category_previous_total.get(cat, 0) + 2.0)
+            supply_growth_ratio = max(0.25, min(4.0, cohort_growth / max(0.25, category_growth)))
+
+            recent_rates = recent_demand.get(key, [])
+            previous_rates = previous_demand.get(key, [])
+            recent_median = median(recent_rates)
+            previous_median = median(previous_rates)
+            demand_growth_ratio = 1.0
+            if recent_median is not None and previous_median is not None and previous_median > 0:
+                demand_growth_ratio = max(0.25, min(4.0, recent_median / previous_median))
+
+            stats[key] = {
+                "median": price_median,
+                "count": count,
+                "supply_percentile": supply_percentile,
+                "recent_count": recent,
+                "previous_count": previous,
+                "supply_growth_ratio": supply_growth_ratio,
+                "demand_recent_median": recent_median,
+                "demand_previous_median": previous_median,
+                "demand_growth_ratio": demand_growth_ratio,
+                "demand_recent_samples": len(recent_rates),
+                "demand_previous_samples": len(previous_rates),
+                "prior_signals": int(prior_signals.get(key, 0)),
+                "prior_confirmed": int(prior_confirmed.get(key, 0)),
+            }
         return stats
 
     async def analyze_scan(self, scan: UserScan) -> None:
@@ -387,6 +532,14 @@ class AIWorker:
                         external_id=external_id,
                         category_key=str(listing.category_key or ""),
                         identity_key=listing.identity_key,
+                        cohort_key=score.cohort_key,
+                        opportunity_type=score.opportunity_type,
+                        saturation_score=int(score.saturation_score),
+                        supply_percentile=float(score.supply_percentile),
+                        supply_growth_ratio=float(score.supply_growth_ratio),
+                        demand_growth_ratio=float(score.demand_growth_ratio),
+                        demand_supply_ratio=float(score.demand_supply_ratio),
+                        repeatability=float(score.repeatability),
                         is_control=external_id in controls,
                         baseline_at=snap.captured_at,
                         baseline_views=int(snap.initial_view_count),
@@ -420,7 +573,7 @@ class AIWorker:
                         session.add(AIEarlyWinnerEvent(
                             candidate_id=int(candidate.id),
                             event_type="winner",
-                            payload_json=json.dumps({"from": "initial", "score": candidate.current_score}, ensure_ascii=False),
+                            payload_json=json.dumps({"from": "initial", "score": candidate.current_score, "type": candidate.opportunity_type}, ensure_ascii=False),
                         ))
                     for hours in AI_CHECKPOINT_HOURS:
                         session.add(AIEarlyWinnerObservation(
@@ -512,7 +665,22 @@ class AIWorker:
             evidence_bonus = 5 if int(obs.target_hours) <= 1 else 10 if int(obs.target_hours) <= 3 else 15
             candidate.confidence = min(98, int(candidate.confidence or 0) + evidence_bonus)
             candidate.stage = dynamic.stage
-            candidate.latest_reasons_json = json.dumps(list(dynamic.reasons), ensure_ascii=False)
+            # Reclassify the *reason* for the opportunity as live evidence arrives.
+            # High saturation is allowed to become Hot Product when momentum proves it.
+            sat = int(candidate.saturation_score or 0)
+            if dynamic.score >= 82 and sat >= 65 and dynamic.momentum_ratio >= 1.15:
+                candidate.opportunity_type = "hot_product"
+            elif dynamic.score >= 84 and sat <= 45 and float(candidate.repeatability or 0.0) >= 0.42:
+                candidate.opportunity_type = "hidden_gem"
+            elif dynamic.score >= 82 and float(candidate.demand_supply_ratio or 1.0) >= 1.12 and dynamic.momentum_ratio >= 1.08:
+                candidate.opportunity_type = "emerging"
+            elif sat >= 70 and dynamic.momentum_ratio < 1.05:
+                candidate.opportunity_type = "saturated"
+            elif candidate.opportunity_type not in {"hidden_gem", "hot_product", "emerging"}:
+                candidate.opportunity_type = "spark"
+            live_reasons = list(dynamic.reasons)
+            live_reasons.append(f"тип сигнала сейчас: {candidate.opportunity_type}")
+            candidate.latest_reasons_json = json.dumps(live_reasons, ensure_ascii=False)
             if old_outcome == "pending" and dynamic.outcome in {"confirmed", "rejected"}:
                 candidate.outcome = dynamic.outcome
                 candidate.resolved_at = measured_at
@@ -556,12 +724,12 @@ class AIWorker:
                 if old_stage != "early_winner" and candidate.stage == "early_winner":
                     session.add(AIEarlyWinnerEvent(
                         candidate_id=int(candidate.id), event_type="winner",
-                        payload_json=json.dumps({"from": old_stage, "score": candidate.current_score}, ensure_ascii=False),
+                        payload_json=json.dumps({"from": old_stage, "score": candidate.current_score, "type": candidate.opportunity_type}, ensure_ascii=False),
                     ))
                 if old_outcome != candidate.outcome and candidate.outcome in {"confirmed", "rejected"}:
                     session.add(AIEarlyWinnerEvent(
                         candidate_id=int(candidate.id), event_type=candidate.outcome,
-                        payload_json=json.dumps({"score": candidate.current_score, "target_hours": obs.target_hours}, ensure_ascii=False),
+                        payload_json=json.dumps({"score": candidate.current_score, "target_hours": obs.target_hours, "type": candidate.opportunity_type}, ensure_ascii=False),
                     ))
             await session.commit()
 

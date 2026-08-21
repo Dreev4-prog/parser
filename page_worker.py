@@ -37,6 +37,7 @@ os.environ["DIST_TRAFFIC_GLOBAL_LIMIT"] = "8"
 os.environ["DIST_TRAFFIC_SHARED_COOLDOWN"] = "1"
 
 from app_version import APP_VERSION
+from browser_idle import BrowserIdleShutdownGuard
 from parser import KleinanzeigenParser, TemporaryAccessError, shutdown_shared_browser_runtime
 from page_manager import (
     PAGE_CACHE_TTL_SECONDS,
@@ -73,6 +74,7 @@ PAGE_WORKER_HEARTBEAT_SECONDS = _env_int("PAGE_WORKER_HEARTBEAT_SECONDS", 3, 1, 
 PAGE_WORKER_RECLAIM_IDLE_MS = _env_int("PAGE_WORKER_RECLAIM_IDLE_MS", 120_000, 30_000, 300_000)
 PAGE_WORKER_JOB_TIMEOUT_SECONDS = _env_int("PAGE_WORKER_JOB_TIMEOUT_SECONDS", 90, 20, 240)
 PAGE_WORKER_STATUS_TTL_SECONDS = max(10, PAGE_WORKER_HEARTBEAT_SECONDS * 5)
+PAGE_WORKER_BROWSER_IDLE_SECONDS = _env_int("PAGE_WORKER_BROWSER_IDLE_SECONDS", 600, 60, 3600)
 
 
 class PageWorkerProcess:
@@ -98,6 +100,7 @@ class PageWorkerProcess:
         self.rate_ema = 0.0
         self._group_ready = False
         self._stop = asyncio.Event()
+        self._activity_lock = asyncio.Lock()
 
         # Keep local category pressure bounded; Redis fleet guards cap the aggregate
         # across all four Page Worker replicas.
@@ -262,7 +265,8 @@ class PageWorkerProcess:
                         await self._ack(msg_id)
                         continue
 
-                    self.active += 1
+                    async with self._activity_lock:
+                        self.active += 1
                     item_started = time.monotonic()
                     try:
                         info = await asyncio.wait_for(
@@ -325,7 +329,8 @@ class PageWorkerProcess:
                         await self.redis.delete(self.pending_key(cache_id))
                         log.warning("Page Worker page failed page=%s error=%s", requested_page, exc)
                     finally:
-                        self.active = max(0, self.active - 1)
+                        async with self._activity_lock:
+                            self.active = max(0, self.active - 1)
                         await self._ack(msg_id)
                 except asyncio.CancelledError:
                     raise
@@ -339,26 +344,39 @@ class PageWorkerProcess:
         await self.redis.ping()
         await self.ensure_group()
         hb = asyncio.create_task(self.heartbeat_loop(), name="page-worker-heartbeat")
+        idle_guard = BrowserIdleShutdownGuard(
+            redis=self.redis,
+            stream=PAGE_STREAM,
+            active_count=lambda: self.active,
+            activity_lock=self._activity_lock,
+            stop_event=self._stop,
+            idle_seconds=PAGE_WORKER_BROWSER_IDLE_SECONDS,
+            label="Page Worker",
+            logger=log,
+        )
+        idle_task = asyncio.create_task(idle_guard.run(), name="page-worker-browser-idle")
         consumers = [
             asyncio.create_task(self.consumer_loop(i), name=f"page-worker-consumer-{i}")
             for i in range(1, PAGE_WORKER_CONCURRENCY + 1)
         ]
         await self.heartbeat()
         log.info(
-            "DT PARSER Page Worker online | id=%s | replica=%s | concurrency=%s | cache=%ss",
+            "DT PARSER Page Worker online | id=%s | replica=%s | concurrency=%s | cache=%ss | browser_idle=%ss",
             self.base_id,
             os.getenv("RAILWAY_REPLICA_ID", "local"),
             PAGE_WORKER_CONCURRENCY,
             PAGE_CACHE_TTL_SECONDS,
+            PAGE_WORKER_BROWSER_IDLE_SECONDS,
         )
         try:
             await asyncio.gather(*consumers)
         finally:
             self._stop.set()
             hb.cancel()
+            idle_task.cancel()
             for task in consumers:
                 task.cancel()
-            await asyncio.gather(hb, *consumers, return_exceptions=True)
+            await asyncio.gather(hb, idle_task, *consumers, return_exceptions=True)
             try:
                 await self.redis.delete(self.worker_key())
             except Exception:

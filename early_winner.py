@@ -10,7 +10,7 @@ from typing import Iterable
 from product_identity import canonical_text
 from zoneinfo import ZoneInfo
 
-MODEL_VERSION = "ew-opportunity-v2"
+MODEL_VERSION = "product-opportunity-v3"
 BERLIN = ZoneInfo("Europe/Berlin")
 UTC = timezone.utc
 
@@ -150,10 +150,19 @@ class InitialScore:
     predicted_6h_high: int
     reasons: tuple[str, ...]
     cohort_key: str = ""
+    # v4.6: popularity/saturation is descriptive, never a direct negative Score.
+    saturation_score: int = 0
+    supply_percentile: float = 0.0
+    supply_growth_ratio: float = 1.0
+    demand_growth_ratio: float = 1.0
+    demand_supply_ratio: float = 1.0
+    repeatability: float = 0.0
+    anomaly_ratio: float = 1.0
+    current_vs_history_ratio: float = 1.0
+    opportunity_type: str = "spark"
+    # Kept as compatibility aliases for older tests/callers. v4.6 never subtracts them.
     supply_fit: float = 0.0
     mass_penalty: float = 0.0
-    anomaly_ratio: float = 1.0
-    opportunity_type: str = "anomaly"
 
 
 @dataclass(frozen=True)
@@ -242,59 +251,58 @@ def opportunity_cohort_key(row: FeatureRow) -> str:
     return opportunity_family_key(row.title, row.category_key)
 
 
-def _market_tuple(value) -> tuple[float | None, int]:
-    """Accept v4.5 tuple stats and the v4.5.1 keyed stats format."""
-    if value is None:
-        return None, 0
-    if isinstance(value, tuple) and len(value) >= 2:
-        median, count = value[0], value[1]
-        return (float(median) if median is not None else None), int(count or 0)
-    if isinstance(value, dict):
-        median = value.get("median")
-        return (float(median) if median is not None else None), int(value.get("count") or 0)
-    return None, 0
+def _market_profile(value) -> dict[str, float | int | None]:
+    """Normalize legacy v4.5 stats and the richer v4.6 market profile.
 
-
-def _supply_fit(count: int) -> float:
-    """Sweet-spot curve: neither mass-market nor one-off dead inventory wins by rarity alone."""
-    n = max(0, int(count or 0))
-    if n == 0:
-        return 0.75  # unseen/new family: neutral-positive, but must win on demand/anomaly
-    if n <= 2:
-        return 0.30  # too little evidence to call a niche attractive
-    if n <= 5:
-        return 0.65
-    if n <= 35:
-        return 1.00  # ideal discovery zone
-    if n <= 75:
-        return 0.82
-    if n <= 120:
-        return 0.58
-    if n <= 200:
-        return 0.32
-    return 0.12
-
-
-def _mass_penalty(count: int, scan_share: float) -> float:
-    """0..35 score penalty for saturated families.
-
-    Historical supply is primary; current-scan share catches a mass family even when
-    history is still warming up. The penalty is intentionally smooth around boundaries.
+    Saturation and trend are evidence, not a veto. Missing history is deliberately
+    neutral for opportunity scoring and lowers confidence instead of awarding rarity.
     """
-    n = max(0, int(count or 0))
-    historical = 0.0
-    if n > 60:
-        historical = min(35.0, (n - 60) / 190.0 * 35.0)
-    share_penalty = 0.0
-    if scan_share > 0.12:
-        share_penalty = min(12.0, (scan_share - 0.12) / 0.28 * 12.0)
-    return min(35.0, historical + share_penalty)
+    profile: dict[str, float | int | None] = {
+        "median": None,
+        "count": 0,
+        "supply_percentile": 0.0,
+        "recent_count": 0,
+        "previous_count": 0,
+        "supply_growth_ratio": 1.0,
+        "demand_recent_median": None,
+        "demand_previous_median": None,
+        "demand_growth_ratio": 1.0,
+        "demand_recent_samples": 0,
+        "demand_previous_samples": 0,
+        "prior_signals": 0,
+        "prior_confirmed": 0,
+    }
+    if value is None:
+        return profile
+    if isinstance(value, tuple) and len(value) >= 2:
+        profile["median"] = float(value[0]) if value[0] is not None else None
+        profile["count"] = int(value[1] or 0)
+        return profile
+    if isinstance(value, dict):
+        for key in profile:
+            if key in value and value.get(key) is not None:
+                profile[key] = value.get(key)
+        profile["median"] = float(profile["median"]) if profile["median"] is not None else None
+        for key in ("count", "recent_count", "previous_count", "demand_recent_samples", "demand_previous_samples", "prior_signals", "prior_confirmed"):
+            profile[key] = int(profile[key] or 0)
+        for key in ("supply_percentile", "supply_growth_ratio", "demand_growth_ratio"):
+            profile[key] = float(profile[key] or (1.0 if "growth" in key else 0.0))
+        for key in ("demand_recent_median", "demand_previous_median"):
+            if profile[key] is not None:
+                profile[key] = float(profile[key])
+    return profile
 
 
 def _ratio_factor(ratio: float) -> float:
     # 0.5x -> 0; 1x -> .33; 2x -> .67; 4x+ -> 1.0.
     ratio = max(0.05, float(ratio))
     return clamp((math.log(ratio, 2.0) + 1.0) / 3.0)
+
+
+def _growth_factor(ratio: float) -> float:
+    """Trend factor with 1.0x as a true neutral 0.5."""
+    ratio = max(0.20, min(5.0, float(ratio or 1.0)))
+    return clamp(0.5 + math.log(ratio, 2.0) / 2.0)
 
 
 def _absolute_demand_factor(views: int, vph: float) -> float:
@@ -304,24 +312,61 @@ def _absolute_demand_factor(views: int, vph: float) -> float:
     return 0.72 * vph_part + 0.28 * views_part
 
 
-def _opportunity_type(market_count: int, mass_penalty: float, anomaly_ratio: float, peer_count: int) -> str:
-    if mass_penalty >= 12.0:
-        return "saturated"
-    if 3 <= market_count <= 60 and anomaly_ratio >= 1.8:
+def _saturation_score(supply_percentile: float, scan_share: float, market_count: int) -> int:
+    """0..100 category-relative saturation.
+
+    v4.5.1 used absolute count thresholds (e.g. 200 listings = mass market) for every
+    category. v4.6 compares a family with *other families in its own category* and only
+    uses current-scan share as a secondary hint. Saturation never subtracts Score.
+    """
+    if int(market_count or 0) <= 0:
+        return 0
+    historical = clamp(float(supply_percentile or 0.0))
+    scan_component = clamp(float(scan_share or 0.0) / 0.25)
+    return int(round(100.0 * clamp(0.86 * historical + 0.14 * scan_component)))
+
+
+def _combine_growth(current_vs_history: float | None, historical_growth: float | None) -> tuple[float, bool]:
+    values = [float(x) for x in (current_vs_history, historical_growth) if x is not None and x > 0]
+    if not values:
+        return 1.0, False
+    # Geometric mean: a one-day spike can help, but persistent historical growth matters too.
+    log_mean = sum(math.log(max(0.20, min(5.0, x))) for x in values) / len(values)
+    return max(0.20, min(5.0, math.exp(log_mean))), True
+
+
+def _opportunity_type(
+    *,
+    score: int,
+    saturation_score: int,
+    anomaly_ratio: float,
+    demand_growth_ratio: float,
+    demand_supply_ratio: float,
+    repeatability: float,
+    trend_evidence: bool,
+) -> str:
+    """Classify *why* a product is interesting instead of treating popularity as bad."""
+    movement = max(float(demand_growth_ratio or 1.0), float(demand_supply_ratio or 1.0))
+    if score >= 80 and saturation_score >= 65 and trend_evidence and movement >= 1.18:
+        return "hot_product"
+    if score >= 80 and saturation_score <= 45 and anomaly_ratio >= 1.45 and repeatability >= 0.42:
         return "hidden_gem"
-    if peer_count >= 3 and market_count <= 120 and anomaly_ratio >= 1.45:
+    if score >= 80 and trend_evidence and demand_supply_ratio >= 1.12 and movement >= 1.18:
         return "emerging"
-    return "anomaly"
+    if saturation_score >= 70 and (not trend_evidence or movement < 1.12):
+        return "saturated"
+    return "spark"
 
 
 def score_initial_rows(
     rows: list[FeatureRow],
-    market_stats: dict[str, tuple[float, int]] | None = None,
+    market_stats: dict[str, tuple[float, int] | dict] | None = None,
 ) -> list[InitialScore]:
-    """Opportunity Discovery v2.
+    """DT Product Opportunity Engine v3.
 
-    The score answers a different question than TOP views: "is demand unusually strong
-    *relative to supply*?" Recognition confidence only affects confidence, never Score.
+    Opportunity Score answers: "is something unusually strong happening with this
+    product now?" Saturation is a separate axis. A popular family can therefore become
+    a Hot Product when demand accelerates; it is not pushed down merely for being large.
     """
     market_stats = market_stats or {}
     by_category: dict[str, list[FeatureRow]] = {}
@@ -344,14 +389,14 @@ def score_initial_rows(
             else:
                 ungrouped_rates.append(item.views_per_hour)
 
-        # Balance the category baseline by product family. Ten iPhones must not
-        # count ten times more than one emerging drill/camera/coffee machine.
+        # Family-balanced baseline: 20 copies of one iPhone do not redefine the category.
         balanced_category_rates = list(ungrouped_rates)
         for group in cohort_groups.values():
             balanced_category_rates.append(percentile_value([x.views_per_hour for x in group], 0.50))
         if len(balanced_category_rates) < 2:
             balanced_category_rates = list(category_rates)
         category_median = max(0.25, percentile_value(balanced_category_rates, 0.50))
+        category_p75 = max(category_median, percentile_value(balanced_category_rates, 0.75))
 
         for row in category_rows:
             cohort_key = cohort_key_by_id.get(row.external_id, "")
@@ -363,59 +408,103 @@ def score_initial_rows(
             peer_p85 = percentile_value(peer_rates, 0.85)
             peer_p90 = percentile_value(peer_rates, 0.90)
 
-            # Category percentile is the broad demand signal; peer stats are kept for
-            # future checkpoints so a mass family has to outperform its own baseline too.
             category_velocity_pct = percentile_rank(row.views_per_hour, balanced_category_rates)
             views_pct = percentile_rank(float(row.views), view_values)
             absolute_demand = _absolute_demand_factor(row.views, row.views_per_hour)
-            demand_factor = 0.76 * category_velocity_pct + 0.24 * absolute_demand
+            demand_factor = 0.68 * category_velocity_pct + 0.32 * absolute_demand
 
             category_ratio = row.views_per_hour / category_median
-            if use_peers:
-                peer_ratio = row.views_per_hour / max(0.25, peer_median)
-                anomaly_factor = 0.72 * _ratio_factor(category_ratio) + 0.28 * _ratio_factor(peer_ratio)
-            else:
-                anomaly_factor = _ratio_factor(category_ratio)
-            anomaly_ratio = category_ratio
+            peer_ratio = row.views_per_hour / max(0.25, peer_median) if use_peers else category_ratio
 
             market_value = None
-            # New keys are prefixed; raw identity lookup preserves compatibility with v4.5 tests/data.
             for key in (cohort_key, row.identity_key or "", (cohort_key[3:] if cohort_key.startswith("id:") else "")):
                 if key and key in market_stats:
                     market_value = market_stats[key]
                     break
-            market_median, market_count = _market_tuple(market_value)
-            price_factor, price_delta = _price_factor(row.price_eur, market_median)
-            supply_fit = _supply_fit(market_count)
+            profile = _market_profile(market_value)
+            market_median = profile["median"]
+            market_count = int(profile["count"] or 0)
+            price_factor, price_delta = _price_factor(row.price_eur, float(market_median) if market_median is not None else None)
+
             scan_share = (len(peers) / max(1, len(category_rows))) if cohort_key else 0.0
-            mass_penalty = _mass_penalty(market_count, scan_share if len(peers) >= 8 and len(category_rows) >= 30 else 0.0)
+            saturation = _saturation_score(float(profile["supply_percentile"] or 0.0), scan_share, market_count)
+
+            # Repeatability: multiple independent strong listings beat a single viral ad.
+            if peers:
+                strong_peers = sum(1 for x in peers if x.views_per_hour >= category_p75)
+                peer_share = strong_peers / max(1, len(peers))
+                peer_depth = clamp((len(peers) - 1) / 4.0)
+                current_repeatability = 0.65 * peer_share + 0.35 * peer_depth
+            else:
+                current_repeatability = 0.28
+            prior_signals = int(profile["prior_signals"] or 0)
+            prior_confirmed = int(profile["prior_confirmed"] or 0)
+            if prior_signals > 0:
+                historical_repeatability = prior_confirmed / max(1, prior_signals)
+                repeatability = clamp(0.65 * current_repeatability + 0.35 * historical_repeatability)
+            else:
+                repeatability = clamp(current_repeatability)
+
+            demand_recent = profile["demand_recent_median"]
+            demand_previous = profile["demand_previous_median"]
+            history_samples = int(profile["demand_recent_samples"] or 0) + int(profile["demand_previous_samples"] or 0)
+            current_family_rate = percentile_value([x.views_per_hour for x in peers], 0.50) if len(peers) >= 2 else row.views_per_hour
+            current_vs_history: float | None = None
+            if demand_recent is not None and float(demand_recent) > 0 and int(profile["demand_recent_samples"] or 0) >= 2:
+                current_vs_history = current_family_rate / max(0.25, float(demand_recent))
+            historical_growth: float | None = None
+            if demand_recent is not None and demand_previous is not None and float(demand_previous) > 0 and history_samples >= 4:
+                historical_growth = float(demand_recent) / max(0.25, float(demand_previous))
+            demand_growth_ratio, trend_evidence = _combine_growth(current_vs_history, historical_growth)
+
+            supply_growth_ratio = max(0.25, min(4.0, float(profile["supply_growth_ratio"] or 1.0)))
+            demand_supply_ratio = (
+                max(0.25, min(4.0, demand_growth_ratio / max(0.50, supply_growth_ratio)))
+                if trend_evidence else 1.0
+            )
+
+            # Own-history acceleration is crucial for popular products: an iPhone that is
+            # merely always popular is not a new opportunity; one accelerating vs itself is.
+            if current_vs_history is not None:
+                anomaly_factor = (
+                    0.42 * _ratio_factor(category_ratio)
+                    + 0.18 * _ratio_factor(peer_ratio)
+                    + 0.40 * _growth_factor(current_vs_history)
+                )
+                anomaly_ratio = max(category_ratio, current_vs_history)
+            else:
+                anomaly_factor = 0.72 * _ratio_factor(category_ratio) + 0.28 * _ratio_factor(peer_ratio)
+                anomaly_ratio = category_ratio
+
+            trend_factor = _growth_factor(demand_growth_ratio) if trend_evidence else 0.50
+            imbalance_factor = _growth_factor(demand_supply_ratio) if trend_evidence else 0.50
             freshness = clamp(1.0 - (row.age_minutes / (24.0 * 60.0)))
 
-            # Recognition confidence is *not* a score component. This is the key v2
-            # correction: a Makita/coffee-machine/camera the parser does not know can
-            # beat an iPhone if its demand/supply signal is stronger.
+            # No mass penalty. Saturation is intentionally absent from this formula.
             raw = (
-                36.0 * demand_factor
-                + 28.0 * anomaly_factor
-                + 16.0 * supply_fit
-                + 8.0 * freshness
-                + 4.0 * price_factor
-                + 8.0 * (0.5 if not use_peers else clamp(percentile_rank(peer_median, balanced_category_rates)))
-                - mass_penalty
+                34.0 * demand_factor
+                + 26.0 * anomaly_factor
+                + 16.0 * trend_factor
+                + 12.0 * imbalance_factor
+                + 8.0 * repeatability
+                + 3.0 * freshness
+                + 1.0 * price_factor
             )
             score = int(round(max(0.0, min(100.0, raw))))
 
             identity_conf = int(row.identity_confidence or 0)
-            evidence_count = market_count if market_count > 0 else (len(peers) if cohort_key else 0)
-            confidence = int(round(max(25.0, min(96.0,
-                42.0
-                + min(22.0, max(0, peer_count - 1) * 2.0)
-                + min(20.0, math.sqrt(max(0, evidence_count)) * 3.2)
-                + (5.0 if cohort_key else 0.0)
-                + min(5.0, identity_conf * 0.05)
+            evidence_count = market_count if market_count > 0 else len(peers)
+            confidence = int(round(max(22.0, min(97.0,
+                34.0
+                + min(18.0, max(0, len(peers) - 1) * 2.5)
+                + min(18.0, math.sqrt(max(0, evidence_count)) * 2.6)
+                + min(14.0, history_samples * 1.4)
+                + min(8.0, prior_signals * 1.2)
+                + (3.0 if cohort_key else 0.0)
+                + min(2.0, identity_conf * 0.02)
             ))))
 
-            uncertainty = max(0.16, min(0.36, 0.42 - 0.0025 * confidence))
+            uncertainty = max(0.16, min(0.38, 0.44 - 0.0027 * confidence))
             growth3 = row.views_per_hour * 3.0 * 0.92
             growth6 = row.views_per_hour * 6.0 * 0.84
             p3_low = max(row.views, int(round(row.views + growth3 * (1.0 - uncertainty))))
@@ -423,46 +512,53 @@ def score_initial_rows(
             p6_low = max(row.views, int(round(row.views + growth6 * (1.0 - uncertainty))))
             p6_high = max(p6_low, int(round(row.views + growth6 * (1.0 + uncertainty))))
 
-            opp_type = _opportunity_type(market_count, mass_penalty, anomaly_ratio, len(peers) if cohort_key else 0)
+            opp_type = _opportunity_type(
+                score=score,
+                saturation_score=saturation,
+                anomaly_ratio=anomaly_ratio,
+                demand_growth_ratio=demand_growth_ratio,
+                demand_supply_ratio=demand_supply_ratio,
+                repeatability=repeatability,
+                trend_evidence=trend_evidence,
+            )
             reasons: list[str] = []
             if opp_type == "hidden_gem":
-                reasons.append("💎 Hidden Gem: сильный спрос при ограниченном предложении")
+                reasons.append("💎 Hidden Gem: сильный спрос при относительно низком насыщении")
             elif opp_type == "emerging":
-                reasons.append("🚀 Emerging: ниша показывает устойчивый спрос до массового насыщения")
+                reasons.append("🚀 Emerging: спрос растёт быстрее предложения")
+            elif opp_type == "hot_product":
+                reasons.append("🔥 Hot Product: товар популярный, но спрос ускорился относительно собственной нормы")
             elif opp_type == "saturated":
-                reasons.append("⚠️ Saturated: спрос есть, но ниша уже массовая — Score снижен")
+                reasons.append("⚫ Saturated: предложений много, нового ускорения спроса пока нет")
             else:
-                reasons.append("⚡ Anomaly: объявление заметно выбивается по спросу и требует подтверждения")
+                reasons.append("⚡ Spark: необычный спрос замечен, но товарному сигналу ещё нужны подтверждения")
 
-            if category_ratio >= 2.0:
+            if current_vs_history is not None:
+                reasons.append(f"текущий темп семьи {current_vs_history:.2f}× к её недавней собственной норме")
+            elif category_ratio >= 1.5:
                 reasons.append(f"темп {category_ratio:.1f}× выше медианы категории")
-            elif category_velocity_pct >= 0.85:
-                reasons.append(f"темп входит примерно в верхние {max(1, 100-int(category_velocity_pct*100))}% категории")
             else:
-                reasons.append("темп пока не даёт сильной аномалии относительно категории")
+                reasons.append("истории собственного темпа пока мало; используем категорийный baseline")
 
-            if use_peers:
-                reasons.append(f"есть {len(peers)} сопоставимых объявления в текущем скане")
+            if trend_evidence:
+                reasons.append(f"динамика спроса {demand_growth_ratio:.2f}× · спрос/предложение {demand_supply_ratio:.2f}×")
+            else:
+                reasons.append("история тренда ещё накапливается — нейтрально, без бонуса за неизвестность")
             if market_count:
-                reasons.append(f"за окно рынка найдено {market_count} сопоставимых публикаций")
+                reasons.append(f"рынок: {market_count} сопоставимых · насыщение {saturation}/100 относительно своей категории")
             else:
-                reasons.append("история этой товарной семьи ещё небольшая — решает реальный спрос, а не известность модели")
-            if mass_penalty >= 5:
-                reasons.append(f"штраф за массовость: −{mass_penalty:.0f} Score")
-            elif 6 <= market_count <= 35:
-                reasons.append("предложение находится в sweet spot: уже подтверждено, но ещё не массовое")
-            elif 0 < market_count <= 2:
-                reasons.append("слишком мало повторных публикаций: бонус за редкость ограничен")
-
+                reasons.append("товарная семья новая для базы: насыщение неизвестно, а не автоматически «редко = хорошо»")
+            if len(peers) >= 2:
+                reasons.append(f"повторяемость текущего сигнала: {repeatability*100:.0f}% на {len(peers)} сопоставимых")
+            if supply_growth_ratio >= 1.15:
+                reasons.append(f"предложение тоже растёт: {supply_growth_ratio:.2f}× к норме категории")
+            elif supply_growth_ratio <= 0.85 and market_count:
+                reasons.append(f"предложение растёт медленнее рынка: {supply_growth_ratio:.2f}×")
             if price_delta is not None:
                 if price_delta >= 8:
                     reasons.append(f"цена примерно на {price_delta:.0f}% ниже медианы похожих")
                 elif price_delta <= -10:
                     reasons.append(f"цена примерно на {abs(price_delta):.0f}% выше медианы похожих")
-                else:
-                    reasons.append("цена близка к медиане похожих объявлений")
-            if row.age_minutes <= 90:
-                reasons.append("объявление очень свежее")
 
             result.append(InitialScore(
                 external_id=row.external_id,
@@ -477,7 +573,7 @@ def score_initial_rows(
                 peer_vph_p85=peer_p85,
                 peer_vph_p90=peer_p90,
                 market_median_eur=float(market_median) if market_median is not None else None,
-                market_cohort_size=int(market_count),
+                market_cohort_size=market_count,
                 price_delta_pct=price_delta,
                 predicted_3h_low=p3_low,
                 predicted_3h_high=p3_high,
@@ -485,10 +581,17 @@ def score_initial_rows(
                 predicted_6h_high=p6_high,
                 reasons=tuple(reasons),
                 cohort_key=cohort_key,
-                supply_fit=supply_fit,
-                mass_penalty=mass_penalty,
+                saturation_score=saturation,
+                supply_percentile=float(profile["supply_percentile"] or 0.0),
+                supply_growth_ratio=supply_growth_ratio,
+                demand_growth_ratio=demand_growth_ratio,
+                demand_supply_ratio=demand_supply_ratio,
+                repeatability=repeatability,
                 anomaly_ratio=anomaly_ratio,
+                current_vs_history_ratio=float(current_vs_history or 1.0),
                 opportunity_type=opp_type,
+                supply_fit=0.0,
+                mass_penalty=0.0,
             ))
     return result
 
@@ -503,7 +606,11 @@ def select_candidates(
     control_per_category: int = 2,
     max_per_cohort: int = 2,
 ) -> tuple[list[str], set[str]]:
-    """Bounded opportunity shortlist with diversity by product family."""
+    """Bounded product-opportunity shortlist with family diversity.
+
+    Saturated/no-movement products are background, not primary discoveries. Hot Product
+    is explicitly allowed even at very high saturation when its own demand is moving.
+    """
     by_category: dict[str, list[InitialScore]] = {}
     for score in scores:
         by_category.setdefault(category_by_external_id.get(score.external_id, "unknown"), []).append(score)
@@ -511,11 +618,13 @@ def select_candidates(
     selected: list[InitialScore] = []
     controls: set[str] = set()
     for rows in by_category.values():
-        rows = sorted(rows, key=lambda x: (x.score, x.velocity_percentile), reverse=True)
+        rows = sorted(rows, key=lambda x: (x.score, x.repeatability, x.velocity_percentile), reverse=True)
         cohort_used: dict[str, int] = {}
         visible_count = 0
         for item in rows:
             if item.score < score_floor or visible_count >= max(1, per_category):
+                continue
+            if item.opportunity_type == "saturated" and item.score < 90:
                 continue
             key = item.cohort_key or f"single:{item.external_id}"
             if cohort_used.get(key, 0) >= max(1, max_per_cohort):
@@ -524,7 +633,8 @@ def select_candidates(
             selected.append(item)
             visible_count += 1
 
-        low = [x for x in rows if x.score < score_floor]
+        selected_ids = {x.external_id for x in selected}
+        low = [x for x in rows if x.external_id not in selected_ids and x.score < score_floor]
         for item in low[:max(0, control_per_category)]:
             selected.append(item)
             controls.add(item.external_id)

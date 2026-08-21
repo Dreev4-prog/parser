@@ -7059,8 +7059,9 @@ async def _admin_view_worker_text() -> str:
 
 def admin_ai_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔥 Early Winners", callback_data="adminai:winners"),
-         InlineKeyboardButton(text="⚡ Watch / Rising", callback_data="adminai:active")],
+        [InlineKeyboardButton(text="💎 Hidden Gems", callback_data="adminai:hidden"),
+         InlineKeyboardButton(text="🚀 Hot / Emerging", callback_data="adminai:momentum")],
+        [InlineKeyboardButton(text="⚡ Sparks / Watch", callback_data="adminai:active")],
         [InlineKeyboardButton(text="✅ Подтверждены", callback_data="adminai:confirmed"),
          InlineKeyboardButton(text="❌ Не подтвердились", callback_data="adminai:rejected")],
         [InlineKeyboardButton(text="📊 Точность AI", callback_data="adminai:accuracy"),
@@ -7080,6 +7081,16 @@ def _ai_stage_label(stage: str, outcome: str = "pending") -> str:
         "rising": "⚡ RISING",
         "watch": "🟡 WATCH",
     }.get(stage or "", "🟡 WATCH")
+
+
+def _ai_opportunity_label(value: str | None) -> str:
+    return {
+        "hidden_gem": "💎 HIDDEN GEM",
+        "emerging": "🚀 EMERGING",
+        "hot_product": "🔥 HOT PRODUCT",
+        "saturated": "⚫ SATURATED",
+        "spark": "⚡ SPARK",
+    }.get(str(value or ""), "⚡ SPARK")
 
 
 def _ai_json_list(raw: str | None) -> list[str]:
@@ -7121,6 +7132,11 @@ async def _admin_ai_dashboard_text() -> str:
     eligible = sum(int(x.eligible_count or 0) for x in runs if x.status == "done")
     watch = sum(1 for x in candidates if x.outcome == "pending" and x.stage == "watch")
     rising = sum(1 for x in candidates if x.outcome == "pending" and x.stage == "rising")
+    hidden_gems = sum(1 for x in candidates if x.outcome == "pending" and x.opportunity_type == "hidden_gem")
+    emerging = sum(1 for x in candidates if x.outcome == "pending" and x.opportunity_type == "emerging")
+    hot_products = sum(1 for x in candidates if x.outcome == "pending" and x.opportunity_type == "hot_product")
+    sparks = sum(1 for x in candidates if x.outcome == "pending" and x.opportunity_type == "spark")
+    saturated = sum(1 for x in candidates if x.outcome == "pending" and x.opportunity_type == "saturated")
     ai_candidates_total = len(candidates)
     run_errors = sum(1 for x in runs if x.status == "error")
     winners = sum(1 for x in candidates if x.outcome == "pending" and x.stage == "early_winner")
@@ -7142,7 +7158,7 @@ async def _admin_ai_dashboard_text() -> str:
         worker_text = "▫️ REDIS_URL недоступен в Main Bot"
 
     lines = [
-        "<b>🧠 DT AI LAB · EARLY WINNER</b>",
+        "<b>🧠 DT AI LAB · PRODUCT OPPORTUNITY</b>",
         "",
         f"AI Worker: <b>{worker_text}</b>",
         "Режим: <b>🔒 Shadow · только админка</b>",
@@ -7152,10 +7168,12 @@ async def _admin_ai_dashboard_text() -> str:
         f"Сканов обработано: <b>{sum(1 for x in runs if x.status == 'done')}</b>",
         f"Объявлений в сканах: <b>{scanned}</b>",
         f"Подходят для раннего анализа: <b>{eligible}</b>",
-        f"AI-кандидатов найдено: <b>{ai_candidates_total}</b>",
-        f"🟡 WATCH: <b>{watch}</b>",
-        f"⚡ RISING: <b>{rising}</b>",
-        f"🔥 EARLY WINNER: <b>{winners}</b>",
+        f"AI-сигналов найдено: <b>{ai_candidates_total}</b>",
+        f"💎 HIDDEN GEM: <b>{hidden_gems}</b>",
+        f"🚀 EMERGING: <b>{emerging}</b>",
+        f"🔥 HOT PRODUCT: <b>{hot_products}</b>",
+        f"⚡ SPARK: <b>{sparks}</b> · ⚫ SATURATED: <b>{saturated}</b>",
+        f"Уровни Score · 🟡 WATCH {watch} · ⚡ RISING {rising} · 🔥 90+ {winners}",
         f"✅ Подтверждены: <b>{confirmed}</b>",
         f"❌ Не подтвердились: <b>{rejected}</b>",
         f"🧪 Контрольная группа: <b>{controls}</b>",
@@ -7180,7 +7198,17 @@ async def _ai_candidate_rows(kind: str, limit: int = 15) -> list[tuple[AIEarlyWi
             .join(UserScan, UserScan.id == AIEarlyWinnerCandidate.scan_id)
             .where(AIEarlyWinnerCandidate.is_control.is_(False))
         )
-        if kind == "winners":
+        if kind == "hidden":
+            query = query.where(
+                AIEarlyWinnerCandidate.outcome == "pending",
+                AIEarlyWinnerCandidate.opportunity_type == "hidden_gem",
+            ).order_by(AIEarlyWinnerCandidate.current_score.desc(), AIEarlyWinnerCandidate.latest_at.desc())
+        elif kind == "momentum":
+            query = query.where(
+                AIEarlyWinnerCandidate.outcome == "pending",
+                AIEarlyWinnerCandidate.opportunity_type.in_(["hot_product", "emerging"]),
+            ).order_by(AIEarlyWinnerCandidate.current_score.desc(), AIEarlyWinnerCandidate.latest_at.desc())
+        elif kind == "winners":
             query = query.where(
                 AIEarlyWinnerCandidate.outcome == "pending",
                 AIEarlyWinnerCandidate.stage == "early_winner",
@@ -7188,7 +7216,7 @@ async def _ai_candidate_rows(kind: str, limit: int = 15) -> list[tuple[AIEarlyWi
         elif kind == "active":
             query = query.where(
                 AIEarlyWinnerCandidate.outcome == "pending",
-                AIEarlyWinnerCandidate.stage.in_(["watch", "rising"]),
+                AIEarlyWinnerCandidate.opportunity_type.in_(["spark", "saturated"]),
             ).order_by(AIEarlyWinnerCandidate.current_score.desc(), AIEarlyWinnerCandidate.latest_at.desc())
         elif kind == "confirmed":
             query = query.where(AIEarlyWinnerCandidate.outcome == "confirmed").order_by(AIEarlyWinnerCandidate.resolved_at.desc())
@@ -7203,7 +7231,12 @@ def _ai_list_keyboard(kind: str, rows: list[tuple[AIEarlyWinnerCandidate, Listin
     buttons: list[list[InlineKeyboardButton]] = []
     for candidate, listing, _scan in rows[:15]:
         title = " ".join((listing.title or "Объявление").split())[:27]
-        icon = "✅" if candidate.outcome == "confirmed" else "❌" if candidate.outcome == "rejected" else "🔥" if candidate.stage == "early_winner" else "⚡" if candidate.stage == "rising" else "🟡"
+        if candidate.outcome == "confirmed":
+            icon = "✅"
+        elif candidate.outcome == "rejected":
+            icon = "❌"
+        else:
+            icon = {"hidden_gem": "💎", "hot_product": "🔥", "emerging": "🚀", "saturated": "⚫"}.get(candidate.opportunity_type, "⚡")
         buttons.append([InlineKeyboardButton(
             text=f"{icon} {int(candidate.current_score or 0)} · {title}",
             callback_data=f"aic:{int(candidate.id)}:{kind[:10]}",
@@ -7215,21 +7248,24 @@ def _ai_list_keyboard(kind: str, rows: list[tuple[AIEarlyWinnerCandidate, Listin
 
 async def _admin_ai_list_text(kind: str, rows: list[tuple[AIEarlyWinnerCandidate, Listing, UserScan]]) -> str:
     titles = {
-        "winners": "🔥 Early Winners",
-        "active": "⚡ Watch / Rising",
+        "hidden": "💎 Hidden Gems",
+        "momentum": "🚀 Hot / Emerging",
+        "winners": "🔥 90+ Score",
+        "active": "⚡ Sparks / Saturated",
         "confirmed": "✅ Подтверждённые",
         "rejected": "❌ Не подтвердились",
         "recent": "🧪 Последние прогнозы",
     }
-    lines = [f"<b>{titles.get(kind, '🧠 Early Winner')}</b>", ""]
+    lines = [f"<b>{titles.get(kind, '🧠 Product Opportunity')}</b>", ""]
     if not rows:
         lines.append("Пока нет объявлений в этом разделе.")
         return "\n".join(lines)
     for idx, (candidate, listing, scan) in enumerate(rows[:15], start=1):
         price = f"{listing.price_eur} €" if listing.price_eur is not None else (listing.price_text or "—")
         lines.append(
-            f"{idx}. {_ai_stage_label(candidate.stage, candidate.outcome)} · <b>{int(candidate.current_score or 0)}/100</b> "
-            f"(conf {int(candidate.confidence or 0)}%)\n"
+            f"{idx}. {_ai_opportunity_label(candidate.opportunity_type)} · {_ai_stage_label(candidate.stage, candidate.outcome)}\n"
+            f"   Opportunity <b>{int(candidate.current_score or 0)}/100</b> · Saturation <b>{int(candidate.saturation_score or 0)}/100</b> "
+            f"· conf {int(candidate.confidence or 0)}%\n"
             f"   {html.escape((listing.title or 'Объявление')[:80])} · <b>{html.escape(str(price))}</b>\n"
             f"   👁 {int(candidate.latest_views or 0)} · scan #{scan.id} · {_utc_to_msk_text(candidate.latest_at)} МСК"
         )
@@ -7260,10 +7296,13 @@ async def _admin_ai_candidate(candidate_id: int) -> tuple[str, InlineKeyboardMar
     reasons = _ai_json_list(candidate.reasons_json)
     latest_reasons = _ai_json_list(candidate.latest_reasons_json)
     lines = [
-        f"<b>{_ai_stage_label(candidate.stage, candidate.outcome)}</b>",
+        f"<b>{_ai_opportunity_label(candidate.opportunity_type)}</b> · {_ai_stage_label(candidate.stage, candidate.outcome)}",
         f"<b>{html.escape((listing.title or 'Объявление')[:180])}</b>",
         "",
-        f"🚀 Score: <b>{int(candidate.current_score or 0)}/100</b> · старт {int(candidate.initial_score or 0)}",
+        f"🚀 Opportunity: <b>{int(candidate.current_score or 0)}/100</b> · старт {int(candidate.initial_score or 0)}",
+        f"🌊 Saturation: <b>{int(candidate.saturation_score or 0)}/100</b> · percentile предложения {float(candidate.supply_percentile or 0)*100:.0f}%",
+        f"📈 Demand trend: <b>{float(candidate.demand_growth_ratio or 1.0):.2f}×</b> · Supply trend: <b>{float(candidate.supply_growth_ratio or 1.0):.2f}×</b>",
+        f"⚖️ Demand/Supply momentum: <b>{float(candidate.demand_supply_ratio or 1.0):.2f}×</b> · repeatability <b>{float(candidate.repeatability or 0)*100:.0f}%</b>",
         f"🎯 Уверенность данных: <b>{int(candidate.confidence or 0)}%</b>",
         f"🗂 {html.escape(cat_name)} · scan <b>#{scan.id}</b>",
         f"💶 Цена: <b>{html.escape(str(price))}</b>",
@@ -7310,7 +7349,16 @@ async def _admin_ai_candidate(candidate_id: int) -> tuple[str, InlineKeyboardMar
         else:
             lines.append(f"+{obs.target_hours}ч ⏳ ожидается {_utc_to_msk_text(obs.due_at)} МСК")
 
-    back_kind = "confirmed" if candidate.outcome == "confirmed" else "rejected" if candidate.outcome == "rejected" else "winners" if candidate.stage == "early_winner" else "active"
+    if candidate.outcome == "confirmed":
+        back_kind = "confirmed"
+    elif candidate.outcome == "rejected":
+        back_kind = "rejected"
+    elif candidate.opportunity_type == "hidden_gem":
+        back_kind = "hidden"
+    elif candidate.opportunity_type in {"hot_product", "emerging"}:
+        back_kind = "momentum"
+    else:
+        back_kind = "active"
     buttons: list[list[InlineKeyboardButton]] = []
     if listing.url:
         buttons.append([InlineKeyboardButton(text="🔗 Открыть объявление", url=listing.url)])
@@ -7421,7 +7469,8 @@ async def ai_admin_notification_scheduler(bot: Bot) -> None:
                             await session.commit()
                     continue
                 candidate, listing = row
-                title = "🔥 <b>Новый Early Winner</b>" if event.event_type == "winner" else "✅ <b>Early Winner подтверждён</b>"
+                type_title = _ai_opportunity_label(candidate.opportunity_type)
+                title = f"{type_title} · <b>новый сигнал 90+</b>" if event.event_type == "winner" else f"✅ <b>Сигнал подтверждён</b> · {type_title}"
                 text = (
                     f"{title}\n\n"
                     f"{html.escape((listing.title or 'Объявление')[:140])}\n"
@@ -7778,7 +7827,7 @@ async def admin_ai_section_handler(callback: CallbackQuery) -> None:
             ]),
         )
         return
-    if kind not in {"winners", "active", "confirmed", "rejected", "recent"}:
+    if kind not in {"hidden", "momentum", "winners", "active", "confirmed", "rejected", "recent"}:
         kind = "recent"
     rows = await _ai_candidate_rows(kind)
     await _edit_or_answer(callback.message, await _admin_ai_list_text(kind, rows), reply_markup=_ai_list_keyboard(kind, rows))
