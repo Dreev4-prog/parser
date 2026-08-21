@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ReleaseInvariantTests(unittest.TestCase):
     def test_release_version(self):
-        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.6.4")
+        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.6.0")
 
     def test_date_window_and_timezone_semantics_were_not_changed(self):
         source = (ROOT / "date_manager.py").read_text(encoding="utf-8")
@@ -64,7 +64,7 @@ class ReleaseInvariantTests(unittest.TestCase):
         source = (ROOT / "bot.py").read_text(encoding="utf-8")
         self.assertIn('callback_data="adminai:hidden"', source)
         self.assertIn('callback_data="adminai:momentum"', source)
-        self.assertIn('{"new", "hidden", "momentum", "winners", "active", "confirmed", "rejected", "recent"}', source)
+        self.assertIn('{"hidden", "momentum", "winners", "active", "confirmed", "rejected", "recent"}', source)
 
     def test_ai_v46_columns_have_additive_migration(self):
         source = (ROOT / "db.py").read_text(encoding="utf-8")
@@ -72,45 +72,6 @@ class ReleaseInvariantTests(unittest.TestCase):
         self.assertIn("ADD COLUMN IF NOT EXISTS", source)
         self.assertIn('"opportunity_type"', source)
         self.assertIn('"saturation_score"', source)
-
-
-    def test_v461_idle_browser_shutdown_is_conservative(self):
-        idle = (ROOT / "browser_idle.py").read_text(encoding="utf-8")
-        self.assertIn("depth is None or depth > 0", idle)
-        self.assertIn("async with self.activity_lock", idle)
-        self.assertIn("shutdown_shared_browser_runtime", idle)
-        parser = (ROOT / "parser.py").read_text(encoding="utf-8")
-        self.assertIn("self._shared_browser_generation != _SHARED_BROWSER_FLEET.generation", parser)
-        for worker in ("page_worker.py", "date_worker.py", "view_counter_worker.py"):
-            source = (ROOT / worker).read_text(encoding="utf-8")
-            self.assertIn("BrowserIdleShutdownGuard", source)
-            self.assertIn("600", source)
-
-
-    def test_v462_ai_notifications_live_in_lab_badge_not_chat_pushes(self):
-        source = (ROOT / "bot.py").read_text(encoding="utf-8")
-        self.assertIn('AI_BADGE_EVENT_TYPES = ("winner", "confirmed")', source)
-        self.assertIn('callback_data="adminai:new"', source)
-        self.assertIn('DT AI Lab 🔴', source)
-        self.assertIn('async def _mark_ai_signals_seen', source)
-        self.assertNotIn('name="ai-admin-notification-scheduler"', source)
-        worker = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
-        self.assertIn('candidate.outcome == "confirmed"', worker)
-
-
-    def test_v464_admin_workers_are_consolidated_and_active_scans_visible(self):
-        source = (ROOT / "bot.py").read_text(encoding="utf-8")
-        self.assertIn('text="⚙️ Воркеры", callback_data="adminworkers"', source)
-        self.assertIn('callback_data="adminactive"', source)
-        self.assertIn('async def _admin_workers_text()', source)
-        self.assertIn('async def _admin_active_scans_text', source)
-        self.assertIn('UserScan.status == "running"', source)
-        main_start = source.index('def admin_keyboard(')
-        main_end = source.index('def admin_back_keyboard', main_start)
-        main = source[main_start:main_end]
-        self.assertNotIn('callback_data="admindates"', main)
-        self.assertNotIn('callback_data="adminpages"', main)
-        self.assertNotIn('callback_data="adminviews"', main)
 
 
 

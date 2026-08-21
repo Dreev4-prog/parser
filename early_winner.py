@@ -523,15 +523,15 @@ def score_initial_rows(
             )
             reasons: list[str] = []
             if opp_type == "hidden_gem":
-                reasons.append("💎 Скрытая находка: сильный спрос при относительно низком насыщении")
+                reasons.append("💎 Hidden Gem: сильный спрос при относительно низком насыщении")
             elif opp_type == "emerging":
-                reasons.append("🚀 Набирает обороты: спрос растёт быстрее предложения")
+                reasons.append("🚀 Emerging: спрос растёт быстрее предложения")
             elif opp_type == "hot_product":
-                reasons.append("🔥 Горячий товар: товар популярный, но спрос ускорился относительно собственной нормы")
+                reasons.append("🔥 Hot Product: товар популярный, но спрос ускорился относительно собственной нормы")
             elif opp_type == "saturated":
-                reasons.append("⚫ Перенасыщен: предложений много, нового ускорения спроса пока нет")
+                reasons.append("⚫ Saturated: предложений много, нового ускорения спроса пока нет")
             else:
-                reasons.append("⚡ Первичный сигнал: необычный спрос замечен, но товарному сигналу ещё нужны подтверждения")
+                reasons.append("⚡ Spark: необычный спрос замечен, но товарному сигналу ещё нужны подтверждения")
 
             if current_vs_history is not None:
                 reasons.append(f"текущий темп семьи {current_vs_history:.2f}× к её недавней собственной норме")
