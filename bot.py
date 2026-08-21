@@ -6728,13 +6728,15 @@ def payment_invoice_keyboard(payment: SubscriptionPayment) -> InlineKeyboardMark
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def admin_keyboard() -> InlineKeyboardMarkup:
+def admin_keyboard(ai_unread: int = 0) -> InlineKeyboardMarkup:
+    unread = max(0, int(ai_unread or 0))
+    ai_label = "🧠 DT AI Lab" if unread <= 0 else f"🧠 DT AI Lab 🔴 {min(unread, 99)}{'+' if unread > 99 else ''}"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adminstats")],
         [InlineKeyboardButton(text="📅 Date Worker", callback_data="admindates"),
          InlineKeyboardButton(text="📄 Page Worker", callback_data="adminpages")],
         [InlineKeyboardButton(text="👁 View Worker", callback_data="adminviews")],
-        [InlineKeyboardButton(text="🧠 DT AI Lab", callback_data="adminai")],
+        [InlineKeyboardButton(text=ai_label, callback_data="adminai")],
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="adminusers"),
          InlineKeyboardButton(text="💳 Платежи", callback_data="adminpayments")],
         [InlineKeyboardButton(text="🎟 Тарифы", callback_data="adminplans"),
@@ -7057,11 +7059,47 @@ async def _admin_view_worker_text() -> str:
     return "\n".join(lines)
 
 
-def admin_ai_keyboard() -> InlineKeyboardMarkup:
+AI_BADGE_EVENT_TYPES = ("winner", "confirmed")
+
+
+async def _ai_unread_signal_count() -> int:
+    """Count unique strong AI candidates not yet opened in the New section."""
+    async with SessionLocal() as session:
+        value = (await session.execute(
+            select(func.count(func.distinct(AIEarlyWinnerEvent.candidate_id))).where(
+                AIEarlyWinnerEvent.notified_at.is_(None),
+                AIEarlyWinnerEvent.event_type.in_(AI_BADGE_EVENT_TYPES),
+            )
+        )).scalar_one()
+    return int(value or 0)
+
+
+async def _mark_ai_signals_seen(candidate_ids: list[int]) -> None:
+    ids = sorted({int(x) for x in candidate_ids if int(x) > 0})
+    if not ids:
+        return
+    async with SessionLocal() as session:
+        await session.execute(
+            update(AIEarlyWinnerEvent)
+            .where(
+                AIEarlyWinnerEvent.candidate_id.in_(ids),
+                AIEarlyWinnerEvent.notified_at.is_(None),
+                AIEarlyWinnerEvent.event_type.in_(AI_BADGE_EVENT_TYPES),
+            )
+            .values(notified_at=datetime.utcnow())
+            .execution_options(synchronize_session=False)
+        )
+        await session.commit()
+
+
+def admin_ai_keyboard(unread_count: int = 0) -> InlineKeyboardMarkup:
+    unread = max(0, int(unread_count or 0))
+    new_label = "🆕 Новые" if unread <= 0 else f"🔴 Новые · {min(unread, 99)}{'+' if unread > 99 else ''}"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Hidden Gems", callback_data="adminai:hidden"),
-         InlineKeyboardButton(text="🚀 Hot / Emerging", callback_data="adminai:momentum")],
-        [InlineKeyboardButton(text="⚡ Sparks / Watch", callback_data="adminai:active")],
+        [InlineKeyboardButton(text=new_label, callback_data="adminai:new")],
+        [InlineKeyboardButton(text="💎 Скрытые находки", callback_data="adminai:hidden"),
+         InlineKeyboardButton(text="🚀 Горячие / Набирают обороты", callback_data="adminai:momentum")],
+        [InlineKeyboardButton(text="⚡ Первичные сигналы / Наблюдение", callback_data="adminai:active")],
         [InlineKeyboardButton(text="✅ Подтверждены", callback_data="adminai:confirmed"),
          InlineKeyboardButton(text="❌ Не подтвердились", callback_data="adminai:rejected")],
         [InlineKeyboardButton(text="📊 Точность AI", callback_data="adminai:accuracy"),
@@ -7073,24 +7111,24 @@ def admin_ai_keyboard() -> InlineKeyboardMarkup:
 
 def _ai_stage_label(stage: str, outcome: str = "pending") -> str:
     if outcome == "confirmed":
-        return "✅ CONFIRMED"
+        return "✅ Подтверждён"
     if outcome == "rejected":
-        return "❌ REJECTED"
+        return "❌ Не подтвердился"
     return {
-        "early_winner": "🔥 EARLY WINNER",
-        "rising": "⚡ RISING",
-        "watch": "🟡 WATCH",
-    }.get(stage or "", "🟡 WATCH")
+        "early_winner": "🔥 Сильный сигнал 90+",
+        "rising": "⚡ Рост",
+        "watch": "🟡 Наблюдение",
+    }.get(stage or "", "🟡 Наблюдение")
 
 
 def _ai_opportunity_label(value: str | None) -> str:
     return {
-        "hidden_gem": "💎 HIDDEN GEM",
-        "emerging": "🚀 EMERGING",
-        "hot_product": "🔥 HOT PRODUCT",
-        "saturated": "⚫ SATURATED",
-        "spark": "⚡ SPARK",
-    }.get(str(value or ""), "⚡ SPARK")
+        "hidden_gem": "💎 Скрытая находка",
+        "emerging": "🚀 Набирает обороты",
+        "hot_product": "🔥 Горячий товар",
+        "saturated": "⚫ Перенасыщен",
+        "spark": "⚡ Первичный сигнал",
+    }.get(str(value or ""), "⚡ Первичный сигнал")
 
 
 def _ai_json_list(raw: str | None) -> list[str]:
@@ -7127,6 +7165,12 @@ async def _admin_ai_dashboard_text() -> str:
         pending_obs = int((await session.execute(select(func.count(AIEarlyWinnerObservation.id)).where(
             AIEarlyWinnerObservation.status.in_(["pending", "running"])
         ))).scalar_one() or 0)
+        unread_signals = int((await session.execute(
+            select(func.count(func.distinct(AIEarlyWinnerEvent.candidate_id))).where(
+                AIEarlyWinnerEvent.notified_at.is_(None),
+                AIEarlyWinnerEvent.event_type.in_(AI_BADGE_EVENT_TYPES),
+            )
+        )).scalar_one() or 0)
 
     scanned = sum(int(x.listing_count or 0) for x in runs if x.status == "done")
     eligible = sum(int(x.eligible_count or 0) for x in runs if x.status == "done")
@@ -7147,33 +7191,34 @@ async def _admin_ai_dashboard_text() -> str:
 
     if worker.get("alive"):
         worker_text = (
-            f"🟢 online · v{html.escape(str(worker.get('version') or '—'))} · "
-            f"model {html.escape(str(worker.get('model_version') or '—'))}"
+            f"🟢 в сети · v{html.escape(str(worker.get('version') or '—'))} · "
+            f"модель {html.escape(str(worker.get('model_version') or '—'))}"
         )
         if worker.get("paused_for_scans"):
             worker_text += " · ⏸ ждёт завершения пользовательских сканов"
     elif worker.get("enabled"):
-        worker_text = "🔴 offline · heartbeat AI Worker не найден"
+        worker_text = "🔴 не в сети · сигнал от AI Worker не найден"
     else:
-        worker_text = "▫️ REDIS_URL недоступен в Main Bot"
+        worker_text = "▫️ REDIS_URL недоступен в основном боте"
 
     lines = [
-        "<b>🧠 DT AI LAB · PRODUCT OPPORTUNITY</b>",
+        "<b>🧠 DT AI LAB · ПОИСК ВОЗМОЖНОСТЕЙ</b>",
         "",
         f"AI Worker: <b>{worker_text}</b>",
-        "Режим: <b>🔒 Shadow · только админка</b>",
+        "Режим: <b>🔒 Теневой · только админка</b>",
         "Пользовательский парсер и его Автозамеры не меняются.",
+        f"🔔 Новых сильных сигналов: <b>{unread_signals}</b>",
         "",
         "<b>📊 Воронка сегодня</b>",
         f"Сканов обработано: <b>{sum(1 for x in runs if x.status == 'done')}</b>",
         f"Объявлений в сканах: <b>{scanned}</b>",
         f"Подходят для раннего анализа: <b>{eligible}</b>",
         f"AI-сигналов найдено: <b>{ai_candidates_total}</b>",
-        f"💎 HIDDEN GEM: <b>{hidden_gems}</b>",
-        f"🚀 EMERGING: <b>{emerging}</b>",
-        f"🔥 HOT PRODUCT: <b>{hot_products}</b>",
-        f"⚡ SPARK: <b>{sparks}</b> · ⚫ SATURATED: <b>{saturated}</b>",
-        f"Уровни Score · 🟡 WATCH {watch} · ⚡ RISING {rising} · 🔥 90+ {winners}",
+        f"💎 Скрытая находка: <b>{hidden_gems}</b>",
+        f"🚀 Набирает обороты: <b>{emerging}</b>",
+        f"🔥 Горячий товар: <b>{hot_products}</b>",
+        f"⚡ Первичный сигнал: <b>{sparks}</b> · ⚫ Перенасыщен: <b>{saturated}</b>",
+        f"Уровни оценки · 🟡 Наблюдение {watch} · ⚡ Рост {rising} · 🔥 90+ {winners}",
         f"✅ Подтверждены: <b>{confirmed}</b>",
         f"❌ Не подтвердились: <b>{rejected}</b>",
         f"🧪 Контрольная группа: <b>{controls}</b>",
@@ -7184,7 +7229,7 @@ async def _admin_ai_dashboard_text() -> str:
     if accuracy is None:
         lines.extend(["", "📈 Точность: <b>пока накапливаем подтверждения</b>"])
     else:
-        lines.extend(["", f"📈 Confirm rate среди завершённых наблюдений: <b>{accuracy:.1f}%</b> ({confirmed}/{resolved})"])
+        lines.extend(["", f"📈 Доля подтверждений среди завершённых наблюдений: <b>{accuracy:.1f}%</b> ({confirmed}/{resolved})"])
     if worker.get("last_error"):
         lines.append(f"⚠️ Последняя ошибка: <code>{html.escape(str(worker.get('last_error')))[:260]}</code>")
     return "\n".join(lines)
@@ -7198,7 +7243,19 @@ async def _ai_candidate_rows(kind: str, limit: int = 15) -> list[tuple[AIEarlyWi
             .join(UserScan, UserScan.id == AIEarlyWinnerCandidate.scan_id)
             .where(AIEarlyWinnerCandidate.is_control.is_(False))
         )
-        if kind == "hidden":
+        if kind == "new":
+            unread_ids = (
+                select(AIEarlyWinnerEvent.candidate_id)
+                .where(
+                    AIEarlyWinnerEvent.notified_at.is_(None),
+                    AIEarlyWinnerEvent.event_type.in_(AI_BADGE_EVENT_TYPES),
+                )
+                .distinct()
+            )
+            query = query.where(AIEarlyWinnerCandidate.id.in_(unread_ids)).order_by(
+                AIEarlyWinnerCandidate.created_at.desc(), AIEarlyWinnerCandidate.current_score.desc()
+            )
+        elif kind == "hidden":
             query = query.where(
                 AIEarlyWinnerCandidate.outcome == "pending",
                 AIEarlyWinnerCandidate.opportunity_type == "hidden_gem",
@@ -7248,15 +7305,16 @@ def _ai_list_keyboard(kind: str, rows: list[tuple[AIEarlyWinnerCandidate, Listin
 
 async def _admin_ai_list_text(kind: str, rows: list[tuple[AIEarlyWinnerCandidate, Listing, UserScan]]) -> str:
     titles = {
-        "hidden": "💎 Hidden Gems",
-        "momentum": "🚀 Hot / Emerging",
-        "winners": "🔥 90+ Score",
-        "active": "⚡ Sparks / Saturated",
+        "new": "🔴 Новые сигналы",
+        "hidden": "💎 Скрытые находки",
+        "momentum": "🚀 Горячие / Набирают обороты",
+        "winners": "🔥 Сильные сигналы 90+",
+        "active": "⚡ Первичные / Перенасыщенные",
         "confirmed": "✅ Подтверждённые",
         "rejected": "❌ Не подтвердились",
         "recent": "🧪 Последние прогнозы",
     }
-    lines = [f"<b>{titles.get(kind, '🧠 Product Opportunity')}</b>", ""]
+    lines = [f"<b>{titles.get(kind, '🧠 Поиск возможностей')}</b>", ""]
     if not rows:
         lines.append("Пока нет объявлений в этом разделе.")
         return "\n".join(lines)
@@ -7264,16 +7322,16 @@ async def _admin_ai_list_text(kind: str, rows: list[tuple[AIEarlyWinnerCandidate
         price = f"{listing.price_eur} €" if listing.price_eur is not None else (listing.price_text or "—")
         lines.append(
             f"{idx}. {_ai_opportunity_label(candidate.opportunity_type)} · {_ai_stage_label(candidate.stage, candidate.outcome)}\n"
-            f"   Opportunity <b>{int(candidate.current_score or 0)}/100</b> · Saturation <b>{int(candidate.saturation_score or 0)}/100</b> "
-            f"· conf {int(candidate.confidence or 0)}%\n"
+            f"   Возможность <b>{int(candidate.current_score or 0)}/100</b> · Насыщенность <b>{int(candidate.saturation_score or 0)}/100</b> "
+            f"· уверенность {int(candidate.confidence or 0)}%\n"
             f"   {html.escape((listing.title or 'Объявление')[:80])} · <b>{html.escape(str(price))}</b>\n"
-            f"   👁 {int(candidate.latest_views or 0)} · scan #{scan.id} · {_utc_to_msk_text(candidate.latest_at)} МСК"
+            f"   👁 {int(candidate.latest_views or 0)} · скан #{scan.id} · {_utc_to_msk_text(candidate.latest_at)} МСК"
         )
     lines.extend(["", "Нажми на объявление ниже, чтобы увидеть причины, прогноз и контрольные точки."])
     return "\n".join(lines)
 
 
-async def _admin_ai_candidate(candidate_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+async def _admin_ai_candidate(candidate_id: int, requested_back_kind: str | None = None) -> tuple[str, InlineKeyboardMarkup] | None:
     async with SessionLocal() as session:
         row = (await session.execute(
             select(AIEarlyWinnerCandidate, Listing, UserScan)
@@ -7299,16 +7357,16 @@ async def _admin_ai_candidate(candidate_id: int) -> tuple[str, InlineKeyboardMar
         f"<b>{_ai_opportunity_label(candidate.opportunity_type)}</b> · {_ai_stage_label(candidate.stage, candidate.outcome)}",
         f"<b>{html.escape((listing.title or 'Объявление')[:180])}</b>",
         "",
-        f"🚀 Opportunity: <b>{int(candidate.current_score or 0)}/100</b> · старт {int(candidate.initial_score or 0)}",
-        f"🌊 Saturation: <b>{int(candidate.saturation_score or 0)}/100</b> · percentile предложения {float(candidate.supply_percentile or 0)*100:.0f}%",
-        f"📈 Demand trend: <b>{float(candidate.demand_growth_ratio or 1.0):.2f}×</b> · Supply trend: <b>{float(candidate.supply_growth_ratio or 1.0):.2f}×</b>",
-        f"⚖️ Demand/Supply momentum: <b>{float(candidate.demand_supply_ratio or 1.0):.2f}×</b> · repeatability <b>{float(candidate.repeatability or 0)*100:.0f}%</b>",
+        f"🚀 Оценка возможности: <b>{int(candidate.current_score or 0)}/100</b> · старт {int(candidate.initial_score or 0)}",
+        f"🌊 Насыщенность: <b>{int(candidate.saturation_score or 0)}/100</b> · процентиль предложения {float(candidate.supply_percentile or 0)*100:.0f}%",
+        f"📈 Тренд спроса: <b>{float(candidate.demand_growth_ratio or 1.0):.2f}×</b> · тренд предложения: <b>{float(candidate.supply_growth_ratio or 1.0):.2f}×</b>",
+        f"⚖️ Спрос / предложение: <b>{float(candidate.demand_supply_ratio or 1.0):.2f}×</b> · повторяемость <b>{float(candidate.repeatability or 0)*100:.0f}%</b>",
         f"🎯 Уверенность данных: <b>{int(candidate.confidence or 0)}%</b>",
-        f"🗂 {html.escape(cat_name)} · scan <b>#{scan.id}</b>",
+        f"🗂 {html.escape(cat_name)} · скан <b>#{scan.id}</b>",
         f"💶 Цена: <b>{html.escape(str(price))}</b>",
         f"👁 Старт: <b>{int(candidate.baseline_views or 0)}</b> · сейчас: <b>{int(candidate.latest_views or 0)}</b>",
         f"⏱ Возраст при обнаружении: <b>{float(candidate.age_minutes or 0)/60.0:.1f} ч</b>",
-        f"⚡ Стартовый темп: <b>{float(candidate.initial_views_per_hour or 0):.1f}/ч</b> · percentile <b>{float(candidate.velocity_percentile or 0)*100:.0f}%</b>",
+        f"⚡ Стартовый темп: <b>{float(candidate.initial_views_per_hour or 0):.1f}/ч</b> · процентиль <b>{float(candidate.velocity_percentile or 0)*100:.0f}%</b>",
     ]
     market_n = int(candidate.market_cohort_size or 0)
     if candidate.market_median_eur is not None:
@@ -7331,7 +7389,7 @@ async def _admin_ai_candidate(candidate_id: int) -> tuple[str, InlineKeyboardMar
         f"+6ч: <b>{int(candidate.predicted_6h_low or 0)}–{int(candidate.predicted_6h_high or 0)}</b> просмотров",
     ])
     if reasons:
-        lines.extend(["", "<b>Почему такой стартовый Score</b>"])
+        lines.extend(["", "<b>Почему такая стартовая оценка</b>"])
         lines.extend([f"• {html.escape(reason)}" for reason in reasons[:6]])
     if latest_reasons:
         lines.extend(["", "<b>Что изменилось после замеров</b>"])
@@ -7341,15 +7399,17 @@ async def _admin_ai_candidate(candidate_id: int) -> tuple[str, InlineKeyboardMar
     for obs in observations:
         if obs.status == "done" and obs.view_count is not None:
             lines.append(
-                f"+{obs.target_hours}ч ✅ <b>{obs.view_count}</b> views · Δ{int(obs.delta_views or 0):+d} "
-                f"· {float(obs.observed_views_per_hour or 0):.1f}/ч · score {int(obs.score_after or 0)}"
+                f"+{obs.target_hours}ч ✅ <b>{obs.view_count}</b> просмотров · Δ{int(obs.delta_views or 0):+d} "
+                f"· {float(obs.observed_views_per_hour or 0):.1f}/ч · оценка {int(obs.score_after or 0)}"
             )
         elif obs.status in {"error", "missed"}:
-            lines.append(f"+{obs.target_hours}ч ⚠️ {html.escape(obs.status)}")
+            lines.append(f"+{obs.target_hours}ч ⚠️ {'ошибка' if obs.status == 'error' else 'пропущен'}")
         else:
             lines.append(f"+{obs.target_hours}ч ⏳ ожидается {_utc_to_msk_text(obs.due_at)} МСК")
 
-    if candidate.outcome == "confirmed":
+    if requested_back_kind in {"new", "hidden", "momentum", "winners", "active", "confirmed", "rejected", "recent"}:
+        back_kind = requested_back_kind
+    elif candidate.outcome == "confirmed":
         back_kind = "confirmed"
     elif candidate.outcome == "rejected":
         back_kind = "rejected"
@@ -7387,11 +7447,11 @@ async def _admin_ai_accuracy_text() -> str:
     confirmed = [x for x in resolved if x.outcome == "confirmed"]
     lines = ["<b>📊 DT AI · Точность · 30 дней</b>", ""]
     if not resolved:
-        lines.append("Пока мало завершённых +3/+6 контрольных точек. Shadow mode продолжает собирать выборку.")
+        lines.append("Пока мало завершённых +3/+6 контрольных точек. Теневой режим продолжает собирать выборку.")
     else:
         lines.append(f"Завершённых кандидатов: <b>{len(resolved)}</b>")
         lines.append(f"Подтвердились: <b>{len(confirmed)}/{len(resolved)} · {len(confirmed)/len(resolved)*100:.1f}%</b>")
-        lines.extend(["", "<b>По стартовому Score</b>"])
+        lines.extend(["", "<b>По стартовой оценке</b>"])
         for lo, hi, label in ((90, 100, "90–100"), (80, 89, "80–89"), (65, 79, "65–79")):
             group = [x for x in resolved if lo <= int(x.initial_score or 0) <= hi]
             hits = sum(1 for x in group if x.outcome == "confirmed")
@@ -7422,83 +7482,16 @@ async def _admin_ai_accuracy_text() -> str:
         control_hits = sum(1 for x in controls if x.outcome == "confirmed")
         lines.extend([
             "",
-            f"🧪 Контрольная группа: неожиданных winners <b>{control_hits}/{len(controls)}</b>",
+            f"🧪 Контрольная группа: неожиданных сильных сигналов <b>{control_hits}/{len(controls)}</b>",
             "Она нужна, чтобы видеть не только удачные прогнозы, но и возможные пропуски модели.",
         ])
     return "\n".join(lines)
 
 
 async def ai_admin_notification_scheduler(bot: Bot) -> None:
-    """Deliver only high-signal AI shadow events to admins.
-
-    Rejected candidates stay visible in the funnel but do not generate push spam.
-    """
+    """Legacy compatibility stub. v4.6.2 stores AI alerts in the Lab badge instead of sending chat pushes."""
     while True:
-        try:
-            await asyncio.sleep(12.0)
-            if not ADMIN_IDS:
-                continue
-            async with SessionLocal() as session:
-                events = list((await session.execute(
-                    select(AIEarlyWinnerEvent)
-                    .where(AIEarlyWinnerEvent.notified_at.is_(None))
-                    .order_by(AIEarlyWinnerEvent.created_at.asc())
-                    .limit(10)
-                )).scalars().all())
-            for event in events:
-                if event.event_type not in {"winner", "confirmed"}:
-                    async with SessionLocal() as session:
-                        db_event = await session.get(AIEarlyWinnerEvent, int(event.id))
-                        if db_event is not None:
-                            db_event.notified_at = datetime.utcnow()
-                            await session.commit()
-                    continue
-                async with SessionLocal() as session:
-                    row = (await session.execute(
-                        select(AIEarlyWinnerCandidate, Listing)
-                        .join(Listing, Listing.external_id == AIEarlyWinnerCandidate.external_id)
-                        .where(AIEarlyWinnerCandidate.id == int(event.candidate_id))
-                    )).one_or_none()
-                if row is None:
-                    # Do not let a stale/out-of-band event permanently occupy the
-                    # first page of the outbox and starve newer AI notifications.
-                    async with SessionLocal() as session:
-                        db_event = await session.get(AIEarlyWinnerEvent, int(event.id))
-                        if db_event is not None:
-                            db_event.notified_at = datetime.utcnow()
-                            await session.commit()
-                    continue
-                candidate, listing = row
-                type_title = _ai_opportunity_label(candidate.opportunity_type)
-                title = f"{type_title} · <b>новый сигнал 90+</b>" if event.event_type == "winner" else f"✅ <b>Сигнал подтверждён</b> · {type_title}"
-                text = (
-                    f"{title}\n\n"
-                    f"{html.escape((listing.title or 'Объявление')[:140])}\n"
-                    f"🚀 Score: <b>{int(candidate.current_score or 0)}/100</b> · уверенность данных {int(candidate.confidence or 0)}%\n"
-                    f"👁 {int(candidate.latest_views or 0)} просмотров\n"
-                    f"🧪 Shadow mode · кандидат #{candidate.id}"
-                )
-                markup_rows = [[InlineKeyboardButton(text="🧠 Разобрать в AI Lab", callback_data=f"aic:{candidate.id}:winners")]]
-                if listing.url:
-                    markup_rows.append([InlineKeyboardButton(text="🔗 Открыть объявление", url=listing.url)])
-                markup = InlineKeyboardMarkup(inline_keyboard=markup_rows)
-                delivered = False
-                for admin_id in ADMIN_IDS:
-                    try:
-                        await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
-                        delivered = True
-                    except Exception:
-                        log.debug("Could not deliver AI event=%s admin=%s", event.id, admin_id, exc_info=True)
-                if delivered:
-                    async with SessionLocal() as session:
-                        db_event = await session.get(AIEarlyWinnerEvent, int(event.id))
-                        if db_event is not None:
-                            db_event.notified_at = datetime.utcnow()
-                            await session.commit()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("AI admin notification scheduler failed")
+        await asyncio.sleep(3600.0)
 
 
 async def _edit_or_answer(target: Message, text: str, *, reply_markup=None) -> None:
@@ -7780,7 +7773,7 @@ async def admin_command(message: Message, state: FSMContext) -> None:
     if not _is_admin(message.from_user.id):
         await message.answer("Нет доступа.")
         return
-    await message.answer(await _admin_dashboard_text(), parse_mode=ParseMode.HTML, reply_markup=admin_keyboard())
+    await message.answer(await _admin_dashboard_text(), parse_mode=ParseMode.HTML, reply_markup=admin_keyboard(await _ai_unread_signal_count()))
 
 
 @dp.callback_query(F.data == "adminhome")
@@ -7790,7 +7783,7 @@ async def admin_home_handler(callback: CallbackQuery, state: FSMContext) -> None
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer()
-    await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=admin_keyboard())
+    await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=admin_keyboard(await _ai_unread_signal_count()))
 
 
 @dp.callback_query(F.data == "adminstats")
@@ -7799,7 +7792,7 @@ async def admin_stats_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer()
-    await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=admin_keyboard())
+    await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=admin_keyboard(await _ai_unread_signal_count()))
 
 
 @dp.callback_query(F.data == "adminai")
@@ -7808,7 +7801,8 @@ async def admin_ai_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer()
-    await _edit_or_answer(callback.message, await _admin_ai_dashboard_text(), reply_markup=admin_ai_keyboard())
+    unread = await _ai_unread_signal_count()
+    await _edit_or_answer(callback.message, await _admin_ai_dashboard_text(), reply_markup=admin_ai_keyboard(unread))
 
 
 @dp.callback_query(F.data.startswith("adminai:"))
@@ -7827,9 +7821,13 @@ async def admin_ai_section_handler(callback: CallbackQuery) -> None:
             ]),
         )
         return
-    if kind not in {"hidden", "momentum", "winners", "active", "confirmed", "rejected", "recent"}:
+    if kind not in {"new", "hidden", "momentum", "winners", "active", "confirmed", "rejected", "recent"}:
         kind = "recent"
     rows = await _ai_candidate_rows(kind)
+    # Viewing the New list is the acknowledgement action. Only candidates actually
+    # rendered on this page are marked seen, so a backlog larger than 15 remains badged.
+    if kind == "new" and rows:
+        await _mark_ai_signals_seen([int(candidate.id) for candidate, _listing, _scan in rows[:15]])
     await _edit_or_answer(callback.message, await _admin_ai_list_text(kind, rows), reply_markup=_ai_list_keyboard(kind, rows))
 
 
@@ -7839,11 +7837,13 @@ async def admin_ai_candidate_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     try:
-        candidate_id = int(callback.data.split(":", 2)[1])
+        parts = callback.data.split(":", 2)
+        candidate_id = int(parts[1])
+        requested_back_kind = parts[2] if len(parts) > 2 else None
     except Exception:
         await callback.answer("Некорректный кандидат", show_alert=True)
         return
-    detail = await _admin_ai_candidate(candidate_id)
+    detail = await _admin_ai_candidate(candidate_id, requested_back_kind=requested_back_kind)
     if detail is None:
         await callback.answer("Кандидат не найден", show_alert=True)
         return
@@ -10755,9 +10755,6 @@ async def main() -> None:
         subscription_lifecycle_scheduler(bot), name="subscription-lifecycle-scheduler"
     )
     archive_task = asyncio.create_task(scan_archive_scheduler(), name="scan-archive-scheduler")
-    ai_notification_task = asyncio.create_task(
-        ai_admin_notification_scheduler(bot), name="ai-admin-notification-scheduler"
-    )
     observation_tasks = [] if DISTRIBUTED_WORKERS else [
         asyncio.create_task(observation_scheduler(bot, i), name=f"view-observation-worker-{i}")
         for i in range(1, OBSERVATION_CONCURRENCY + 1)
@@ -10772,12 +10769,11 @@ async def main() -> None:
         payment_task.cancel()
         subscription_task.cancel()
         archive_task.cancel()
-        ai_notification_task.cancel()
         for task in observation_tasks:
             task.cancel()
         for task in worker_tasks:
             task.cancel()
-        shutdown_tasks = [payment_task, subscription_task, archive_task, ai_notification_task, *observation_tasks, *worker_tasks]
+        shutdown_tasks = [payment_task, subscription_task, archive_task, *observation_tasks, *worker_tasks]
         if distributed_queue_ticker_task is not None:
             shutdown_tasks.insert(0, distributed_queue_ticker_task)
         if ticker_task is not None:

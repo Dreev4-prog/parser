@@ -1,3 +1,13 @@
+# DT Parser v4.6.3 — Русский интерфейс DT AI Lab
+
+Все пользовательские названия и метрики DT AI Lab переведены на русский язык. Внутренние enum/ключи модели (`hidden_gem`, `hot_product`, `watch` и т.д.) не менялись, поэтому история AI, PostgreSQL и логика Product Opportunity Engine остаются совместимыми.
+
+DT AI Lab больше не спамит отдельными Telegram-сообщениями на каждый сильный сигнал. `winner/confirmed` теперь копятся как непросмотренные: в админ-панели кнопка показывает `🧠 DT AI Lab 🔴 N`, а внутри Lab появился раздел `🔴 Новые · N`. Счётчик считает уникальных кандидатов и сбрасывается только для реально просмотренных строк после открытия раздела «Новые». Rejected остаются в Lab, но не создают notification noise.
+
+AI scoring, Product Opportunity Engine, +1/+3/+6, обычный parser и v4.6.1 Idle Browser Memory не менялись. Новых Railway Variables/миграций нет. См. `DEPLOY_V4_6_2_AI_LAB_BADGE.md`.
+
+---
+
 # DT Parser v4.6.1 — IDLE BROWSER MEMORY
 
 Page Worker, Date Worker and View Worker now keep Chromium warm only while it is useful. A 10-minute idle countdown starts **only when the whole corresponding Redis worker stream is empty and the local replica has zero active work**. Any queued/claimed/new task resets the countdown. After 10 uninterrupted idle minutes the worker closes only the shared Chromium/Playwright runtime; Redis/PostgreSQL, heartbeat and the worker process stay online. The next browser job recreates Chromium lazily.

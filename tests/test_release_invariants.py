@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ReleaseInvariantTests(unittest.TestCase):
     def test_release_version(self):
-        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.6.1")
+        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.6.3")
 
     def test_date_window_and_timezone_semantics_were_not_changed(self):
         source = (ROOT / "date_manager.py").read_text(encoding="utf-8")
@@ -64,7 +64,7 @@ class ReleaseInvariantTests(unittest.TestCase):
         source = (ROOT / "bot.py").read_text(encoding="utf-8")
         self.assertIn('callback_data="adminai:hidden"', source)
         self.assertIn('callback_data="adminai:momentum"', source)
-        self.assertIn('{"hidden", "momentum", "winners", "active", "confirmed", "rejected", "recent"}', source)
+        self.assertIn('{"new", "hidden", "momentum", "winners", "active", "confirmed", "rejected", "recent"}', source)
 
     def test_ai_v46_columns_have_additive_migration(self):
         source = (ROOT / "db.py").read_text(encoding="utf-8")
@@ -85,6 +85,17 @@ class ReleaseInvariantTests(unittest.TestCase):
             source = (ROOT / worker).read_text(encoding="utf-8")
             self.assertIn("BrowserIdleShutdownGuard", source)
             self.assertIn("600", source)
+
+
+    def test_v462_ai_notifications_live_in_lab_badge_not_chat_pushes(self):
+        source = (ROOT / "bot.py").read_text(encoding="utf-8")
+        self.assertIn('AI_BADGE_EVENT_TYPES = ("winner", "confirmed")', source)
+        self.assertIn('callback_data="adminai:new"', source)
+        self.assertIn('DT AI Lab 🔴', source)
+        self.assertIn('async def _mark_ai_signals_seen', source)
+        self.assertNotIn('name="ai-admin-notification-scheduler"', source)
+        worker = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
+        self.assertIn('candidate.outcome == "confirmed"', worker)
 
 
 
