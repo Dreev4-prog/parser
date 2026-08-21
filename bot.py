@@ -204,15 +204,6 @@ if not MENU_IMAGE_PATH.exists():
 # it avoids re-uploading the menu image every time the user returns home.
 _MENU_IMAGE_FILE_ID: str | None = None
 
-# v4.7.2: dedicated task holder for scan-fleet wake-up. This is intentionally
-# separate from the reverted v4.6.8 UI background/caching layer.
-_scan_wakeup_tasks: set[asyncio.Task] = set()
-
-def _start_scan_wakeup(coro) -> None:
-    task = asyncio.create_task(coro)
-    _scan_wakeup_tasks.add(task)
-    task.add_done_callback(_scan_wakeup_tasks.discard)
-
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
@@ -6624,24 +6615,6 @@ async def enqueue_user_scan(
             parse_mode=ParseMode.HTML,
         )
 
-    # v4.7.1 SCAN FLEET WAKE-UP. Wake all foreground worker fleets together as
-    # soon as a real scan is accepted. Date only refreshes readiness (no site
-    # request), Page starts process-local Chromium without opening a page, and
-    # View warms only its cheap HTTP session. All managers debounce simultaneous
-    # users, so four users starting together still create one warmup wave.
-    async def _wake_scan_fleets() -> None:
-        tasks = []
-        if REMOTE_DATE_WORKER_ENABLED:
-            tasks.append(REMOTE_DATE_MANAGER.request_prewarm())
-        if REMOTE_PAGE_WORKER_ENABLED:
-            tasks.append(REMOTE_PAGE_MANAGER.request_prewarm())
-        if REMOTE_VIEW_WORKER_ENABLED:
-            tasks.append(REMOTE_VIEW_MANAGER.request_prewarm())
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-    _start_scan_wakeup(_wake_scan_fleets())
-
     job_uid = uuid.uuid4().hex[:12]
     scan = await create_user_scan(user_id, job_uid, category_keys, page_limit, target_date, price_filter=price_filter)
     status = await message.answer("⏳ <b>Подготавливаю скан…</b>", parse_mode=ParseMode.HTML)
@@ -7407,13 +7380,11 @@ async def _admin_view_worker_text() -> str:
     last_shard_workers = int(status.get("last_shard_workers", 0) or 0)
     last_shard_failed = int(status.get("last_shard_failed", 0) or 0)
     expected_replicas = int(status.get("expected_replicas", 0) or 0)
-    prewarm_ready = int(status.get("prewarm_ready_total", 0) or 0)
     lines = [
         "<b>👁 VIEW MANAGER PRO</b>",
         "",
         f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b> / ожидается <b>{expected_replicas or len(workers)}</b>",
         f"Redis queue: <b>{queue_depth}</b> · активных jobs: <b>{active_jobs}</b>",
-        f"Scan wake-up HTTP: <b>{prewarm_ready}/{len(workers)}</b> replicas готовы",
         f"Общий HTTP pool: <b>{pool_total}</b> · Browser: <b>{browser_total}</b>",
         f"Скорость: <b>{rate_total:.1f} views/sec</b>",
         f"View Sharding: <b>{'✅ ВКЛ' if sharding_enabled else '⛔ ВЫКЛ'}</b> · цель ≈ <b>{shard_size}</b> URL/job",
@@ -7443,14 +7414,6 @@ async def _admin_view_worker_text() -> str:
         failures = int(worker.get("rounds_failed", 0) or 0)
         reason = html.escape(str(worker.get("adaptive_reason") or "—"))[:180]
         consumer = html.escape(str(worker.get("consumer") or f"worker-{idx}"))[:45]
-        prewarm_total = int(worker.get("prewarm_total", 0) or 0)
-        prewarm_ok = int(worker.get("prewarm_success_total", 0) or 0)
-        batch_stats = worker.get("last_view_batch_stats") or {}
-        if not isinstance(batch_stats, dict):
-            batch_stats = {}
-        initial_misses = int(batch_stats.get("initial_misses", 0) or 0)
-        session_recovered = int(batch_stats.get("session_recovered", 0) or 0)
-        batch_browser = int(batch_stats.get("browser_fallback", 0) or 0)
         lines.extend([
             "",
             f"<b>Worker {idx}</b> · v<b>{html.escape(str(worker.get('version') or '—'))}</b> · <code>{consumer}</code>",
@@ -7460,8 +7423,6 @@ async def _admin_view_worker_text() -> str:
             f"Exact: <b>{exact_pct:.1f}%</b> · browser fallback: <b>{fallback_pct:.1f}%</b> · processed: <b>{processed}</b>",
             f"403: <b>{r403}</b> · 429: <b>{r429}</b> · refusals/60s: <b>{refusals_60}</b>",
             f"Penalty: <b>{penalty}</b> · cooldown: <b>{cooldown:.1f}s</b> · requeue: <b>{requeues}</b> · errors: <b>{failures}</b>",
-            f"Fast path: initial misses <b>{initial_misses}</b> · session recovered <b>{session_recovered}</b> · Chromium <b>{batch_browser}</b>",
-            f"Prewarm HTTP: <b>{prewarm_ok}/{prewarm_total}</b>",
             f"Adaptive: <code>{reason}</code>",
         ])
     return "\n".join(lines)
@@ -8092,13 +8053,11 @@ async def _admin_date_worker_text() -> str:
 
     workers = list(status.get("workers") or [])
     expected_replicas = int(status.get("expected_replicas", 0) or 0)
-    prewarm_ready = int(status.get("prewarm_ready_total", 0) or 0)
     lines = [
         "<b>📅 DATE MANAGER</b>",
         "",
         f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b> / ожидается <b>{expected_replicas or len(workers)}</b>",
         f"Redis queue: <b>{int(status.get('queue_depth', 0) or 0)}</b> · активных: <b>{int(status.get('active_total', 0) or 0)}</b>",
-        f"Scan wake-up: <b>{prewarm_ready}/{len(workers)}</b> replicas подтвердили готовность",
         f"Date cache: <b>{int(status.get('cache_ttl', 180) or 180)} сек.</b> · Predictor: <b>{int(status.get('predictor_ttl', 3600) or 3600) // 60} мин.</b> · окно дат: <b>{int(status.get('max_age_days', DATE_MAX_AGE_DAYS) or DATE_MAX_AGE_DAYS) + 1} дней</b>",
         f"Общая скорость: <b>{float(status.get('rate_total', 0.0) or 0.0):.2f} probes/sec</b>",
         f"Проб отправлено: <b>{int(status.get('probes_queued_total', 0) or 0)}</b> · cache hits: <b>{int(status.get('cache_hits_total', 0) or 0)}</b>",
@@ -8125,7 +8084,6 @@ async def _admin_date_worker_text() -> str:
             f"probes: <b>{int(worker.get('processed', 0) or 0)}</b> · speed <b>{float(worker.get('rate_ema', 0.0) or 0.0):.2f}/s</b>",
             f"HTTP fast: <b>{int(worker.get('http_fast_ok', 0) or 0)}</b> · browser confirm: <b>{int(worker.get('browser_confirm_ok', 0) or 0)}/{int(worker.get('browser_confirms', 0) or 0)}</b>",
             f"403/429: <b>{int(worker.get('http_403', 0) or 0)}/{int(worker.get('http_429', 0) or 0)}</b> · conflicts: <b>{int(worker.get('transport_conflicts', 0) or 0)}</b> · errors <b>{int(worker.get('errors', 0) or 0)}</b>",
-            f"Wake-up: <b>{int(worker.get('prewarm_total', 0) or 0)}</b> · last <b>{_human_duration(max(0, int(time.time() - float(worker.get('last_prewarm_at', 0.0) or 0.0)))) if float(worker.get('last_prewarm_at', 0.0) or 0.0) > 0 else '—'}</b> назад",
         ])
     lines.extend([
         "",
@@ -8155,14 +8113,11 @@ async def _admin_page_worker_text() -> str:
 
     workers = list(status.get("workers") or [])
     expected_replicas = int(status.get("expected_replicas", 0) or 0)
-    browser_ready = int(status.get("browser_ready_total", 0) or 0)
-    prewarm_ready = int(status.get("prewarm_ready_total", 0) or 0)
     lines = [
         "<b>📄 PAGE MANAGER</b>",
         "",
         f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b> / ожидается <b>{expected_replicas or len(workers)}</b>",
         f"Redis queue: <b>{int(status.get('queue_depth', 0) or 0)}</b> · активных: <b>{int(status.get('active_total', 0) or 0)}</b>",
-        f"Scan wake-up: <b>{prewarm_ready}/{len(workers)}</b> · Chromium готов: <b>{browser_ready}/{len(workers)}</b>",
         f"Кэш страниц: <b>{int(status.get('cache_ttl', 180) or 180)} сек.</b>",
         f"Streaming: <b>✅ ВКЛ</b> · Rolling: <b>{'✅' if status.get('rolling_prefetch') else '—'}</b> "
         f"окно <b>{int(status.get('prefetch_window_pages', 0) or 0)}</b> / low-water <b>{int(status.get('prefetch_low_water_pages', 0) or 0)}</b> · "
@@ -8185,7 +8140,6 @@ async def _admin_page_worker_text() -> str:
             f"Fleet: <b>{html.escape(str(worker.get('fleet_bucket') or '—'))}</b> · scan/browser/global <b>{int(worker.get('fleet_scan_limit', 0) or 0)}/{int(worker.get('fleet_browser_limit', 0) or 0)}/{int(worker.get('fleet_global_limit', 0) or 0)}</b>",
             f"pages: <b>{int(worker.get('processed', 0) or 0)}</b> · cache-hit worker: <b>{int(worker.get('cache_served', 0) or 0)}</b> · speed <b>{float(worker.get('rate_ema', 0.0) or 0.0):.2f}/s</b>",
             f"403/429: <b>{int(worker.get('http_403', 0) or 0)}/{int(worker.get('http_429', 0) or 0)}</b> · penalty <b>{int(worker.get('penalty', 0) or 0)}</b>",
-            f"Chromium: <b>{'готов' if worker.get('browser_ready') else 'cold'}</b> · prewarm <b>{int(worker.get('prewarm_success_total', 0) or 0)}/{int(worker.get('prewarm_total', 0) or 0)}</b>",
         ])
     lines.extend([
         "",

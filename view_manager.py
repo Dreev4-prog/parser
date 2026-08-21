@@ -55,16 +55,6 @@ VIEW_SHARD_MIN_URLS = _env_int("VIEW_SHARD_MIN_URLS", 300, 100, 5000)
 VIEW_SHARD_SIZE = _env_int("VIEW_SHARD_SIZE", 180, 50, 1000)
 VIEW_SHARD_MAX_COUNT = _env_int("VIEW_SHARD_MAX_COUNT", 16, 2, 64)
 VIEW_SHARDS_PER_WORKER = _env_int("VIEW_SHARDS_PER_WORKER", 4, 1, 4)
-# v4.7.0: large batches must not depend on a perfect heartbeat snapshot at the
-# exact millisecond the view phase begins. If some Railway replicas are still
-# warming, pre-shard for the intended fleet so late replicas can immediately
-# steal independent work from Redis instead of watching one giant job.
-VIEW_EXPECTED_REPLICAS = _env_int("VIEW_EXPECTED_REPLICAS", 4, 1, 16)
-VIEW_PREWARM_KEY = f"{VIEW_REDIS_PREFIX}:prewarm:event"
-VIEW_PREWARM_GATE_KEY = f"{VIEW_REDIS_PREFIX}:prewarm:gate"
-VIEW_PREWARM_EVENT_TTL_SECONDS = _env_int("VIEW_PREWARM_EVENT_TTL_SECONDS", 600, 60, 3600)
-VIEW_PREWARM_DEBOUNCE_SECONDS = _env_int("VIEW_PREWARM_DEBOUNCE_SECONDS", 90, 15, 600)
-VIEW_WORKER_READY_WAIT_SECONDS = _env_int("VIEW_WORKER_READY_WAIT_SECONDS", 8, 0, 30)
 
 
 @dataclass
@@ -98,8 +88,6 @@ class RemoteViewManager:
         self.last_shard_at = 0.0
         self.last_shard_failed = 0
         self.partial_shard_fallbacks_total = 0
-        self.prewarm_requests_total = 0
-        self.last_prewarm_at = 0.0
 
     async def connect(self):
         if not self.enabled:
@@ -129,34 +117,6 @@ class RemoteViewManager:
                 await redis.aclose()
             except Exception:
                 pass
-
-
-    async def request_prewarm(self) -> bool:
-        """Broadcast a lightweight View-fleet warmup hint.
-
-        This does not open Chromium and does not enqueue a measurement. Every
-        live View Worker sees the same short-lived event and warms only its HTTP
-        session/cookies. The debounce key prevents four simultaneous user scans
-        from creating repeated warmup traffic.
-        """
-        if not self.enabled:
-            return False
-        try:
-            redis = await self.connect()
-            gate = await redis.set(
-                VIEW_PREWARM_GATE_KEY, str(time.time()), ex=VIEW_PREWARM_DEBOUNCE_SECONDS, nx=True
-            )
-            if not gate:
-                return False
-            token = f"{int(time.time())}:{uuid.uuid4().hex[:10]}"
-            await redis.set(VIEW_PREWARM_KEY, token, ex=VIEW_PREWARM_EVENT_TTL_SECONDS)
-            self.prewarm_requests_total += 1
-            self.last_prewarm_at = time.time()
-            log.info("View fleet lightweight prewarm requested token=%s", token)
-            return True
-        except Exception:
-            log.debug("Could not request View Worker prewarm", exc_info=True)
-            return False
 
     def _payload_key(self, job_id: str) -> str:
         return f"{VIEW_REDIS_PREFIX}:job:{job_id}:payload"
@@ -195,9 +155,6 @@ class RemoteViewManager:
             "shard_size": VIEW_SHARD_SIZE,
             "shard_max_count": VIEW_SHARD_MAX_COUNT,
             "shards_per_worker": VIEW_SHARDS_PER_WORKER,
-            "expected_replicas": VIEW_EXPECTED_REPLICAS,
-            "prewarm_requests_total": self.prewarm_requests_total,
-            "last_prewarm_at": self.last_prewarm_at,
             "last_shard_count": self.last_shard_count,
             "last_shard_total": self.last_shard_total,
             "last_shard_workers": self.last_shard_workers,
@@ -254,11 +211,6 @@ class RemoteViewManager:
                 base["pool_total"] = sum(int(x.get("view_pool", 0) or 0) for x in workers)
                 base["browser_total"] = sum(int(x.get("browser_pool", 0) or 0) for x in workers)
                 base["rate_total"] = sum(float(x.get("rate_ema", 0.0) or 0.0) for x in workers)
-                event_at = float(self.last_prewarm_at or 0.0)
-                base["prewarm_ready_total"] = (
-                    sum(1 for x in workers if float(x.get("last_prewarm_at", 0.0) or 0.0) >= event_at - 2.0)
-                    if event_at > 0 else 0
-                )
             return base
         except Exception as exc:
             base["error"] = str(exc)[:300]
@@ -435,19 +387,11 @@ class RemoteViewManager:
         if not urls or not self.enabled:
             return None
         urls = list(dict.fromkeys(urls))
-        # v4.7.0: a cold Railway replica can miss the exact instant the view phase
-        # begins. Waiting a few seconds here is dramatically cheaper than sending
-        # the whole batch to the main bot's local fallback for several minutes.
         if not await self.worker_alive():
-            deadline = time.monotonic() + VIEW_WORKER_READY_WAIT_SECONDS
-            while time.monotonic() < deadline:
-                await asyncio.sleep(0.5)
-                if await self.worker_alive():
-                    break
-            else:
-                return None
+            return None
 
-        # Count currently healthy replicas. Large jobs are cold-safe sharded below.
+        # Count currently healthy replicas. If the second replica is down, stay
+        # on the proven single-job path instead of introducing shard overhead.
         worker_count = 1
         if VIEW_SHARDING_ENABLED and len(urls) >= VIEW_SHARD_MIN_URLS:
             try:
@@ -456,15 +400,9 @@ class RemoteViewManager:
             except Exception:
                 worker_count = 1
 
-        # v4.7.0 Cold-safe sharding. Previously a 1000-URL batch became one
-        # indivisible Redis job whenever only one heartbeat happened to be visible
-        # at this instant. Replicas that woke seconds later then had nothing to do.
-        # Large batches are now pre-sharded for at least the intended fleet size.
-        # If only one worker truly exists it simply consumes those shards in order;
-        # if more replicas appear, they can join immediately.
-        effective_workers = max(worker_count, VIEW_EXPECTED_REPLICAS)
         should_shard = (
             VIEW_SHARDING_ENABLED
+            and worker_count >= 2
             and len(urls) >= VIEW_SHARD_MIN_URLS
         )
         if not should_shard:
@@ -481,7 +419,7 @@ class RemoteViewManager:
             )
 
         natural_shards = max(2, math.ceil(len(urls) / VIEW_SHARD_SIZE))
-        worker_shards = max(2, effective_workers * VIEW_SHARDS_PER_WORKER)
+        worker_shards = max(2, worker_count * VIEW_SHARDS_PER_WORKER)
         shard_count = min(VIEW_SHARD_MAX_COUNT, len(urls), max(natural_shards, worker_shards))
         shards = self._split_balanced(urls, shard_count)
         shard_count = len(shards)
@@ -494,8 +432,8 @@ class RemoteViewManager:
         self.last_shard_failed = 0
 
         log.info(
-            "Remote view sharding parent=%s total=%s live_workers=%s effective_workers=%s shards=%s target_size=%s",
-            parent_job_id[:10], len(urls), worker_count, effective_workers, shard_count, VIEW_SHARD_SIZE,
+            "Remote view sharding parent=%s total=%s workers=%s shards=%s target_size=%s",
+            parent_job_id[:10], len(urls), worker_count, shard_count, VIEW_SHARD_SIZE,
         )
 
         progress_lock = asyncio.Lock()

@@ -50,14 +50,12 @@ os.environ["DIST_TRAFFIC_GLOBAL_LIMIT"] = "8"
 os.environ["DIST_TRAFFIC_SHARED_COOLDOWN"] = "1"
 
 from app_version import APP_VERSION
-from browser_idle import BrowserIdleShutdownGuard
 from parser import KleinanzeigenParser, TemporaryAccessError, profile_page_dates, shutdown_shared_browser_runtime
 from date_manager import (
     DATE_CACHE_TTL_SECONDS,
     DATE_ERROR_TTL_SECONDS,
     DATE_GROUP,
     DATE_HEARTBEAT_KEY,
-    DATE_PREWARM_KEY,
     DATE_PENDING_TTL_SECONDS,
     DATE_REDIS_PREFIX,
     DATE_STREAM,
@@ -90,7 +88,6 @@ DATE_WORKER_HEARTBEAT_SECONDS = _env_int("DATE_WORKER_HEARTBEAT_SECONDS", 3, 1, 
 DATE_WORKER_RECLAIM_IDLE_MS = _env_int("DATE_WORKER_RECLAIM_IDLE_MS", 90_000, 30_000, 300_000)
 DATE_WORKER_JOB_TIMEOUT_SECONDS = _env_int("DATE_WORKER_JOB_TIMEOUT_SECONDS", 45, 15, 120)
 DATE_WORKER_STATUS_TTL_SECONDS = max(10, DATE_WORKER_HEARTBEAT_SECONDS * 5)
-DATE_WORKER_BROWSER_IDLE_SECONDS = _env_int("DATE_WORKER_BROWSER_IDLE_SECONDS", 600, 60, 3600)
 
 
 def _assess_probe(info, target_day, *, strict_http: bool):
@@ -161,10 +158,6 @@ class DateWorkerProcess:
         self.rate_ema = 0.0
         self._group_ready = False
         self._stop = asyncio.Event()
-        self._activity_lock = asyncio.Lock()
-        self.prewarm_total = 0
-        self.last_prewarm_at = 0.0
-        self._last_prewarm_token: str | None = None
         # HTTP probes are cheap and parallel. Chromium confirmation is deliberately
         # narrow and also protected by the Redis date-browser fleet bucket.
         self._browser_confirm_sem = asyncio.Semaphore(DATE_WORKER_BROWSER_CONFIRM_CONCURRENCY)
@@ -244,8 +237,6 @@ class DateWorkerProcess:
             "penalty": penalty,
             "cooldown_seconds": round(cooldown, 2),
             "cache_ttl": DATE_CACHE_TTL_SECONDS,
-            "prewarm_total": self.prewarm_total,
-            "last_prewarm_at": self.last_prewarm_at,
             "uptime_seconds": int(time.monotonic() - self.started),
         }
         raw = json.dumps(payload, ensure_ascii=False)
@@ -264,29 +255,6 @@ class DateWorkerProcess:
                 log.warning("Date Worker heartbeat failed", exc_info=True)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=DATE_WORKER_HEARTBEAT_SECONDS)
-            except asyncio.TimeoutError:
-                pass
-
-    async def prewarm_loop(self) -> None:
-        """Acknowledge scan-start readiness without external site traffic."""
-        while not self._stop.is_set():
-            try:
-                token = await self.redis.get(DATE_PREWARM_KEY)
-                if token and token != self._last_prewarm_token:
-                    self._last_prewarm_token = str(token)
-                    self.prewarm_total += 1
-                    # Redis + parser/httpx are already alive; force a fresh heartbeat
-                    # so the manager/admin sees this replica as ready immediately.
-                    await self.redis.ping()
-                    self.last_prewarm_at = time.time()
-                    await self.heartbeat()
-                    log.info("Date Worker readiness prewarm token=%s", str(token)[:24])
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.debug("Date Worker readiness prewarm skipped", exc_info=True)
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=1.0)
             except asyncio.TimeoutError:
                 pass
 
@@ -357,8 +325,7 @@ class DateWorkerProcess:
                         await self._ack(msg_id)
                         continue
 
-                    async with self._activity_lock:
-                        self.active += 1
+                    self.active += 1
                     started = time.monotonic()
                     try:
                         target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
@@ -484,8 +451,7 @@ class DateWorkerProcess:
                         await self.redis.delete(self.pending_key(cache_id))
                         log.warning("Date Worker probe failed page=%s error=%s", requested_page, exc)
                     finally:
-                        async with self._activity_lock:
-                            self.active = max(0, self.active - 1)
+                        self.active = max(0, self.active - 1)
                         await self._ack(msg_id)
                 except asyncio.CancelledError:
                     raise
@@ -500,43 +466,28 @@ class DateWorkerProcess:
         await self.redis.ping()
         await self.ensure_group()
         hb = asyncio.create_task(self.heartbeat_loop(), name="date-worker-heartbeat")
-        prewarm_task = asyncio.create_task(self.prewarm_loop(), name="date-worker-prewarm")
-        idle_guard = BrowserIdleShutdownGuard(
-            redis=self.redis,
-            stream=DATE_STREAM,
-            active_count=lambda: self.active,
-            activity_lock=self._activity_lock,
-            stop_event=self._stop,
-            idle_seconds=DATE_WORKER_BROWSER_IDLE_SECONDS,
-            label="Date Worker",
-            logger=log,
-        )
-        idle_task = asyncio.create_task(idle_guard.run(), name="date-worker-browser-idle")
         consumers = [
             asyncio.create_task(self.consumer_loop(i), name=f"date-worker-consumer-{i}")
             for i in range(1, DATE_WORKER_CONCURRENCY + 1)
         ]
         await self.heartbeat()
         log.info(
-            "DT PARSER Date Worker online | id=%s | replica=%s | http_concurrency=%s | browser_confirm=%s | cache=%ss | HTTP-first=%s | browser_idle=%ss",
+            "DT PARSER Date Worker online | id=%s | replica=%s | http_concurrency=%s | browser_confirm=%s | cache=%ss | HTTP-first=%s",
             self.base_id,
             os.getenv("RAILWAY_REPLICA_ID", "local"),
             DATE_WORKER_CONCURRENCY,
             DATE_WORKER_BROWSER_CONFIRM_CONCURRENCY,
             DATE_CACHE_TTL_SECONDS,
             DATE_WORKER_HTTP_FIRST,
-            DATE_WORKER_BROWSER_IDLE_SECONDS,
         )
         try:
             await asyncio.gather(*consumers)
         finally:
             self._stop.set()
             hb.cancel()
-            prewarm_task.cancel()
-            idle_task.cancel()
             for task in consumers:
                 task.cancel()
-            await asyncio.gather(hb, prewarm_task, idle_task, *consumers, return_exceptions=True)
+            await asyncio.gather(hb, *consumers, return_exceptions=True)
             try:
                 await self.redis.delete(self.worker_key())
             except Exception:

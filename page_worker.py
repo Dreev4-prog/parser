@@ -37,17 +37,12 @@ os.environ["DIST_TRAFFIC_GLOBAL_LIMIT"] = "8"
 os.environ["DIST_TRAFFIC_SHARED_COOLDOWN"] = "1"
 
 from app_version import APP_VERSION
-from browser_idle import BrowserIdleShutdownGuard
-from parser import (
-    KleinanzeigenParser, TemporaryAccessError, shared_browser_runtime_running,
-    shutdown_shared_browser_runtime, warm_shared_browser_runtime,
-)
+from parser import KleinanzeigenParser, TemporaryAccessError, shutdown_shared_browser_runtime
 from page_manager import (
     PAGE_CACHE_TTL_SECONDS,
     PAGE_ERROR_TTL_SECONDS,
     PAGE_GROUP,
     PAGE_HEARTBEAT_KEY,
-    PAGE_PREWARM_KEY,
     PAGE_PENDING_TTL_SECONDS,
     PAGE_REDIS_PREFIX,
     PAGE_STREAM,
@@ -78,7 +73,6 @@ PAGE_WORKER_HEARTBEAT_SECONDS = _env_int("PAGE_WORKER_HEARTBEAT_SECONDS", 3, 1, 
 PAGE_WORKER_RECLAIM_IDLE_MS = _env_int("PAGE_WORKER_RECLAIM_IDLE_MS", 120_000, 30_000, 300_000)
 PAGE_WORKER_JOB_TIMEOUT_SECONDS = _env_int("PAGE_WORKER_JOB_TIMEOUT_SECONDS", 90, 20, 240)
 PAGE_WORKER_STATUS_TTL_SECONDS = max(10, PAGE_WORKER_HEARTBEAT_SECONDS * 5)
-PAGE_WORKER_BROWSER_IDLE_SECONDS = _env_int("PAGE_WORKER_BROWSER_IDLE_SECONDS", 600, 60, 3600)
 
 
 class PageWorkerProcess:
@@ -104,12 +98,6 @@ class PageWorkerProcess:
         self.rate_ema = 0.0
         self._group_ready = False
         self._stop = asyncio.Event()
-        self._activity_lock = asyncio.Lock()
-        self._idle_guard: BrowserIdleShutdownGuard | None = None
-        self.prewarm_total = 0
-        self.prewarm_success_total = 0
-        self.last_prewarm_at = 0.0
-        self._last_prewarm_token: str | None = None
 
         # Keep local category pressure bounded; Redis fleet guards cap the aggregate
         # across all four Page Worker replicas.
@@ -186,10 +174,6 @@ class PageWorkerProcess:
             "cooldown_seconds": round(cooldown, 2),
             "refusals_60s": refusals_60s,
             "cache_ttl": PAGE_CACHE_TTL_SECONDS,
-            "browser_ready": bool(shared_browser_runtime_running()),
-            "prewarm_total": self.prewarm_total,
-            "prewarm_success_total": self.prewarm_success_total,
-            "last_prewarm_at": self.last_prewarm_at,
             "uptime_seconds": int(time.monotonic() - self.started),
         }
         raw = json.dumps(payload, ensure_ascii=False)
@@ -208,45 +192,6 @@ class PageWorkerProcess:
                 log.warning("Page Worker heartbeat failed", exc_info=True)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=PAGE_WORKER_HEARTBEAT_SECONDS)
-            except asyncio.TimeoutError:
-                pass
-
-    async def prewarm_loop(self) -> None:
-        """Launch shared Chromium before the first real page job.
-
-        The event is broadcast, so every Railway Page replica performs its own
-        process-local warmup. There is deliberately no page navigation here.
-        """
-        while not self._stop.is_set():
-            try:
-                token = await self.redis.get(PAGE_PREWARM_KEY)
-                if token and token != self._last_prewarm_token:
-                    self._last_prewarm_token = str(token)
-                    self.prewarm_total += 1
-                    started = time.monotonic()
-                    guard = self._idle_guard
-                    if guard is not None:
-                        guard.touch()
-                    async with self._activity_lock:
-                        if guard is not None:
-                            guard.touch()
-                        ok = await asyncio.wait_for(warm_shared_browser_runtime(), timeout=20.0)
-                        if guard is not None:
-                            guard.touch()
-                    if ok:
-                        self.prewarm_success_total += 1
-                    self.last_prewarm_at = time.time()
-                    await self.heartbeat()
-                    log.info(
-                        "Page Worker Chromium prewarm token=%s ok=%s elapsed=%.2fs",
-                        str(token)[:24], ok, time.monotonic() - started,
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.debug("Page Worker prewarm skipped", exc_info=True)
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=1.0)
             except asyncio.TimeoutError:
                 pass
 
@@ -317,8 +262,7 @@ class PageWorkerProcess:
                         await self._ack(msg_id)
                         continue
 
-                    async with self._activity_lock:
-                        self.active += 1
+                    self.active += 1
                     item_started = time.monotonic()
                     try:
                         info = await asyncio.wait_for(
@@ -381,8 +325,7 @@ class PageWorkerProcess:
                         await self.redis.delete(self.pending_key(cache_id))
                         log.warning("Page Worker page failed page=%s error=%s", requested_page, exc)
                     finally:
-                        async with self._activity_lock:
-                            self.active = max(0, self.active - 1)
+                        self.active = max(0, self.active - 1)
                         await self._ack(msg_id)
                 except asyncio.CancelledError:
                     raise
@@ -396,42 +339,26 @@ class PageWorkerProcess:
         await self.redis.ping()
         await self.ensure_group()
         hb = asyncio.create_task(self.heartbeat_loop(), name="page-worker-heartbeat")
-        idle_guard = BrowserIdleShutdownGuard(
-            redis=self.redis,
-            stream=PAGE_STREAM,
-            active_count=lambda: self.active,
-            activity_lock=self._activity_lock,
-            stop_event=self._stop,
-            idle_seconds=PAGE_WORKER_BROWSER_IDLE_SECONDS,
-            label="Page Worker",
-            logger=log,
-        )
-        self._idle_guard = idle_guard
-        idle_task = asyncio.create_task(idle_guard.run(), name="page-worker-browser-idle")
-        prewarm_task = asyncio.create_task(self.prewarm_loop(), name="page-worker-prewarm")
         consumers = [
             asyncio.create_task(self.consumer_loop(i), name=f"page-worker-consumer-{i}")
             for i in range(1, PAGE_WORKER_CONCURRENCY + 1)
         ]
         await self.heartbeat()
         log.info(
-            "DT PARSER Page Worker online | id=%s | replica=%s | concurrency=%s | cache=%ss | browser_idle=%ss",
+            "DT PARSER Page Worker online | id=%s | replica=%s | concurrency=%s | cache=%ss",
             self.base_id,
             os.getenv("RAILWAY_REPLICA_ID", "local"),
             PAGE_WORKER_CONCURRENCY,
             PAGE_CACHE_TTL_SECONDS,
-            PAGE_WORKER_BROWSER_IDLE_SECONDS,
         )
         try:
             await asyncio.gather(*consumers)
         finally:
             self._stop.set()
             hb.cancel()
-            idle_task.cancel()
-            prewarm_task.cancel()
             for task in consumers:
                 task.cancel()
-            await asyncio.gather(hb, idle_task, prewarm_task, *consumers, return_exceptions=True)
+            await asyncio.gather(hb, *consumers, return_exceptions=True)
             try:
                 await self.redis.delete(self.worker_key())
             except Exception:

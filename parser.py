@@ -64,19 +64,6 @@ ACCURATE_VIEW_BROWSER_CONCURRENCY = max(1, min(4, int(os.getenv("ACCURATE_VIEW_B
 # direct requests to fill the process-wide Views Pool; Chromium fallback remains
 # separately capped by ACCURATE_VIEW_BROWSER_CONCURRENCY.
 ACCURATE_VIEW_HTTP_CONCURRENCY = max(2, min(24, int(os.getenv("ACCURATE_VIEW_HTTP_CONCURRENCY", "12"))))
-# v4.6.9 View Fast Recovery. A temporary refusal from the cheap official counter
-# must not immediately turn into a Chromium storm. Retry only transient transport
-# failures (403/429/5xx/timeouts) through the same adaptive HTTP lane. A normal
-# HTTP 200 whose payload genuinely has no explicit counter may still use Chromium.
-ACCURATE_VIEW_TRANSIENT_HTTP_RETRIES = max(0, min(2, int(os.getenv("ACCURATE_VIEW_TRANSIENT_HTTP_RETRIES", "0"))))
-ACCURATE_VIEW_TRANSIENT_RETRY_JITTER_MS = max(0, min(1000, int(os.getenv("ACCURATE_VIEW_TRANSIENT_RETRY_JITTER_MS", "150"))))
-# v4.7.0 Fast Session Recovery. When many cheap counter calls miss at once, warm
-# one normal Kleinanzeigen HTTP session and retry the official endpoint before
-# paying the cost of a rendered Chromium page for every listing.
-VIEW_HTTP_WARM_TTL_SECONDS = max(30.0, min(900.0, float(os.getenv("VIEW_HTTP_WARM_TTL_SECONDS", "300"))))
-ACCURATE_VIEW_SESSION_RECOVERY_MIN_MISSES = max(2, min(200, int(os.getenv("ACCURATE_VIEW_SESSION_RECOVERY_MIN_MISSES", "8"))))
-ACCURATE_VIEW_SESSION_RECOVERY_MIN_RATIO = max(0.01, min(1.0, float(os.getenv("ACCURATE_VIEW_SESSION_RECOVERY_MIN_RATIO", "0.08"))))
-ACCURATE_VIEW_SESSION_RECOVERY_ENABLED = os.getenv("ACCURATE_VIEW_SESSION_RECOVERY_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 ACCURATE_VIEW_DOM_TIMEOUT_MS = max(500, min(8000, int(os.getenv("ACCURATE_VIEW_DOM_TIMEOUT_MS", "2500"))))
 ACCURATE_VIEW_RETRIES = max(1, min(3, int(os.getenv("ACCURATE_VIEW_RETRIES", "2"))))
 
@@ -139,21 +126,6 @@ class _SharedBrowserRuntime:
         self._playwright = None
         self._browser = None
         self._contexts_created = 0
-        # Incremented whenever the shared Chromium lifetime changes. Long-lived
-        # parser objects use this to detect that an idle shutdown invalidated
-        # their old BrowserContext and recreate it lazily on the next job.
-        self._generation = 0
-
-    @property
-    def generation(self) -> int:
-        return int(self._generation)
-
-    def is_running(self) -> bool:
-        browser = self._browser
-        try:
-            return bool(browser and browser.is_connected())
-        except Exception:
-            return False
 
     async def _ensure_browser(self):
         async with self._lock:
@@ -195,11 +167,9 @@ class _SharedBrowserRuntime:
                     "--mute-audio",
                 ],
             )
-            self._generation += 1
             log.info(
-                "Railway browser fleet runtime started | replica=%s | generation=%s",
+                "Railway browser fleet runtime started | replica=%s",
                 os.getenv("RAILWAY_REPLICA_ID", "local"),
-                self._generation,
             )
             return self._browser
 
@@ -233,7 +203,6 @@ class _SharedBrowserRuntime:
 
     async def close(self) -> None:
         async with self._lock:
-            had_runtime = self._browser is not None or self._playwright is not None
             try:
                 if self._browser is not None:
                     await self._browser.close()
@@ -246,33 +215,9 @@ class _SharedBrowserRuntime:
             except Exception:
                 pass
             self._playwright = None
-            if had_runtime:
-                self._generation += 1
 
 
 _SHARED_BROWSER_FLEET = _SharedBrowserRuntime()
-
-
-def shared_browser_runtime_running() -> bool:
-    return bool(SHARED_BROWSER_RUNTIME and _SHARED_BROWSER_FLEET.is_running())
-
-
-async def warm_shared_browser_runtime() -> bool:
-    """Start the process-local shared Chromium without opening a page.
-
-    Used by Page Worker scan-start prewarm. This intentionally performs no
-    Kleinanzeigen navigation and creates no browser context, so it removes the
-    expensive cold launch from the first real page job without creating extra
-    site traffic.
-    """
-    if not SHARED_BROWSER_RUNTIME:
-        return False
-    await _SHARED_BROWSER_FLEET._ensure_browser()
-    return _SHARED_BROWSER_FLEET.is_running()
-
-
-def shared_browser_runtime_generation() -> int:
-    return int(_SHARED_BROWSER_FLEET.generation)
 
 
 async def shutdown_shared_browser_runtime() -> None:
@@ -1192,28 +1137,15 @@ class KleinanzeigenParser:
             },
             timeout=30.0,
             follow_redirects=True,
-            # v4.7.0: keep the cheap official-counter TCP/TLS pool warm long
-            # enough to bridge the page/date phase into the view phase. Traffic
-            # concurrency is still governed by TRAFFIC; this only avoids cold
-            # handshakes and does not increase request pressure.
-            limits=httpx.Limits(
-                max_connections=32,
-                max_keepalive_connections=24,
-                keepalive_expiry=300.0,
-            ),
         )
         self._playwright = None
         self._browser = None
         self._browser_context = None
         self._uses_shared_browser_runtime = False
-        self._shared_browser_generation = -1
         self._browser_lock = asyncio.Lock()
         self._scan_page = None
         self._scan_page_lock = asyncio.Lock()
         self._direct_mode_lock = asyncio.Lock()
-        self._view_http_warm_lock = asyncio.Lock()
-        self._view_http_warmed_at = 0.0
-        self.last_view_batch_stats: dict[str, object] = {}
         self._hybrid_lock = asyncio.Lock()
         self.scan_transport = SCAN_TRANSPORT
         self._direct_view_mode: str = "unknown"  # unknown|http|context|browser
@@ -1264,7 +1196,6 @@ class KleinanzeigenParser:
         self._browser_context = None
         self._browser = None
         self._playwright = None
-        self._shared_browser_generation = -1
         await self.client.aclose()
 
     async def _fetch_response(
@@ -1379,14 +1310,6 @@ class KleinanzeigenParser:
         log.warning("Stable Reset: scan browser session recycled after persistent page failure")
 
     async def _ensure_scan_page(self):
-        if SHARED_BROWSER_RUNTIME and self._scan_page is not None:
-            if (
-                self._shared_browser_generation != _SHARED_BROWSER_FLEET.generation
-                or not _SHARED_BROWSER_FLEET.is_running()
-            ):
-                self._scan_page = None
-                self._browser_context = None
-                self._context_session_seeded = False
         if self._scan_page is not None and not self._scan_page.is_closed():
             return self._scan_page
         context = await self._ensure_view_browser()
@@ -1869,28 +1792,9 @@ class KleinanzeigenParser:
         return None, None
 
     async def _ensure_view_browser(self):
-        # Idle memory shutdown closes the process-local shared Chromium while
-        # worker/parser objects intentionally stay alive. Detect that lifetime
-        # change before reusing a cached BrowserContext.
-        if SHARED_BROWSER_RUNTIME and self._browser_context is not None:
-            if (
-                self._shared_browser_generation != _SHARED_BROWSER_FLEET.generation
-                or not _SHARED_BROWSER_FLEET.is_running()
-            ):
-                self._browser_context = None
-                self._scan_page = None
-                self._context_session_seeded = False
         if self._browser_context is not None:
             return self._browser_context
         async with self._browser_lock:
-            if SHARED_BROWSER_RUNTIME and self._browser_context is not None:
-                if (
-                    self._shared_browser_generation != _SHARED_BROWSER_FLEET.generation
-                    or not _SHARED_BROWSER_FLEET.is_running()
-                ):
-                    self._browser_context = None
-                    self._scan_page = None
-                    self._context_session_seeded = False
             if self._browser_context is not None:
                 return self._browser_context
             storage_state = None
@@ -1903,7 +1807,6 @@ class KleinanzeigenParser:
                     storage_state=storage_state
                 )
                 self._uses_shared_browser_runtime = True
-                self._shared_browser_generation = _SHARED_BROWSER_FLEET.generation
                 return self._browser_context
 
             if self._playwright is None:
@@ -2147,16 +2050,13 @@ class KleinanzeigenParser:
             page = None
             passive_tasks = []
             try:
-                # v4.6.9: acquire the browser lane before a cold Chromium/context
-                # startup. After idle shutdown this prevents every View Worker
-                # replica from launching Chromium simultaneously while only one or
-                # two navigations are actually allowed by the distributed limiter.
+                context = await self._ensure_view_browser()
+                page = await context.new_page()
+                await self._install_lightweight_route(page)
+                ad_id = extract_external_id(url)
+                passive_future, passive_tasks = self._attach_passive_view_capture(page, ad_id)
+
                 async with TRAFFIC.lease("browser", traffic_priority):
-                    context = await self._ensure_view_browser()
-                    page = await context.new_page()
-                    await self._install_lightweight_route(page)
-                    ad_id = extract_external_id(url)
-                    passive_future, passive_tasks = self._attach_passive_view_capture(page, ad_id)
                     response = await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
                 if response is not None:
                     if response.status in {403, 429}:
@@ -2287,44 +2187,6 @@ class KleinanzeigenParser:
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
         }
-
-    async def warm_view_http_session(
-        self, *, force: bool = False, traffic_priority: str = "normal"
-    ) -> bool:
-        """Warm only the lightweight HTTP session used by exact view counters.
-
-        No Chromium is launched. A normal public homepage request establishes
-        DNS/TLS/keep-alive state and any ordinary public cookies in the same
-        httpx client that later calls s-vac-inc-get. This is deliberately cheap
-        enough to broadcast to every View Worker when the first scan starts.
-        """
-        now = time.monotonic()
-        if not force and now - self._view_http_warmed_at < VIEW_HTTP_WARM_TTL_SECONDS:
-            return True
-        async with self._view_http_warm_lock:
-            now = time.monotonic()
-            if not force and now - self._view_http_warmed_at < VIEW_HTTP_WARM_TTL_SECONDS:
-                return True
-            try:
-                async with TRAFFIC.lease("view", traffic_priority):
-                    response = await self.client.get(
-                        BASE_URL + "/",
-                        headers={
-                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                            "Accept-Language": "de-DE,de;q=0.9,en;q=0.7",
-                        },
-                        timeout=10.0,
-                    )
-                if response.status_code in {403, 429}:
-                    await TRAFFIC.report_refusal(response.status_code, "view")
-                    return False
-                if 200 <= response.status_code < 500:
-                    await TRAFFIC.report_success("view")
-                    self._view_http_warmed_at = time.monotonic()
-                    return True
-                return False
-            except Exception:
-                return False
 
     async def _direct_view_http_shared(
         self, url: str, *, traffic_priority: str = "normal"
@@ -2769,25 +2631,6 @@ class KleinanzeigenParser:
                 except Exception:
                     pass
 
-    @staticmethod
-    def _direct_view_failure_is_transient(result: ViewCountResult) -> bool:
-        """Return True only for failures worth retrying before Chromium.
-
-        Do not retry a successful HTTP 200 with an unparseable/absent counter: that
-        is a genuine browser-fallback candidate. Retrying is reserved for temporary
-        transport pressure so one 403/429 burst cannot enqueue hundreds of pages.
-        """
-        source = str(result.source or "").lower()
-        error = str(result.error or "").lower()
-        if any(token in source for token in (
-            "status-403", "status-429", "status-408",
-            "status-500", "status-502", "status-503", "status-504",
-        )):
-            return True
-        if source.endswith(":error") or "timeout" in error or "timed out" in error:
-            return True
-        return False
-
     async def fetch_public_view_counts(
         self,
         urls: list[str],
@@ -2828,11 +2671,12 @@ class KleinanzeigenParser:
                 pass
 
         if accurate:
-            # v4.7.0 Three-stage exact views:
-            # 1) cheap official counter over the already-open HTTP pool;
-            # 2) if misses are systemic, warm one normal public HTTP session and
-            #    retry those misses as a batch (still no Chromium);
-            # 3) only the true remainder opens rendered ad pages.
+            # v4.3.2 Two-Phase Accurate Views:
+            # 1) fill the shared HTTP Views Pool with Kleinanzeigen's official
+            #    counter endpoint for the entire batch;
+            # 2) only the misses enter the much heavier Chromium lane.
+            # Previously each item held a 2-slot semaphore across HTTP + browser,
+            # so three users could not actually use the process-wide 6-slot pool.
             http_sem = asyncio.Semaphore(ACCURATE_VIEW_HTTP_CONCURRENCY)
             browser_sem = asyncio.Semaphore(max(1, min(ACCURATE_VIEW_BROWSER_CONCURRENCY, concurrency)))
             fallback_urls: list[str] = []
@@ -2840,10 +2684,9 @@ class KleinanzeigenParser:
             fallback_lock = asyncio.Lock()
             phase1_started = time.monotonic()
             singleflight_hits = 0
-            transient_retries_total = 0
 
             async def direct_phase(url: str):
-                nonlocal done_count, singleflight_hits, transient_retries_total
+                nonlocal done_count, singleflight_hits
                 if not _allowed_url(url) or "/s-anzeige/" not in url:
                     results[url] = ViewCountResult(
                         None, None, "verified:invalid-url",
@@ -2860,26 +2703,6 @@ class KleinanzeigenParser:
                     )
                 if shared:
                     singleflight_hits += 1
-
-                transient_attempts = 0
-                while (
-                    direct.views is None
-                    and transient_attempts < ACCURATE_VIEW_TRANSIENT_HTTP_RETRIES
-                    and self._direct_view_failure_is_transient(direct)
-                ):
-                    transient_attempts += 1
-                    transient_retries_total += 1
-                    if ACCURATE_VIEW_TRANSIENT_RETRY_JITTER_MS > 0:
-                        jitter = (abs(hash((url, transient_attempts))) % (ACCURATE_VIEW_TRANSIENT_RETRY_JITTER_MS + 1)) / 1000.0
-                        if jitter > 0:
-                            await asyncio.sleep(jitter)
-                    async with http_sem:
-                        direct, retry_shared = await self._direct_view_http_shared(
-                            url, traffic_priority=traffic_priority
-                        )
-                    if retry_shared:
-                        singleflight_hits += 1
-
                 if direct.views is not None:
                     results[url] = ViewCountResult(
                         int(direct.views),
@@ -2901,76 +2724,12 @@ class KleinanzeigenParser:
             await asyncio.gather(*(direct_phase(url) for url in urls))
             valid_total = sum(1 for url in urls if _allowed_url(url) and "/s-anzeige/" in url)
             phase1_elapsed = max(0.001, time.monotonic() - phase1_started)
-            phase1_misses = len(fallback_urls)
-            miss_ratio = phase1_misses / max(1, valid_total)
-
-            session_attempted = False
-            session_warmed = False
-            session_recovered = 0
-            if (
-                ACCURATE_VIEW_SESSION_RECOVERY_ENABLED
-                and phase1_misses >= ACCURATE_VIEW_SESSION_RECOVERY_MIN_MISSES
-                and miss_ratio >= ACCURATE_VIEW_SESSION_RECOVERY_MIN_RATIO
-            ):
-                # A broad miss pattern normally means the cheap client is cold or
-                # lost ordinary public session state. One homepage request is much
-                # cheaper than opening hundreds of ad pages in Chromium.
-                session_attempted = True
-                session_warmed = await self.warm_view_http_session(
-                    force=True, traffic_priority=traffic_priority
-                )
-                if session_warmed:
-                    retry_urls = list(fallback_urls)
-                    fallback_urls.clear()
-
-                    async def session_retry(url: str):
-                        nonlocal done_count, singleflight_hits, session_recovered
-                        async with http_sem:
-                            direct, shared = await self._direct_view_http_shared(
-                                url, traffic_priority=traffic_priority
-                            )
-                        if shared:
-                            singleflight_hits += 1
-                        if direct.views is not None:
-                            results[url] = ViewCountResult(
-                                int(direct.views), direct.raw_text,
-                                f"verified-official:{direct.source}",
-                                direct.final_url, direct.page_title, None,
-                            )
-                            session_recovered += 1
-                            async with done_lock:
-                                done_count += 1
-                            await report_progress()
-                            return
-                        async with fallback_lock:
-                            fallback_urls.append(url)
-                            direct_errors[url] = direct.error or direct.source
-
-                    await asyncio.gather(*(session_retry(url) for url in retry_urls))
-
             log.info(
-                "Accurate views fast path total=%s http_ok=%s initial_misses=%s "
-                "session_attempted=%s session_warmed=%s session_recovered=%s browser_fallback=%s "
-                "transient_retries=%s shared=%s elapsed=%.2fs rate=%.1f/s",
-                total, valid_total - phase1_misses, phase1_misses, session_attempted,
-                session_warmed, session_recovered, len(fallback_urls), transient_retries_total,
+                "Accurate views phase1 complete total=%s http_ok=%s browser_fallback=%s "
+                "shared=%s elapsed=%.2fs rate=%.1f/s",
+                total, valid_total - len(fallback_urls), len(fallback_urls),
                 singleflight_hits, phase1_elapsed, valid_total / phase1_elapsed,
             )
-
-            browser_fallback_total = len(fallback_urls)
-            self.last_view_batch_stats = {
-                "total": total,
-                "valid_total": valid_total,
-                "http_ok": max(0, valid_total - phase1_misses),
-                "initial_misses": phase1_misses,
-                "session_attempted": session_attempted,
-                "session_warmed": session_warmed,
-                "session_recovered": session_recovered,
-                "browser_fallback": browser_fallback_total,
-                "transient_retries": transient_retries_total,
-                "singleflight_hits": singleflight_hits,
-                "phase1_seconds": round(phase1_elapsed, 3),
-            }
 
             if fallback_urls:
                 async def browser_phase(url: str):

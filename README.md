@@ -1,66 +1,45 @@
-# DT Parser v4.7.3 — Performance Restore
+# DT Parser v4.7.4 — v4.6.0 Parser Core Restore
 
 Production-clean GitHub package.
 
-## What changed in v4.7.3
+This build uses the **exact v4.6.0 parser/worker core** for Date, Page and View collection, while retaining the newer Telegram UI, RU/EN localization, admin operations center and DT AI Lab improvements.
 
-This release restores the proven fast parsing path while keeping the useful idle-memory and worker-fleet improvements.
+## Parser core
 
-### Global idle shutdown
+The following files are restored byte-for-byte from v4.6.0:
 
-Chromium still closes after 10 minutes of true idle time, but the countdown now starts only when BOTH conditions are true:
+- `parser.py`
+- `date_manager.py`
+- `date_worker.py`
+- `page_manager.py`
+- `page_worker.py`
+- `view_manager.py`
+- `view_counter_worker.py`
 
-- the local Date/Page/View worker queue is empty and has no active job;
-- the global `dtparser:scan_jobs` stream is empty, meaning no foreground user scan is queued or still being processed.
+The foreground scan orchestration in `bot.py` was also compared with v4.6.0; `process_scan_job`, `scan_worker` and `distributed_scan_worker` are identical.
 
-This prevents Page/View Chromium from shutting down between stages of one long scan. The workers, Redis connections and heartbeats remain online.
+All post-v4.6.0 wake-up/prewarm/idle-browser changes have been removed from the parser critical path.
 
-### Fast exact views restored
+## Retained user-facing features
 
-The default view path is restored to the proven two-phase flow:
+- Russian / English UI
+- language selection on first `/start`
+- current admin panel and active parsing view
+- DT AI Lab unread badge
+- Russian AI Lab labels
+- Product Opportunity Engine
+- v4.6.7 Fast UI navigation
 
-1. one exact request to Kleinanzeigen's official public counter;
-2. only misses go to exact Chromium fallback.
+## Memory behavior
 
-Per-item transient HTTP retries are disabled by default and the later forced HTTP-session recovery pass is disabled by default. Both mechanisms remain available only as optional diagnostics/tuning switches if explicitly enabled.
-
-Defaults:
-
-- `ACCURATE_VIEW_TRANSIENT_HTTP_RETRIES=0`
-- `ACCURATE_VIEW_SESSION_RECOVERY_ENABLED=0`
-
-No guessed view counts are introduced.
-
-### Retained improvements
-
-- 10-minute Chromium memory release after the whole parser becomes idle;
-- Date/Page/View scan-fleet wake-up;
-- Page Worker Chromium prewarm;
-- View Worker lightweight HTTP prewarm;
-- cold-safe View sharding for the expected 4-replica fleet;
-- up to 2 exact Chromium fallback navigations fleet-wide;
-- v4.6.7 Fast UI behavior;
-- Russian / English user interface;
-- DT AI Lab and Product Opportunity Engine;
-- admin workers / active parsing center.
+This release intentionally restores v4.6.0 runtime behavior. The 10-minute Chromium idle shutdown introduced in v4.6.1 is **not active**. Idle memory can therefore be higher than in v4.6.1+, but this gives a clean performance baseline matching the last version known to parse correctly and quickly.
 
 ## Railway
 
-All services use the same repository and root `railway.json`:
+All services continue to use the same repository and root `railway.json`:
 
 ```text
 python service_launcher.py
 ```
 
-`service_launcher.py` selects Bot / Date Worker / Page Worker / View Worker / AI Worker from the Railway service name or `DT_SERVICE_ROLE`.
-
-No new required Railway variables or PostgreSQL migrations are needed for v4.7.3.
-
-## Language
-
-A new user chooses a language on the first `/start`:
-
-- 🇷🇺 Русский
-- 🇬🇧 English
-
-The choice is saved per user and can later be changed in Settings or with `/language`. The admin panel remains Russian.
+No new required Railway variables and no PostgreSQL migration are needed.
