@@ -54,6 +54,7 @@ from models import (
 )
 from product_identity import TYPE_DISPLAY, ProductIdentity, recognize_product
 from traffic import TRAFFIC
+from i18n import LANG_EN, LANG_RU, get_user_language, language_name, set_user_language, translate_text
 from distributed import (
     COORDINATOR, DISTRIBUTED_WORKERS, DISTRIBUTED_MODE_SOURCE,
     DISTRIBUTED_CONFIG_ERROR, IS_RAILWAY, REDIS_URL, STABLE_SINGLE_SERVICE_MODE,
@@ -104,6 +105,95 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+
+
+# v4.6.5: per-user RU/EN presentation layer.  The parser/business logic remains
+# language-neutral; all outgoing Telegram text/inline-button labels are localized
+# at the Bot API boundary.  Admin chats intentionally stay Russian.
+_UI_LANGUAGE: ContextVar[str | None] = ContextVar("dt_ui_language", default=None)
+
+
+def _copy_model_with_updates(obj, **updates):
+    if not updates:
+        return obj
+    copier = getattr(obj, "model_copy", None)
+    if callable(copier):
+        return copier(update=updates)
+    copier = getattr(obj, "copy", None)
+    if callable(copier):
+        try:
+            return copier(update=updates)
+        except TypeError:
+            pass
+    for key, value in updates.items():
+        try:
+            setattr(obj, key, value)
+        except Exception:
+            pass
+    return obj
+
+
+def _localize_inline_markup(markup, language: str | None):
+    if language != LANG_EN or not isinstance(markup, InlineKeyboardMarkup):
+        return markup
+    changed = False
+    rows = []
+    for row in markup.inline_keyboard:
+        new_row = []
+        for button in row:
+            text = getattr(button, "text", None)
+            translated = translate_text(text, language) if isinstance(text, str) else text
+            if translated != text:
+                changed = True
+                button = _copy_model_with_updates(button, text=translated)
+            new_row.append(button)
+        rows.append(new_row)
+    return InlineKeyboardMarkup(inline_keyboard=rows) if changed else markup
+
+
+def _localize_telegram_method(method, language: str | None):
+    if language != LANG_EN:
+        return method
+    updates = {}
+    text = getattr(method, "text", None)
+    if isinstance(text, str):
+        translated = translate_text(text, language)
+        if translated != text:
+            updates["text"] = translated
+    caption = getattr(method, "caption", None)
+    if isinstance(caption, str):
+        translated = translate_text(caption, language)
+        if translated != caption:
+            updates["caption"] = translated
+    markup = getattr(method, "reply_markup", None)
+    translated_markup = _localize_inline_markup(markup, language)
+    if translated_markup is not markup:
+        updates["reply_markup"] = translated_markup
+    return _copy_model_with_updates(method, **updates)
+
+
+class LocalizedBot(Bot):
+    """Bot wrapper that localizes both foreground and background sends."""
+
+    async def __call__(self, method, request_timeout=None):
+        language = _UI_LANGUAGE.get()
+        chat_id = getattr(method, "chat_id", None)
+        numeric_chat_id = None
+        try:
+            numeric_chat_id = int(chat_id) if chat_id is not None else None
+        except (TypeError, ValueError):
+            numeric_chat_id = None
+
+        if numeric_chat_id in ADMIN_IDS:
+            language = LANG_RU
+        elif language is None and numeric_chat_id is not None and numeric_chat_id > 0:
+            try:
+                language = await get_user_language(numeric_chat_id)
+            except Exception:
+                log.debug("Could not resolve UI language for chat=%s", numeric_chat_id, exc_info=True)
+
+        method = _localize_telegram_method(method, language)
+        return await super().__call__(method, request_timeout=request_timeout)
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
@@ -656,6 +746,7 @@ def settings_keyboard(s: UserSettings) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"↕️ {SORT_LABELS.get(s.sort_mode, s.sort_mode)}", callback_data="set_sort")],
         [InlineKeyboardButton(text="🔎 Ключевые слова", callback_data="set_include"),
          InlineKeyboardButton(text="🚫 Исключения", callback_data="set_exclude")],
+        [InlineKeyboardButton(text="🌐 Язык", callback_data="language_settings")],
         [InlineKeyboardButton(text="▶️ Новый скан", callback_data="start_scan")],
         [InlineKeyboardButton(text="ℹ️ Что выбрать?", callback_data="mode_help"),
          InlineKeyboardButton(text="♻️ Сбросить", callback_data="reset_settings")],
@@ -6692,6 +6783,7 @@ async def subscription_keyboard(user_id: int) -> InlineKeyboardMarkup:
                 callback_data=f"buyplan:{plan.key}",
             )])
     rows.append([InlineKeyboardButton(text="💳 Мои платежи", callback_data="mypayments")])
+    rows.append([InlineKeyboardButton(text="🌐 Язык", callback_data="language_settings")])
     if allowed(user_id):
         rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -6921,6 +7013,80 @@ async def send_access_screen(message: Message, user_id: int) -> None:
     )
 
 
+def language_keyboard(current: str | None = None) -> InlineKeyboardMarkup:
+    ru = "✅ 🇷🇺 Русский" if current == LANG_RU else "🇷🇺 Русский"
+    en = "✅ 🇬🇧 English" if current == LANG_EN else "🇬🇧 English"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=ru, callback_data="language:ru"),
+         InlineKeyboardButton(text=en, callback_data="language:en")],
+    ])
+
+
+def language_prompt_text(current: str | None = None) -> str:
+    if current in (LANG_RU, LANG_EN):
+        return (
+            "<b>🌐 Язык интерфейса / Interface language</b>\n\n"
+            f"Текущий язык / Current language: <b>{language_name(current)}</b>\n\n"
+            "Выберите язык / Choose language:"
+        )
+    return (
+        "<b>🌐 Выберите язык / Choose language</b>\n\n"
+        "🇷🇺 Русский\n🇬🇧 English\n\n"
+        "Язык можно изменить позже в настройках.\n"
+        "You can change the language later in Settings."
+    )
+
+
+async def _send_language_picker(message: Message, current: str | None = None) -> None:
+    # Deliberately bilingual and not run through localization: this is the one
+    # screen shown before the user has chosen a language.
+    token = _UI_LANGUAGE.set(LANG_RU)
+    try:
+        await message.answer(
+            language_prompt_text(current),
+            parse_mode=ParseMode.HTML,
+            reply_markup=language_keyboard(current),
+        )
+    finally:
+        _UI_LANGUAGE.reset(token)
+
+
+class LanguageContextMiddleware(BaseMiddleware):
+    """Load a user's chosen language before access checks and handlers."""
+
+    async def __call__(self, handler, event, data):
+        tg_user = getattr(event, "from_user", None)
+        if tg_user is None or int(tg_user.id) in ADMIN_IDS:
+            return await handler(event, data)
+        try:
+            language = await get_user_language(int(tg_user.id))
+        except Exception:
+            log.exception("Could not load UI language user=%s", tg_user.id)
+            language = None
+        token = _UI_LANGUAGE.set(language)
+        try:
+            # Existing users from pre-v4.6.5 are gated once, too, so nobody gets
+            # a half-Russian/half-English experience after upgrade.
+            if language is None:
+                if isinstance(event, Message):
+                    text = (event.text or "").strip()
+                    if text.startswith("/start") or text.startswith("/language"):
+                        return await handler(event, data)
+                    await _send_language_picker(event)
+                    return None
+                if isinstance(event, CallbackQuery):
+                    callback_data = event.data or ""
+                    if callback_data.startswith("language:") or callback_data == "language_settings":
+                        return await handler(event, data)
+                    await event.answer()
+                    if event.message:
+                        await _send_language_picker(event.message)
+                    return None
+            return await handler(event, data)
+        finally:
+            _UI_LANGUAGE.reset(token)
+
+
 class ActivityAccessMiddleware(BaseMiddleware):
     """Track users and keep commercial access checks outside parser handlers."""
 
@@ -6948,13 +7114,15 @@ class ActivityAccessMiddleware(BaseMiddleware):
                 return await handler(event, data)
             if text.startswith("/help"):
                 return await handler(event, data)
+            if text.startswith("/language"):
+                return await handler(event, data)
             await send_access_screen(event, uid)
             return None
 
         if isinstance(event, CallbackQuery):
             callback_data = event.data or ""
-            public_prefixes = ("buyplan:", "payprovider:", "paycheck:", "mypayments")
-            if callback_data == "subscription" or callback_data.startswith(public_prefixes):
+            public_prefixes = ("buyplan:", "payprovider:", "paycheck:", "mypayments", "language:")
+            if callback_data in {"subscription", "language_settings"} or callback_data.startswith(public_prefixes):
                 return await handler(event, data)
             if is_banned_cached(uid):
                 await event.answer("Доступ заблокирован", show_alert=True)
@@ -6967,6 +7135,12 @@ class ActivityAccessMiddleware(BaseMiddleware):
 
 
 dp = Dispatcher()
+
+# Language selection is resolved before commercial access so first-run users and
+# expired subscribers can always choose/change the interface language.
+_language_middleware = LanguageContextMiddleware()
+dp.message.outer_middleware(_language_middleware)
+dp.callback_query.outer_middleware(_language_middleware)
 
 # Commercial access/user tracking runs before regular handlers. It never performs
 # parser work, so Telegram navigation stays responsive while scans run in background.
@@ -8579,9 +8753,21 @@ async def subscription_lifecycle_scheduler(bot: Bot) -> None:
 
 
 
-async def setup_bot_commands(bot: Bot) -> None:
-    """Configure Telegram's bottom-left Menu button and command list."""
-    user_commands = [
+def user_commands_for_language(language: str = LANG_RU) -> list[BotCommand]:
+    if language == LANG_EN:
+        return [
+            BotCommand(command="menu", description="🏠 Main menu"),
+            BotCommand(command="new_scan", description="▶️ New scan"),
+            BotCommand(command="stop", description="⏹ Stop parser"),
+            BotCommand(command="my_scans", description="📊 My scans"),
+            BotCommand(command="popular", description="🔥 Popular"),
+            BotCommand(command="categories", description="🗂 Categories"),
+            BotCommand(command="settings", description="⚙️ Settings"),
+            BotCommand(command="subscription", description="💎 Subscription"),
+            BotCommand(command="language", description="🌐 Language"),
+            BotCommand(command="help", description="ℹ️ Help"),
+        ]
+    return [
         BotCommand(command="menu", description="🏠 Главное меню"),
         BotCommand(command="new_scan", description="▶️ Новый скан"),
         BotCommand(command="stop", description="⏹ Остановить парсер"),
@@ -8590,14 +8776,38 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="categories", description="🗂 Категории"),
         BotCommand(command="settings", description="⚙️ Настройки"),
         BotCommand(command="subscription", description="💎 Подписка"),
+        BotCommand(command="language", description="🌐 Язык"),
         BotCommand(command="help", description="ℹ️ Помощь"),
     ]
+
+
+async def set_user_command_language(bot: Bot, user_id: int, language: str) -> None:
+    if int(user_id) in ADMIN_IDS:
+        return
+    try:
+        await bot.set_my_commands(
+            user_commands_for_language(language),
+            scope=BotCommandScopeChat(chat_id=int(user_id)),
+        )
+    except Exception:
+        log.debug("Could not update command language user=%s", user_id, exc_info=True)
+
+
+async def setup_bot_commands(bot: Bot) -> None:
+    """Configure Telegram's bottom-left Menu button and command list."""
+    user_commands = user_commands_for_language(LANG_RU)
     admin_commands = user_commands + [
         BotCommand(command="admin", description="🛠 Админ-панель"),
     ]
 
-    # Default command menu for every private user.
+    # Default menu is Russian; Telegram-native English clients also get an
+    # English command list.  The in-bot language selector additionally installs
+    # a per-chat command list so the user's explicit choice wins.
     await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+    try:
+        await bot.set_my_commands(user_commands_for_language(LANG_EN), scope=BotCommandScopeDefault(), language_code="en")
+    except Exception:
+        log.debug("Could not configure Telegram English command list", exc_info=True)
     # Admin chats get the same menu plus /admin.
     for admin_id in sorted(ADMIN_IDS):
         try:
@@ -8608,6 +8818,60 @@ async def setup_bot_commands(bot: Bot) -> None:
     # Force Telegram to render the standard Commands menu button instead of
     # requiring users to type slash commands manually.
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+
+
+# Legacy body replaced by v4.6.5; marker kept out intentionally.
+@dp.message(Command("language"))
+async def language_command(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    current = await get_user_language(message.from_user.id)
+    await _send_language_picker(message, current)
+
+
+@dp.callback_query(F.data == "language_settings")
+async def language_settings(callback: CallbackQuery) -> None:
+    current = await get_user_language(callback.from_user.id)
+    await callback.answer()
+    token = _UI_LANGUAGE.set(LANG_RU)
+    try:
+        await _edit_or_answer(
+            callback.message,
+            language_prompt_text(current),
+            reply_markup=language_keyboard(current),
+        )
+    finally:
+        _UI_LANGUAGE.reset(token)
+
+
+@dp.callback_query(F.data.startswith("language:"))
+async def choose_language(callback: CallbackQuery, state: FSMContext) -> None:
+    language = (callback.data or "").split(":", 1)[1].strip().lower()
+    if language not in {LANG_RU, LANG_EN}:
+        await callback.answer("Unknown language", show_alert=True)
+        return
+    await set_user_language(callback.from_user.id, language)
+    await set_user_command_language(callback.bot, callback.from_user.id, language)
+    token = _UI_LANGUAGE.set(language)
+    try:
+        await callback.answer("Language saved" if language == LANG_EN else "Язык сохранён")
+        await state.clear()
+        if not allowed(callback.from_user.id):
+            if callback.message:
+                await callback.message.answer(
+                    await subscription_text(callback.from_user.id),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=await subscription_keyboard(callback.from_user.id),
+                )
+            return
+        user = await get_commerce_user(callback.from_user.id)
+        if user is not None and not bool(user.onboarding_completed):
+            if callback.message:
+                await _show_onboarding(callback.message, callback.from_user.id, 1)
+            return
+        if callback.message:
+            await _send_home_message(callback.message, callback.from_user.id)
+    finally:
+        _UI_LANGUAGE.reset(token)
 
 
 def onboarding_keyboard(step: int) -> InlineKeyboardMarkup:
@@ -8820,6 +9084,12 @@ async def start(message: Message, state: FSMContext) -> None:
             parse_mode=ParseMode.HTML,
         )
         return
+    language = await get_user_language(message.from_user.id)
+    if language is None and message.from_user.id not in ADMIN_IDS:
+        await _send_language_picker(message)
+        return
+    if language is not None:
+        await set_user_command_language(message.bot, message.from_user.id, language)
     if not allowed(message.from_user.id):
         await send_access_screen(message, message.from_user.id)
         return
@@ -10868,7 +11138,7 @@ async def main() -> None:
     if archived:
         log.info("v3.3.0 initial scan archive: %s moved", archived)
 
-    bot = Bot(BOT_TOKEN)
+    bot = LocalizedBot(BOT_TOKEN)
     try:
         await setup_bot_commands(bot)
     except Exception:
