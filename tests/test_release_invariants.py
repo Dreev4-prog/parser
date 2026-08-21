@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ReleaseInvariantTests(unittest.TestCase):
     def test_release_version(self):
-        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.6.3")
+        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.6.4")
 
     def test_date_window_and_timezone_semantics_were_not_changed(self):
         source = (ROOT / "date_manager.py").read_text(encoding="utf-8")
@@ -96,6 +96,21 @@ class ReleaseInvariantTests(unittest.TestCase):
         self.assertNotIn('name="ai-admin-notification-scheduler"', source)
         worker = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
         self.assertIn('candidate.outcome == "confirmed"', worker)
+
+
+    def test_v464_admin_workers_are_consolidated_and_active_scans_visible(self):
+        source = (ROOT / "bot.py").read_text(encoding="utf-8")
+        self.assertIn('text="⚙️ Воркеры", callback_data="adminworkers"', source)
+        self.assertIn('callback_data="adminactive"', source)
+        self.assertIn('async def _admin_workers_text()', source)
+        self.assertIn('async def _admin_active_scans_text', source)
+        self.assertIn('UserScan.status == "running"', source)
+        main_start = source.index('def admin_keyboard(')
+        main_end = source.index('def admin_back_keyboard', main_start)
+        main = source[main_start:main_end]
+        self.assertNotIn('callback_data="admindates"', main)
+        self.assertNotIn('callback_data="adminpages"', main)
+        self.assertNotIn('callback_data="adminviews"', main)
 
 
 

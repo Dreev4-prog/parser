@@ -6728,14 +6728,15 @@ def payment_invoice_keyboard(payment: SubscriptionPayment) -> InlineKeyboardMark
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def admin_keyboard(ai_unread: int = 0) -> InlineKeyboardMarkup:
+def admin_keyboard(ai_unread: int = 0, active_scans: int = 0) -> InlineKeyboardMarkup:
     unread = max(0, int(ai_unread or 0))
+    active = max(0, int(active_scans or 0))
     ai_label = "🧠 DT AI Lab" if unread <= 0 else f"🧠 DT AI Lab 🔴 {min(unread, 99)}{'+' if unread > 99 else ''}"
+    parsing_label = "👀 Кто сейчас парсит" if active <= 0 else f"👀 Сейчас парсят · {active}"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adminstats")],
-        [InlineKeyboardButton(text="📅 Date Worker", callback_data="admindates"),
-         InlineKeyboardButton(text="📄 Page Worker", callback_data="adminpages")],
-        [InlineKeyboardButton(text="👁 View Worker", callback_data="adminviews")],
+        [InlineKeyboardButton(text="⚙️ Воркеры", callback_data="adminworkers"),
+         InlineKeyboardButton(text=parsing_label, callback_data="adminactive")],
         [InlineKeyboardButton(text=ai_label, callback_data="adminai")],
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="adminusers"),
          InlineKeyboardButton(text="💳 Платежи", callback_data="adminpayments")],
@@ -6752,24 +6753,43 @@ def admin_back_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def admin_workers_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Date", callback_data="admindates"),
+         InlineKeyboardButton(text="📄 Page", callback_data="adminpages"),
+         InlineKeyboardButton(text="👁 View", callback_data="adminviews")],
+        [InlineKeyboardButton(text="🧠 DT AI Lab", callback_data="adminai")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminworkers")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
+    ])
+
+
+def admin_active_scans_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminactive")],
+        [InlineKeyboardButton(text="⚙️ Воркеры", callback_data="adminworkers")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
+    ])
+
+
 def admin_view_worker_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminviews")],
-        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
+        [InlineKeyboardButton(text="⬅️ Воркеры", callback_data="adminworkers")],
     ])
 
 
 def admin_page_worker_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminpages")],
-        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
+        [InlineKeyboardButton(text="⬅️ Воркеры", callback_data="adminworkers")],
     ])
 
 
 def admin_date_worker_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="admindates")],
-        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
+        [InlineKeyboardButton(text="⬅️ Воркеры", callback_data="adminworkers")],
     ])
 
 
@@ -6979,6 +6999,136 @@ async def _admin_dashboard_text() -> str:
         f"Успешных: <b>{stats['paid_count']}</b> · ожидают: <b>{stats['pending_payments']}</b>\n"
         f"За 24ч: <b>{stats['paid_24h']:g} USDT</b> · всего: <b>{stats['paid_total']:g} USDT</b>"
     )
+
+
+async def _admin_running_scan_count() -> int:
+    async with SessionLocal() as session:
+        value = (await session.execute(
+            select(func.count(UserScan.id)).where(
+                UserScan.status == "running",
+                UserScan.finished_at.is_(None),
+            )
+        )).scalar_one()
+        return int(value or 0)
+
+
+async def _admin_live_keyboard() -> InlineKeyboardMarkup:
+    ai_unread, active_scans = await asyncio.gather(
+        _ai_unread_signal_count(),
+        _admin_running_scan_count(),
+    )
+    return admin_keyboard(ai_unread, active_scans)
+
+
+def _worker_health_label(status: dict, *, active_key: str = "active_total") -> str:
+    if not status.get("enabled"):
+        return "▫️ выключен"
+    if not status.get("alive"):
+        return "🔴 offline"
+    workers = len(list(status.get("workers") or []))
+    active = int(status.get(active_key, 0) or 0)
+    queue = int(status.get("queue_depth", 0) or 0)
+    return f"🟢 {workers} · активных {active} · очередь {queue}"
+
+
+async def _admin_workers_text() -> str:
+    date_status, page_status, view_status, ai_status = await asyncio.gather(
+        REMOTE_DATE_MANAGER.status(),
+        REMOTE_PAGE_MANAGER.status(),
+        REMOTE_VIEW_MANAGER.status(),
+        AI_MANAGER.status(),
+    )
+    ai_label = "🟢 online" if ai_status.get("alive") else ("🔴 offline" if ai_status.get("enabled") else "▫️ выключен")
+    if ai_status.get("alive") and ai_status.get("paused_for_scans"):
+        ai_label += " · ждёт завершения сканов"
+    total_active = (
+        int(date_status.get("active_total", 0) or 0)
+        + int(page_status.get("active_total", 0) or 0)
+        + int(view_status.get("active_jobs", 0) or 0)
+    )
+    total_queue = (
+        int(date_status.get("queue_depth", 0) or 0)
+        + int(page_status.get("queue_depth", 0) or 0)
+        + int(view_status.get("queue_depth", 0) or 0)
+    )
+    return "\n".join([
+        "<b>⚙️ ВОРКЕРЫ DT PARSER</b>",
+        "",
+        f"📅 Date Worker: <b>{_worker_health_label(date_status)}</b>",
+        f"📄 Page Worker: <b>{_worker_health_label(page_status)}</b>",
+        f"👁 View Worker: <b>{_worker_health_label(view_status, active_key='active_jobs')}</b>",
+        f"🧠 AI Worker: <b>{ai_label}</b>",
+        "",
+        f"Всего активных worker-задач: <b>{total_active}</b>",
+        f"Всего в worker-очередях: <b>{total_queue}</b>",
+        "",
+        "<i>Нажми Date / Page / View ниже, чтобы открыть подробную диагностику конкретного воркера.</i>",
+    ])
+
+
+def _admin_scan_user_label(user: BotUser | None, user_id: int) -> str:
+    if user is not None and user.username:
+        return f"@{html.escape(user.username)}"
+    if user is not None and user.first_name:
+        return html.escape(user.first_name)
+    return f"ID {int(user_id)}"
+
+
+async def _admin_active_scans_text(limit: int = 20) -> str:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(UserScan, BotUser)
+            .outerjoin(BotUser, BotUser.user_id == UserScan.user_id)
+            .where(
+                UserScan.status.in_(ACTIVE_SCAN_STATUSES),
+                UserScan.finished_at.is_(None),
+            )
+            .order_by(UserScan.created_at.asc(), UserScan.id.asc())
+            .limit(max(1, int(limit)))
+        )
+        rows = list(result.all())
+
+    running = [(scan, user) for scan, user in rows if scan.status == "running"]
+    queued = [(scan, user) for scan, user in rows if scan.status == "queued"]
+    cancelling = [(scan, user) for scan, user in rows if scan.status == "cancelling"]
+    lines = [
+        "<b>👀 КТО СЕЙЧАС ПАРСИТ</b>",
+        "",
+        f"🟢 Парсят сейчас: <b>{len(running)}</b> · 🟡 в очереди: <b>{len(queued)}</b>",
+    ]
+    if cancelling:
+        lines[-1] += f" · 🟠 останавливаются: <b>{len(cancelling)}</b>"
+
+    if not rows:
+        lines.extend(["", "Сейчас активных сканов нет."] )
+        return "\n".join(lines)
+
+    now = datetime.utcnow()
+    if running:
+        lines.extend(["", "<b>🟢 Активные сканы</b>"] )
+        for scan, user in running[:12]:
+            elapsed = max(0, int((now - scan.created_at).total_seconds()))
+            lines.extend([
+                f"• <b>{_admin_scan_user_label(user, scan.user_id)}</b> · <code>{scan.user_id}</code>",
+                f"  {html.escape(scan.title or 'Скан')} · {_date_label(scan.target_date)} · {int(scan.page_limit or 0)} стр.",
+                f"  Статус: <b>парсит</b> · идёт <b>{_human_duration(elapsed)}</b>",
+            ])
+
+    if queued:
+        lines.extend(["", "<b>🟡 Очередь</b>"] )
+        for pos, (scan, user) in enumerate(queued[:8], start=1):
+            waited = max(0, int((now - scan.created_at).total_seconds()))
+            lines.append(
+                f"{pos}. <b>{_admin_scan_user_label(user, scan.user_id)}</b> · "
+                f"{html.escape(scan.title or 'Скан')} · {_date_label(scan.target_date)} · "
+                f"{int(scan.page_limit or 0)} стр. · ждёт {_human_duration(waited)}"
+            )
+
+    if cancelling:
+        lines.extend(["", "<b>🟠 Останавливаются</b>"] )
+        for scan, user in cancelling[:5]:
+            lines.append(f"• <b>{_admin_scan_user_label(user, scan.user_id)}</b> · {html.escape(scan.title or 'Скан')}")
+    return "\n".join(lines)
 
 
 async def _admin_view_worker_text() -> str:
@@ -7773,7 +7923,7 @@ async def admin_command(message: Message, state: FSMContext) -> None:
     if not _is_admin(message.from_user.id):
         await message.answer("Нет доступа.")
         return
-    await message.answer(await _admin_dashboard_text(), parse_mode=ParseMode.HTML, reply_markup=admin_keyboard(await _ai_unread_signal_count()))
+    await message.answer(await _admin_dashboard_text(), parse_mode=ParseMode.HTML, reply_markup=await _admin_live_keyboard())
 
 
 @dp.callback_query(F.data == "adminhome")
@@ -7783,7 +7933,7 @@ async def admin_home_handler(callback: CallbackQuery, state: FSMContext) -> None
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer()
-    await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=admin_keyboard(await _ai_unread_signal_count()))
+    await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=await _admin_live_keyboard())
 
 
 @dp.callback_query(F.data == "adminstats")
@@ -7792,7 +7942,33 @@ async def admin_stats_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer()
-    await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=admin_keyboard(await _ai_unread_signal_count()))
+    await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=await _admin_live_keyboard())
+
+
+@dp.callback_query(F.data == "adminworkers")
+async def admin_workers_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message,
+        await _admin_workers_text(),
+        reply_markup=admin_workers_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "adminactive")
+async def admin_active_scans_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message,
+        await _admin_active_scans_text(),
+        reply_markup=admin_active_scans_keyboard(),
+    )
 
 
 @dp.callback_query(F.data == "adminai")
