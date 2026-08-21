@@ -200,6 +200,9 @@ _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
     MENU_IMAGE_PATH = _PROJECT_DIR / "assets" / "dt_parser_menu.png"
+# v4.6.7: after the first upload Telegram gives us a reusable file_id. Reusing
+# it avoids re-uploading the menu image every time the user returns home.
+_MENU_IMAGE_FILE_ID: str | None = None
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
@@ -1123,8 +1126,9 @@ async def archive_active_finished_scans(user_id: int) -> int:
             return int(result.rowcount or 0)
 
 
-async def get_user_scans(user_id: int, limit: int = 10) -> list[UserScan]:
-    await archive_expired_scans(user_id)
+async def get_user_scans(user_id: int, limit: int = 10, *, archive: bool = True) -> list[UserScan]:
+    if archive:
+        await archive_expired_scans(user_id)
     async with SessionLocal() as session:
         result = await session.execute(
             select(UserScan)
@@ -1154,14 +1158,25 @@ async def get_user_archive(user_id: int, page: int = 0, page_size: int = SCAN_AR
         return list(result.scalars().all()), total
 
 
-async def get_archive_count(user_id: int) -> int:
-    await archive_expired_scans(user_id)
+async def get_archive_count(user_id: int, *, archive: bool = True) -> int:
+    if archive:
+        await archive_expired_scans(user_id)
     async with SessionLocal() as session:
         return int((await session.execute(
             select(func.count(UserScan.id)).where(
                 UserScan.user_id == user_id, UserScan.archived_at.is_not(None)
             )
         )).scalar_one())
+
+
+async def get_user_scans_overview(user_id: int, limit: int = 10) -> tuple[list[UserScan], int]:
+    """One archive sweep, then load inbox + archive count in parallel."""
+    await archive_expired_scans(user_id)
+    scans, archive_count = await asyncio.gather(
+        get_user_scans(user_id, limit, archive=False),
+        get_archive_count(user_id, archive=False),
+    )
+    return scans, archive_count
 
 
 async def get_user_popular_categories(user_id: int, limit_scans: int = 100) -> list[tuple[str, UserScan]]:
@@ -7847,7 +7862,17 @@ async def ai_admin_notification_scheduler(bot: Bot) -> None:
 
 
 async def _edit_or_answer(target: Message, text: str, *, reply_markup=None) -> None:
-    """Prefer editing inline-menu messages, but gracefully fall back to a new one."""
+    """Open a UI screen with one Telegram request whenever possible.
+
+    The home menu is a photo message. Calling edit_text() on a photo always
+    produces a Telegram Bad Request, which previously added a full network
+    round-trip before the fallback answer() and made every tab feel 1-2s slow.
+    Media messages now go straight to answer(); text messages still edit in
+    place and keep the old fallback for genuinely stale/non-editable messages.
+    """
+    if not getattr(target, "text", None):
+        await target.answer(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+        return
     try:
         await target.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
     except Exception:
@@ -7858,11 +7883,11 @@ async def _edit_or_answer(target: Message, text: str, *, reply_markup=None) -> N
 async def subscription_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.answer()
-    await _edit_or_answer(
-        callback.message,
-        await subscription_text(callback.from_user.id),
-        reply_markup=await subscription_keyboard(callback.from_user.id),
+    text, markup = await asyncio.gather(
+        subscription_text(callback.from_user.id),
+        subscription_keyboard(callback.from_user.id),
     )
+    await _edit_or_answer(callback.message, text, reply_markup=markup)
 
 
 @dp.callback_query(F.data == "mypayments")
@@ -8981,20 +9006,42 @@ def home_text(selected_count: int, auto_observations: bool = False) -> str:
 
 
 async def _send_home_message(message: Message, user_id: int, *, intro: bool = False) -> None:
-    """Send the branded DT PARSER home card with navigation buttons below it."""
-    selected = await get_selected(user_id)
-    user_settings = await get_settings(user_id)
+    """Send the branded DT PARSER home card with low-latency navigation."""
+    global _MENU_IMAGE_FILE_ID
+    selected, user_settings = await asyncio.gather(
+        get_selected(user_id),
+        get_settings(user_id),
+    )
     auto_enabled = bool(getattr(user_settings, "auto_observations", False))
     markup = main_keyboard(len(selected), admin=_is_admin(user_id), auto_observations=auto_enabled)
     caption = home_text(len(selected), auto_enabled)
 
+    if _MENU_IMAGE_FILE_ID:
+        try:
+            await message.answer_photo(
+                photo=_MENU_IMAGE_FILE_ID,
+                caption=caption,
+                reply_markup=markup,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except Exception:
+            # File IDs can theoretically become unusable after a bot/token
+            # replacement. Drop the cache and upload the local asset once.
+            _MENU_IMAGE_FILE_ID = None
+
     if MENU_IMAGE_PATH.exists():
-        await message.answer_photo(
+        sent = await message.answer_photo(
             photo=FSInputFile(MENU_IMAGE_PATH),
             caption=caption,
             reply_markup=markup,
             parse_mode=ParseMode.HTML,
         )
+        if getattr(sent, "photo", None):
+            try:
+                _MENU_IMAGE_FILE_ID = sent.photo[-1].file_id
+            except Exception:
+                pass
         return
 
     # Safe fallback if the asset was accidentally omitted from a deployment.
@@ -9024,8 +9071,7 @@ async def _send_popular_message(message: Message, user_id: int) -> None:
 
 
 async def _send_my_scans_message(message: Message, user_id: int) -> None:
-    scans = await get_user_scans(user_id, 10)
-    archive_count = await get_archive_count(user_id)
+    scans, archive_count = await get_user_scans_overview(user_id, 10)
     if not scans:
         text = (
             "<b>📊 Мои сканы</b>\n\nСвежих сканов пока нет. После завершения они будут храниться здесь 24 часа, затем уйдут в Архив."
@@ -9042,7 +9088,10 @@ async def _send_my_scans_message(message: Message, user_id: int) -> None:
 
 async def _begin_scan_from_message(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
-    selected_keys = await get_selected(user_id)
+    selected_keys, has_active_scan = await asyncio.gather(
+        get_selected(user_id),
+        user_has_active_scan(user_id),
+    )
     selected_cats = [CATEGORIES[k] for k in CATEGORIES if k in selected_keys]
     if not selected_cats:
         await message.answer(
@@ -9052,7 +9101,7 @@ async def _begin_scan_from_message(message: Message, state: FSMContext) -> None:
         )
         return
 
-    if await user_has_active_scan(user_id):
+    if has_active_scan:
         await message.answer("⏳ У тебя уже идёт парсинг.")
         return
 
@@ -9214,8 +9263,8 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     if not allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
-    user = await get_commerce_user(callback.from_user.id)
     await callback.answer()
+    user = await get_commerce_user(callback.from_user.id)
     if user is not None and not bool(user.onboarding_completed):
         await _edit_or_answer(callback.message, onboarding_text(1), reply_markup=onboarding_keyboard(1))
         return
@@ -9296,8 +9345,8 @@ async def settings(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     if not allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
-    s = await get_settings(callback.from_user.id)
     await callback.answer()
+    s = await get_settings(callback.from_user.id)
     await _edit_or_answer(callback.message, settings_text(s), reply_markup=settings_keyboard(s))
 
 
@@ -9613,8 +9662,8 @@ async def run_view_test(message: Message, state: FSMContext) -> None:
 async def popular_now(callback: CallbackQuery) -> None:
     if not allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
-    items = await get_user_popular_categories(callback.from_user.id)
     await callback.answer()
+    items = await get_user_popular_categories(callback.from_user.id)
     if not items:
         text = (
             "🔥 <b>Популярное</b>\n\n"
@@ -9626,18 +9675,9 @@ async def popular_now(callback: CallbackQuery) -> None:
             "Выбери категорию — показываем только её <b>последний успешный скан</b>.\n"
             "TOP роста доступен по замерам 3 / 6 / 12 часов; автозамеры включаются по желанию."
         )
-    try:
-        await callback.message.edit_text(
-            text, parse_mode=ParseMode.HTML,
-            reply_markup=popular_categories_keyboard(items),
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        await callback.message.answer(
-            text, parse_mode=ParseMode.HTML,
-            reply_markup=popular_categories_keyboard(items),
-            disable_web_page_preview=True,
-        )
+    await _edit_or_answer(
+        callback.message, text, reply_markup=popular_categories_keyboard(items)
+    )
 
 
 @dp.callback_query(F.data.startswith("popularcat:"))
@@ -9772,9 +9812,8 @@ async def my_scans(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     if not allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
-    scans = await get_user_scans(callback.from_user.id, 10)
-    archive_count = await get_archive_count(callback.from_user.id)
     await callback.answer()
+    scans, archive_count = await get_user_scans_overview(callback.from_user.id, 10)
     if not scans:
         text = (
             "<b>📊 Мои сканы</b>\n\nСвежих сканов пока нет. После завершения они будут храниться здесь 24 часа, затем уйдут в Архив."
@@ -10820,7 +10859,10 @@ async def start_scan(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
 
-    selected_keys = await get_selected(callback.from_user.id)
+    selected_keys, has_active_scan = await asyncio.gather(
+        get_selected(callback.from_user.id),
+        user_has_active_scan(callback.from_user.id),
+    )
     selected_cats = [CATEGORIES[k] for k in CATEGORIES if k in selected_keys]
     if not selected_cats:
         await callback.answer("Сначала выбери хотя бы одну категорию", show_alert=True)
@@ -10832,7 +10874,7 @@ async def start_scan(callback: CallbackQuery, state: FSMContext) -> None:
         )
         return
 
-    if await user_has_active_scan(callback.from_user.id):
+    if has_active_scan:
         await callback.answer("У тебя уже идёт парсинг", show_alert=True)
         return
 

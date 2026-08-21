@@ -1,4 +1,4 @@
-# DT Parser v4.6.6 — Language Switch Fix
+# DT Parser v4.6.7 — Fast UI
 
 Production-clean GitHub package.
 
@@ -22,6 +22,15 @@ A new user chooses a language on the first `/start`:
 The choice is saved per user and can later be changed in `⚙️ Настройки / Settings → 🌐 Язык / Language` or with `/language`.
 
 The normal user interface follows the saved language even for admin accounts. The actual admin panel remains Russian.
+
+
+## Fast UI
+
+- media-menu callbacks no longer waste a Telegram API round-trip on an invalid `edit_text`;
+- the main menu reuses Telegram `file_id` after the first image upload;
+- independent PostgreSQL reads are parallelized on the home screen, subscription screen and scan start checks;
+- `Мои сканы / My scans` performs one archive sweep instead of two and loads list/count in parallel;
+- callback spinners are acknowledged before non-critical database reads where safe.
 
 ## Included production features
 
