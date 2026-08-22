@@ -2211,12 +2211,11 @@ def _write_universal_xlsx(
 def write_listing_xlsx(rows: list[Listing], mode: str) -> Path:
     now = datetime.now(MOSCOW)
     headers = [
-        "Раздел", "Категория", "Название", "Цена", "Цена, €", "👁 Просмотры",
+        "Раздел", "Категория", "Название", "Цена, €", "👁 Просмотры",
         "Дата (МСК)", "Как показано на Kleinanzeigen", "Ссылка",
     ]
     data = [[
         _export_section_name(row), row.category, row.title,
-        _price_display(row.price_text, row.price_eur),
         row.price_eur if row.price_eur is not None else None,
         row.view_count if row.view_count is not None else None,
         _date_label(row.posted_date_msk), row.posted_text or "", row.url,
@@ -2252,12 +2251,11 @@ def write_frequent_xlsx(rows) -> Path:
 def write_market_xlsx(rows) -> Path:
     now = datetime.now(MOSCOW)
     headers = [
-        "Раздел", "Категория", "Название", "Цена", "Цена, €", "👁 Просмотры",
+        "Раздел", "Категория", "Название", "Цена, €", "👁 Просмотры",
         "Медиана группы, €", "Ниже медианы, %", "Образцов", "Точность группы, %", "Дата", "Ссылка",
     ]
     data = [[
         _export_section_name(row), row.category, row.title,
-        row.price_text or (f"{row.price_eur} €" if row.price_eur is not None else "—"),
         row.price_eur, getattr(row, "view_count", None), row.median_price,
         row.discount_pct, row.samples, row.confidence, row.posted_text, row.url,
     ] for row in rows]
@@ -2313,13 +2311,12 @@ def write_listing_csv(rows: list[Listing], mode: str) -> Path:
     path, writer, f = _temp_csv(f"kleinanzeigen_{mode}_{now:%Y-%m-%d_%H-%M}.csv")
     try:
         writer.writerow([
-            "Категория", "Название", "Цена", "Цена, €", "👁 Просмотры",
+            "Категория", "Название", "Цена, €", "👁 Просмотры",
             "Дата (МСК)", "Как показано на Kleinanzeigen", "Ссылка"
         ])
         for row in rows:
             writer.writerow([
                 row.category, row.title,
-                _price_display(row.price_text, row.price_eur),
                 row.price_eur if row.price_eur is not None else "",
                 row.view_count if row.view_count is not None else "",
                 _date_label(row.posted_date_msk), row.posted_text or "", row.url,
@@ -2356,12 +2353,12 @@ def write_market_csv(rows) -> Path:
     path, writer, f = _temp_csv(f"kleinanzeigen_nizhe_rynka_{now:%Y-%m-%d_%H-%M}.csv")
     try:
         writer.writerow([
-            "Категория", "Название", "Цена", "Цена, €", "👁 Просмотры", "Медиана группы, €",
+            "Категория", "Название", "Цена, €", "👁 Просмотры", "Медиана группы, €",
             "Ниже медианы, %", "Образцов", "Точность группы, %", "Дата", "Ссылка",
         ])
         for row in rows:
             writer.writerow([
-                row.category, row.title, row.price_text or f"{row.price_eur} €", row.price_eur,
+                row.category, row.title, row.price_eur,
                 getattr(row, "view_count", None) if getattr(row, "view_count", None) is not None else "",
                 row.median_price, row.discount_pct, row.samples, row.confidence, row.posted_text, row.url,
             ])
@@ -3234,6 +3231,9 @@ def _calculate_scan_quality(
         # A verified empty day can still be a valid scan.
         notes.append("объявлений за дату не найдено")
 
+    # `invalid_pages` and `repeated_pages` are mutually exclusive unique-page
+    # counters in v4.8.5. Repeated content is one defect, not a repeated+invalid
+    # double penalty for the same physical page.
     score -= min(30.0, invalid_pages * 10.0)
     score -= min(25.0, repeated_pages * 12.0)
     score -= min(20.0, low_quality_pages * 4.0)
@@ -3627,6 +3627,13 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     low_quality_pages = 0
     verified_pages = 0
     view_failures = 0
+    # v4.8.5 Quality Integrity: quality is about unique logical pages, not
+    # network attempts. A page retried four times must still count as one page.
+    # Snapshots also let a later successful retry remove the earlier penalty.
+    page_quality_metrics: dict[tuple[str, int], dict[str, int]] = {}
+    invalid_page_keys: set[tuple[str, int]] = set()
+    repeated_page_keys: set[tuple[str, int]] = set()
+    low_quality_page_keys: set[tuple[str, int]] = set()
 
     def classify(items):
         profile = profile_page_dates(items, target_day)
@@ -3868,14 +3875,6 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     await mark_promoted_listings(promoted_ids)
                 if not from_checkpoint:
                     network_requests += 1
-                cards_seen += int(getattr(info, "raw_candidates", 0) or 0)
-                listings_parsed += len(info.items)
-                missing_date_count += int(getattr(info, "missing_date_count", 0) or 0)
-                missing_price_count += int(getattr(info, "missing_price_count", 0) or 0)
-                promoted_filtered += int(getattr(info, "promoted_filtered", 0) or 0)
-                duplicate_count += int(getattr(info, "duplicate_cards", 0) or 0)
-                if bool(getattr(info, "page_verified", False)):
-                    verified_pages += 1
                 if getattr(info, "max_page", None):
                     site_max_page = max(1, int(info.max_page))
                     effective_limit = max(1, min(PUBLIC_SEARCH_PAGE_CAP, site_max_page))
@@ -3897,12 +3896,47 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     valid = False
                     repeated = True
                     invalid_note = f"страница {page} повторила содержимое страницы {previous}"
-            if fresh and repeated:
-                repeated_pages += 1
-            if fresh and not valid:
-                invalid_pages += 1
-            if fresh and items and relation == "unknown":
-                low_quality_pages += 1
+            if fresh:
+                metric_key = (str(base_url), int(page))
+                current_metrics = {
+                    "cards": int(getattr(info, "raw_candidates", 0) or 0),
+                    "parsed": len(info.items),
+                    "missing_date": int(getattr(info, "missing_date_count", 0) or 0),
+                    "missing_price": int(getattr(info, "missing_price_count", 0) or 0),
+                    "promoted": int(getattr(info, "promoted_filtered", 0) or 0),
+                    "duplicates": int(getattr(info, "duplicate_cards", 0) or 0),
+                    "verified": 1 if bool(getattr(info, "page_verified", False)) else 0,
+                }
+                previous_metrics = page_quality_metrics.get(metric_key, {})
+                cards_seen += current_metrics["cards"] - int(previous_metrics.get("cards", 0))
+                listings_parsed += current_metrics["parsed"] - int(previous_metrics.get("parsed", 0))
+                missing_date_count += current_metrics["missing_date"] - int(previous_metrics.get("missing_date", 0))
+                missing_price_count += current_metrics["missing_price"] - int(previous_metrics.get("missing_price", 0))
+                promoted_filtered += current_metrics["promoted"] - int(previous_metrics.get("promoted", 0))
+                duplicate_count += current_metrics["duplicates"] - int(previous_metrics.get("duplicates", 0))
+                verified_pages += current_metrics["verified"] - int(previous_metrics.get("verified", 0))
+                page_quality_metrics[metric_key] = current_metrics
+
+                # A repeated-content page is a dedicated defect class; do not also
+                # count it as a generic invalid page. A later healthy retry clears it.
+                if repeated:
+                    repeated_page_keys.add(metric_key)
+                    invalid_page_keys.discard(metric_key)
+                elif not valid:
+                    invalid_page_keys.add(metric_key)
+                    repeated_page_keys.discard(metric_key)
+                else:
+                    invalid_page_keys.discard(metric_key)
+                    repeated_page_keys.discard(metric_key)
+
+                if items and relation == "unknown" and valid:
+                    low_quality_page_keys.add(metric_key)
+                else:
+                    low_quality_page_keys.discard(metric_key)
+
+                invalid_pages = len(invalid_page_keys)
+                repeated_pages = len(repeated_page_keys)
+                low_quality_pages = len(low_quality_page_keys)
 
             if not valid:
                 relation, pairs, days = "invalid", [], []
@@ -4133,26 +4167,40 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                                         "too_deep",
                                         "дата глубже публичного окна; региональная структура подтверждена",
                                     )
-                        # Check the most likely page first, then immediate neighbours.
-                        # This usually turns a 7-12 request local locator into 1-3
-                        # foreground verification requests while preserving truth.
-                        verify_order: list[int] = []
-                        for candidate_page in (
-                            boundary_hint, boundary_hint - 1, boundary_hint + 1,
-                            boundary_hint - 2, boundary_hint + 2, boundary_hint + 3,
-                        ):
-                            if 1 <= candidate_page <= effective_limit and candidate_page not in verify_order:
-                                verify_order.append(candidate_page)
+                        # v4.8.5 Smart Hint Rejection. Verify the hinted page first,
+                        # then move ONE page toward the target based on chronology.
+                        # If both pages say the same direction, the remote hint is far
+                        # off and the proven local locator is cheaper than checking four
+                        # more neighbours. Example: hint=17 -> older, page16 -> older: 
+                        # immediately fall back instead of probing 18/15/19/20 too.
                         remote_confirmed = None
                         remote_weak = False
-                        for verify_page in verify_order:
-                            _vi, verify_relation, _vp, _vd = await stable_fetch(verify_page, "date_verify")
-                            if verify_relation == "target":
-                                remote_confirmed = verify_page
-                                break
-                            if verify_relation in {"unknown", "invalid"}:
-                                remote_weak = True
-                                break
+                        first_relation = None
+                        _vi, first_relation, _vp, _vd = await stable_fetch(boundary_hint, "date_verify")
+                        if first_relation == "target":
+                            remote_confirmed = boundary_hint
+                        elif first_relation in {"unknown", "invalid"}:
+                            remote_weak = True
+                        elif first_relation in {"newer", "older"}:
+                            direction = 1 if first_relation == "newer" else -1
+                            directional_page = boundary_hint + direction
+                            if 1 <= directional_page <= effective_limit:
+                                _vi2, second_relation, _vp2, _vd2 = await stable_fetch(directional_page, "date_verify")
+                                if second_relation == "target":
+                                    remote_confirmed = directional_page
+                                elif second_relation in {"unknown", "invalid"}:
+                                    remote_weak = True
+                                elif second_relation == first_relation:
+                                    log.info(
+                                        "Date Worker directional miss category=%s target=%s hint=%s relation=%s next=%s; local locator fallback",
+                                        cat.name, target_date, boundary_hint, first_relation, directional_page,
+                                    )
+                                # A direction flip without an exact target is a bracket,
+                                # not proof of the first target page. Let the local
+                                # exponential/binary locator resolve it safely.
+                        else:
+                            # Mixed/empty hints are acceleration misses, not errors.
+                            remote_weak = False
                         if remote_confirmed is not None:
                             candidate = remote_confirmed
                             walkback_steps = 0
@@ -4953,9 +5001,21 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         )
 
         if hidden_pages_collected >= goal_pages:
+            # v4.8.5 Integrity Recovery: reaching the numeric page goal is not
+            # sufficient if a feed/page was explicitly left unresolved. Keep the
+            # category partial so the existing bounded auto-recovery pass reuses
+            # strong PostgreSQL checkpoints and refetches only weak/missing areas.
+            if unresolved:
+                request_complete = False
+                hit_limit = True
+                reason = (
+                    f"собрано {hidden_pages_collected}/{goal_pages} подтверждённых страниц, "
+                    "но остался неподтверждённый участок; запускается автодопроверка"
+                )
+                return False, True
             request_complete = True
             reason = f"проверено {depth} реальных страниц выбранной даты"
-            return True, unresolved
+            return True, False
 
         if queue and feeds_processed >= max_hidden_feeds:
             unresolved = True

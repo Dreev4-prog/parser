@@ -1,4 +1,4 @@
-# DT PARSER v4.8.4 — Scan Integrity
+# DT PARSER v4.8.5 — Integrity Recovery
 
 Основа: v4.8.3 Reliable Core.
 
@@ -7,6 +7,15 @@
 Все P0-исправления v4.8.3 (resilient traffic, versioned Redis runtime, fresh-jobs-first, dynamic page identity, 450ms Page wait, View sharding) сохранены.
 
 Основа релиза — проверенная ветка Golden Core, но теперь исправлены именно узкие места, которые мешали бесперебойной работе при 403, рестартах Railway и обычных батчах просмотров.
+
+## v4.8.5
+
+- quality по уникальным страницам, без штрафа за каждый retry;
+- repeated-content не считается ещё раз generic invalid;
+- unresolved region/page запрещает ложный `done` и запускает bounded auto-recovery;
+- Date Worker далёкий hint отбрасывается после двух направленных проверок;
+- обычный XLSX/CSV: одна `Цена, €` + отдельные `👁 Просмотры`.
+
 
 ## Что изменено
 
