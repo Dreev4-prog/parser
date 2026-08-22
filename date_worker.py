@@ -47,7 +47,13 @@ os.environ["DIST_TRAFFIC_COOLDOWN_BUCKET"] = "search-fleet"
 os.environ["DIST_TRAFFIC_SCAN_LIMIT"] = "4"
 os.environ["DIST_TRAFFIC_BROWSER_LIMIT"] = "2"
 os.environ["DIST_TRAFFIC_GLOBAL_LIMIT"] = "8"
-os.environ["DIST_TRAFFIC_SHARED_COOLDOWN"] = "1"
+os.environ["DIST_TRAFFIC_SHARED_COOLDOWN"] = "0"
+os.environ["TRAFFIC_MAX_PENALTY_LEVEL"] = "1"
+os.environ["TRAFFIC_403_COOLDOWN_SECONDS"] = "0"
+os.environ["TRAFFIC_429_COOLDOWN_SECONDS"] = "3"
+os.environ["TRAFFIC_MAX_COOLDOWN_SECONDS"] = "3"
+os.environ["TRAFFIC_RECOVERY_SUCCESS_COUNT"] = "10"
+os.environ["TRAFFIC_RECOVERY_QUIET_SECONDS"] = "10"
 
 from app_version import APP_VERSION
 from parser import KleinanzeigenParser, TemporaryAccessError, profile_page_dates, shutdown_shared_browser_runtime

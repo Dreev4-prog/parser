@@ -66,10 +66,16 @@ class AdaptiveTrafficManager:
         self.scan_min_interval = _env_float("TRAFFIC_SCAN_MIN_INTERVAL_SECONDS", 0.55, 0.0, 5.0)
         self.view_min_interval = _env_float("TRAFFIC_VIEW_MIN_INTERVAL_SECONDS", 0.20, 0.0, 2.0)
         self.browser_min_interval = _env_float("TRAFFIC_BROWSER_MIN_INTERVAL_SECONDS", 0.75, 0.0, 10.0)
-        self.base_cooldown = _env_float("TRAFFIC_403_COOLDOWN_SECONDS", 8.0, 1.0, 60.0)
-        self.max_cooldown = _env_float("TRAFFIC_MAX_COOLDOWN_SECONDS", 60.0, 5.0, 240.0)
-        self.recovery_successes = _env_int("TRAFFIC_RECOVERY_SUCCESS_COUNT", 60, 10, 1000)
-        self.recovery_quiet_seconds = _env_float("TRAFFIC_RECOVERY_QUIET_SECONDS", 60.0, 10.0, 600.0)
+        # Refusal handling keeps the historical defaults unless a worker selects
+        # the fast-local profile. 403 may use a zero hard-pause: the refused
+        # request still fails normally, but the process keeps a live lane instead
+        # of freezing every local consumer. 429 retains its own bounded pause.
+        self.base_cooldown = _env_float("TRAFFIC_403_COOLDOWN_SECONDS", 8.0, 0.0, 60.0)
+        self.rate_limit_cooldown = _env_float("TRAFFIC_429_COOLDOWN_SECONDS", self.base_cooldown, 0.0, 60.0)
+        self.max_cooldown = _env_float("TRAFFIC_MAX_COOLDOWN_SECONDS", 60.0, 0.0, 240.0)
+        self.max_penalty = _env_int("TRAFFIC_MAX_PENALTY_LEVEL", 3, 0, 3)
+        self.recovery_successes = _env_int("TRAFFIC_RECOVERY_SUCCESS_COUNT", 60, 1, 1000)
+        self.recovery_quiet_seconds = _env_float("TRAFFIC_RECOVERY_QUIET_SECONDS", 60.0, 0.5, 600.0)
 
         self._condition = asyncio.Condition()
         self._active = {"scan": 0, "view": 0, "browser": 0}
@@ -156,14 +162,19 @@ class AdaptiveTrafficManager:
             self._success_since_penalty = 0
             self._prune_refusals(now)
 
-            # One refusal already lowers concurrency. A cluster makes the cooldown
-            # progressively longer, but it remains bounded and self-recovers.
-            self._penalty = min(3, self._penalty + 1)
+            # Keep a bounded local penalty. Dedicated workers can cap this at one
+            # level so repeated 403s reduce pressure without entering an exponential
+            # emergency mode. A 403 profile may intentionally use zero hard-pause;
+            # a 429 can retain a short local pause because it is an explicit rate limit.
+            self._penalty = min(self.max_penalty, self._penalty + 1)
             cluster = max(1, len(self._refusals))
-            cooldown = min(self.max_cooldown, self.base_cooldown * (2 ** (self._penalty - 1)))
-            if cluster >= 3:
-                cooldown = min(self.max_cooldown, cooldown * 1.5)
-            self._cooldown_until = max(self._cooldown_until, now + cooldown)
+            base = self.rate_limit_cooldown if int(status_code) == 429 else self.base_cooldown
+            if base > 0.0 and self.max_cooldown > 0.0:
+                exponent = max(0, self._penalty - 1)
+                cooldown = min(self.max_cooldown, base * (2 ** exponent))
+                if cluster >= 3 and self.max_penalty > 1:
+                    cooldown = min(self.max_cooldown, cooldown * 1.5)
+                self._cooldown_until = max(self._cooldown_until, now + cooldown)
             self._condition.notify_all()
         if DISTRIBUTED_WORKERS and DIST_TRAFFIC_SHARED_COOLDOWN:
             try:

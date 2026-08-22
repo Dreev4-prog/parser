@@ -70,14 +70,14 @@ BROWSER_POOL = _env_int("VIEW_WORKER_BROWSER_POOL_SIZE", 1, 1, 4)
 VIEW_INTERVAL = _env_float("VIEW_WORKER_VIEW_MIN_INTERVAL_SECONDS", 0.05, 0.0, 2.0)
 ADAPTIVE_ENABLED = _env_bool("VIEW_WORKER_ADAPTIVE_ENABLED", True)
 ADAPTIVE_HEALTHY_ROUNDS = _env_int("VIEW_WORKER_ADAPTIVE_HEALTHY_ROUNDS", 2, 1, 20)
-ADAPTIVE_BACKOFF_SECONDS = _env_float("VIEW_WORKER_ADAPTIVE_BACKOFF_SECONDS", 8.0, 1.0, 120.0)
+ADAPTIVE_BACKOFF_SECONDS = _env_float("VIEW_WORKER_ADAPTIVE_BACKOFF_SECONDS", 3.0, 1.0, 120.0)
 ADAPTIVE_FALLBACK_WARN_RATIO = _env_float("VIEW_WORKER_ADAPTIVE_FALLBACK_WARN_RATIO", 0.12, 0.01, 1.0)
 ADAPTIVE_UNKNOWN_WARN_RATIO = _env_float("VIEW_WORKER_ADAPTIVE_UNKNOWN_WARN_RATIO", 0.05, 0.0, 1.0)
 
 # v4.3.36 FOUR-USER VIEW FLEET GUARD.
 # Four Railway View Worker replicas share one Redis traffic budget. Adding the
 # fourth replica increases distribution/recovery capacity, not request pressure:
-# the fleet-wide view budget stays capped at 16 and 403/429 cooldown is shared.
+# the fleet-wide view budget stays capped at 16 while refusal backoff stays local to each replica.
 # Main bot / Date / Page workers keep their existing proven traffic modes.
 os.environ["STABLE_SINGLE_SERVICE_MODE"] = "0"
 os.environ["DIST_TRAFFIC_VIEW_BUCKET"] = "view"
@@ -87,6 +87,14 @@ os.environ["DIST_TRAFFIC_COOLDOWN_BUCKET"] = "view-fleet"
 os.environ["DIST_TRAFFIC_VIEW_LIMIT"] = "16"
 os.environ["DIST_TRAFFIC_GLOBAL_LIMIT"] = "16"
 os.environ["DIST_TRAFFIC_BROWSER_LIMIT"] = "1"
+
+os.environ["DIST_TRAFFIC_SHARED_COOLDOWN"] = "0"
+os.environ["TRAFFIC_MAX_PENALTY_LEVEL"] = "1"
+os.environ["TRAFFIC_403_COOLDOWN_SECONDS"] = "0"
+os.environ["TRAFFIC_429_COOLDOWN_SECONDS"] = "3"
+os.environ["TRAFFIC_MAX_COOLDOWN_SECONDS"] = "3"
+os.environ["TRAFFIC_RECOVERY_SUCCESS_COUNT"] = "10"
+os.environ["TRAFFIC_RECOVERY_QUIET_SECONDS"] = "10"
 
 # The TrafficManager is created during parser import. Give it the physical MAX;
 # the worker later lowers base_view_limit to current_pool before every round.
@@ -606,10 +614,10 @@ class ViewCounterWorker:
         now = time.monotonic()
         if new_refusals > 0 or penalty_level > 0:
             old = self.current_pool
-            self.current_pool = max(VIEW_POOL_MIN, self.current_pool - 2)
+            self.current_pool = max(VIEW_POOL_MIN, self.current_pool - 1)
             self.healthy_rounds = 0
             self.growth_blocked_until = now + ADAPTIVE_BACKOFF_SECONDS
-            self.last_adaptive_reason = f"refusal/penalty: {old}->{self.current_pool}"
+            self.last_adaptive_reason = f"refusal/local-soft: {old}->{self.current_pool}"
         elif fallback_ratio >= ADAPTIVE_FALLBACK_WARN_RATIO or unknown_ratio >= ADAPTIVE_UNKNOWN_WARN_RATIO:
             old = self.current_pool
             self.current_pool = max(VIEW_POOL_MIN, self.current_pool - 1)
