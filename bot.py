@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import copy
 import json
 from collections import Counter
 from contextvars import ContextVar
@@ -1428,8 +1429,16 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
             if scan_settings is None:
                 scan_settings = UserSettings(user_id=job.user_id)
             scan_settings.price_filter = job.price_filter or "any"
+            effective_settings = scan_settings
+            if job.incomplete_categories:
+                # v4.8.6: a partial crawl deliberately skips the final views phase.
+                # Do not turn hundreds of confirmed rows into a fake zero merely
+                # because a min-views filter cannot yet be evaluated. Preserve a
+                # provisional snapshot with every non-view filter still applied.
+                effective_settings = copy.copy(scan_settings)
+                effective_settings.min_views = 0
             rows = apply_listing_settings(
-                rows, scan_settings, exact_date_scan=True, apply_output_mode=True
+                rows, effective_settings, exact_date_scan=True, apply_output_mode=True
             )
 
             scan.result_count = len(rows)
@@ -1463,7 +1472,10 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
                     ))
             await session.commit()
 
-    if not cancelled:
+    if not cancelled and job.incomplete_categories == 0:
+        # v4.8.6: automatic view observations belong only to a fully confirmed
+        # snapshot. A partial scan must not start background view rounds behind
+        # the integrity gate.
         await ensure_scan_observation_plan(job.scan_id, now)
 
 
@@ -3611,6 +3623,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     hit_limit = False
     collection_start_page = 0
     direct_pages_collected = 0
+    collection_pages_confirmed = 0
     network_requests = 0
     max_page_reached = 0
 
@@ -4622,7 +4635,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         failure can stop the direct pass. Regional hidden-fill is reserved for a
         real public-window/depth problem.
         """
-        nonlocal direct_pages_collected, collection_start_page, request_complete, reason, hit_limit
+        nonlocal direct_pages_collected, collection_pages_confirmed, collection_start_page, request_complete, reason, hit_limit
         candidate = int(locator["candidate"])
         limit = int(locator["limit"])
         fetch = locator["fetch"]
@@ -4688,6 +4701,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 if target_on_page:
                     await process_target_items(items, pairs)
                     direct_pages_collected += 1
+                    collection_pages_confirmed += 1
                     update_live(page, days, "collecting", direct_pages_collected)
                     if direct_pages_collected >= depth:
                         request_complete = True
@@ -4712,6 +4726,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
 
             if target_on_page or relation == "target":
                 direct_pages_collected += 1
+                collection_pages_confirmed += 1
                 update_live(page, days, "collecting", direct_pages_collected)
                 await process_target_items(items, pairs)
                 if direct_pages_collected >= depth:
@@ -4810,7 +4825,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         discovered from that category page. Nothing from the previous selected
         category is reused.
         """
-        nonlocal request_complete, reason, hit_limit
+        nonlocal request_complete, reason, hit_limit, collection_pages_confirmed
         if remaining_virtual_pages <= 0:
             return True, False
 
@@ -4976,6 +4991,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 if target_on_page:
                     await process_target_items(items, pairs)
                     hidden_pages_collected += 1
+                    collection_pages_confirmed += 1
                     update_live(
                         page, days, "collecting",
                         direct_pages_collected + hidden_pages_collected,
@@ -5001,20 +5017,21 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         )
 
         if hidden_pages_collected >= goal_pages:
-            # v4.8.5 Integrity Recovery: reaching the numeric page goal is not
-            # sufficient if a feed/page was explicitly left unresolved. Keep the
-            # category partial so the existing bounded auto-recovery pass reuses
-            # strong PostgreSQL checkpoints and refetches only weak/missing areas.
-            if unresolved:
-                request_complete = False
-                hit_limit = True
-                reason = (
-                    f"собрано {hidden_pages_collected}/{goal_pages} подтверждённых страниц, "
-                    "но остался неподтверждённый участок; запускается автодопроверка"
-                )
-                return False, True
+            # v4.8.6 Coverage Integrity: the user's depth is a count of VERIFIED
+            # target-date pages, not a requirement that every regional feed remain
+            # flawless. If one regional page repeats/normalizes but another
+            # independent region supplies a verified replacement, 50/50 really is
+            # 50 confirmed pages and the crawl is complete. Only a verified-page
+            # shortfall may produce a partial scan.
             request_complete = True
-            reason = f"проверено {depth} реальных страниц выбранной даты"
+            hit_limit = False
+            if unresolved:
+                reason = (
+                    f"проверено {depth} подтверждённых страниц выбранной даты; "
+                    "один слабый региональный участок заменён другой подтверждённой страницей"
+                )
+            else:
+                reason = f"проверено {depth} реальных страниц выбранной даты"
             return True, False
 
         if queue and feeds_processed >= max_hidden_feeds:
@@ -5029,8 +5046,8 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
 
         hit_limit = True
         reason = (
-            f"частичный результат: выбранная дата проверена не во всех частях категории; "
-            f"собрано {today_seen} объявлений выбранной даты"
+            f"частичный результат: подтверждено {collection_pages_confirmed}/{depth} страниц; "
+            f"собрано {today_seen} объявлений выбранной даты после локальных повторов"
         )
         return False, True
 
@@ -5155,7 +5172,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         elif need_view_counts and deferred_view_items and not request_complete:
             log.warning(
                 "Deferred views skipped for incomplete crawl category=%s target=%s confirmed_pages=%s/%s reason=%s",
-                cat.name, target_date, direct_pages_collected, depth, reason,
+                cat.name, target_date, collection_pages_confirmed, depth, reason,
             )
 
         quality_score, quality_note = _calculate_scan_quality(
@@ -5871,38 +5888,44 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
         except Exception:
             log.exception("Could not load snapshot rows for job=%s", job.job_id)
 
-    try:
-        result_prefix = (
-            "📄 <b>Результат скана</b>\n"
-            f"📅 {_date_label(job.target_date)} · 🗂 {job.completed_categories}/{len(job.category_keys)} категорий"
-        )
-        adapter = BotChatAdapter(
-            bot,
-            job.chat_id,
-            prefix=result_prefix,
-            reply_markup=post_scan_keyboard(job.scan_id, recheck=bool(job.incomplete_categories)),
-        )
-        result_count = await send_smart_export(
-            adapter,
-            job.user_id,
-            len(job.category_keys),
-            category_keys_override=set(job.category_keys),
-            rows_override=snapshot_rows,
-            price_filter_override=job.price_filter,
-        )
-        export_ok = True
-    except Exception:
-        log.exception("Could not auto-export result for job=%s", job.job_id)
+    if job.incomplete_categories:
+        # v4.8.6: partial data is provisional. Do not run the final smart export
+        # (especially min-views filtering) before the views phase has legally run.
+        # The confirmed rows are saved and remain available from the scan card.
+        result_count = len(job.matched_ids or set())
+    else:
         try:
-            await bot.send_message(
-                job.chat_id,
-                "⚠️ <b>Результат сохранён, но XLSX не отправился.</b>\n\n"
-                "Открой скан — файл можно скачать повторно.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=post_scan_keyboard(job.scan_id, recheck=bool(job.incomplete_categories)),
+            result_prefix = (
+                "📄 <b>Результат скана</b>\n"
+                f"📅 {_date_label(job.target_date)} · 🗂 {job.completed_categories}/{len(job.category_keys)} категорий"
             )
+            adapter = BotChatAdapter(
+                bot,
+                job.chat_id,
+                prefix=result_prefix,
+                reply_markup=post_scan_keyboard(job.scan_id, recheck=False),
+            )
+            result_count = await send_smart_export(
+                adapter,
+                job.user_id,
+                len(job.category_keys),
+                category_keys_override=set(job.category_keys),
+                rows_override=snapshot_rows,
+                price_filter_override=job.price_filter,
+            )
+            export_ok = True
         except Exception:
-            pass
+            log.exception("Could not auto-export result for job=%s", job.job_id)
+            try:
+                await bot.send_message(
+                    job.chat_id,
+                    "⚠️ <b>Результат сохранён, но XLSX не отправился.</b>\n\n"
+                    "Открой скан — файл можно скачать повторно.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=post_scan_keyboard(job.scan_id, recheck=False),
+                )
+            except Exception:
+                pass
 
     quality_values = [int(x) for x in (job.quality_scores or []) if x is not None]
     quality_avg = round(sum(quality_values) / len(quality_values)) if quality_values else 0
@@ -5914,7 +5937,10 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
         f"🗂 Категории: <b>{job.completed_categories}/{len(job.category_keys)}</b>",
     ]
     if result_count is not None:
-        lines.append(f"📦 В результате: <b>{result_count}</b>")
+        if job.incomplete_categories:
+            lines.append(f"📦 Подтверждено объявлений: <b>{result_count}</b>")
+        else:
+            lines.append(f"📦 В результате: <b>{result_count}</b>")
     if job.auto_recovered_categories:
         lines.append(f"🔧 Автовосстановлено: <b>{job.auto_recovered_categories}</b> категорий")
     if job.incomplete_categories:
@@ -5931,8 +5957,8 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
             lines.append("🔔 Автозамеры: <b>⛔ ВЫКЛ</b> · ручное обновление доступно всегда")
     if job.incomplete_categories:
         result_tail = (
-            "Подтверждённые данные сохранены. Нулевой результат не считается окончательным, "
-            "пока сервер не подтвердил все участки."
+            "Подтверждённые объявления сохранены. Финальные фильтры по просмотрам и итоговый XLSX "
+            "применяются только после полного подтверждения глубины."
         )
     elif export_ok and result_count:
         result_tail = "📊 XLSX отправлен ниже."

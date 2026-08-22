@@ -1,36 +1,11 @@
-# DT PARSER v4.8.5 — Integrity Recovery
+# DT PARSER v4.8.6 — Coverage Complete
 
-Основа: v4.8.3 Reliable Core.
+Основа: v4.8.5 Integrity Recovery / Golden Core.
 
-Ключевой integrity-fix: просмотры запускаются только после полностью подтверждённого crawl (`request_complete=True`). Частичный проход больше не перескакивает в фазу Views. Сначала выполняется автоматическая допроверка слабых/пропущенных участков; только успешный полный проход собирает просмотры. Если восстановление не завершилось, scan остаётся partial и подтверждённые данные сохраняются без ложного финального этапа.
+Главное изменение 4.8.6: integrity определяется по количеству реально подтверждённых target-date страниц. Если пользователь запросил 50 страниц и система действительно собрала 50 валидных страниц, единичный `repeated-content` в одном региональном feed не делает весь scan ложным partial — слабая страница не используется, а глубина добирается другой подтверждённой страницей.
 
-Все P0-исправления v4.8.3 (resilient traffic, versioned Redis runtime, fresh-jobs-first, dynamic page identity, 450ms Page wait, View sharding) сохранены.
+При настоящем shortfall Views не запускаются, partial сохраняет подтверждённые объявления без ложного `0`, а фоновые автозамеры не планируются до полного scan.
 
-Основа релиза — проверенная ветка Golden Core, но теперь исправлены именно узкие места, которые мешали бесперебойной работе при 403, рестартах Railway и обычных батчах просмотров.
+Сохранены: resilient 403/429 traffic, Redis runtime isolation, fresh-jobs-first, dynamic page identity, 450ms Page wait, View sharding, Smart Date Hint, unique-page quality и чистый XLSX (`Цена, €` + `👁 Просмотры`).
 
-## v4.8.5
-
-- quality по уникальным страницам, без штрафа за каждый retry;
-- repeated-content не считается ещё раз generic invalid;
-- unresolved region/page запрещает ложный `done` и запускает bounded auto-recovery;
-- Date Worker далёкий hint отбрасывается после двух направленных проверок;
-- обычный XLSX/CSV: одна `Цена, €` + отдельные `👁 Просмотры`.
-
-
-## Что изменено
-
-- основной Bot/local fallback использует тот же короткий resilient traffic profile, что Date/Page/View Worker;
-- 403 больше не держит отдельную страницу/scan lane десятки секунд: максимум один короткий retry;
-- 429 сохраняет короткую локальную паузу до ~3 секунд;
-- Redis runtime Date/Page/View отделён от долгоживущего cache и имеет namespace `runtime:v483`;
-- свежие jobs обслуживаются раньше crash-recovery/XAUTOCLAIM;
-- Page Worker не отклоняет правильную `/seite:N` страницу только из-за старого предположения «ровно 25 слотов»;
-- foreground ждёт Page cache 450 мс вместо 1800 мс;
-- обычный батч 50–60 просмотров теперь шардируется примерно на 4 View Worker, а не отдаётся одной реплике;
-- RU/EN, админка, AI Lab и Product Opportunity Engine сохранены.
-
-## Что намеренно не трогали
-
-Фильтры, финальную проверку даты, Stable Engine, извлечение объявлений и алгоритм точного счётчика просмотров. Цель 4.8.3 — убрать искусственные паузы и плохое распределение работы, не менять смысл результатов.
-
-Подробности: `DEPLOY_V4_8_3_RELIABLE_CORE.md`.
+Подробнее: `DEPLOY_V4_8_6_COVERAGE_COMPLETE.md`.
