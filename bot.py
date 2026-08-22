@@ -35,6 +35,7 @@ os.environ["TRAFFIC_RECOVERY_QUIET_SECONDS"] = "10"
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -539,14 +540,30 @@ class AdminInput(StatesGroup):
     user_search = State()
     plan_price = State()
     custom_days = State()
+    broadcast_content = State()
 
 
 def allowed(user_id: int) -> bool:
     return has_access(int(user_id), ADMIN_IDS)
 
 
+def read_only_history_allowed(user_id: int) -> bool:
+    """Allow expired subscribers to keep access to their own saved scan history.
+
+    This deliberately does not grant parser/network work. Banned users remain blocked,
+    and admin-only mode keeps its original closed semantics.
+    """
+    uid = int(user_id)
+    if uid in ADMIN_IDS or allowed(uid):
+        return True
+    if is_banned_cached(uid):
+        return False
+    return current_access_mode() == "subscription"
+
+
 def main_keyboard(
-    selected_count: int = 0, *, admin: bool = False, auto_observations: bool | None = None
+    selected_count: int = 0, *, admin: bool = False, auto_observations: bool | None = None,
+    access_active: bool = True,
 ) -> InlineKeyboardMarkup:
     """Product-style home screen with one clear primary action."""
     if auto_observations is True:
@@ -555,15 +572,22 @@ def main_keyboard(
         auto_label = "⏱ Автозамеры · ⛔ ВЫКЛ"
     else:
         auto_label = "⏱ Автозамеры"
-    rows = [
-        [InlineKeyboardButton(text="▶️ Новый скан", callback_data="start_scan")],
-        [InlineKeyboardButton(text="🔥 Популярное", callback_data="popular_now"),
-         InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
-        [InlineKeyboardButton(text=f"🗂 Категории · {selected_count}/{MAX_SELECTED_CATEGORIES}", callback_data="groups"),
-         InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
-        [InlineKeyboardButton(text=auto_label, callback_data="auto_obs_menu")],
-        [InlineKeyboardButton(text="💎 Подписка", callback_data="subscription")],
-    ]
+    if access_active:
+        rows = [
+            [InlineKeyboardButton(text="▶️ Новый скан", callback_data="start_scan")],
+            [InlineKeyboardButton(text="🔥 Популярное", callback_data="popular_now"),
+             InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
+            [InlineKeyboardButton(text=f"🗂 Категории · {selected_count}/{MAX_SELECTED_CATEGORIES}", callback_data="groups"),
+             InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
+            [InlineKeyboardButton(text=auto_label, callback_data="auto_obs_menu")],
+            [InlineKeyboardButton(text="💎 Подписка", callback_data="subscription")],
+        ]
+    else:
+        rows = [
+            [InlineKeyboardButton(text="🔒 Новый скан", callback_data="start_scan")],
+            [InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
+            [InlineKeyboardButton(text="💎 Продлить подписку", callback_data="subscription")],
+        ]
     if admin:
         rows.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="adminhome")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -6962,6 +6986,7 @@ def admin_keyboard(ai_unread: int = 0, active_scans: int = 0) -> InlineKeyboardM
         [InlineKeyboardButton(text="🎟 Тарифы", callback_data="adminplans"),
          InlineKeyboardButton(text="🔐 Режим доступа", callback_data="adminmode")],
         [InlineKeyboardButton(text="🔎 Найти пользователя", callback_data="adminusersearch")],
+        [InlineKeyboardButton(text="📣 Рассылка", callback_data="adminbroadcast")],
         [InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
     ])
 
@@ -6969,6 +6994,20 @@ def admin_keyboard(ai_unread: int = 0, active_scans: int = 0) -> InlineKeyboardM
 def admin_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")]
+    ])
+
+
+def admin_broadcast_preview_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 Отправить всем", callback_data="adminbroadcast:send")],
+        [InlineKeyboardButton(text="✏️ Заменить пост", callback_data="adminbroadcast:replace")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adminbroadcast:cancel")],
+    ])
+
+
+def admin_broadcast_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
     ])
 
 
@@ -7256,18 +7295,12 @@ class ActivityAccessMiddleware(BaseMiddleware):
         if uid in ADMIN_IDS or allowed(uid):
             return await handler(event, data)
 
-        # /start and subscription/payment callbacks must stay reachable without access.
+        # /start, the read-only home/history, and subscription/payment callbacks
+        # stay reachable after a subscription expires. Parser/network actions remain gated.
         if isinstance(event, Message):
             text = (event.text or "").strip()
-            if text.startswith("/start"):
-                return await handler(event, data)
-            if text.startswith("/admin"):
-                return await handler(event, data)
-            if text.startswith("/subscription"):
-                return await handler(event, data)
-            if text.startswith("/help"):
-                return await handler(event, data)
-            if text.startswith("/language"):
+            public_commands = ("/start", "/menu", "/my_scans", "/admin", "/subscription", "/help", "/language")
+            if text.startswith(public_commands):
                 return await handler(event, data)
             await send_access_screen(event, uid)
             return None
@@ -7280,7 +7313,22 @@ class ActivityAccessMiddleware(BaseMiddleware):
             if is_banned_cached(uid):
                 await event.answer("Доступ заблокирован", show_alert=True)
                 return None
-            await event.answer("Нужна активная подписка", show_alert=True)
+
+            readonly_exact = {"home", "post_home", "my_scans", "archive_my_scans", "archive_noop"}
+            readonly_prefixes = (
+                "scan_archive:", "scan:", "scanproducts:", "scantop:", "scantop50:",
+                "scangrowth:", "scangrowthexport:", "scanhistory:", "scanexport:",
+            )
+            if read_only_history_allowed(uid) and (
+                callback_data in readonly_exact or callback_data.startswith(readonly_prefixes)
+            ):
+                return await handler(event, data)
+
+            if callback_data == "start_scan" or callback_data.startswith(("scanrepeat:", "scanrecheck:", "scanviews:")):
+                alert = "Для этого действия нужна активная подписка"
+            else:
+                alert = "Нужна активная подписка"
+            await event.answer(alert, show_alert=True)
             if event.message:
                 await send_access_screen(event.message, uid)
             return None
@@ -8409,6 +8457,169 @@ async def admin_pages_handler(callback: CallbackQuery) -> None:
     )
 
 
+async def _broadcast_recipient_ids() -> list[int]:
+    """All registered, non-banned bot users; expired subscribers are included."""
+    async with SessionLocal() as session:
+        rows = (await session.execute(
+            select(BotUser.user_id)
+            .where(BotUser.is_banned.is_(False))
+            .order_by(BotUser.user_id.asc())
+        )).scalars().all()
+    return [int(uid) for uid in rows]
+
+
+@dp.callback_query(F.data == "adminbroadcast")
+async def admin_broadcast_begin(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdminInput.broadcast_content)
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message,
+        "<b>📣 Рассылка пользователям</b>\n\n"
+        "Отправь сюда готовый пост в одном из форматов:\n"
+        "• обычный текст;\n"
+        "• фотография;\n"
+        "• фотография + подпись.\n\n"
+        "Я покажу предпросмотр и ничего не отправлю без отдельного подтверждения. "
+        "Рассылка идёт всем зарегистрированным пользователям бота, включая пользователей с истёкшей подпиской; заблокированные администратором аккаунты пропускаются.",
+        reply_markup=admin_broadcast_back_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "adminbroadcast:replace")
+async def admin_broadcast_replace(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdminInput.broadcast_content)
+    await callback.answer()
+    await callback.message.answer(
+        "✏️ Отправь новый текст, фото или фото с подписью.",
+        reply_markup=admin_broadcast_back_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "adminbroadcast:cancel")
+async def admin_broadcast_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await callback.answer("Рассылка отменена")
+    await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=await _admin_live_keyboard())
+
+
+@dp.message(AdminInput.broadcast_content)
+async def admin_broadcast_content_message(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message.from_user.id):
+        await state.clear()
+        return
+    # v4.8.7 deliberately supports the three launch formats only. Keeping the
+    # source Telegram message lets copy_message preserve entities/caption/photo
+    # quality without re-uploading media or adding a "Forwarded from" header.
+    if not message.text and not message.photo:
+        await message.answer("⚠️ Поддерживается текст, фото или фото с подписью. Отправь пост ещё раз.")
+        return
+    await state.update_data(
+        broadcast_source_chat_id=int(message.chat.id),
+        broadcast_source_message_id=int(message.message_id),
+        broadcast_kind="photo" if message.photo else "text",
+    )
+    recipients = await _broadcast_recipient_ids()
+    await message.answer("<b>👁 Предпросмотр</b>", parse_mode=ParseMode.HTML)
+    try:
+        await message.bot.copy_message(
+            chat_id=message.chat.id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+    except Exception:
+        log.warning("Broadcast preview copy failed", exc_info=True)
+    await message.answer(
+        f"<b>📣 Готово к рассылке</b>\n\nПолучателей: <b>{len(recipients)}</b>.\n"
+        "Проверь пост выше и подтверди отправку.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_broadcast_preview_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "adminbroadcast:send")
+async def admin_broadcast_send(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    data = await state.get_data()
+    source_chat_id = int(data.get("broadcast_source_chat_id") or 0)
+    source_message_id = int(data.get("broadcast_source_message_id") or 0)
+    if not source_chat_id or not source_message_id:
+        await callback.answer("Сначала подготовь пост", show_alert=True)
+        await state.clear()
+        return
+
+    recipients = await _broadcast_recipient_ids()
+    await state.clear()
+    await callback.answer("Рассылка запущена")
+    progress = await callback.message.answer(
+        f"📣 <b>Рассылка запущена</b>\nПолучателей: <b>{len(recipients)}</b>\nОтправлено: <b>0</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    sent = 0
+    blocked = 0
+    failed = 0
+    for index, uid in enumerate(recipients, start=1):
+        try:
+            try:
+                await callback.bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=source_chat_id,
+                    message_id=source_message_id,
+                )
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(float(exc.retry_after) + 0.2)
+                await callback.bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=source_chat_id,
+                    message_id=source_message_id,
+                )
+            sent += 1
+        except TelegramForbiddenError:
+            blocked += 1
+        except TelegramBadRequest:
+            failed += 1
+        except Exception:
+            failed += 1
+            log.warning("Broadcast delivery failed user=%s", uid, exc_info=True)
+
+        # Keep comfortably below Telegram's common broadcast-rate ceiling and
+        # avoid making the bot less responsive while a campaign is running.
+        await asyncio.sleep(0.055)
+        if index % 25 == 0 and index < len(recipients):
+            try:
+                await progress.edit_text(
+                    f"📣 <b>Рассылка выполняется</b>\n"
+                    f"Обработано: <b>{index}/{len(recipients)}</b>\n"
+                    f"Отправлено: <b>{sent}</b> · недоступны: <b>{blocked}</b> · ошибки: <b>{failed}</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+    await progress.edit_text(
+        "✅ <b>Рассылка завершена</b>\n\n"
+        f"Всего получателей: <b>{len(recipients)}</b>\n"
+        f"Доставлено: <b>{sent}</b>\n"
+        f"Бот заблокирован / чат недоступен: <b>{blocked}</b>\n"
+        f"Другие ошибки: <b>{failed}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_back_keyboard(),
+    )
+
+
 @dp.callback_query(F.data == "adminusers")
 async def admin_users_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
@@ -9026,11 +9237,7 @@ async def choose_language(callback: CallbackQuery, state: FSMContext) -> None:
         await state.clear()
         if not allowed(callback.from_user.id):
             if callback.message:
-                await callback.message.answer(
-                    await subscription_text(callback.from_user.id),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=await subscription_keyboard(callback.from_user.id),
-                )
+                await _send_home_message(callback.message, callback.from_user.id)
             return
         user = await get_commerce_user(callback.from_user.id)
         if user is not None and not bool(user.onboarding_completed):
@@ -9098,7 +9305,15 @@ async def _show_onboarding(message: Message, user_id: int, step: int = 1) -> Non
     )
 
 
-def home_text(selected_count: int, auto_observations: bool = False) -> str:
+def home_text(selected_count: int, auto_observations: bool = False, access_active: bool = True) -> str:
+    if not access_active:
+        return (
+            "<b>🔎 Kleinanzeigen Analytics</b>\n\n"
+            "⌛ <b>Подписка не активна</b>\n\n"
+            "Твои прошлые сканы и сохранённые результаты остаются доступны. "
+            "Можно открыть карточку скана, TOP, историю и скачать XLSX.\n\n"
+            "🔒 Для нового скана, повторного запуска или обновления просмотров нужна активная подписка."
+        )
     if selected_count:
         state_line = f"🗂 Категории: <b>{selected_count}/{MAX_SELECTED_CATEGORIES}</b> · выбраны"
     else:
@@ -9129,8 +9344,11 @@ async def _send_home_message(message: Message, user_id: int, *, intro: bool = Fa
         get_settings(user_id),
     )
     auto_enabled = bool(getattr(user_settings, "auto_observations", False))
-    markup = main_keyboard(len(selected), admin=_is_admin(user_id), auto_observations=auto_enabled)
-    caption = home_text(len(selected), auto_enabled)
+    access_active = allowed(user_id)
+    markup = main_keyboard(
+        len(selected), admin=_is_admin(user_id), auto_observations=auto_enabled, access_active=access_active
+    )
+    caption = home_text(len(selected), auto_enabled, access_active=access_active)
 
     if _MENU_IMAGE_FILE_ID:
         try:
@@ -9284,7 +9502,7 @@ async def start(message: Message, state: FSMContext) -> None:
     if language is not None:
         await set_user_command_language(message.bot, message.from_user.id, language)
     if not allowed(message.from_user.id):
-        await send_access_screen(message, message.from_user.id)
+        await _send_home_message(message, message.from_user.id, intro=True)
         return
     user = await get_commerce_user(message.from_user.id)
     if user is not None and not bool(user.onboarding_completed):
@@ -9377,9 +9595,12 @@ async def help_command(message: Message, state: FSMContext) -> None:
 @dp.callback_query(F.data == "home")
 async def home(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    if not allowed(callback.from_user.id):
+    if not read_only_history_allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
     await callback.answer()
+    if not allowed(callback.from_user.id):
+        await _send_home_message(callback.message, callback.from_user.id)
+        return
     user = await get_commerce_user(callback.from_user.id)
     if user is not None and not bool(user.onboarding_completed):
         await _edit_or_answer(callback.message, onboarding_text(1), reply_markup=onboarding_keyboard(1))
@@ -9400,7 +9621,7 @@ async def post_settings(callback: CallbackQuery, state: FSMContext) -> None:
 @dp.callback_query(F.data == "post_home")
 async def post_home(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    if not allowed(callback.from_user.id):
+    if not read_only_history_allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
     await callback.answer()
     await _send_home_message(callback.message, callback.from_user.id)
@@ -9926,7 +10147,7 @@ async def popular_category_growth(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data == "my_scans")
 async def my_scans(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    if not allowed(callback.from_user.id):
+    if not read_only_history_allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
     await callback.answer()
     scans, archive_count = await get_user_scans_overview(callback.from_user.id, 10)
@@ -9947,7 +10168,7 @@ async def my_scans(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "archive_my_scans")
 async def archive_my_scans(callback: CallbackQuery) -> None:
-    if not allowed(callback.from_user.id):
+    if not read_only_history_allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
     moved = await archive_active_finished_scans(callback.from_user.id)
     scans = await get_user_scans(callback.from_user.id, 10)
@@ -9964,7 +10185,7 @@ async def archive_my_scans(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("scan_archive:"))
 async def scan_archive(callback: CallbackQuery) -> None:
-    if not allowed(callback.from_user.id):
+    if not read_only_history_allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
     try:
         page = max(0, int(callback.data.split(":", 1)[1]))
