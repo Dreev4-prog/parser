@@ -82,12 +82,11 @@ ADAPTIVE_UNKNOWN_WARN_RATIO = _env_float("VIEW_WORKER_ADAPTIVE_UNKNOWN_WARN_RATI
 os.environ["STABLE_SINGLE_SERVICE_MODE"] = "0"
 os.environ["DIST_TRAFFIC_VIEW_BUCKET"] = "view"
 os.environ["DIST_TRAFFIC_BROWSER_BUCKET"] = "view-browser"
-os.environ["DIST_TRAFFIC_GLOBAL_BUCKET"] = "view-fleet-perf480"
-os.environ["DIST_TRAFFIC_COOLDOWN_BUCKET"] = "view-fleet-perf480"
+os.environ["DIST_TRAFFIC_GLOBAL_BUCKET"] = "view-fleet"
+os.environ["DIST_TRAFFIC_COOLDOWN_BUCKET"] = "view-fleet"
 os.environ["DIST_TRAFFIC_VIEW_LIMIT"] = "16"
 os.environ["DIST_TRAFFIC_GLOBAL_LIMIT"] = "16"
-os.environ["DIST_TRAFFIC_BROWSER_LIMIT"] = "2"
-os.environ["DIST_TRAFFIC_SHARED_COOLDOWN"] = "0"
+os.environ["DIST_TRAFFIC_BROWSER_LIMIT"] = "1"
 
 # The TrafficManager is created during parser import. Give it the physical MAX;
 # the worker later lowers base_view_limit to current_pool before every round.
@@ -308,8 +307,6 @@ class ViewCounterWorker:
             "http_429": self.refusal_counts[429],
             "penalty": penalty,
             "cooldown_seconds": round(cooldown, 2),
-            "traffic_wait_ms_avg": round(1000.0 * (float(getattr(traffic, "local_wait_seconds_total", 0.0) or 0.0) / max(1, int(getattr(traffic, "lease_acquires", 0) or 0))), 1) if 'traffic' in locals() else 0.0,
-            "redis_wait_ms_avg": round(1000.0 * (float(getattr(traffic, "distributed_wait_seconds_total", 0.0) or 0.0) / max(1, int(getattr(traffic, "lease_acquires", 0) or 0))), 1) if 'traffic' in locals() else 0.0,
             "refusals_60s": refusals_60s,
             "rounds_total": self.rounds_total,
             "rounds_failed": self.rounds_failed,
@@ -406,17 +403,7 @@ class ViewCounterWorker:
         await self.ensure_group()
         while len(self.active) < MAX_ACTIVE_JOBS:
             loaded = False
-
-            # v4.8.0: serve fresh shards before crash-recovery history.
-            rows = await self.redis.xreadgroup(
-                VIEW_GROUP, self.consumer, {VIEW_STREAM: ">"}, count=1, block=1
-            )
-            if rows and rows[0][1]:
-                msg_id, fields = rows[0][1][0]
-                loaded = await self._load_message(str(msg_id), fields or {})
-                if loaded:
-                    continue
-
+            # First reclaim a genuinely abandoned pending job from a crashed worker.
             try:
                 claimed = await self.redis.xautoclaim(
                     VIEW_STREAM,
@@ -434,7 +421,6 @@ class ViewCounterWorker:
                 log.debug("View worker XAUTOCLAIM skipped", exc_info=True)
             if loaded:
                 continue
-
             rows = await self.redis.xreadgroup(
                 VIEW_GROUP,
                 self.consumer,
@@ -442,9 +428,12 @@ class ViewCounterWorker:
                 count=1,
                 block=BLOCK_MS if not self.active else 1,
             )
-            if not rows or not rows[0][1]:
+            if not rows:
                 break
-            msg_id, fields = rows[0][1][0]
+            _stream, messages = rows[0]
+            if not messages:
+                break
+            msg_id, fields = messages[0]
             await self._load_message(str(msg_id), fields or {})
 
     async def _persist_partial(self, job: ActiveJob, url: str, item: dict[str, Any]) -> None:

@@ -40,24 +40,20 @@ REDIS_URL = os.getenv("REDIS_URL", "").strip()
 # rollback without changing code or removing the Railway service.
 REMOTE_PAGE_WORKER_ENABLED = _env_bool("REMOTE_PAGE_WORKER_ENABLED", bool(REDIS_URL))
 PAGE_REDIS_PREFIX = os.getenv("PAGE_REDIS_PREFIX", "dtparser:pageworker").strip() or "dtparser:pageworker"
-# v4.8.0: cache may safely survive a short deploy, but queue/pending state must not.
-PAGE_RUNTIME_SCHEMA = (os.getenv("WORKER_RUNTIME_SCHEMA", "perf480").strip() or "perf480")
-PAGE_RUNTIME_PREFIX = f"{PAGE_REDIS_PREFIX}:runtime:{PAGE_RUNTIME_SCHEMA}"
-PAGE_STREAM = f"{PAGE_RUNTIME_PREFIX}:jobs"
-PAGE_GROUP = f"{PAGE_RUNTIME_PREFIX}:workers"
-PAGE_HEARTBEAT_KEY = f"{PAGE_RUNTIME_PREFIX}:heartbeat"
+PAGE_STREAM = f"{PAGE_REDIS_PREFIX}:jobs"
+PAGE_GROUP = f"{PAGE_REDIS_PREFIX}:workers"
+PAGE_HEARTBEAT_KEY = f"{PAGE_REDIS_PREFIX}:heartbeat"
 PAGE_CACHE_TTL_SECONDS = _env_int("PAGE_CACHE_TTL_SECONDS", 180, 30, 900)
-PAGE_PENDING_TTL_SECONDS = _env_int("PAGE_PENDING_TTL_SECONDS", 120, 30, 900)
+PAGE_PENDING_TTL_SECONDS = _env_int("PAGE_PENDING_TTL_SECONDS", 180, 30, 900)
 PAGE_ERROR_TTL_SECONDS = _env_int("PAGE_ERROR_TTL_SECONDS", 45, 10, 300)
 PAGE_REMOTE_TIMEOUT_SECONDS = _env_int("PAGE_REMOTE_TIMEOUT_SECONDS", 150, 20, 600)
 PAGE_REMOTE_STALL_SECONDS = _env_int("PAGE_REMOTE_STALL_SECONDS", 25, 8, 120)
 PAGE_HEARTBEAT_STALE_SECONDS = _env_int("PAGE_HEARTBEAT_STALE_SECONDS", 20, 8, 120)
-PAGE_EXPECTED_REPLICAS = _env_int("PAGE_EXPECTED_REPLICAS", 4, 1, 16)
 PAGE_PROGRESS_POLL_MS = _env_int("PAGE_PROGRESS_POLL_MS", 250, 100, 2000)
 # v4.3.22 streaming Page Worker: the foreground scan never waits for the whole
 # 15/25/50-page batch. It may wait briefly for only the *next* page when a worker
 # already owns it, which avoids duplicate local+remote fetches without a 0/N pause.
-PAGE_CACHE_WAIT_MS = _env_int("PAGE_CACHE_WAIT_MS", 900, 0, 5000)
+PAGE_CACHE_WAIT_MS = _env_int("PAGE_CACHE_WAIT_MS", 1800, 0, 5000)
 PAGE_CACHE_WAIT_POLL_MS = _env_int("PAGE_CACHE_WAIT_POLL_MS", 100, 50, 500)
 PAGE_PREFETCH_ENABLED = _env_bool("PAGE_PREFETCH_ENABLED", True)
 PAGE_PREFETCH_MIN_PAGES = _env_int("PAGE_PREFETCH_MIN_PAGES", 4, 1, 50)
@@ -265,10 +261,10 @@ class RemotePageManager:
         return f"{PAGE_REDIS_PREFIX}:cache:{cache_id}"
 
     def pending_key(self, cache_id: str) -> str:
-        return f"{PAGE_RUNTIME_PREFIX}:pending:{cache_id}"
+        return f"{PAGE_REDIS_PREFIX}:pending:{cache_id}"
 
     def error_key(self, cache_id: str) -> str:
-        return f"{PAGE_RUNTIME_PREFIX}:error:{cache_id}"
+        return f"{PAGE_REDIS_PREFIX}:error:{cache_id}"
 
     async def worker_count(self) -> int:
         if not self.enabled:
@@ -276,7 +272,7 @@ class RemotePageManager:
         try:
             redis = await self.connect()
             count = 0
-            async for key in redis.scan_iter(match=f"{PAGE_RUNTIME_PREFIX}:worker:*", count=50):
+            async for key in redis.scan_iter(match=f"{PAGE_REDIS_PREFIX}:worker:*", count=50):
                 raw = await redis.get(key)
                 if not raw:
                     continue
@@ -582,8 +578,6 @@ class RemotePageManager:
             "prefetch_window_pages": PAGE_PREFETCH_WINDOW_PAGES,
             "prefetch_low_water_pages": PAGE_PREFETCH_LOW_WATER_PAGES,
             "cache_wait_ms": PAGE_CACHE_WAIT_MS,
-            "runtime_schema": PAGE_RUNTIME_SCHEMA,
-            "expected_replicas": PAGE_EXPECTED_REPLICAS,
             "cache_hits_total": self.cache_hits_total,
             "cache_misses_total": self.cache_misses_total,
             "prefetch_batches_total": self.prefetch_batches_total,
@@ -608,7 +602,7 @@ class RemotePageManager:
             except Exception:
                 base["queue_depth"] = -1
             workers: list[dict[str, Any]] = []
-            async for key in redis.scan_iter(match=f"{PAGE_RUNTIME_PREFIX}:worker:*", count=50):
+            async for key in redis.scan_iter(match=f"{PAGE_REDIS_PREFIX}:worker:*", count=50):
                 raw = await redis.get(key)
                 if not raw:
                     continue

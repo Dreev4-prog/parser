@@ -42,14 +42,12 @@ else:
 os.environ["STABLE_SINGLE_SERVICE_MODE"] = "0"
 os.environ["DIST_TRAFFIC_SCAN_BUCKET"] = "date"
 os.environ["DIST_TRAFFIC_BROWSER_BUCKET"] = "date-browser"
-os.environ["DIST_TRAFFIC_GLOBAL_BUCKET"] = "search-fleet-perf480"
-# v4.8.0: concurrency stays fleet-wide, but a refusal is local to the replica.
-# One Date worker must never freeze every Date/Page replica for 5/8/15/30 sec.
-os.environ["DIST_TRAFFIC_COOLDOWN_BUCKET"] = "date-fleet-perf480"
+os.environ["DIST_TRAFFIC_GLOBAL_BUCKET"] = "search-fleet"
+os.environ["DIST_TRAFFIC_COOLDOWN_BUCKET"] = "search-fleet"
 os.environ["DIST_TRAFFIC_SCAN_LIMIT"] = "4"
 os.environ["DIST_TRAFFIC_BROWSER_LIMIT"] = "2"
 os.environ["DIST_TRAFFIC_GLOBAL_LIMIT"] = "8"
-os.environ["DIST_TRAFFIC_SHARED_COOLDOWN"] = "0"
+os.environ["DIST_TRAFFIC_SHARED_COOLDOWN"] = "1"
 
 from app_version import APP_VERSION
 from parser import KleinanzeigenParser, TemporaryAccessError, profile_page_dates, shutdown_shared_browser_runtime
@@ -60,7 +58,6 @@ from date_manager import (
     DATE_HEARTBEAT_KEY,
     DATE_PENDING_TTL_SECONDS,
     DATE_REDIS_PREFIX,
-    DATE_RUNTIME_PREFIX,
     DATE_STREAM,
     REDIS_URL,
 )
@@ -183,13 +180,13 @@ class DateWorkerProcess:
         return f"{DATE_REDIS_PREFIX}:cache:{cache_id}"
 
     def pending_key(self, cache_id: str) -> str:
-        return f"{DATE_RUNTIME_PREFIX}:pending:{cache_id}"
+        return f"{DATE_REDIS_PREFIX}:pending:{cache_id}"
 
     def error_key(self, cache_id: str) -> str:
-        return f"{DATE_RUNTIME_PREFIX}:error:{cache_id}"
+        return f"{DATE_REDIS_PREFIX}:error:{cache_id}"
 
     def worker_key(self) -> str:
-        return f"{DATE_RUNTIME_PREFIX}:worker:{self.base_id}"
+        return f"{DATE_REDIS_PREFIX}:worker:{self.base_id}"
 
     async def ensure_group(self) -> None:
         if self._group_ready:
@@ -239,8 +236,6 @@ class DateWorkerProcess:
             "transport_conflicts": self.transport_conflicts,
             "penalty": penalty,
             "cooldown_seconds": round(cooldown, 2),
-            "traffic_wait_ms_avg": round(1000.0 * (float(getattr(traffic, "local_wait_seconds_total", 0.0) or 0.0) / max(1, int(getattr(traffic, "lease_acquires", 0) or 0))), 1) if 'traffic' in locals() else 0.0,
-            "redis_wait_ms_avg": round(1000.0 * (float(getattr(traffic, "distributed_wait_seconds_total", 0.0) or 0.0) / max(1, int(getattr(traffic, "lease_acquires", 0) or 0))), 1) if 'traffic' in locals() else 0.0,
             "cache_ttl": DATE_CACHE_TTL_SECONDS,
             "uptime_seconds": int(time.monotonic() - self.started),
         }
@@ -265,18 +260,6 @@ class DateWorkerProcess:
 
     async def _consume(self, consumer: str) -> tuple[str, dict] | None:
         await self.ensure_group()
-
-        # v4.8.0: fresh user work wins. Older releases reclaimed abandoned PEL
-        # messages before reading new jobs, so a redeploy could spend minutes on
-        # historical work while a live scan appeared frozen. Read new work first.
-        rows = await self.redis.xreadgroup(
-            DATE_GROUP, consumer, {DATE_STREAM: ">"}, count=1, block=1
-        )
-        if rows and rows[0][1]:
-            msg_id, fields = rows[0][1][0]
-            return str(msg_id), dict(fields or {})
-
-        # Crash recovery remains available, but only when no fresh message exists.
         try:
             claimed = await self.redis.xautoclaim(
                 DATE_STREAM,
@@ -294,11 +277,18 @@ class DateWorkerProcess:
             log.debug("Date Worker XAUTOCLAIM failed", exc_info=True)
 
         rows = await self.redis.xreadgroup(
-            DATE_GROUP, consumer, {DATE_STREAM: ">"}, count=1, block=3000
+            DATE_GROUP,
+            consumer,
+            {DATE_STREAM: ">"},
+            count=1,
+            block=3000,
         )
-        if not rows or not rows[0][1]:
+        if not rows:
             return None
-        msg_id, fields = rows[0][1][0]
+        _stream, messages = rows[0]
+        if not messages:
+            return None
+        msg_id, fields = messages[0]
         return str(msg_id), dict(fields or {})
 
     async def _ack(self, message_id: str) -> None:

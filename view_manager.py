@@ -36,9 +36,7 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 REMOTE_VIEW_WORKER_ENABLED = _env_bool("REMOTE_VIEW_WORKER_ENABLED", False)
-VIEW_REDIS_BASE_PREFIX = os.getenv("VIEW_REDIS_PREFIX", "dtparser:viewcounter").strip() or "dtparser:viewcounter"
-VIEW_RUNTIME_SCHEMA = (os.getenv("WORKER_RUNTIME_SCHEMA", "perf480").strip() or "perf480")
-VIEW_REDIS_PREFIX = f"{VIEW_REDIS_BASE_PREFIX}:runtime:{VIEW_RUNTIME_SCHEMA}"
+VIEW_REDIS_PREFIX = os.getenv("VIEW_REDIS_PREFIX", "dtparser:viewcounter").strip() or "dtparser:viewcounter"
 VIEW_STREAM = f"{VIEW_REDIS_PREFIX}:jobs"
 VIEW_GROUP = f"{VIEW_REDIS_PREFIX}:workers"
 VIEW_HEARTBEAT_KEY = f"{VIEW_REDIS_PREFIX}:heartbeat"
@@ -57,9 +55,6 @@ VIEW_SHARD_MIN_URLS = _env_int("VIEW_SHARD_MIN_URLS", 300, 100, 5000)
 VIEW_SHARD_SIZE = _env_int("VIEW_SHARD_SIZE", 180, 50, 1000)
 VIEW_SHARD_MAX_COUNT = _env_int("VIEW_SHARD_MAX_COUNT", 16, 2, 64)
 VIEW_SHARDS_PER_WORKER = _env_int("VIEW_SHARDS_PER_WORKER", 4, 1, 4)
-# Shard against the fleet we deploy, not only heartbeats visible in one instant.
-# If a replica starts a few seconds late it can still steal pending shards.
-VIEW_EXPECTED_REPLICAS = _env_int("VIEW_EXPECTED_REPLICAS", 4, 1, 16)
 
 
 @dataclass
@@ -166,8 +161,6 @@ class RemoteViewManager:
             "last_shard_at": self.last_shard_at,
             "last_shard_failed": self.last_shard_failed,
             "partial_shard_fallbacks_total": self.partial_shard_fallbacks_total,
-            "expected_replicas": VIEW_EXPECTED_REPLICAS,
-            "runtime_schema": VIEW_RUNTIME_SCHEMA,
         }
         if not self.enabled:
             return base
@@ -407,10 +400,9 @@ class RemoteViewManager:
             except Exception:
                 worker_count = 1
 
-        shard_worker_count = max(worker_count, VIEW_EXPECTED_REPLICAS if worker_count >= 1 else 1)
         should_shard = (
             VIEW_SHARDING_ENABLED
-            and shard_worker_count >= 2
+            and worker_count >= 2
             and len(urls) >= VIEW_SHARD_MIN_URLS
         )
         if not should_shard:
@@ -427,7 +419,7 @@ class RemoteViewManager:
             )
 
         natural_shards = max(2, math.ceil(len(urls) / VIEW_SHARD_SIZE))
-        worker_shards = max(2, shard_worker_count * VIEW_SHARDS_PER_WORKER)
+        worker_shards = max(2, worker_count * VIEW_SHARDS_PER_WORKER)
         shard_count = min(VIEW_SHARD_MAX_COUNT, len(urls), max(natural_shards, worker_shards))
         shards = self._split_balanced(urls, shard_count)
         shard_count = len(shards)
@@ -440,8 +432,8 @@ class RemoteViewManager:
         self.last_shard_failed = 0
 
         log.info(
-            "Remote view sharding parent=%s total=%s live_workers=%s expected=%s shards=%s target_size=%s",
-            parent_job_id[:10], len(urls), worker_count, shard_worker_count, shard_count, VIEW_SHARD_SIZE,
+            "Remote view sharding parent=%s total=%s workers=%s shards=%s target_size=%s",
+            parent_job_id[:10], len(urls), worker_count, shard_count, VIEW_SHARD_SIZE,
         )
 
         progress_lock = asyncio.Lock()
