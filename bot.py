@@ -5066,7 +5066,12 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         # v4.1.6: the category crawl is complete before public view counters are
         # collected.  This keeps page traversal fast and gives Telegram a distinct
         # "Собираю просмотры" phase instead of spending 10-15 seconds on every page.
-        if need_view_counts and deferred_view_items:
+        # v4.8.4 Scan Integrity: never start the expensive views phase from a
+        # structurally incomplete crawl. A partial category must first pass the
+        # bounded automatic recovery pipeline. If recovery succeeds, that complete
+        # pass will collect views once; if it stays partial, we preserve confirmed
+        # page data without pretending the scan has entered its final phase.
+        if request_complete and need_view_counts and deferred_view_items:
             live = category_live_progress.get(progress_key)
             if live is not None:
                 live.phase = "views"
@@ -5087,6 +5092,11 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     "Deferred view-count phase failed category=%s target=%s",
                     cat.name, target_date,
                 )
+        elif need_view_counts and deferred_view_items and not request_complete:
+            log.warning(
+                "Deferred views skipped for incomplete crawl category=%s target=%s confirmed_pages=%s/%s reason=%s",
+                cat.name, target_date, direct_pages_collected, depth, reason,
+            )
 
         quality_score, quality_note = _calculate_scan_quality(
             listings_parsed=listings_parsed,
