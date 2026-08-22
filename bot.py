@@ -277,6 +277,7 @@ if STABLE_SINGLE_SERVICE_MODE:
     # instant rollback to the exact one-worker v4.2.5 execution model.
     MAX_CONCURRENT_JOBS = MULTIUSER_LOCAL_WORKERS if MULTIUSER_STABLE_MODE else 1
 MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
+QUEUE_START_NOTIFY_AFTER_SECONDS = max(0, min(300, int(os.getenv("QUEUE_START_NOTIFY_AFTER_SECONDS", "8"))))
 PARSER_WORKER_CONCURRENCY = max(1, min(8, int(os.getenv("PARSER_WORKER_CONCURRENCY", "1"))))
 if STABLE_SINGLE_SERVICE_MODE and MULTIUSER_STABLE_MODE:
     # TRAFFIC is process-wide and acts as the global Views Pool. Keep request
@@ -579,7 +580,8 @@ def main_keyboard(
              InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
             [InlineKeyboardButton(text=f"🗂 Категории · {selected_count}/{MAX_SELECTED_CATEGORIES}", callback_data="groups"),
              InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
-            [InlineKeyboardButton(text=auto_label, callback_data="auto_obs_menu")],
+            [InlineKeyboardButton(text="📥 Очередь", callback_data="queue_status"),
+             InlineKeyboardButton(text=auto_label, callback_data="auto_obs_menu")],
             [InlineKeyboardButton(text="💎 Подписка", callback_data="subscription")],
         ]
     else:
@@ -5349,7 +5351,11 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         await cancel_hidden_date_prewarm()
         raise
 
-def job_keyboard(job_id: str) -> InlineKeyboardMarkup:
+def job_keyboard(job_id: str, *, queued: bool = False) -> InlineKeyboardMarkup:
+    if queued:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отменить очередь", callback_data=f"cancel_scan:{job_id}")],
+        ])
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⏹ Остановить парсер", callback_data=f"cancel_scan:{job_id}")],
     ])
@@ -5671,19 +5677,21 @@ async def queue_status_text(user_id: int) -> str:
         if mine and mine.state == "queued" and mine.job_id in queued_job_ids:
             position = queued_job_ids.index(mine.job_id) + 1
 
+    free_slots = max(0, MAX_CONCURRENT_JOBS - len(running))
     lines = [
         "<b>📥 Очередь парсинга</b>",
         "",
-        f"Воркеров: <b>{MAX_CONCURRENT_JOBS}</b>",
-        f"Лимит очереди: <b>{MAX_QUEUE_SIZE}</b>",
-        f"Сейчас выполняется: <b>{len(running)}</b>",
-        f"Ждут в очереди: <b>{len(queued)}</b>",
-        f"Кэш категории: <b>{CATEGORY_CACHE_TTL_SECONDS // 60} мин.</b>" if CATEGORY_CACHE_TTL_SECONDS else "Кэш категории: <b>выключен</b>",
+        f"⚙️ Активно: <b>{len(running)}/{MAX_CONCURRENT_JOBS}</b>",
+        f"🟢 Свободно: <b>{free_slots}</b>",
+        f"⏳ Ждут: <b>{len(queued)}</b>",
     ]
     if mine:
         lines += ["", "<b>Твоя задача</b>"]
         if mine.state == "queued":
-            lines.append(f"⏳ В очереди" + (f", позиция примерно <b>{position}</b>" if position else ""))
+            lines.append(f"⏳ В очереди" + (f" · позиция <b>{position}/{len(queued)}</b>" if position else ""))
+            if position:
+                lines.append(f"👥 Перед тобой: <b>{max(0, position - 1)}</b>")
+            lines.append("Позиция обновляется автоматически.")
         elif mine.state == "running":
             lines.append(f"⚙️ Выполняется воркером <b>#{mine.worker_id}</b>")
             if mine.current_category:
@@ -5742,14 +5750,29 @@ def render_user_job_status(job: ScanJob) -> str:
                 position = queued_job_ids.index(job.job_id) + 1
             except ValueError:
                 position = 1
-            headline = "⏳ <b>Ожидание парсера</b>\n\n"
-            queue_line = f"📍 Позиция в очереди: <b>{position}</b>\n"
-        else:
-            headline = "♻️ <b>Восстанавливаю скан…</b>\n\n" if job.recovered else "⏳ <b>Подготавливаю скан</b>\n\n"
-            queue_line = ""
+            running_count = sum(1 for item in active_jobs.values() if item.state == "running" and not item.cancel_requested)
+            waiting_count = sum(1 for item in active_jobs.values() if item.state == "queued" and not item.cancel_requested)
+            ahead = max(0, position - 1)
+            free_slots = max(0, MAX_CONCURRENT_JOBS - running_count)
+            slot_line = (
+                f"⚙️ Занято слотов: <b>{running_count}/{MAX_CONCURRENT_JOBS}</b>\n"
+                if free_slots == 0
+                else f"🟢 Свободных слотов: <b>{free_slots}</b> · запуск начинается\n"
+            )
+            return (
+                "⏳ <b>Скан в очереди</b>\n\n"
+                f"📍 Твоя позиция: <b>{position}/{max(position, waiting_count)}</b>\n"
+                + slot_line
+                + f"👥 Перед тобой: <b>{ahead}</b>\n"
+                + f"🗂 Категорий: <b>{total}</b>\n"
+                + f"📅 <b>{_date_label(job.target_date)}</b> · 📄 <b>{depth} стр.</b>\n"
+                + f"💶 <b>{html.escape(price_filter_label(job.price_filter))}</b>\n"
+                + f"⏱ Ждёшь: <b>{_human_duration(waited)}</b>\n\n"
+                + "Позиция обновляется автоматически. Как только освободится слот, скан запустится сам."
+            )
+        headline = "♻️ <b>Восстанавливаю скан…</b>\n\n" if job.recovered else "⏳ <b>Подготавливаю скан</b>\n\n"
         return (
             headline
-            + queue_line
             + f"🗂 Категорий: <b>{total}</b>\n"
             + f"📅 <b>{_date_label(job.target_date)}</b> · 📄 <b>{depth} стр.</b>\n"
             + f"💶 <b>{html.escape(price_filter_label(job.price_filter))}</b>\n"
@@ -5862,7 +5885,7 @@ async def edit_job_status(bot: Bot, job: ScanJob, text: str, *, force: bool = Fa
             message_id=job.status_message_id,
             text=text,
             parse_mode=ParseMode.HTML,
-            reply_markup=job_keyboard(job.job_id) if job.state in {"queued", "running"} else None,
+            reply_markup=job_keyboard(job.job_id, queued=(job.state == "queued")) if job.state in {"queued", "running"} else None,
         )
     except Exception as exc:
         # Telegram may reject an identical edit; this must never stop parsing.
@@ -6166,7 +6189,19 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
     job.quality_scores = job.quality_scores or []
     job.quality_notes = job.quality_notes or []
     job.incomplete_category_keys = job.incomplete_category_keys or set()
+    waited_before_start = max(0, int((datetime.utcnow() - job.created_at).total_seconds()))
     await edit_job_status(bot, job, render_user_job_status(job), force=True)
+    if waited_before_start >= QUEUE_START_NOTIFY_AFTER_SECONDS:
+        try:
+            await bot.send_message(
+                job.chat_id,
+                "🚀 <b>Твой скан вышел из очереди и начался.</b>\n\n"
+                f"⏱ Ожидание: <b>{_human_duration(waited_before_start)}</b>\n"
+                "Прогресс дальше обновляется в основной карточке.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            log.debug("Could not send queue-start notification job=%s", job.job_id, exc_info=True)
 
     for idx, key in enumerate(job.category_keys, start=1):
         if job.cancel_requested:
@@ -6458,12 +6493,13 @@ async def distributed_queue_ui_ticker(bot: Bot) -> None:
                     continue
                 waited = max(0, int((datetime.utcnow() - scan.created_at).total_seconds()))
                 text = (
-                    "⏳ <b>Ожидание Browser Fleet</b>\n\n"
-                    f"📍 Позиция в очереди: <b>{position}/{total_waiting}</b>\n"
-                    f"🧩 Активных worker: <b>{workers}</b>\n"
+                    "⏳ <b>Скан в очереди</b>\n\n"
+                    f"📍 Твоя позиция: <b>{position}/{total_waiting}</b>\n"
+                    f"⚙️ Активных parser-worker: <b>{workers}</b>\n"
+                    f"👥 Перед тобой: <b>{max(0, position - 1)}</b>\n"
                     f"📅 <b>{_date_label(scan.target_date)}</b> · 📄 <b>{scan.page_limit} стр.</b>\n"
-                    f"⏱ <b>{_human_duration(waited)}</b>\n\n"
-                    "Как только освободится worker, карточка автоматически перейдёт к сканированию."
+                    f"⏱ Ждёшь: <b>{_human_duration(waited)}</b>\n\n"
+                    "Позиция обновляется автоматически. Как только освободится worker, скан начнётся сам."
                 )
                 try:
                     await bot.edit_message_text(
@@ -6471,7 +6507,7 @@ async def distributed_queue_ui_ticker(bot: Bot) -> None:
                         message_id=int(scan.status_message_id),
                         text=text,
                         parse_mode=ParseMode.HTML,
-                        reply_markup=job_keyboard(str(scan.job_uid)),
+                        reply_markup=job_keyboard(str(scan.job_uid), queued=True),
                     )
                 except Exception:
                     # Identical edits / deleted messages are non-fatal.
@@ -6792,7 +6828,7 @@ async def enqueue_user_scan(
     await status.edit_text(
         render_user_job_status(job),
         parse_mode=ParseMode.HTML,
-        reply_markup=job_keyboard(job.job_id),
+        reply_markup=job_keyboard(job.job_id, queued=True),
     )
     return job
 
@@ -11063,7 +11099,7 @@ async def queue_status(callback: CallbackQuery) -> None:
                     f"⚙️ Активных parser-worker: <b>{worker_count}</b>\n\n"
                     "Живой процент обновляется в основной карточке запуска."
                 )
-            markup = job_keyboard(str(scan.job_uid))
+            markup = job_keyboard(str(scan.job_uid), queued=(scan.status == "queued"))
         else:
             text = "✅ Сейчас у тебя нет активного парсинга."
             selected = await get_selected(callback.from_user.id)
@@ -11075,7 +11111,7 @@ async def queue_status(callback: CallbackQuery) -> None:
         job = active_jobs.get(callback.from_user.id)
     if job and job.state in {"queued", "running"}:
         text = render_user_job_status(job)
-        markup = job_keyboard(job.job_id)
+        markup = job_keyboard(job.job_id, queued=(job.state == "queued"))
     else:
         text = "✅ Сейчас у тебя нет активного парсинга."
         selected = await get_selected(callback.from_user.id)
@@ -11152,7 +11188,7 @@ async def stop_scan_command(message: Message, state: FSMContext) -> None:
         return
     if previous_state == "queued":
         await message.answer(
-            "⏹ <b>Парсинг остановлен.</b> Задание снято до начала сетевого сканирования.",
+            "❌ <b>Скан удалён из очереди.</b> Задание отменено до начала сетевого сканирования.",
             parse_mode=ParseMode.HTML,
             reply_markup=stopped_job_keyboard(),
         )
@@ -11174,9 +11210,9 @@ async def cancel_scan(callback: CallbackQuery) -> None:
         return
 
     if previous_state == "queued":
-        await callback.answer("Парсинг остановлен")
+        await callback.answer("Убрано из очереди")
         await callback.message.edit_text(
-            "⏹ <b>Парсинг остановлен</b>\n\nЗадание снято до начала сканирования.",
+            "❌ <b>Скан удалён из очереди</b>\n\nЗадание отменено до начала сканирования.",
             parse_mode=ParseMode.HTML,
             reply_markup=stopped_job_keyboard(),
         )
