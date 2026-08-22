@@ -37,9 +37,14 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 REMOTE_VIEW_WORKER_ENABLED = _env_bool("REMOTE_VIEW_WORKER_ENABLED", False)
 VIEW_REDIS_PREFIX = os.getenv("VIEW_REDIS_PREFIX", "dtparser:viewcounter").strip() or "dtparser:viewcounter"
-VIEW_STREAM = f"{VIEW_REDIS_PREFIX}:jobs"
-VIEW_GROUP = f"{VIEW_REDIS_PREFIX}:workers"
-VIEW_HEARTBEAT_KEY = f"{VIEW_REDIS_PREFIX}:heartbeat"
+# v4.8.3: every release gets a fresh ephemeral view runtime. Old streams/jobs
+# can expire naturally without being reclaimed by a newly deployed worker fleet.
+VIEW_RUNTIME_PREFIX = os.getenv(
+    "VIEW_RUNTIME_PREFIX", f"{VIEW_REDIS_PREFIX}:runtime:v483"
+).strip() or f"{VIEW_REDIS_PREFIX}:runtime:v483"
+VIEW_STREAM = f"{VIEW_RUNTIME_PREFIX}:jobs"
+VIEW_GROUP = f"{VIEW_RUNTIME_PREFIX}:workers"
+VIEW_HEARTBEAT_KEY = f"{VIEW_RUNTIME_PREFIX}:heartbeat"
 VIEW_JOB_TTL_SECONDS = _env_int("VIEW_JOB_TTL_SECONDS", 3600, 300, 24 * 3600)
 VIEW_RESULT_TTL_SECONDS = _env_int("VIEW_RESULT_TTL_SECONDS", 900, 60, 6 * 3600)
 VIEW_REMOTE_TIMEOUT_SECONDS = _env_int("VIEW_REMOTE_TIMEOUT_SECONDS", 1800, 60, 7200)
@@ -51,10 +56,11 @@ VIEW_PROGRESS_POLL_MS = _env_int("VIEW_PROGRESS_POLL_MS", 500, 100, 3000)
 # the same time. The exact view extraction algorithm remains inside the same
 # known-good worker/parser code.
 VIEW_SHARDING_ENABLED = _env_bool("VIEW_SHARDING_ENABLED", True)
-VIEW_SHARD_MIN_URLS = _env_int("VIEW_SHARD_MIN_URLS", 300, 100, 5000)
-VIEW_SHARD_SIZE = _env_int("VIEW_SHARD_SIZE", 180, 50, 1000)
-VIEW_SHARD_MAX_COUNT = _env_int("VIEW_SHARD_MAX_COUNT", 16, 2, 64)
-VIEW_SHARDS_PER_WORKER = _env_int("VIEW_SHARDS_PER_WORKER", 4, 1, 4)
+VIEW_SHARD_MIN_URLS = _env_int("VIEW_SHARD_MIN_URLS", 40, 20, 5000)
+VIEW_SHARD_SIZE = _env_int("VIEW_SHARD_SIZE", 18, 8, 1000)
+VIEW_SHARD_MAX_COUNT = _env_int("VIEW_SHARD_MAX_COUNT", 8, 2, 64)
+VIEW_SHARDS_PER_WORKER = _env_int("VIEW_SHARDS_PER_WORKER", 1, 1, 4)
+VIEW_EXPECTED_WORKERS = _env_int("VIEW_EXPECTED_WORKERS", 4, 1, 16)
 
 
 @dataclass
@@ -119,16 +125,16 @@ class RemoteViewManager:
                 pass
 
     def _payload_key(self, job_id: str) -> str:
-        return f"{VIEW_REDIS_PREFIX}:job:{job_id}:payload"
+        return f"{VIEW_RUNTIME_PREFIX}:job:{job_id}:payload"
 
     def _progress_key(self, job_id: str) -> str:
-        return f"{VIEW_REDIS_PREFIX}:job:{job_id}:progress"
+        return f"{VIEW_RUNTIME_PREFIX}:job:{job_id}:progress"
 
     def _result_key(self, job_id: str) -> str:
-        return f"{VIEW_REDIS_PREFIX}:job:{job_id}:result"
+        return f"{VIEW_RUNTIME_PREFIX}:job:{job_id}:result"
 
     def _cancel_key(self, job_id: str) -> str:
-        return f"{VIEW_REDIS_PREFIX}:job:{job_id}:cancel"
+        return f"{VIEW_RUNTIME_PREFIX}:job:{job_id}:cancel"
 
     async def worker_alive(self) -> bool:
         if not self.enabled:
@@ -172,7 +178,7 @@ class RemoteViewManager:
                 base["queue_depth"] = -1
 
             workers: list[dict[str, Any]] = []
-            pattern = f"{VIEW_REDIS_PREFIX}:worker:*"
+            pattern = f"{VIEW_RUNTIME_PREFIX}:worker:*"
             try:
                 async for key in redis.scan_iter(match=pattern, count=50):
                     raw = await redis.get(key)
@@ -396,7 +402,11 @@ class RemoteViewManager:
         if VIEW_SHARDING_ENABLED and len(urls) >= VIEW_SHARD_MIN_URLS:
             try:
                 live_status = await self.status()
-                worker_count = max(1, len(live_status.get("workers") or []))
+                live_workers = max(1, len(live_status.get("workers") or []))
+                # A just-redeployed fourth replica can miss the first heartbeat by a
+                # few seconds. Sharding into the configured fleet size is still safe:
+                # fewer live workers simply consume the small shards sequentially.
+                worker_count = max(live_workers, VIEW_EXPECTED_WORKERS)
             except Exception:
                 worker_count = 1
 

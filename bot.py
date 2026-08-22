@@ -19,6 +19,19 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+# v4.8.3 Reliable Core: the main Telegram parser must not keep the historical
+# process-wide emergency pause after a single 403. Dedicated workers already use
+# this profile. Apply it before importing traffic.py/parser.py so local fallback
+# scans behave the same way: 403 = no hard sleep, 429 = short bounded pause,
+# one penalty level with fast recovery. Aggregate Redis concurrency limits remain.
+os.environ["DIST_TRAFFIC_SHARED_COOLDOWN"] = "0"
+os.environ["TRAFFIC_MAX_PENALTY_LEVEL"] = "1"
+os.environ["TRAFFIC_403_COOLDOWN_SECONDS"] = "0"
+os.environ["TRAFFIC_429_COOLDOWN_SECONDS"] = "3"
+os.environ["TRAFFIC_MAX_COOLDOWN_SECONDS"] = "3"
+os.environ["TRAFFIC_RECOVERY_SUCCESS_COUNT"] = "10"
+os.environ["TRAFFIC_RECOVERY_QUIET_SECONDS"] = "10"
+
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart

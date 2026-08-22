@@ -1,11 +1,21 @@
-# DT PARSER v4.8.1 — Golden Core
+# DT PARSER v4.8.3 — Reliable Core
 
-v4.8.1 is the controlled baseline release: the complete Date/Page/View/traffic parsing core is byte-for-byte v4.4.0, while the modern DT PARSER interface and product features remain.
+Основа релиза — проверенная ветка Golden Core, но теперь исправлены именно узкие места, которые мешали бесперебойной работе при 403, рестартах Railway и обычных батчах просмотров.
 
-The goal is to distinguish parser-core regressions from Railway/Redis/runtime/Kleinanzeigen behavior without changing the proven v4.4.0 scan algorithms.
+## Что изменено
 
-See `DEPLOY_V4_8_1_GOLDEN_CORE.md` for the exact core file list and test procedure.
+- основной Bot/local fallback использует тот же короткий resilient traffic profile, что Date/Page/View Worker;
+- 403 больше не держит отдельную страницу/scan lane десятки секунд: максимум один короткий retry;
+- 429 сохраняет короткую локальную паузу до ~3 секунд;
+- Redis runtime Date/Page/View отделён от долгоживущего cache и имеет namespace `runtime:v483`;
+- свежие jobs обслуживаются раньше crash-recovery/XAUTOCLAIM;
+- Page Worker не отклоняет правильную `/seite:N` страницу только из-за старого предположения «ровно 25 слотов»;
+- foreground ждёт Page cache 450 мс вместо 1800 мс;
+- обычный батч 50–60 просмотров теперь шардируется примерно на 4 View Worker, а не отдаётся одной реплике;
+- RU/EN, админка, AI Lab и Product Opportunity Engine сохранены.
 
+## Что намеренно не трогали
 
-## v4.8.2 Resilient Traffic
-The Golden Core parser remains intact. Date/Page/View now use bounded local refusal handling: no shared 403 freeze, max penalty level 1, no hard pause for 403, and a maximum 3-second local pause for 429. See `DEPLOY_V4_8_2_RESILIENT_TRAFFIC.md`.
+Фильтры, финальную проверку даты, Stable Engine, извлечение объявлений и алгоритм точного счётчика просмотров. Цель 4.8.3 — убрать искусственные паузы и плохое распределение работы, не менять смысл результатов.
+
+Подробности: `DEPLOY_V4_8_3_RELIABLE_CORE.md`.

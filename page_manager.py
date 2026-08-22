@@ -40,9 +40,13 @@ REDIS_URL = os.getenv("REDIS_URL", "").strip()
 # rollback without changing code or removing the Railway service.
 REMOTE_PAGE_WORKER_ENABLED = _env_bool("REMOTE_PAGE_WORKER_ENABLED", bool(REDIS_URL))
 PAGE_REDIS_PREFIX = os.getenv("PAGE_REDIS_PREFIX", "dtparser:pageworker").strip() or "dtparser:pageworker"
-PAGE_STREAM = f"{PAGE_REDIS_PREFIX}:jobs"
-PAGE_GROUP = f"{PAGE_REDIS_PREFIX}:workers"
-PAGE_HEARTBEAT_KEY = f"{PAGE_REDIS_PREFIX}:heartbeat"
+# v4.8.3: cache is stable, queue/pending/worker state is release-scoped.
+PAGE_RUNTIME_PREFIX = os.getenv(
+    "PAGE_RUNTIME_PREFIX", f"{PAGE_REDIS_PREFIX}:runtime:v483"
+).strip() or f"{PAGE_REDIS_PREFIX}:runtime:v483"
+PAGE_STREAM = f"{PAGE_RUNTIME_PREFIX}:jobs"
+PAGE_GROUP = f"{PAGE_RUNTIME_PREFIX}:workers"
+PAGE_HEARTBEAT_KEY = f"{PAGE_RUNTIME_PREFIX}:heartbeat"
 PAGE_CACHE_TTL_SECONDS = _env_int("PAGE_CACHE_TTL_SECONDS", 180, 30, 900)
 PAGE_PENDING_TTL_SECONDS = _env_int("PAGE_PENDING_TTL_SECONDS", 180, 30, 900)
 PAGE_ERROR_TTL_SECONDS = _env_int("PAGE_ERROR_TTL_SECONDS", 45, 10, 300)
@@ -53,8 +57,8 @@ PAGE_PROGRESS_POLL_MS = _env_int("PAGE_PROGRESS_POLL_MS", 250, 100, 2000)
 # v4.3.22 streaming Page Worker: the foreground scan never waits for the whole
 # 15/25/50-page batch. It may wait briefly for only the *next* page when a worker
 # already owns it, which avoids duplicate local+remote fetches without a 0/N pause.
-PAGE_CACHE_WAIT_MS = _env_int("PAGE_CACHE_WAIT_MS", 1800, 0, 5000)
-PAGE_CACHE_WAIT_POLL_MS = _env_int("PAGE_CACHE_WAIT_POLL_MS", 100, 50, 500)
+PAGE_CACHE_WAIT_MS = _env_int("PAGE_CACHE_WAIT_MS", 450, 0, 2000)
+PAGE_CACHE_WAIT_POLL_MS = _env_int("PAGE_CACHE_WAIT_POLL_MS", 75, 25, 250)
 PAGE_PREFETCH_ENABLED = _env_bool("PAGE_PREFETCH_ENABLED", True)
 PAGE_PREFETCH_MIN_PAGES = _env_int("PAGE_PREFETCH_MIN_PAGES", 4, 1, 50)
 PAGE_PREFETCH_EXTRA_PAGES = _env_int("PAGE_PREFETCH_EXTRA_PAGES", 3, 0, 10)
@@ -261,10 +265,10 @@ class RemotePageManager:
         return f"{PAGE_REDIS_PREFIX}:cache:{cache_id}"
 
     def pending_key(self, cache_id: str) -> str:
-        return f"{PAGE_REDIS_PREFIX}:pending:{cache_id}"
+        return f"{PAGE_RUNTIME_PREFIX}:pending:{cache_id}"
 
     def error_key(self, cache_id: str) -> str:
-        return f"{PAGE_REDIS_PREFIX}:error:{cache_id}"
+        return f"{PAGE_RUNTIME_PREFIX}:error:{cache_id}"
 
     async def worker_count(self) -> int:
         if not self.enabled:
@@ -272,7 +276,7 @@ class RemotePageManager:
         try:
             redis = await self.connect()
             count = 0
-            async for key in redis.scan_iter(match=f"{PAGE_REDIS_PREFIX}:worker:*", count=50):
+            async for key in redis.scan_iter(match=f"{PAGE_RUNTIME_PREFIX}:worker:*", count=50):
                 raw = await redis.get(key)
                 if not raw:
                     continue
@@ -602,7 +606,7 @@ class RemotePageManager:
             except Exception:
                 base["queue_depth"] = -1
             workers: list[dict[str, Any]] = []
-            async for key in redis.scan_iter(match=f"{PAGE_REDIS_PREFIX}:worker:*", count=50):
+            async for key in redis.scan_iter(match=f"{PAGE_RUNTIME_PREFIX}:worker:*", count=50):
                 raw = await redis.get(key)
                 if not raw:
                     continue

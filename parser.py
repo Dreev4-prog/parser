@@ -32,13 +32,14 @@ MAX_PAGES_PER_CATEGORY = min(
 )
 PAGE_DELAY_SECONDS = max(0.0, float(os.getenv("PAGE_DELAY_SECONDS", "1.0")))
 CATEGORY_HTTP_RETRIES = max(1, min(4, int(os.getenv("CATEGORY_HTTP_RETRIES", "3"))))
-CATEGORY_403_BACKOFF_SECONDS = max(3.0, float(os.getenv("CATEGORY_403_BACKOFF_SECONDS", "10")))
+CATEGORY_403_BACKOFF_SECONDS = max(0.0, min(5.0, float(os.getenv("CATEGORY_403_BACKOFF_SECONDS", "1.25"))))
 CATEGORY_RETRY_JITTER_SECONDS = max(0.0, float(os.getenv("CATEGORY_RETRY_JITTER_SECONDS", "2.0")))
 # v3.1.3: an interactive category scan should survive a temporary site-wide
 # refusal instead of immediately becoming a false/partial zero. This is a wait,
 # not a bypass: all traffic goes through the shared circuit breaker.
-CATEGORY_ACCESS_MAX_WAIT_SECONDS = max(30.0, min(900.0, float(os.getenv("CATEGORY_ACCESS_MAX_WAIT_SECONDS", "180"))))
-CATEGORY_ACCESS_RETRY_MIN_SECONDS = max(5.0, min(120.0, float(os.getenv("CATEGORY_ACCESS_RETRY_MIN_SECONDS", "12"))))
+CATEGORY_ACCESS_MAX_WAIT_SECONDS = max(1.0, min(30.0, float(os.getenv("CATEGORY_ACCESS_MAX_WAIT_SECONDS", "6"))))
+CATEGORY_ACCESS_RETRY_MIN_SECONDS = max(0.25, min(5.0, float(os.getenv("CATEGORY_ACCESS_RETRY_MIN_SECONDS", "1.25"))))
+CATEGORY_ACCESS_REFUSAL_RETRIES = max(0, min(2, int(os.getenv("CATEGORY_ACCESS_REFUSAL_RETRIES", "1"))))
 STOP_AFTER_EMPTY_TODAY_PAGES = max(1, int(os.getenv("STOP_AFTER_EMPTY_TODAY_PAGES", "2")))
 AVAILABILITY_TIMEOUT = max(5.0, float(os.getenv("AVAILABILITY_TIMEOUT", "20")))
 # v3.1 parser-quality thresholds. A page with too few trustworthy publication
@@ -76,8 +77,9 @@ SCAN_TRANSPORT = os.getenv("SCAN_TRANSPORT", "http").strip().lower()
 if SCAN_TRANSPORT not in {"http", "browser", "hybrid"}:
     SCAN_TRANSPORT = "http"
 BROWSER_SCAN_NAV_TIMEOUT_MS = max(10_000, min(90_000, int(os.getenv("BROWSER_SCAN_NAV_TIMEOUT_MS", "35000"))))
-BROWSER_SCAN_ACCESS_MAX_WAIT_SECONDS = max(10.0, min(180.0, float(os.getenv("BROWSER_SCAN_ACCESS_MAX_WAIT_SECONDS", "45"))))
-BROWSER_SCAN_RETRY_MIN_SECONDS = max(2.0, min(30.0, float(os.getenv("BROWSER_SCAN_RETRY_MIN_SECONDS", "6"))))
+BROWSER_SCAN_ACCESS_MAX_WAIT_SECONDS = max(1.0, min(20.0, float(os.getenv("BROWSER_SCAN_ACCESS_MAX_WAIT_SECONDS", "6"))))
+BROWSER_SCAN_RETRY_MIN_SECONDS = max(0.25, min(5.0, float(os.getenv("BROWSER_SCAN_RETRY_MIN_SECONDS", "1.25"))))
+BROWSER_SCAN_REFUSAL_RETRIES = max(0, min(2, int(os.getenv("BROWSER_SCAN_REFUSAL_RETRIES", "1"))))
 BROWSER_RESULTS_WAIT_MS = max(500, min(12_000, int(os.getenv("BROWSER_RESULTS_WAIT_MS", "4500"))))
 BROWSER_RENDER_SETTLE_MS = max(0, min(2500, int(os.getenv("BROWSER_RENDER_SETTLE_MS", "250"))))
 HYBRID_HTTP_TIMEOUT_MS = max(5_000, min(60_000, int(os.getenv("HYBRID_HTTP_TIMEOUT_MS", "18000"))))
@@ -901,6 +903,10 @@ def category_page_info_from_html(
     request_matches = True
     page_verified = requested_page <= 1
     warnings: list[str] = []
+    offset_mismatch = False
+    max_page_violation = False
+    requested_page = max(1, int(requested_page))
+    inferred_stride = 25
 
     if range_match:
         result_start = _de_int(range_match.group(1))
@@ -908,33 +914,54 @@ def category_page_info_from_html(
         total_results = _de_int(range_match.group(3))
         if result_start and result_end and result_end >= result_start:
             page_size = max(1, result_end - result_start + 1)
-            # Normal Kleinanzeigen category pages contain 25 organic slots. On a
-            # partially filled last page the offset still maps correctly with 25.
-            actual_page = ((result_start - 1) // 25) + 1
-            page_verified = actual_page == max(1, requested_page)
+            # v4.8.3: Kleinanzeigen can change the number of organic slots without
+            # changing /seite:N URLs. Infer a plausible stride from the observed
+            # offset instead of rejecting every page against a hardcoded 25.
+            if requested_page > 1:
+                numerator = result_start - 1
+                denominator = requested_page - 1
+                candidate = int(round(numerator / denominator)) if denominator else 25
+                tolerance = max(2, int(max(1, candidate) * 0.15))
+                if 10 <= candidate <= 50 and abs(numerator - candidate * denominator) <= tolerance:
+                    inferred_stride = candidate
+            elif page_size >= 10:
+                inferred_stride = min(50, page_size)
+            actual_page = ((result_start - 1) // max(1, inferred_stride)) + 1
+            page_verified = actual_page == requested_page
         if total_results is not None:
-            max_page = max(1, (total_results + 24) // 25)
-        expected_start = 1 + (max(1, requested_page) - 1) * 25
+            max_page = max(1, (total_results + inferred_stride - 1) // inferred_stride)
+        expected_start = 1 + (requested_page - 1) * inferred_stride
         if result_start is not None and result_start != expected_start:
-            request_matches = False
-            warnings.append(f"result offset {result_start} != expected {expected_start}")
+            offset_mismatch = True
+            warnings.append(
+                f"nonstandard result offset {result_start} != expected {expected_start} "
+                f"(stride {inferred_stride})"
+            )
         if max_page is not None and requested_page > max_page:
-            request_matches = False
+            max_page_violation = True
             warnings.append(f"requested page {requested_page} > calculated max {max_page}")
 
-    # Verify page identity from the final URL when possible. This catches redirects
-    # even when the result-range header is absent.
+    # The final /seite:N URL is the strongest page-identity signal. If it explicitly
+    # confirms the requested page, a harmless result-offset/layout change must not
+    # poison the Page Worker cache. Offset/max-page diagnostics remain as warnings.
     decoded_final = unquote(final_url or "")
     final_page_match = re.search(r"/seite:(\d+)(?:/|$)", decoded_final)
+    final_url_confirms_page = False
     if final_page_match:
         final_page = int(final_page_match.group(1))
-        if final_page != max(1, requested_page):
+        if final_page != requested_page:
             request_matches = False
             warnings.append(f"final URL page {final_page} != requested {requested_page}")
         else:
+            final_url_confirms_page = True
             page_verified = True
+            actual_page = requested_page
     elif requested_page == 1:
+        final_url_confirms_page = True
         page_verified = True
+
+    if not final_url_confirms_page and (offset_mismatch or max_page_violation):
+        request_matches = False
 
     ids = [x.external_id for x in items if x.external_id]
     fingerprint_ids = ids if len(ids) <= 9 else (ids[:6] + ids[-3:])
@@ -1227,18 +1254,23 @@ class KleinanzeigenParser:
                     # Only normal category-page scans get the long recovery window.
                     # This deliberately waits for the public site to recover; it does
                     # not change identity, headers or otherwise evade the refusal.
-                    if traffic_kind == "scan" and elapsed < CATEGORY_ACCESS_MAX_WAIT_SECONDS:
+                    if (
+                        traffic_kind == "scan"
+                        and refusal_attempt <= CATEGORY_ACCESS_REFUSAL_RETRIES
+                        and elapsed < CATEGORY_ACCESS_MAX_WAIT_SECONDS
+                    ):
                         snap = await TRAFFIC.snapshot()
-                        progressive = CATEGORY_ACCESS_RETRY_MIN_SECONDS * min(refusal_attempt, 3)
-                        delay = max(CATEGORY_ACCESS_RETRY_MIN_SECONDS, snap.cooldown_seconds, progressive)
-                        delay = min(60.0, delay) + random.uniform(0.0, CATEGORY_RETRY_JITTER_SECONDS)
+                        # v4.8.3: one short local retry is enough. A worker must not
+                        # occupy a scan lane for 15-180 seconds while other jobs wait.
+                        # 429 may inherit the TrafficManager's <=3s explicit rate-limit
+                        # pause; 403 normally retries after ~1.25s and then fast-fails.
+                        delay = max(CATEGORY_ACCESS_RETRY_MIN_SECONDS, snap.cooldown_seconds)
+                        delay += random.uniform(0.0, min(0.35, CATEGORY_RETRY_JITTER_SECONDS))
                         remaining = max(0.0, CATEGORY_ACCESS_MAX_WAIT_SECONDS - elapsed)
                         delay = min(delay, remaining) if remaining > 0 else 0
                         log.warning(
-                            "Category access refused status=%s attempt=%s; shared cooldown %.1fs, "
-                            "waiting %.1fs (recovery window %.0fs): %s",
-                            status, refusal_attempt, snap.cooldown_seconds, delay,
-                            CATEGORY_ACCESS_MAX_WAIT_SECONDS, url,
+                            "Category access refused status=%s attempt=%s; fast retry %.1fs: %s",
+                            status, refusal_attempt, delay, url,
                         )
                         if delay > 0:
                             await asyncio.sleep(delay)
@@ -1353,11 +1385,17 @@ class KleinanzeigenParser:
                         refusal_attempt += 1
                         await TRAFFIC.report_refusal(status, "scan")
                         elapsed = time.monotonic() - started
-                        if elapsed < BROWSER_SCAN_ACCESS_MAX_WAIT_SECONDS:
-                            delay = min(20.0, BROWSER_SCAN_RETRY_MIN_SECONDS * min(refusal_attempt, 3))
-                            delay += random.uniform(0.0, min(1.5, CATEGORY_RETRY_JITTER_SECONDS))
+                        if (
+                            refusal_attempt <= BROWSER_SCAN_REFUSAL_RETRIES
+                            and elapsed < BROWSER_SCAN_ACCESS_MAX_WAIT_SECONDS
+                        ):
+                            delay = BROWSER_SCAN_RETRY_MIN_SECONDS
+                            if status == 429:
+                                snap = await TRAFFIC.snapshot()
+                                delay = max(delay, min(3.0, snap.cooldown_seconds))
+                            delay += random.uniform(0.0, min(0.35, CATEGORY_RETRY_JITTER_SECONDS))
                             remaining = max(0.0, BROWSER_SCAN_ACCESS_MAX_WAIT_SECONDS - elapsed)
-                            if remaining:
+                            if remaining and delay > 0:
                                 await asyncio.sleep(min(delay, remaining))
                             await self._reset_scan_page()
                             continue

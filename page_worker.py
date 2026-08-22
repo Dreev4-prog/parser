@@ -51,6 +51,7 @@ from page_manager import (
     PAGE_HEARTBEAT_KEY,
     PAGE_PENDING_TTL_SECONDS,
     PAGE_REDIS_PREFIX,
+    PAGE_RUNTIME_PREFIX,
     PAGE_STREAM,
     REDIS_URL,
     serialize_page_info,
@@ -126,13 +127,13 @@ class PageWorkerProcess:
         return f"{PAGE_REDIS_PREFIX}:cache:{cache_id}"
 
     def pending_key(self, cache_id: str) -> str:
-        return f"{PAGE_REDIS_PREFIX}:pending:{cache_id}"
+        return f"{PAGE_RUNTIME_PREFIX}:pending:{cache_id}"
 
     def error_key(self, cache_id: str) -> str:
-        return f"{PAGE_REDIS_PREFIX}:error:{cache_id}"
+        return f"{PAGE_RUNTIME_PREFIX}:error:{cache_id}"
 
     def worker_key(self) -> str:
-        return f"{PAGE_REDIS_PREFIX}:worker:{self.base_id}"
+        return f"{PAGE_RUNTIME_PREFIX}:worker:{self.base_id}"
 
     async def ensure_group(self) -> None:
         if self._group_ready:
@@ -203,7 +204,18 @@ class PageWorkerProcess:
 
     async def _consume(self, consumer: str) -> tuple[str, dict] | None:
         await self.ensure_group()
-        # Crash recovery first.
+        # v4.8.3: serve fresh page jobs first; reclaim abandoned work only when the
+        # live queue is empty. This keeps recovery from delaying an interactive scan.
+        rows = await self.redis.xreadgroup(
+            PAGE_GROUP,
+            consumer,
+            {PAGE_STREAM: ">"},
+            count=1,
+            block=250,
+        )
+        if rows and rows[0][1]:
+            msg_id, fields = rows[0][1][0]
+            return str(msg_id), dict(fields or {})
         try:
             claimed = await self.redis.xautoclaim(
                 PAGE_STREAM,
@@ -219,21 +231,7 @@ class PageWorkerProcess:
                 return str(msg_id), dict(fields or {})
         except Exception:
             log.debug("Page Worker XAUTOCLAIM failed", exc_info=True)
-
-        rows = await self.redis.xreadgroup(
-            PAGE_GROUP,
-            consumer,
-            {PAGE_STREAM: ">"},
-            count=1,
-            block=3000,
-        )
-        if not rows:
-            return None
-        _stream, messages = rows[0]
-        if not messages:
-            return None
-        msg_id, fields = messages[0]
-        return str(msg_id), dict(fields or {})
+        return None
 
     async def _ack(self, message_id: str) -> None:
         pipe = self.redis.pipeline(transaction=False)

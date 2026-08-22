@@ -121,6 +121,7 @@ from view_manager import (
     VIEW_HEARTBEAT_KEY,
     VIEW_JOB_TTL_SECONDS,
     VIEW_REDIS_PREFIX,
+    VIEW_RUNTIME_PREFIX,
     VIEW_RESULT_TTL_SECONDS,
     VIEW_STREAM,
 )
@@ -211,22 +212,22 @@ class ViewCounterWorker:
         self._apply_pool_limit()
 
     def payload_key(self, job_id: str) -> str:
-        return f"{VIEW_REDIS_PREFIX}:job:{job_id}:payload"
+        return f"{VIEW_RUNTIME_PREFIX}:job:{job_id}:payload"
 
     def progress_key(self, job_id: str) -> str:
-        return f"{VIEW_REDIS_PREFIX}:job:{job_id}:progress"
+        return f"{VIEW_RUNTIME_PREFIX}:job:{job_id}:progress"
 
     def result_key(self, job_id: str) -> str:
-        return f"{VIEW_REDIS_PREFIX}:job:{job_id}:result"
+        return f"{VIEW_RUNTIME_PREFIX}:job:{job_id}:result"
 
     def cancel_key(self, job_id: str) -> str:
-        return f"{VIEW_REDIS_PREFIX}:job:{job_id}:cancel"
+        return f"{VIEW_RUNTIME_PREFIX}:job:{job_id}:cancel"
 
     def partial_key(self, job_id: str) -> str:
-        return f"{VIEW_REDIS_PREFIX}:job:{job_id}:partial"
+        return f"{VIEW_RUNTIME_PREFIX}:job:{job_id}:partial"
 
     def worker_status_key(self) -> str:
-        return f"{VIEW_REDIS_PREFIX}:worker:{self.consumer}"
+        return f"{VIEW_RUNTIME_PREFIX}:worker:{self.consumer}"
 
     def _apply_pool_limit(self) -> None:
         # parser.py's HTTP phase has its own wide semaphore, but every request
@@ -410,8 +411,21 @@ class ViewCounterWorker:
     async def admit_jobs(self) -> None:
         await self.ensure_group()
         while len(self.active) < MAX_ACTIVE_JOBS:
+            # v4.8.3: new view shards win over crash recovery. A stale pending
+            # message can never delay the user's current scan after a deployment.
+            rows = await self.redis.xreadgroup(
+                VIEW_GROUP,
+                self.consumer,
+                {VIEW_STREAM: ">"},
+                count=1,
+                block=BLOCK_MS if not self.active else 1,
+            )
+            if rows and rows[0][1]:
+                msg_id, fields = rows[0][1][0]
+                if await self._load_message(str(msg_id), fields or {}):
+                    continue
+
             loaded = False
-            # First reclaim a genuinely abandoned pending job from a crashed worker.
             try:
                 claimed = await self.redis.xautoclaim(
                     VIEW_STREAM,
@@ -427,22 +441,8 @@ class ViewCounterWorker:
                     loaded = await self._load_message(str(msg_id), fields or {})
             except Exception:
                 log.debug("View worker XAUTOCLAIM skipped", exc_info=True)
-            if loaded:
-                continue
-            rows = await self.redis.xreadgroup(
-                VIEW_GROUP,
-                self.consumer,
-                {VIEW_STREAM: ">"},
-                count=1,
-                block=BLOCK_MS if not self.active else 1,
-            )
-            if not rows:
+            if not loaded:
                 break
-            _stream, messages = rows[0]
-            if not messages:
-                break
-            msg_id, fields = messages[0]
-            await self._load_message(str(msg_id), fields or {})
 
     async def _persist_partial(self, job: ActiveJob, url: str, item: dict[str, Any]) -> None:
         key = self.partial_key(job.job_id)

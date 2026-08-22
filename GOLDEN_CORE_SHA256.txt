@@ -1,16 +1,5 @@
-DT PARSER v4.8.2 Resilient Traffic
-Base: DT PARSER v4.8.1 Golden Core / v4.4.0 parsing baseline
+OBSOLETE AFTER v4.8.2
 
-Unchanged from v4.4.0:
-9c0e89f6ecd9086975f5a998a13d11dcc53c3b490d616fafa442efd41d71d422  parser.py
-a021fc3dff80ceebbd8e06b31486ab0d4a5d5188111213a493f0e69a2270b9ff  stable_engine.py
-d6aba4015abd3c05aca13b242c9c24384c41050d46e2b6878372f54f663d8f88  distributed.py
-0041ab84e3480ccc256001bac6175c1a2561933738763e140a8d2615dd1d0673  date_manager.py
-be10da8c2eb9bd9016d3a998962fa925a984f23259a8be1d00c1dd24840f6eef  page_manager.py
-30f1a3b2fccf3b3ec5da06623bb392a931f05667b4c362d07f87fc16965566d7  view_manager.py
-
-Intentionally changed in v4.8.2 (bounded refusal handling only):
-e5a9fb9d4fc72f09a89403860860d7cef95e8f315b8c76d521c2b3b4c5f96734  traffic.py
-522b4fbaa58111c06ab6ff8758f795130d44f9bf0c1a6b47c5d5ee0a79602059  date_worker.py
-01e8f14aae3b0d3f738c126032aa87772d3566ffe7f23881331902e2e2615b3c  page_worker.py
-1bafef31ef99a40412b817ea154fd9448133f6cb69a14cc6aef1417e70d58de8  view_counter_worker.py
+v4.8.3 intentionally changes a small part of the former Golden Core worker/parser layer.
+Use RELIABLE_CORE_SHA256.txt for the current release hashes and change list.
+The v4.4.0 baseline remains the historical reference, not a byte-for-byte claim for v4.8.3.

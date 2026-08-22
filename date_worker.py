@@ -64,6 +64,7 @@ from date_manager import (
     DATE_HEARTBEAT_KEY,
     DATE_PENDING_TTL_SECONDS,
     DATE_REDIS_PREFIX,
+    DATE_RUNTIME_PREFIX,
     DATE_STREAM,
     REDIS_URL,
 )
@@ -186,13 +187,13 @@ class DateWorkerProcess:
         return f"{DATE_REDIS_PREFIX}:cache:{cache_id}"
 
     def pending_key(self, cache_id: str) -> str:
-        return f"{DATE_REDIS_PREFIX}:pending:{cache_id}"
+        return f"{DATE_RUNTIME_PREFIX}:pending:{cache_id}"
 
     def error_key(self, cache_id: str) -> str:
-        return f"{DATE_REDIS_PREFIX}:error:{cache_id}"
+        return f"{DATE_RUNTIME_PREFIX}:error:{cache_id}"
 
     def worker_key(self) -> str:
-        return f"{DATE_REDIS_PREFIX}:worker:{self.base_id}"
+        return f"{DATE_RUNTIME_PREFIX}:worker:{self.base_id}"
 
     async def ensure_group(self) -> None:
         if self._group_ready:
@@ -266,6 +267,19 @@ class DateWorkerProcess:
 
     async def _consume(self, consumer: str) -> tuple[str, dict] | None:
         await self.ensure_group()
+        # v4.8.3: fresh user work has priority. Crash recovery is attempted only
+        # when no new stream message is waiting, so a redeploy cannot spend its
+        # first minutes reclaiming stale jobs before serving the current scan.
+        rows = await self.redis.xreadgroup(
+            DATE_GROUP,
+            consumer,
+            {DATE_STREAM: ">"},
+            count=1,
+            block=250,
+        )
+        if rows and rows[0][1]:
+            msg_id, fields = rows[0][1][0]
+            return str(msg_id), dict(fields or {})
         try:
             claimed = await self.redis.xautoclaim(
                 DATE_STREAM,
@@ -281,21 +295,7 @@ class DateWorkerProcess:
                 return str(msg_id), dict(fields or {})
         except Exception:
             log.debug("Date Worker XAUTOCLAIM failed", exc_info=True)
-
-        rows = await self.redis.xreadgroup(
-            DATE_GROUP,
-            consumer,
-            {DATE_STREAM: ">"},
-            count=1,
-            block=3000,
-        )
-        if not rows:
-            return None
-        _stream, messages = rows[0]
-        if not messages:
-            return None
-        msg_id, fields = messages[0]
-        return str(msg_id), dict(fields or {})
+        return None
 
     async def _ack(self, message_id: str) -> None:
         pipe = self.redis.pipeline(transaction=False)

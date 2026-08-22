@@ -39,9 +39,13 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 REMOTE_DATE_WORKER_ENABLED = _env_bool("REMOTE_DATE_WORKER_ENABLED", bool(REDIS_URL))
 DATE_REDIS_PREFIX = os.getenv("DATE_REDIS_PREFIX", "dtparser:dateworker").strip() or "dtparser:dateworker"
-DATE_STREAM = f"{DATE_REDIS_PREFIX}:jobs"
-DATE_GROUP = f"{DATE_REDIS_PREFIX}:workers"
-DATE_HEARTBEAT_KEY = f"{DATE_REDIS_PREFIX}:heartbeat"
+# v4.8.3: cache/predictor survive releases, ephemeral jobs/pending/heartbeat do not.
+DATE_RUNTIME_PREFIX = os.getenv(
+    "DATE_RUNTIME_PREFIX", f"{DATE_REDIS_PREFIX}:runtime:v483"
+).strip() or f"{DATE_REDIS_PREFIX}:runtime:v483"
+DATE_STREAM = f"{DATE_RUNTIME_PREFIX}:jobs"
+DATE_GROUP = f"{DATE_RUNTIME_PREFIX}:workers"
+DATE_HEARTBEAT_KEY = f"{DATE_RUNTIME_PREFIX}:heartbeat"
 DATE_CACHE_TTL_SECONDS = _env_int("DATE_CACHE_TTL_SECONDS", 180, 30, 900)
 DATE_PENDING_TTL_SECONDS = _env_int("DATE_PENDING_TTL_SECONDS", 90, 20, 300)
 DATE_ERROR_TTL_SECONDS = _env_int("DATE_ERROR_TTL_SECONDS", 45, 10, 180)
@@ -232,10 +236,10 @@ class RemoteDateManager:
         return f"{DATE_REDIS_PREFIX}:cache:{cache_id}"
 
     def pending_key(self, cache_id: str) -> str:
-        return f"{DATE_REDIS_PREFIX}:pending:{cache_id}"
+        return f"{DATE_RUNTIME_PREFIX}:pending:{cache_id}"
 
     def error_key(self, cache_id: str) -> str:
-        return f"{DATE_REDIS_PREFIX}:error:{cache_id}"
+        return f"{DATE_RUNTIME_PREFIX}:error:{cache_id}"
 
     @staticmethod
     def _predictor_namespace(base_url: str) -> str:
@@ -365,7 +369,7 @@ class RemoteDateManager:
             redis = await self.connect()
             now = time.time()
             count = 0
-            async for key in redis.scan_iter(match=f"{DATE_REDIS_PREFIX}:worker:*"):
+            async for key in redis.scan_iter(match=f"{DATE_RUNTIME_PREFIX}:worker:*"):
                 raw = await redis.get(key)
                 if not raw:
                     continue
@@ -868,7 +872,7 @@ class RemoteDateManager:
             base["queue_depth"] = int(await redis.xlen(DATE_STREAM))
             now = time.time()
             workers: list[dict[str, Any]] = []
-            async for key in redis.scan_iter(match=f"{DATE_REDIS_PREFIX}:worker:*"):
+            async for key in redis.scan_iter(match=f"{DATE_RUNTIME_PREFIX}:worker:*"):
                 raw = await redis.get(key)
                 if not raw:
                     continue
