@@ -54,6 +54,7 @@ from models import (
 )
 from product_identity import TYPE_DISPLAY, ProductIdentity, recognize_product
 from traffic import TRAFFIC
+from i18n import LANG_EN, LANG_RU, get_user_language, language_name, set_user_language, translate_text
 from distributed import (
     COORDINATOR, DISTRIBUTED_WORKERS, DISTRIBUTED_MODE_SOURCE,
     DISTRIBUTED_CONFIG_ERROR, IS_RAILWAY, REDIS_URL, STABLE_SINGLE_SERVICE_MODE,
@@ -104,10 +105,105 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+
+
+# v4.6.5: per-user RU/EN presentation layer.  The parser/business logic remains
+# language-neutral; all outgoing Telegram text/inline-button labels are localized
+# at the Bot API boundary.  Admin chats intentionally stay Russian.
+_UI_LANGUAGE: ContextVar[str | None] = ContextVar("dt_ui_language", default=None)
+
+
+def _copy_model_with_updates(obj, **updates):
+    if not updates:
+        return obj
+    copier = getattr(obj, "model_copy", None)
+    if callable(copier):
+        return copier(update=updates)
+    copier = getattr(obj, "copy", None)
+    if callable(copier):
+        try:
+            return copier(update=updates)
+        except TypeError:
+            pass
+    for key, value in updates.items():
+        try:
+            setattr(obj, key, value)
+        except Exception:
+            pass
+    return obj
+
+
+def _localize_inline_markup(markup, language: str | None):
+    if language != LANG_EN or not isinstance(markup, InlineKeyboardMarkup):
+        return markup
+    changed = False
+    rows = []
+    for row in markup.inline_keyboard:
+        new_row = []
+        for button in row:
+            text = getattr(button, "text", None)
+            translated = translate_text(text, language) if isinstance(text, str) else text
+            if translated != text:
+                changed = True
+                button = _copy_model_with_updates(button, text=translated)
+            new_row.append(button)
+        rows.append(new_row)
+    return InlineKeyboardMarkup(inline_keyboard=rows) if changed else markup
+
+
+def _localize_telegram_method(method, language: str | None):
+    if language != LANG_EN:
+        return method
+    updates = {}
+    text = getattr(method, "text", None)
+    if isinstance(text, str):
+        translated = translate_text(text, language)
+        if translated != text:
+            updates["text"] = translated
+    caption = getattr(method, "caption", None)
+    if isinstance(caption, str):
+        translated = translate_text(caption, language)
+        if translated != caption:
+            updates["caption"] = translated
+    markup = getattr(method, "reply_markup", None)
+    translated_markup = _localize_inline_markup(markup, language)
+    if translated_markup is not markup:
+        updates["reply_markup"] = translated_markup
+    return _copy_model_with_updates(method, **updates)
+
+
+class LocalizedBot(Bot):
+    """Bot wrapper that localizes both foreground and background sends."""
+
+    async def __call__(self, method, request_timeout=None):
+        language = _UI_LANGUAGE.get()
+        chat_id = getattr(method, "chat_id", None)
+        numeric_chat_id = None
+        try:
+            numeric_chat_id = int(chat_id) if chat_id is not None else None
+        except (TypeError, ValueError):
+            numeric_chat_id = None
+
+        # v4.6.6: admin accounts are normal users outside the admin surface.
+        # Do not force their entire private chat to Russian here. The language
+        # middleware below forces Russian only while an admin is actually inside
+        # /admin, admin callbacks or AdminInput FSM screens.
+        if language is None and numeric_chat_id is not None and numeric_chat_id > 0:
+            try:
+                language = await get_user_language(numeric_chat_id)
+            except Exception:
+                log.debug("Could not resolve UI language for chat=%s", numeric_chat_id, exc_info=True)
+
+        method = _localize_telegram_method(method, language)
+        return await super().__call__(method, request_timeout=request_timeout)
 _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
     MENU_IMAGE_PATH = _PROJECT_DIR / "assets" / "dt_parser_menu.png"
+# v4.6.7: after the first upload Telegram gives us a reusable file_id. Reusing
+# it avoids re-uploading the menu image every time the user returns home.
+_MENU_IMAGE_FILE_ID: str | None = None
+
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
 AVAILABILITY_CHECK_LIMIT = max(1, int(os.getenv("AVAILABILITY_CHECK_LIMIT", "150")))
@@ -656,6 +752,7 @@ def settings_keyboard(s: UserSettings) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"↕️ {SORT_LABELS.get(s.sort_mode, s.sort_mode)}", callback_data="set_sort")],
         [InlineKeyboardButton(text="🔎 Ключевые слова", callback_data="set_include"),
          InlineKeyboardButton(text="🚫 Исключения", callback_data="set_exclude")],
+        [InlineKeyboardButton(text="🌐 Язык", callback_data="language_settings")],
         [InlineKeyboardButton(text="▶️ Новый скан", callback_data="start_scan")],
         [InlineKeyboardButton(text="ℹ️ Что выбрать?", callback_data="mode_help"),
          InlineKeyboardButton(text="♻️ Сбросить", callback_data="reset_settings")],
@@ -1030,8 +1127,9 @@ async def archive_active_finished_scans(user_id: int) -> int:
             return int(result.rowcount or 0)
 
 
-async def get_user_scans(user_id: int, limit: int = 10) -> list[UserScan]:
-    await archive_expired_scans(user_id)
+async def get_user_scans(user_id: int, limit: int = 10, *, archive: bool = True) -> list[UserScan]:
+    if archive:
+        await archive_expired_scans(user_id)
     async with SessionLocal() as session:
         result = await session.execute(
             select(UserScan)
@@ -1061,14 +1159,25 @@ async def get_user_archive(user_id: int, page: int = 0, page_size: int = SCAN_AR
         return list(result.scalars().all()), total
 
 
-async def get_archive_count(user_id: int) -> int:
-    await archive_expired_scans(user_id)
+async def get_archive_count(user_id: int, *, archive: bool = True) -> int:
+    if archive:
+        await archive_expired_scans(user_id)
     async with SessionLocal() as session:
         return int((await session.execute(
             select(func.count(UserScan.id)).where(
                 UserScan.user_id == user_id, UserScan.archived_at.is_not(None)
             )
         )).scalar_one())
+
+
+async def get_user_scans_overview(user_id: int, limit: int = 10) -> tuple[list[UserScan], int]:
+    """One archive sweep, then load inbox + archive count in parallel."""
+    await archive_expired_scans(user_id)
+    scans, archive_count = await asyncio.gather(
+        get_user_scans(user_id, limit, archive=False),
+        get_archive_count(user_id, archive=False),
+    )
+    return scans, archive_count
 
 
 async def get_user_popular_categories(user_id: int, limit_scans: int = 100) -> list[tuple[str, UserScan]]:
@@ -6692,6 +6801,7 @@ async def subscription_keyboard(user_id: int) -> InlineKeyboardMarkup:
                 callback_data=f"buyplan:{plan.key}",
             )])
     rows.append([InlineKeyboardButton(text="💳 Мои платежи", callback_data="mypayments")])
+    rows.append([InlineKeyboardButton(text="🌐 Язык", callback_data="language_settings")])
     if allowed(user_id):
         rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -6728,13 +6838,16 @@ def payment_invoice_keyboard(payment: SubscriptionPayment) -> InlineKeyboardMark
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def admin_keyboard() -> InlineKeyboardMarkup:
+def admin_keyboard(ai_unread: int = 0, active_scans: int = 0) -> InlineKeyboardMarkup:
+    unread = max(0, int(ai_unread or 0))
+    active = max(0, int(active_scans or 0))
+    ai_label = "🧠 DT AI Lab" if unread <= 0 else f"🧠 DT AI Lab 🔴 {min(unread, 99)}{'+' if unread > 99 else ''}"
+    parsing_label = "👀 Кто сейчас парсит" if active <= 0 else f"👀 Сейчас парсят · {active}"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adminstats")],
-        [InlineKeyboardButton(text="📅 Date Worker", callback_data="admindates"),
-         InlineKeyboardButton(text="📄 Page Worker", callback_data="adminpages")],
-        [InlineKeyboardButton(text="👁 View Worker", callback_data="adminviews")],
-        [InlineKeyboardButton(text="🧠 DT AI Lab", callback_data="adminai")],
+        [InlineKeyboardButton(text="⚙️ Воркеры", callback_data="adminworkers"),
+         InlineKeyboardButton(text=parsing_label, callback_data="adminactive")],
+        [InlineKeyboardButton(text=ai_label, callback_data="adminai")],
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="adminusers"),
          InlineKeyboardButton(text="💳 Платежи", callback_data="adminpayments")],
         [InlineKeyboardButton(text="🎟 Тарифы", callback_data="adminplans"),
@@ -6750,24 +6863,43 @@ def admin_back_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def admin_workers_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Date", callback_data="admindates"),
+         InlineKeyboardButton(text="📄 Page", callback_data="adminpages"),
+         InlineKeyboardButton(text="👁 View", callback_data="adminviews")],
+        [InlineKeyboardButton(text="🧠 DT AI Lab", callback_data="adminai")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminworkers")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
+    ])
+
+
+def admin_active_scans_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminactive")],
+        [InlineKeyboardButton(text="⚙️ Воркеры", callback_data="adminworkers")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
+    ])
+
+
 def admin_view_worker_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminviews")],
-        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
+        [InlineKeyboardButton(text="⬅️ Воркеры", callback_data="adminworkers")],
     ])
 
 
 def admin_page_worker_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminpages")],
-        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
+        [InlineKeyboardButton(text="⬅️ Воркеры", callback_data="adminworkers")],
     ])
 
 
 def admin_date_worker_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="admindates")],
-        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
+        [InlineKeyboardButton(text="⬅️ Воркеры", callback_data="adminworkers")],
     ])
 
 
@@ -6899,6 +7031,106 @@ async def send_access_screen(message: Message, user_id: int) -> None:
     )
 
 
+def language_keyboard(current: str | None = None) -> InlineKeyboardMarkup:
+    ru = "✅ 🇷🇺 Русский" if current == LANG_RU else "🇷🇺 Русский"
+    en = "✅ 🇬🇧 English" if current == LANG_EN else "🇬🇧 English"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=ru, callback_data="language:ru"),
+         InlineKeyboardButton(text=en, callback_data="language:en")],
+    ])
+
+
+def language_prompt_text(current: str | None = None) -> str:
+    if current in (LANG_RU, LANG_EN):
+        return (
+            "<b>🌐 Язык интерфейса / Interface language</b>\n\n"
+            f"Текущий язык / Current language: <b>{language_name(current)}</b>\n\n"
+            "Выберите язык / Choose language:"
+        )
+    return (
+        "<b>🌐 Выберите язык / Choose language</b>\n\n"
+        "🇷🇺 Русский\n🇬🇧 English\n\n"
+        "Язык можно изменить позже в настройках.\n"
+        "You can change the language later in Settings."
+    )
+
+
+async def _send_language_picker(message: Message, current: str | None = None) -> None:
+    # Deliberately bilingual and not run through localization: this is the one
+    # screen shown before the user has chosen a language.
+    token = _UI_LANGUAGE.set(LANG_RU)
+    try:
+        await message.answer(
+            language_prompt_text(current),
+            parse_mode=ParseMode.HTML,
+            reply_markup=language_keyboard(current),
+        )
+    finally:
+        _UI_LANGUAGE.reset(token)
+
+
+async def _admin_surface_requires_russian(event, data) -> bool:
+    """Return True only for the actual admin surface, not the admin user's normal UI."""
+    if isinstance(event, Message):
+        text = (event.text or "").strip().lower()
+        if text.startswith("/admin"):
+            return True
+    elif isinstance(event, CallbackQuery):
+        callback_data = (event.data or "").strip().lower()
+        if callback_data.startswith("admin") or callback_data.startswith("aic:"):
+            return True
+
+    # Admin text-entry flows (user search, custom days, plan price) do not carry
+    # an `admin*` callback while the user is typing, so preserve Russian there too.
+    state = data.get("state") if isinstance(data, dict) else None
+    if state is not None:
+        try:
+            raw_state = await state.get_state()
+        except Exception:
+            raw_state = None
+        if raw_state and str(raw_state).startswith(f"{AdminInput.__name__}:"):
+            return True
+    return False
+
+
+class LanguageContextMiddleware(BaseMiddleware):
+    """Load per-user UI language; keep only the actual admin panel in Russian."""
+
+    async def __call__(self, handler, event, data):
+        tg_user = getattr(event, "from_user", None)
+        if tg_user is None:
+            return await handler(event, data)
+        uid = int(tg_user.id)
+        force_admin_ru = uid in ADMIN_IDS and await _admin_surface_requires_russian(event, data)
+        try:
+            language = LANG_RU if force_admin_ru else await get_user_language(uid)
+        except Exception:
+            log.exception("Could not load UI language user=%s", tg_user.id)
+            language = LANG_RU if force_admin_ru else None
+        token = _UI_LANGUAGE.set(language)
+        try:
+            # Existing users from pre-v4.6.5 are gated once, too, so nobody gets
+            # a half-Russian/half-English experience after upgrade.
+            if language is None:
+                if isinstance(event, Message):
+                    text = (event.text or "").strip()
+                    if text.startswith("/start") or text.startswith("/language"):
+                        return await handler(event, data)
+                    await _send_language_picker(event)
+                    return None
+                if isinstance(event, CallbackQuery):
+                    callback_data = event.data or ""
+                    if callback_data.startswith("language:") or callback_data == "language_settings":
+                        return await handler(event, data)
+                    await event.answer()
+                    if event.message:
+                        await _send_language_picker(event.message)
+                    return None
+            return await handler(event, data)
+        finally:
+            _UI_LANGUAGE.reset(token)
+
+
 class ActivityAccessMiddleware(BaseMiddleware):
     """Track users and keep commercial access checks outside parser handlers."""
 
@@ -6926,13 +7158,15 @@ class ActivityAccessMiddleware(BaseMiddleware):
                 return await handler(event, data)
             if text.startswith("/help"):
                 return await handler(event, data)
+            if text.startswith("/language"):
+                return await handler(event, data)
             await send_access_screen(event, uid)
             return None
 
         if isinstance(event, CallbackQuery):
             callback_data = event.data or ""
-            public_prefixes = ("buyplan:", "payprovider:", "paycheck:", "mypayments")
-            if callback_data == "subscription" or callback_data.startswith(public_prefixes):
+            public_prefixes = ("buyplan:", "payprovider:", "paycheck:", "mypayments", "language:")
+            if callback_data in {"subscription", "language_settings"} or callback_data.startswith(public_prefixes):
                 return await handler(event, data)
             if is_banned_cached(uid):
                 await event.answer("Доступ заблокирован", show_alert=True)
@@ -6945,6 +7179,12 @@ class ActivityAccessMiddleware(BaseMiddleware):
 
 
 dp = Dispatcher()
+
+# Language selection is resolved before commercial access so first-run users and
+# expired subscribers can always choose/change the interface language.
+_language_middleware = LanguageContextMiddleware()
+dp.message.outer_middleware(_language_middleware)
+dp.callback_query.outer_middleware(_language_middleware)
 
 # Commercial access/user tracking runs before regular handlers. It never performs
 # parser work, so Telegram navigation stays responsive while scans run in background.
@@ -6979,6 +7219,136 @@ async def _admin_dashboard_text() -> str:
     )
 
 
+async def _admin_running_scan_count() -> int:
+    async with SessionLocal() as session:
+        value = (await session.execute(
+            select(func.count(UserScan.id)).where(
+                UserScan.status == "running",
+                UserScan.finished_at.is_(None),
+            )
+        )).scalar_one()
+        return int(value or 0)
+
+
+async def _admin_live_keyboard() -> InlineKeyboardMarkup:
+    ai_unread, active_scans = await asyncio.gather(
+        _ai_unread_signal_count(),
+        _admin_running_scan_count(),
+    )
+    return admin_keyboard(ai_unread, active_scans)
+
+
+def _worker_health_label(status: dict, *, active_key: str = "active_total") -> str:
+    if not status.get("enabled"):
+        return "▫️ выключен"
+    if not status.get("alive"):
+        return "🔴 offline"
+    workers = len(list(status.get("workers") or []))
+    active = int(status.get(active_key, 0) or 0)
+    queue = int(status.get("queue_depth", 0) or 0)
+    return f"🟢 {workers} · активных {active} · очередь {queue}"
+
+
+async def _admin_workers_text() -> str:
+    date_status, page_status, view_status, ai_status = await asyncio.gather(
+        REMOTE_DATE_MANAGER.status(),
+        REMOTE_PAGE_MANAGER.status(),
+        REMOTE_VIEW_MANAGER.status(),
+        AI_MANAGER.status(),
+    )
+    ai_label = "🟢 online" if ai_status.get("alive") else ("🔴 offline" if ai_status.get("enabled") else "▫️ выключен")
+    if ai_status.get("alive") and ai_status.get("paused_for_scans"):
+        ai_label += " · ждёт завершения сканов"
+    total_active = (
+        int(date_status.get("active_total", 0) or 0)
+        + int(page_status.get("active_total", 0) or 0)
+        + int(view_status.get("active_jobs", 0) or 0)
+    )
+    total_queue = (
+        int(date_status.get("queue_depth", 0) or 0)
+        + int(page_status.get("queue_depth", 0) or 0)
+        + int(view_status.get("queue_depth", 0) or 0)
+    )
+    return "\n".join([
+        "<b>⚙️ ВОРКЕРЫ DT PARSER</b>",
+        "",
+        f"📅 Date Worker: <b>{_worker_health_label(date_status)}</b>",
+        f"📄 Page Worker: <b>{_worker_health_label(page_status)}</b>",
+        f"👁 View Worker: <b>{_worker_health_label(view_status, active_key='active_jobs')}</b>",
+        f"🧠 AI Worker: <b>{ai_label}</b>",
+        "",
+        f"Всего активных worker-задач: <b>{total_active}</b>",
+        f"Всего в worker-очередях: <b>{total_queue}</b>",
+        "",
+        "<i>Нажми Date / Page / View ниже, чтобы открыть подробную диагностику конкретного воркера.</i>",
+    ])
+
+
+def _admin_scan_user_label(user: BotUser | None, user_id: int) -> str:
+    if user is not None and user.username:
+        return f"@{html.escape(user.username)}"
+    if user is not None and user.first_name:
+        return html.escape(user.first_name)
+    return f"ID {int(user_id)}"
+
+
+async def _admin_active_scans_text(limit: int = 20) -> str:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(UserScan, BotUser)
+            .outerjoin(BotUser, BotUser.user_id == UserScan.user_id)
+            .where(
+                UserScan.status.in_(ACTIVE_SCAN_STATUSES),
+                UserScan.finished_at.is_(None),
+            )
+            .order_by(UserScan.created_at.asc(), UserScan.id.asc())
+            .limit(max(1, int(limit)))
+        )
+        rows = list(result.all())
+
+    running = [(scan, user) for scan, user in rows if scan.status == "running"]
+    queued = [(scan, user) for scan, user in rows if scan.status == "queued"]
+    cancelling = [(scan, user) for scan, user in rows if scan.status == "cancelling"]
+    lines = [
+        "<b>👀 КТО СЕЙЧАС ПАРСИТ</b>",
+        "",
+        f"🟢 Парсят сейчас: <b>{len(running)}</b> · 🟡 в очереди: <b>{len(queued)}</b>",
+    ]
+    if cancelling:
+        lines[-1] += f" · 🟠 останавливаются: <b>{len(cancelling)}</b>"
+
+    if not rows:
+        lines.extend(["", "Сейчас активных сканов нет."] )
+        return "\n".join(lines)
+
+    now = datetime.utcnow()
+    if running:
+        lines.extend(["", "<b>🟢 Активные сканы</b>"] )
+        for scan, user in running[:12]:
+            elapsed = max(0, int((now - scan.created_at).total_seconds()))
+            lines.extend([
+                f"• <b>{_admin_scan_user_label(user, scan.user_id)}</b> · <code>{scan.user_id}</code>",
+                f"  {html.escape(scan.title or 'Скан')} · {_date_label(scan.target_date)} · {int(scan.page_limit or 0)} стр.",
+                f"  Статус: <b>парсит</b> · идёт <b>{_human_duration(elapsed)}</b>",
+            ])
+
+    if queued:
+        lines.extend(["", "<b>🟡 Очередь</b>"] )
+        for pos, (scan, user) in enumerate(queued[:8], start=1):
+            waited = max(0, int((now - scan.created_at).total_seconds()))
+            lines.append(
+                f"{pos}. <b>{_admin_scan_user_label(user, scan.user_id)}</b> · "
+                f"{html.escape(scan.title or 'Скан')} · {_date_label(scan.target_date)} · "
+                f"{int(scan.page_limit or 0)} стр. · ждёт {_human_duration(waited)}"
+            )
+
+    if cancelling:
+        lines.extend(["", "<b>🟠 Останавливаются</b>"] )
+        for scan, user in cancelling[:5]:
+            lines.append(f"• <b>{_admin_scan_user_label(user, scan.user_id)}</b> · {html.escape(scan.title or 'Скан')}")
+    return "\n".join(lines)
+
+
 async def _admin_view_worker_text() -> str:
     status = await REMOTE_VIEW_MANAGER.status()
     if not status.get("enabled"):
@@ -7009,10 +7379,11 @@ async def _admin_view_worker_text() -> str:
     last_shard_total = int(status.get("last_shard_total", 0) or 0)
     last_shard_workers = int(status.get("last_shard_workers", 0) or 0)
     last_shard_failed = int(status.get("last_shard_failed", 0) or 0)
+    expected_replicas = int(status.get("expected_replicas", 0) or 0)
     lines = [
         "<b>👁 VIEW MANAGER PRO</b>",
         "",
-        f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b>",
+        f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b> / ожидается <b>{expected_replicas or len(workers)}</b>",
         f"Redis queue: <b>{queue_depth}</b> · активных jobs: <b>{active_jobs}</b>",
         f"Общий HTTP pool: <b>{pool_total}</b> · Browser: <b>{browser_total}</b>",
         f"Скорость: <b>{rate_total:.1f} views/sec</b>",
@@ -7021,7 +7392,7 @@ async def _admin_view_worker_text() -> str:
     if last_shard_count:
         lines.append(
             f"Последний batch: <b>{last_shard_total}</b> URL → <b>{last_shard_count}</b> jobs "
-            f"· workers: <b>{last_shard_workers}</b> · failed shards: <b>{last_shard_failed}</b>"
+            f"· live при старте: <b>{last_shard_workers}</b> · failed shards: <b>{last_shard_failed}</b>"
         )
     for idx, worker in enumerate(workers[:4], start=1):
         processed = int(worker.get("processed_total", 0) or 0)
@@ -7052,16 +7423,53 @@ async def _admin_view_worker_text() -> str:
             f"Exact: <b>{exact_pct:.1f}%</b> · browser fallback: <b>{fallback_pct:.1f}%</b> · processed: <b>{processed}</b>",
             f"403: <b>{r403}</b> · 429: <b>{r429}</b> · refusals/60s: <b>{refusals_60}</b>",
             f"Penalty: <b>{penalty}</b> · cooldown: <b>{cooldown:.1f}s</b> · requeue: <b>{requeues}</b> · errors: <b>{failures}</b>",
+            f"Ожидание: traffic <b>{float(worker.get('traffic_wait_ms_avg', 0.0) or 0.0):.0f} ms</b> · Redis limiter <b>{float(worker.get('redis_wait_ms_avg', 0.0) or 0.0):.0f} ms</b>",
             f"Adaptive: <code>{reason}</code>",
         ])
     return "\n".join(lines)
 
 
-def admin_ai_keyboard() -> InlineKeyboardMarkup:
+AI_BADGE_EVENT_TYPES = ("winner", "confirmed")
+
+
+async def _ai_unread_signal_count() -> int:
+    """Count unique strong AI candidates not yet opened in the New section."""
+    async with SessionLocal() as session:
+        value = (await session.execute(
+            select(func.count(func.distinct(AIEarlyWinnerEvent.candidate_id))).where(
+                AIEarlyWinnerEvent.notified_at.is_(None),
+                AIEarlyWinnerEvent.event_type.in_(AI_BADGE_EVENT_TYPES),
+            )
+        )).scalar_one()
+    return int(value or 0)
+
+
+async def _mark_ai_signals_seen(candidate_ids: list[int]) -> None:
+    ids = sorted({int(x) for x in candidate_ids if int(x) > 0})
+    if not ids:
+        return
+    async with SessionLocal() as session:
+        await session.execute(
+            update(AIEarlyWinnerEvent)
+            .where(
+                AIEarlyWinnerEvent.candidate_id.in_(ids),
+                AIEarlyWinnerEvent.notified_at.is_(None),
+                AIEarlyWinnerEvent.event_type.in_(AI_BADGE_EVENT_TYPES),
+            )
+            .values(notified_at=datetime.utcnow())
+            .execution_options(synchronize_session=False)
+        )
+        await session.commit()
+
+
+def admin_ai_keyboard(unread_count: int = 0) -> InlineKeyboardMarkup:
+    unread = max(0, int(unread_count or 0))
+    new_label = "🆕 Новые" if unread <= 0 else f"🔴 Новые · {min(unread, 99)}{'+' if unread > 99 else ''}"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Hidden Gems", callback_data="adminai:hidden"),
-         InlineKeyboardButton(text="🚀 Hot / Emerging", callback_data="adminai:momentum")],
-        [InlineKeyboardButton(text="⚡ Sparks / Watch", callback_data="adminai:active")],
+        [InlineKeyboardButton(text=new_label, callback_data="adminai:new")],
+        [InlineKeyboardButton(text="💎 Скрытые находки", callback_data="adminai:hidden"),
+         InlineKeyboardButton(text="🚀 Горячие / Набирают обороты", callback_data="adminai:momentum")],
+        [InlineKeyboardButton(text="⚡ Первичные сигналы / Наблюдение", callback_data="adminai:active")],
         [InlineKeyboardButton(text="✅ Подтверждены", callback_data="adminai:confirmed"),
          InlineKeyboardButton(text="❌ Не подтвердились", callback_data="adminai:rejected")],
         [InlineKeyboardButton(text="📊 Точность AI", callback_data="adminai:accuracy"),
@@ -7073,24 +7481,24 @@ def admin_ai_keyboard() -> InlineKeyboardMarkup:
 
 def _ai_stage_label(stage: str, outcome: str = "pending") -> str:
     if outcome == "confirmed":
-        return "✅ CONFIRMED"
+        return "✅ Подтверждён"
     if outcome == "rejected":
-        return "❌ REJECTED"
+        return "❌ Не подтвердился"
     return {
-        "early_winner": "🔥 EARLY WINNER",
-        "rising": "⚡ RISING",
-        "watch": "🟡 WATCH",
-    }.get(stage or "", "🟡 WATCH")
+        "early_winner": "🔥 Сильный сигнал 90+",
+        "rising": "⚡ Рост",
+        "watch": "🟡 Наблюдение",
+    }.get(stage or "", "🟡 Наблюдение")
 
 
 def _ai_opportunity_label(value: str | None) -> str:
     return {
-        "hidden_gem": "💎 HIDDEN GEM",
-        "emerging": "🚀 EMERGING",
-        "hot_product": "🔥 HOT PRODUCT",
-        "saturated": "⚫ SATURATED",
-        "spark": "⚡ SPARK",
-    }.get(str(value or ""), "⚡ SPARK")
+        "hidden_gem": "💎 Скрытая находка",
+        "emerging": "🚀 Набирает обороты",
+        "hot_product": "🔥 Горячий товар",
+        "saturated": "⚫ Перенасыщен",
+        "spark": "⚡ Первичный сигнал",
+    }.get(str(value or ""), "⚡ Первичный сигнал")
 
 
 def _ai_json_list(raw: str | None) -> list[str]:
@@ -7127,6 +7535,12 @@ async def _admin_ai_dashboard_text() -> str:
         pending_obs = int((await session.execute(select(func.count(AIEarlyWinnerObservation.id)).where(
             AIEarlyWinnerObservation.status.in_(["pending", "running"])
         ))).scalar_one() or 0)
+        unread_signals = int((await session.execute(
+            select(func.count(func.distinct(AIEarlyWinnerEvent.candidate_id))).where(
+                AIEarlyWinnerEvent.notified_at.is_(None),
+                AIEarlyWinnerEvent.event_type.in_(AI_BADGE_EVENT_TYPES),
+            )
+        )).scalar_one() or 0)
 
     scanned = sum(int(x.listing_count or 0) for x in runs if x.status == "done")
     eligible = sum(int(x.eligible_count or 0) for x in runs if x.status == "done")
@@ -7147,33 +7561,34 @@ async def _admin_ai_dashboard_text() -> str:
 
     if worker.get("alive"):
         worker_text = (
-            f"🟢 online · v{html.escape(str(worker.get('version') or '—'))} · "
-            f"model {html.escape(str(worker.get('model_version') or '—'))}"
+            f"🟢 в сети · v{html.escape(str(worker.get('version') or '—'))} · "
+            f"модель {html.escape(str(worker.get('model_version') or '—'))}"
         )
         if worker.get("paused_for_scans"):
             worker_text += " · ⏸ ждёт завершения пользовательских сканов"
     elif worker.get("enabled"):
-        worker_text = "🔴 offline · heartbeat AI Worker не найден"
+        worker_text = "🔴 не в сети · сигнал от AI Worker не найден"
     else:
-        worker_text = "▫️ REDIS_URL недоступен в Main Bot"
+        worker_text = "▫️ REDIS_URL недоступен в основном боте"
 
     lines = [
-        "<b>🧠 DT AI LAB · PRODUCT OPPORTUNITY</b>",
+        "<b>🧠 DT AI LAB · ПОИСК ВОЗМОЖНОСТЕЙ</b>",
         "",
         f"AI Worker: <b>{worker_text}</b>",
-        "Режим: <b>🔒 Shadow · только админка</b>",
+        "Режим: <b>🔒 Теневой · только админка</b>",
         "Пользовательский парсер и его Автозамеры не меняются.",
+        f"🔔 Новых сильных сигналов: <b>{unread_signals}</b>",
         "",
         "<b>📊 Воронка сегодня</b>",
         f"Сканов обработано: <b>{sum(1 for x in runs if x.status == 'done')}</b>",
         f"Объявлений в сканах: <b>{scanned}</b>",
         f"Подходят для раннего анализа: <b>{eligible}</b>",
         f"AI-сигналов найдено: <b>{ai_candidates_total}</b>",
-        f"💎 HIDDEN GEM: <b>{hidden_gems}</b>",
-        f"🚀 EMERGING: <b>{emerging}</b>",
-        f"🔥 HOT PRODUCT: <b>{hot_products}</b>",
-        f"⚡ SPARK: <b>{sparks}</b> · ⚫ SATURATED: <b>{saturated}</b>",
-        f"Уровни Score · 🟡 WATCH {watch} · ⚡ RISING {rising} · 🔥 90+ {winners}",
+        f"💎 Скрытая находка: <b>{hidden_gems}</b>",
+        f"🚀 Набирает обороты: <b>{emerging}</b>",
+        f"🔥 Горячий товар: <b>{hot_products}</b>",
+        f"⚡ Первичный сигнал: <b>{sparks}</b> · ⚫ Перенасыщен: <b>{saturated}</b>",
+        f"Уровни оценки · 🟡 Наблюдение {watch} · ⚡ Рост {rising} · 🔥 90+ {winners}",
         f"✅ Подтверждены: <b>{confirmed}</b>",
         f"❌ Не подтвердились: <b>{rejected}</b>",
         f"🧪 Контрольная группа: <b>{controls}</b>",
@@ -7184,7 +7599,7 @@ async def _admin_ai_dashboard_text() -> str:
     if accuracy is None:
         lines.extend(["", "📈 Точность: <b>пока накапливаем подтверждения</b>"])
     else:
-        lines.extend(["", f"📈 Confirm rate среди завершённых наблюдений: <b>{accuracy:.1f}%</b> ({confirmed}/{resolved})"])
+        lines.extend(["", f"📈 Доля подтверждений среди завершённых наблюдений: <b>{accuracy:.1f}%</b> ({confirmed}/{resolved})"])
     if worker.get("last_error"):
         lines.append(f"⚠️ Последняя ошибка: <code>{html.escape(str(worker.get('last_error')))[:260]}</code>")
     return "\n".join(lines)
@@ -7198,7 +7613,19 @@ async def _ai_candidate_rows(kind: str, limit: int = 15) -> list[tuple[AIEarlyWi
             .join(UserScan, UserScan.id == AIEarlyWinnerCandidate.scan_id)
             .where(AIEarlyWinnerCandidate.is_control.is_(False))
         )
-        if kind == "hidden":
+        if kind == "new":
+            unread_ids = (
+                select(AIEarlyWinnerEvent.candidate_id)
+                .where(
+                    AIEarlyWinnerEvent.notified_at.is_(None),
+                    AIEarlyWinnerEvent.event_type.in_(AI_BADGE_EVENT_TYPES),
+                )
+                .distinct()
+            )
+            query = query.where(AIEarlyWinnerCandidate.id.in_(unread_ids)).order_by(
+                AIEarlyWinnerCandidate.created_at.desc(), AIEarlyWinnerCandidate.current_score.desc()
+            )
+        elif kind == "hidden":
             query = query.where(
                 AIEarlyWinnerCandidate.outcome == "pending",
                 AIEarlyWinnerCandidate.opportunity_type == "hidden_gem",
@@ -7248,15 +7675,16 @@ def _ai_list_keyboard(kind: str, rows: list[tuple[AIEarlyWinnerCandidate, Listin
 
 async def _admin_ai_list_text(kind: str, rows: list[tuple[AIEarlyWinnerCandidate, Listing, UserScan]]) -> str:
     titles = {
-        "hidden": "💎 Hidden Gems",
-        "momentum": "🚀 Hot / Emerging",
-        "winners": "🔥 90+ Score",
-        "active": "⚡ Sparks / Saturated",
+        "new": "🔴 Новые сигналы",
+        "hidden": "💎 Скрытые находки",
+        "momentum": "🚀 Горячие / Набирают обороты",
+        "winners": "🔥 Сильные сигналы 90+",
+        "active": "⚡ Первичные / Перенасыщенные",
         "confirmed": "✅ Подтверждённые",
         "rejected": "❌ Не подтвердились",
         "recent": "🧪 Последние прогнозы",
     }
-    lines = [f"<b>{titles.get(kind, '🧠 Product Opportunity')}</b>", ""]
+    lines = [f"<b>{titles.get(kind, '🧠 Поиск возможностей')}</b>", ""]
     if not rows:
         lines.append("Пока нет объявлений в этом разделе.")
         return "\n".join(lines)
@@ -7264,16 +7692,16 @@ async def _admin_ai_list_text(kind: str, rows: list[tuple[AIEarlyWinnerCandidate
         price = f"{listing.price_eur} €" if listing.price_eur is not None else (listing.price_text or "—")
         lines.append(
             f"{idx}. {_ai_opportunity_label(candidate.opportunity_type)} · {_ai_stage_label(candidate.stage, candidate.outcome)}\n"
-            f"   Opportunity <b>{int(candidate.current_score or 0)}/100</b> · Saturation <b>{int(candidate.saturation_score or 0)}/100</b> "
-            f"· conf {int(candidate.confidence or 0)}%\n"
+            f"   Возможность <b>{int(candidate.current_score or 0)}/100</b> · Насыщенность <b>{int(candidate.saturation_score or 0)}/100</b> "
+            f"· уверенность {int(candidate.confidence or 0)}%\n"
             f"   {html.escape((listing.title or 'Объявление')[:80])} · <b>{html.escape(str(price))}</b>\n"
-            f"   👁 {int(candidate.latest_views or 0)} · scan #{scan.id} · {_utc_to_msk_text(candidate.latest_at)} МСК"
+            f"   👁 {int(candidate.latest_views or 0)} · скан #{scan.id} · {_utc_to_msk_text(candidate.latest_at)} МСК"
         )
     lines.extend(["", "Нажми на объявление ниже, чтобы увидеть причины, прогноз и контрольные точки."])
     return "\n".join(lines)
 
 
-async def _admin_ai_candidate(candidate_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+async def _admin_ai_candidate(candidate_id: int, requested_back_kind: str | None = None) -> tuple[str, InlineKeyboardMarkup] | None:
     async with SessionLocal() as session:
         row = (await session.execute(
             select(AIEarlyWinnerCandidate, Listing, UserScan)
@@ -7299,16 +7727,16 @@ async def _admin_ai_candidate(candidate_id: int) -> tuple[str, InlineKeyboardMar
         f"<b>{_ai_opportunity_label(candidate.opportunity_type)}</b> · {_ai_stage_label(candidate.stage, candidate.outcome)}",
         f"<b>{html.escape((listing.title or 'Объявление')[:180])}</b>",
         "",
-        f"🚀 Opportunity: <b>{int(candidate.current_score or 0)}/100</b> · старт {int(candidate.initial_score or 0)}",
-        f"🌊 Saturation: <b>{int(candidate.saturation_score or 0)}/100</b> · percentile предложения {float(candidate.supply_percentile or 0)*100:.0f}%",
-        f"📈 Demand trend: <b>{float(candidate.demand_growth_ratio or 1.0):.2f}×</b> · Supply trend: <b>{float(candidate.supply_growth_ratio or 1.0):.2f}×</b>",
-        f"⚖️ Demand/Supply momentum: <b>{float(candidate.demand_supply_ratio or 1.0):.2f}×</b> · repeatability <b>{float(candidate.repeatability or 0)*100:.0f}%</b>",
+        f"🚀 Оценка возможности: <b>{int(candidate.current_score or 0)}/100</b> · старт {int(candidate.initial_score or 0)}",
+        f"🌊 Насыщенность: <b>{int(candidate.saturation_score or 0)}/100</b> · процентиль предложения {float(candidate.supply_percentile or 0)*100:.0f}%",
+        f"📈 Тренд спроса: <b>{float(candidate.demand_growth_ratio or 1.0):.2f}×</b> · тренд предложения: <b>{float(candidate.supply_growth_ratio or 1.0):.2f}×</b>",
+        f"⚖️ Спрос / предложение: <b>{float(candidate.demand_supply_ratio or 1.0):.2f}×</b> · повторяемость <b>{float(candidate.repeatability or 0)*100:.0f}%</b>",
         f"🎯 Уверенность данных: <b>{int(candidate.confidence or 0)}%</b>",
-        f"🗂 {html.escape(cat_name)} · scan <b>#{scan.id}</b>",
+        f"🗂 {html.escape(cat_name)} · скан <b>#{scan.id}</b>",
         f"💶 Цена: <b>{html.escape(str(price))}</b>",
         f"👁 Старт: <b>{int(candidate.baseline_views or 0)}</b> · сейчас: <b>{int(candidate.latest_views or 0)}</b>",
         f"⏱ Возраст при обнаружении: <b>{float(candidate.age_minutes or 0)/60.0:.1f} ч</b>",
-        f"⚡ Стартовый темп: <b>{float(candidate.initial_views_per_hour or 0):.1f}/ч</b> · percentile <b>{float(candidate.velocity_percentile or 0)*100:.0f}%</b>",
+        f"⚡ Стартовый темп: <b>{float(candidate.initial_views_per_hour or 0):.1f}/ч</b> · процентиль <b>{float(candidate.velocity_percentile or 0)*100:.0f}%</b>",
     ]
     market_n = int(candidate.market_cohort_size or 0)
     if candidate.market_median_eur is not None:
@@ -7331,7 +7759,7 @@ async def _admin_ai_candidate(candidate_id: int) -> tuple[str, InlineKeyboardMar
         f"+6ч: <b>{int(candidate.predicted_6h_low or 0)}–{int(candidate.predicted_6h_high or 0)}</b> просмотров",
     ])
     if reasons:
-        lines.extend(["", "<b>Почему такой стартовый Score</b>"])
+        lines.extend(["", "<b>Почему такая стартовая оценка</b>"])
         lines.extend([f"• {html.escape(reason)}" for reason in reasons[:6]])
     if latest_reasons:
         lines.extend(["", "<b>Что изменилось после замеров</b>"])
@@ -7341,15 +7769,17 @@ async def _admin_ai_candidate(candidate_id: int) -> tuple[str, InlineKeyboardMar
     for obs in observations:
         if obs.status == "done" and obs.view_count is not None:
             lines.append(
-                f"+{obs.target_hours}ч ✅ <b>{obs.view_count}</b> views · Δ{int(obs.delta_views or 0):+d} "
-                f"· {float(obs.observed_views_per_hour or 0):.1f}/ч · score {int(obs.score_after or 0)}"
+                f"+{obs.target_hours}ч ✅ <b>{obs.view_count}</b> просмотров · Δ{int(obs.delta_views or 0):+d} "
+                f"· {float(obs.observed_views_per_hour or 0):.1f}/ч · оценка {int(obs.score_after or 0)}"
             )
         elif obs.status in {"error", "missed"}:
-            lines.append(f"+{obs.target_hours}ч ⚠️ {html.escape(obs.status)}")
+            lines.append(f"+{obs.target_hours}ч ⚠️ {'ошибка' if obs.status == 'error' else 'пропущен'}")
         else:
             lines.append(f"+{obs.target_hours}ч ⏳ ожидается {_utc_to_msk_text(obs.due_at)} МСК")
 
-    if candidate.outcome == "confirmed":
+    if requested_back_kind in {"new", "hidden", "momentum", "winners", "active", "confirmed", "rejected", "recent"}:
+        back_kind = requested_back_kind
+    elif candidate.outcome == "confirmed":
         back_kind = "confirmed"
     elif candidate.outcome == "rejected":
         back_kind = "rejected"
@@ -7387,11 +7817,11 @@ async def _admin_ai_accuracy_text() -> str:
     confirmed = [x for x in resolved if x.outcome == "confirmed"]
     lines = ["<b>📊 DT AI · Точность · 30 дней</b>", ""]
     if not resolved:
-        lines.append("Пока мало завершённых +3/+6 контрольных точек. Shadow mode продолжает собирать выборку.")
+        lines.append("Пока мало завершённых +3/+6 контрольных точек. Теневой режим продолжает собирать выборку.")
     else:
         lines.append(f"Завершённых кандидатов: <b>{len(resolved)}</b>")
         lines.append(f"Подтвердились: <b>{len(confirmed)}/{len(resolved)} · {len(confirmed)/len(resolved)*100:.1f}%</b>")
-        lines.extend(["", "<b>По стартовому Score</b>"])
+        lines.extend(["", "<b>По стартовой оценке</b>"])
         for lo, hi, label in ((90, 100, "90–100"), (80, 89, "80–89"), (65, 79, "65–79")):
             group = [x for x in resolved if lo <= int(x.initial_score or 0) <= hi]
             hits = sum(1 for x in group if x.outcome == "confirmed")
@@ -7422,87 +7852,30 @@ async def _admin_ai_accuracy_text() -> str:
         control_hits = sum(1 for x in controls if x.outcome == "confirmed")
         lines.extend([
             "",
-            f"🧪 Контрольная группа: неожиданных winners <b>{control_hits}/{len(controls)}</b>",
+            f"🧪 Контрольная группа: неожиданных сильных сигналов <b>{control_hits}/{len(controls)}</b>",
             "Она нужна, чтобы видеть не только удачные прогнозы, но и возможные пропуски модели.",
         ])
     return "\n".join(lines)
 
 
 async def ai_admin_notification_scheduler(bot: Bot) -> None:
-    """Deliver only high-signal AI shadow events to admins.
-
-    Rejected candidates stay visible in the funnel but do not generate push spam.
-    """
+    """Legacy compatibility stub. v4.6.2 stores AI alerts in the Lab badge instead of sending chat pushes."""
     while True:
-        try:
-            await asyncio.sleep(12.0)
-            if not ADMIN_IDS:
-                continue
-            async with SessionLocal() as session:
-                events = list((await session.execute(
-                    select(AIEarlyWinnerEvent)
-                    .where(AIEarlyWinnerEvent.notified_at.is_(None))
-                    .order_by(AIEarlyWinnerEvent.created_at.asc())
-                    .limit(10)
-                )).scalars().all())
-            for event in events:
-                if event.event_type not in {"winner", "confirmed"}:
-                    async with SessionLocal() as session:
-                        db_event = await session.get(AIEarlyWinnerEvent, int(event.id))
-                        if db_event is not None:
-                            db_event.notified_at = datetime.utcnow()
-                            await session.commit()
-                    continue
-                async with SessionLocal() as session:
-                    row = (await session.execute(
-                        select(AIEarlyWinnerCandidate, Listing)
-                        .join(Listing, Listing.external_id == AIEarlyWinnerCandidate.external_id)
-                        .where(AIEarlyWinnerCandidate.id == int(event.candidate_id))
-                    )).one_or_none()
-                if row is None:
-                    # Do not let a stale/out-of-band event permanently occupy the
-                    # first page of the outbox and starve newer AI notifications.
-                    async with SessionLocal() as session:
-                        db_event = await session.get(AIEarlyWinnerEvent, int(event.id))
-                        if db_event is not None:
-                            db_event.notified_at = datetime.utcnow()
-                            await session.commit()
-                    continue
-                candidate, listing = row
-                type_title = _ai_opportunity_label(candidate.opportunity_type)
-                title = f"{type_title} · <b>новый сигнал 90+</b>" if event.event_type == "winner" else f"✅ <b>Сигнал подтверждён</b> · {type_title}"
-                text = (
-                    f"{title}\n\n"
-                    f"{html.escape((listing.title or 'Объявление')[:140])}\n"
-                    f"🚀 Score: <b>{int(candidate.current_score or 0)}/100</b> · уверенность данных {int(candidate.confidence or 0)}%\n"
-                    f"👁 {int(candidate.latest_views or 0)} просмотров\n"
-                    f"🧪 Shadow mode · кандидат #{candidate.id}"
-                )
-                markup_rows = [[InlineKeyboardButton(text="🧠 Разобрать в AI Lab", callback_data=f"aic:{candidate.id}:winners")]]
-                if listing.url:
-                    markup_rows.append([InlineKeyboardButton(text="🔗 Открыть объявление", url=listing.url)])
-                markup = InlineKeyboardMarkup(inline_keyboard=markup_rows)
-                delivered = False
-                for admin_id in ADMIN_IDS:
-                    try:
-                        await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
-                        delivered = True
-                    except Exception:
-                        log.debug("Could not deliver AI event=%s admin=%s", event.id, admin_id, exc_info=True)
-                if delivered:
-                    async with SessionLocal() as session:
-                        db_event = await session.get(AIEarlyWinnerEvent, int(event.id))
-                        if db_event is not None:
-                            db_event.notified_at = datetime.utcnow()
-                            await session.commit()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("AI admin notification scheduler failed")
+        await asyncio.sleep(3600.0)
 
 
 async def _edit_or_answer(target: Message, text: str, *, reply_markup=None) -> None:
-    """Prefer editing inline-menu messages, but gracefully fall back to a new one."""
+    """Open a UI screen with one Telegram request whenever possible.
+
+    The home menu is a photo message. Calling edit_text() on a photo always
+    produces a Telegram Bad Request, which previously added a full network
+    round-trip before the fallback answer() and made every tab feel 1-2s slow.
+    Media messages now go straight to answer(); text messages still edit in
+    place and keep the old fallback for genuinely stale/non-editable messages.
+    """
+    if not getattr(target, "text", None):
+        await target.answer(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+        return
     try:
         await target.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
     except Exception:
@@ -7513,11 +7886,11 @@ async def _edit_or_answer(target: Message, text: str, *, reply_markup=None) -> N
 async def subscription_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.answer()
-    await _edit_or_answer(
-        callback.message,
-        await subscription_text(callback.from_user.id),
-        reply_markup=await subscription_keyboard(callback.from_user.id),
+    text, markup = await asyncio.gather(
+        subscription_text(callback.from_user.id),
+        subscription_keyboard(callback.from_user.id),
     )
+    await _edit_or_answer(callback.message, text, reply_markup=markup)
 
 
 @dp.callback_query(F.data == "mypayments")
@@ -7680,10 +8053,11 @@ async def _admin_date_worker_text() -> str:
         )
 
     workers = list(status.get("workers") or [])
+    expected_replicas = int(status.get("expected_replicas", 0) or 0)
     lines = [
         "<b>📅 DATE MANAGER</b>",
         "",
-        f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b>",
+        f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b> / ожидается <b>{expected_replicas or len(workers)}</b>",
         f"Redis queue: <b>{int(status.get('queue_depth', 0) or 0)}</b> · активных: <b>{int(status.get('active_total', 0) or 0)}</b>",
         f"Date cache: <b>{int(status.get('cache_ttl', 180) or 180)} сек.</b> · Predictor: <b>{int(status.get('predictor_ttl', 3600) or 3600) // 60} мин.</b> · окно дат: <b>{int(status.get('max_age_days', DATE_MAX_AGE_DAYS) or DATE_MAX_AGE_DAYS) + 1} дней</b>",
         f"Общая скорость: <b>{float(status.get('rate_total', 0.0) or 0.0):.2f} probes/sec</b>",
@@ -7711,6 +8085,7 @@ async def _admin_date_worker_text() -> str:
             f"probes: <b>{int(worker.get('processed', 0) or 0)}</b> · speed <b>{float(worker.get('rate_ema', 0.0) or 0.0):.2f}/s</b>",
             f"HTTP fast: <b>{int(worker.get('http_fast_ok', 0) or 0)}</b> · browser confirm: <b>{int(worker.get('browser_confirm_ok', 0) or 0)}/{int(worker.get('browser_confirms', 0) or 0)}</b>",
             f"403/429: <b>{int(worker.get('http_403', 0) or 0)}/{int(worker.get('http_429', 0) or 0)}</b> · conflicts: <b>{int(worker.get('transport_conflicts', 0) or 0)}</b> · errors <b>{int(worker.get('errors', 0) or 0)}</b>",
+            f"Ожидание: traffic <b>{float(worker.get('traffic_wait_ms_avg', 0.0) or 0.0):.0f} ms</b> · Redis limiter <b>{float(worker.get('redis_wait_ms_avg', 0.0) or 0.0):.0f} ms</b>",
         ])
     lines.extend([
         "",
@@ -7739,10 +8114,11 @@ async def _admin_page_worker_text() -> str:
         )
 
     workers = list(status.get("workers") or [])
+    expected_replicas = int(status.get("expected_replicas", 0) or 0)
     lines = [
         "<b>📄 PAGE MANAGER</b>",
         "",
-        f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b>",
+        f"Статус: <b>🟢 online</b> · workers: <b>{len(workers)}</b> / ожидается <b>{expected_replicas or len(workers)}</b>",
         f"Redis queue: <b>{int(status.get('queue_depth', 0) or 0)}</b> · активных: <b>{int(status.get('active_total', 0) or 0)}</b>",
         f"Кэш страниц: <b>{int(status.get('cache_ttl', 180) or 180)} сек.</b>",
         f"Streaming: <b>✅ ВКЛ</b> · Rolling: <b>{'✅' if status.get('rolling_prefetch') else '—'}</b> "
@@ -7766,6 +8142,7 @@ async def _admin_page_worker_text() -> str:
             f"Fleet: <b>{html.escape(str(worker.get('fleet_bucket') or '—'))}</b> · scan/browser/global <b>{int(worker.get('fleet_scan_limit', 0) or 0)}/{int(worker.get('fleet_browser_limit', 0) or 0)}/{int(worker.get('fleet_global_limit', 0) or 0)}</b>",
             f"pages: <b>{int(worker.get('processed', 0) or 0)}</b> · cache-hit worker: <b>{int(worker.get('cache_served', 0) or 0)}</b> · speed <b>{float(worker.get('rate_ema', 0.0) or 0.0):.2f}/s</b>",
             f"403/429: <b>{int(worker.get('http_403', 0) or 0)}/{int(worker.get('http_429', 0) or 0)}</b> · penalty <b>{int(worker.get('penalty', 0) or 0)}</b>",
+            f"Ожидание: traffic <b>{float(worker.get('traffic_wait_ms_avg', 0.0) or 0.0):.0f} ms</b> · Redis limiter <b>{float(worker.get('redis_wait_ms_avg', 0.0) or 0.0):.0f} ms</b>",
         ])
     lines.extend([
         "",
@@ -7780,7 +8157,7 @@ async def admin_command(message: Message, state: FSMContext) -> None:
     if not _is_admin(message.from_user.id):
         await message.answer("Нет доступа.")
         return
-    await message.answer(await _admin_dashboard_text(), parse_mode=ParseMode.HTML, reply_markup=admin_keyboard())
+    await message.answer(await _admin_dashboard_text(), parse_mode=ParseMode.HTML, reply_markup=await _admin_live_keyboard())
 
 
 @dp.callback_query(F.data == "adminhome")
@@ -7790,7 +8167,7 @@ async def admin_home_handler(callback: CallbackQuery, state: FSMContext) -> None
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer()
-    await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=admin_keyboard())
+    await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=await _admin_live_keyboard())
 
 
 @dp.callback_query(F.data == "adminstats")
@@ -7799,7 +8176,33 @@ async def admin_stats_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer()
-    await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=admin_keyboard())
+    await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=await _admin_live_keyboard())
+
+
+@dp.callback_query(F.data == "adminworkers")
+async def admin_workers_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message,
+        await _admin_workers_text(),
+        reply_markup=admin_workers_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "adminactive")
+async def admin_active_scans_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message,
+        await _admin_active_scans_text(),
+        reply_markup=admin_active_scans_keyboard(),
+    )
 
 
 @dp.callback_query(F.data == "adminai")
@@ -7808,7 +8211,8 @@ async def admin_ai_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer()
-    await _edit_or_answer(callback.message, await _admin_ai_dashboard_text(), reply_markup=admin_ai_keyboard())
+    unread = await _ai_unread_signal_count()
+    await _edit_or_answer(callback.message, await _admin_ai_dashboard_text(), reply_markup=admin_ai_keyboard(unread))
 
 
 @dp.callback_query(F.data.startswith("adminai:"))
@@ -7827,9 +8231,13 @@ async def admin_ai_section_handler(callback: CallbackQuery) -> None:
             ]),
         )
         return
-    if kind not in {"hidden", "momentum", "winners", "active", "confirmed", "rejected", "recent"}:
+    if kind not in {"new", "hidden", "momentum", "winners", "active", "confirmed", "rejected", "recent"}:
         kind = "recent"
     rows = await _ai_candidate_rows(kind)
+    # Viewing the New list is the acknowledgement action. Only candidates actually
+    # rendered on this page are marked seen, so a backlog larger than 15 remains badged.
+    if kind == "new" and rows:
+        await _mark_ai_signals_seen([int(candidate.id) for candidate, _listing, _scan in rows[:15]])
     await _edit_or_answer(callback.message, await _admin_ai_list_text(kind, rows), reply_markup=_ai_list_keyboard(kind, rows))
 
 
@@ -7839,11 +8247,13 @@ async def admin_ai_candidate_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     try:
-        candidate_id = int(callback.data.split(":", 2)[1])
+        parts = callback.data.split(":", 2)
+        candidate_id = int(parts[1])
+        requested_back_kind = parts[2] if len(parts) > 2 else None
     except Exception:
         await callback.answer("Некорректный кандидат", show_alert=True)
         return
-    detail = await _admin_ai_candidate(candidate_id)
+    detail = await _admin_ai_candidate(candidate_id, requested_back_kind=requested_back_kind)
     if detail is None:
         await callback.answer("Кандидат не найден", show_alert=True)
         return
@@ -8403,9 +8813,21 @@ async def subscription_lifecycle_scheduler(bot: Bot) -> None:
 
 
 
-async def setup_bot_commands(bot: Bot) -> None:
-    """Configure Telegram's bottom-left Menu button and command list."""
-    user_commands = [
+def user_commands_for_language(language: str = LANG_RU) -> list[BotCommand]:
+    if language == LANG_EN:
+        return [
+            BotCommand(command="menu", description="🏠 Main menu"),
+            BotCommand(command="new_scan", description="▶️ New scan"),
+            BotCommand(command="stop", description="⏹ Stop parser"),
+            BotCommand(command="my_scans", description="📊 My scans"),
+            BotCommand(command="popular", description="🔥 Popular"),
+            BotCommand(command="categories", description="🗂 Categories"),
+            BotCommand(command="settings", description="⚙️ Settings"),
+            BotCommand(command="subscription", description="💎 Subscription"),
+            BotCommand(command="language", description="🌐 Language"),
+            BotCommand(command="help", description="ℹ️ Help"),
+        ]
+    return [
         BotCommand(command="menu", description="🏠 Главное меню"),
         BotCommand(command="new_scan", description="▶️ Новый скан"),
         BotCommand(command="stop", description="⏹ Остановить парсер"),
@@ -8414,14 +8836,38 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="categories", description="🗂 Категории"),
         BotCommand(command="settings", description="⚙️ Настройки"),
         BotCommand(command="subscription", description="💎 Подписка"),
+        BotCommand(command="language", description="🌐 Язык"),
         BotCommand(command="help", description="ℹ️ Помощь"),
     ]
+
+
+async def set_user_command_language(bot: Bot, user_id: int, language: str) -> None:
+    if int(user_id) in ADMIN_IDS:
+        return
+    try:
+        await bot.set_my_commands(
+            user_commands_for_language(language),
+            scope=BotCommandScopeChat(chat_id=int(user_id)),
+        )
+    except Exception:
+        log.debug("Could not update command language user=%s", user_id, exc_info=True)
+
+
+async def setup_bot_commands(bot: Bot) -> None:
+    """Configure Telegram's bottom-left Menu button and command list."""
+    user_commands = user_commands_for_language(LANG_RU)
     admin_commands = user_commands + [
         BotCommand(command="admin", description="🛠 Админ-панель"),
     ]
 
-    # Default command menu for every private user.
+    # Default menu is Russian; Telegram-native English clients also get an
+    # English command list.  The in-bot language selector additionally installs
+    # a per-chat command list so the user's explicit choice wins.
     await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+    try:
+        await bot.set_my_commands(user_commands_for_language(LANG_EN), scope=BotCommandScopeDefault(), language_code="en")
+    except Exception:
+        log.debug("Could not configure Telegram English command list", exc_info=True)
     # Admin chats get the same menu plus /admin.
     for admin_id in sorted(ADMIN_IDS):
         try:
@@ -8432,6 +8878,60 @@ async def setup_bot_commands(bot: Bot) -> None:
     # Force Telegram to render the standard Commands menu button instead of
     # requiring users to type slash commands manually.
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+
+
+# Legacy body replaced by v4.6.5; marker kept out intentionally.
+@dp.message(Command("language"))
+async def language_command(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    current = await get_user_language(message.from_user.id)
+    await _send_language_picker(message, current)
+
+
+@dp.callback_query(F.data == "language_settings")
+async def language_settings(callback: CallbackQuery) -> None:
+    current = await get_user_language(callback.from_user.id)
+    await callback.answer()
+    token = _UI_LANGUAGE.set(LANG_RU)
+    try:
+        await _edit_or_answer(
+            callback.message,
+            language_prompt_text(current),
+            reply_markup=language_keyboard(current),
+        )
+    finally:
+        _UI_LANGUAGE.reset(token)
+
+
+@dp.callback_query(F.data.startswith("language:"))
+async def choose_language(callback: CallbackQuery, state: FSMContext) -> None:
+    language = (callback.data or "").split(":", 1)[1].strip().lower()
+    if language not in {LANG_RU, LANG_EN}:
+        await callback.answer("Unknown language", show_alert=True)
+        return
+    await set_user_language(callback.from_user.id, language)
+    await set_user_command_language(callback.bot, callback.from_user.id, language)
+    token = _UI_LANGUAGE.set(language)
+    try:
+        await callback.answer("Language saved" if language == LANG_EN else "Язык сохранён")
+        await state.clear()
+        if not allowed(callback.from_user.id):
+            if callback.message:
+                await callback.message.answer(
+                    await subscription_text(callback.from_user.id),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=await subscription_keyboard(callback.from_user.id),
+                )
+            return
+        user = await get_commerce_user(callback.from_user.id)
+        if user is not None and not bool(user.onboarding_completed):
+            if callback.message:
+                await _show_onboarding(callback.message, callback.from_user.id, 1)
+            return
+        if callback.message:
+            await _send_home_message(callback.message, callback.from_user.id)
+    finally:
+        _UI_LANGUAGE.reset(token)
 
 
 def onboarding_keyboard(step: int) -> InlineKeyboardMarkup:
@@ -8513,20 +9013,42 @@ def home_text(selected_count: int, auto_observations: bool = False) -> str:
 
 
 async def _send_home_message(message: Message, user_id: int, *, intro: bool = False) -> None:
-    """Send the branded DT PARSER home card with navigation buttons below it."""
-    selected = await get_selected(user_id)
-    user_settings = await get_settings(user_id)
+    """Send the branded DT PARSER home card with low-latency navigation."""
+    global _MENU_IMAGE_FILE_ID
+    selected, user_settings = await asyncio.gather(
+        get_selected(user_id),
+        get_settings(user_id),
+    )
     auto_enabled = bool(getattr(user_settings, "auto_observations", False))
     markup = main_keyboard(len(selected), admin=_is_admin(user_id), auto_observations=auto_enabled)
     caption = home_text(len(selected), auto_enabled)
 
+    if _MENU_IMAGE_FILE_ID:
+        try:
+            await message.answer_photo(
+                photo=_MENU_IMAGE_FILE_ID,
+                caption=caption,
+                reply_markup=markup,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except Exception:
+            # File IDs can theoretically become unusable after a bot/token
+            # replacement. Drop the cache and upload the local asset once.
+            _MENU_IMAGE_FILE_ID = None
+
     if MENU_IMAGE_PATH.exists():
-        await message.answer_photo(
+        sent = await message.answer_photo(
             photo=FSInputFile(MENU_IMAGE_PATH),
             caption=caption,
             reply_markup=markup,
             parse_mode=ParseMode.HTML,
         )
+        if getattr(sent, "photo", None):
+            try:
+                _MENU_IMAGE_FILE_ID = sent.photo[-1].file_id
+            except Exception:
+                pass
         return
 
     # Safe fallback if the asset was accidentally omitted from a deployment.
@@ -8556,8 +9078,7 @@ async def _send_popular_message(message: Message, user_id: int) -> None:
 
 
 async def _send_my_scans_message(message: Message, user_id: int) -> None:
-    scans = await get_user_scans(user_id, 10)
-    archive_count = await get_archive_count(user_id)
+    scans, archive_count = await get_user_scans_overview(user_id, 10)
     if not scans:
         text = (
             "<b>📊 Мои сканы</b>\n\nСвежих сканов пока нет. После завершения они будут храниться здесь 24 часа, затем уйдут в Архив."
@@ -8574,7 +9095,10 @@ async def _send_my_scans_message(message: Message, user_id: int) -> None:
 
 async def _begin_scan_from_message(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
-    selected_keys = await get_selected(user_id)
+    selected_keys, has_active_scan = await asyncio.gather(
+        get_selected(user_id),
+        user_has_active_scan(user_id),
+    )
     selected_cats = [CATEGORIES[k] for k in CATEGORIES if k in selected_keys]
     if not selected_cats:
         await message.answer(
@@ -8584,7 +9108,7 @@ async def _begin_scan_from_message(message: Message, state: FSMContext) -> None:
         )
         return
 
-    if await user_has_active_scan(user_id):
+    if has_active_scan:
         await message.answer("⏳ У тебя уже идёт парсинг.")
         return
 
@@ -8644,6 +9168,12 @@ async def start(message: Message, state: FSMContext) -> None:
             parse_mode=ParseMode.HTML,
         )
         return
+    language = await get_user_language(message.from_user.id)
+    if language is None and message.from_user.id not in ADMIN_IDS:
+        await _send_language_picker(message)
+        return
+    if language is not None:
+        await set_user_command_language(message.bot, message.from_user.id, language)
     if not allowed(message.from_user.id):
         await send_access_screen(message, message.from_user.id)
         return
@@ -8740,8 +9270,8 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     if not allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
-    user = await get_commerce_user(callback.from_user.id)
     await callback.answer()
+    user = await get_commerce_user(callback.from_user.id)
     if user is not None and not bool(user.onboarding_completed):
         await _edit_or_answer(callback.message, onboarding_text(1), reply_markup=onboarding_keyboard(1))
         return
@@ -8822,8 +9352,8 @@ async def settings(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     if not allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
-    s = await get_settings(callback.from_user.id)
     await callback.answer()
+    s = await get_settings(callback.from_user.id)
     await _edit_or_answer(callback.message, settings_text(s), reply_markup=settings_keyboard(s))
 
 
@@ -9139,8 +9669,8 @@ async def run_view_test(message: Message, state: FSMContext) -> None:
 async def popular_now(callback: CallbackQuery) -> None:
     if not allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
-    items = await get_user_popular_categories(callback.from_user.id)
     await callback.answer()
+    items = await get_user_popular_categories(callback.from_user.id)
     if not items:
         text = (
             "🔥 <b>Популярное</b>\n\n"
@@ -9152,18 +9682,9 @@ async def popular_now(callback: CallbackQuery) -> None:
             "Выбери категорию — показываем только её <b>последний успешный скан</b>.\n"
             "TOP роста доступен по замерам 3 / 6 / 12 часов; автозамеры включаются по желанию."
         )
-    try:
-        await callback.message.edit_text(
-            text, parse_mode=ParseMode.HTML,
-            reply_markup=popular_categories_keyboard(items),
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        await callback.message.answer(
-            text, parse_mode=ParseMode.HTML,
-            reply_markup=popular_categories_keyboard(items),
-            disable_web_page_preview=True,
-        )
+    await _edit_or_answer(
+        callback.message, text, reply_markup=popular_categories_keyboard(items)
+    )
 
 
 @dp.callback_query(F.data.startswith("popularcat:"))
@@ -9298,9 +9819,8 @@ async def my_scans(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     if not allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
-    scans = await get_user_scans(callback.from_user.id, 10)
-    archive_count = await get_archive_count(callback.from_user.id)
     await callback.answer()
+    scans, archive_count = await get_user_scans_overview(callback.from_user.id, 10)
     if not scans:
         text = (
             "<b>📊 Мои сканы</b>\n\nСвежих сканов пока нет. После завершения они будут храниться здесь 24 часа, затем уйдут в Архив."
@@ -10346,7 +10866,10 @@ async def start_scan(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
 
-    selected_keys = await get_selected(callback.from_user.id)
+    selected_keys, has_active_scan = await asyncio.gather(
+        get_selected(callback.from_user.id),
+        user_has_active_scan(callback.from_user.id),
+    )
     selected_cats = [CATEGORIES[k] for k in CATEGORIES if k in selected_keys]
     if not selected_cats:
         await callback.answer("Сначала выбери хотя бы одну категорию", show_alert=True)
@@ -10358,7 +10881,7 @@ async def start_scan(callback: CallbackQuery, state: FSMContext) -> None:
         )
         return
 
-    if await user_has_active_scan(callback.from_user.id):
+    if has_active_scan:
         await callback.answer("У тебя уже идёт парсинг", show_alert=True)
         return
 
@@ -10692,7 +11215,7 @@ async def main() -> None:
     if archived:
         log.info("v3.3.0 initial scan archive: %s moved", archived)
 
-    bot = Bot(BOT_TOKEN)
+    bot = LocalizedBot(BOT_TOKEN)
     try:
         await setup_bot_commands(bot)
     except Exception:
@@ -10755,9 +11278,6 @@ async def main() -> None:
         subscription_lifecycle_scheduler(bot), name="subscription-lifecycle-scheduler"
     )
     archive_task = asyncio.create_task(scan_archive_scheduler(), name="scan-archive-scheduler")
-    ai_notification_task = asyncio.create_task(
-        ai_admin_notification_scheduler(bot), name="ai-admin-notification-scheduler"
-    )
     observation_tasks = [] if DISTRIBUTED_WORKERS else [
         asyncio.create_task(observation_scheduler(bot, i), name=f"view-observation-worker-{i}")
         for i in range(1, OBSERVATION_CONCURRENCY + 1)
@@ -10772,12 +11292,11 @@ async def main() -> None:
         payment_task.cancel()
         subscription_task.cancel()
         archive_task.cancel()
-        ai_notification_task.cancel()
         for task in observation_tasks:
             task.cancel()
         for task in worker_tasks:
             task.cancel()
-        shutdown_tasks = [payment_task, subscription_task, archive_task, ai_notification_task, *observation_tasks, *worker_tasks]
+        shutdown_tasks = [payment_task, subscription_task, archive_task, *observation_tasks, *worker_tasks]
         if distributed_queue_ticker_task is not None:
             shutdown_tasks.insert(0, distributed_queue_ticker_task)
         if ticker_task is not None:

@@ -45,6 +45,9 @@ class TrafficSnapshot:
     refusals_60s: int
     total_successes: int
     total_refusals: int
+    lease_acquires: int
+    local_wait_seconds_total: float
+    distributed_wait_seconds_total: float
 
 
 class AdaptiveTrafficManager:
@@ -84,6 +87,9 @@ class AdaptiveTrafficManager:
         self._success_since_penalty = 0
         self._total_successes = 0
         self._total_refusals = 0
+        self._lease_acquires = 0
+        self._local_wait_seconds_total = 0.0
+        self._distributed_wait_seconds_total = 0.0
 
     def _effective_limits(self) -> tuple[int, int, int, int]:
         penalty = self._penalty
@@ -192,6 +198,9 @@ class AdaptiveTrafficManager:
                 refusals_60s=len(self._refusals),
                 total_successes=self._total_successes,
                 total_refusals=self._total_refusals,
+                lease_acquires=self._lease_acquires,
+                local_wait_seconds_total=self._local_wait_seconds_total,
+                distributed_wait_seconds_total=self._distributed_wait_seconds_total,
             )
 
     @asynccontextmanager
@@ -200,6 +209,8 @@ class AdaptiveTrafficManager:
             raise ValueError(f"Unknown traffic kind: {kind}")
         is_background = kind == "view" and priority == "background"
         acquired = False
+        lease_started = time.monotonic()
+        local_acquired_at = lease_started
         try:
             while not acquired:
                 async with self._condition:
@@ -240,6 +251,7 @@ class AdaptiveTrafficManager:
                             self._background_view_active += 1
                         self._next_allowed[kind] = now + self._kind_interval(kind)
                         acquired = True
+                        local_acquired_at = time.monotonic()
                         break
 
                     waits = [0.25]
@@ -253,6 +265,7 @@ class AdaptiveTrafficManager:
                     except asyncio.TimeoutError:
                         pass
             distributed_token = None
+            distributed_started = time.monotonic()
             if DISTRIBUTED_WORKERS:
                 try:
                     distributed_token = await COORDINATOR.acquire_traffic(
@@ -265,6 +278,12 @@ class AdaptiveTrafficManager:
                     # command fails. Keep the local safety limits rather than taking
                     # every worker offline.
                     log.warning("Distributed traffic limiter unavailable; using local limit", exc_info=True)
+            distributed_done = time.monotonic()
+            async with self._condition:
+                self._lease_acquires += 1
+                self._local_wait_seconds_total += max(0.0, local_acquired_at - lease_started)
+                if DISTRIBUTED_WORKERS:
+                    self._distributed_wait_seconds_total += max(0.0, distributed_done - distributed_started)
             try:
                 yield
             finally:

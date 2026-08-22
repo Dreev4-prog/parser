@@ -39,13 +39,19 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 REMOTE_DATE_WORKER_ENABLED = _env_bool("REMOTE_DATE_WORKER_ENABLED", bool(REDIS_URL))
 DATE_REDIS_PREFIX = os.getenv("DATE_REDIS_PREFIX", "dtparser:dateworker").strip() or "dtparser:dateworker"
-DATE_STREAM = f"{DATE_REDIS_PREFIX}:jobs"
-DATE_GROUP = f"{DATE_REDIS_PREFIX}:workers"
-DATE_HEARTBEAT_KEY = f"{DATE_REDIS_PREFIX}:heartbeat"
+# v4.8.0: runtime queue state is schema-isolated from older releases. Keep the
+# proven date cache/predictor namespace stable, but never inherit stale jobs,
+# pending locks or worker heartbeats from a previous parser-core generation.
+DATE_RUNTIME_SCHEMA = (os.getenv("WORKER_RUNTIME_SCHEMA", "perf480").strip() or "perf480")
+DATE_RUNTIME_PREFIX = f"{DATE_REDIS_PREFIX}:runtime:{DATE_RUNTIME_SCHEMA}"
+DATE_STREAM = f"{DATE_RUNTIME_PREFIX}:jobs"
+DATE_GROUP = f"{DATE_RUNTIME_PREFIX}:workers"
+DATE_HEARTBEAT_KEY = f"{DATE_RUNTIME_PREFIX}:heartbeat"
 DATE_CACHE_TTL_SECONDS = _env_int("DATE_CACHE_TTL_SECONDS", 180, 30, 900)
-DATE_PENDING_TTL_SECONDS = _env_int("DATE_PENDING_TTL_SECONDS", 90, 20, 300)
+DATE_PENDING_TTL_SECONDS = _env_int("DATE_PENDING_TTL_SECONDS", 60, 20, 300)
 DATE_ERROR_TTL_SECONDS = _env_int("DATE_ERROR_TTL_SECONDS", 45, 10, 180)
 DATE_HEARTBEAT_STALE_SECONDS = _env_int("DATE_HEARTBEAT_STALE_SECONDS", 20, 8, 120)
+DATE_EXPECTED_REPLICAS = _env_int("DATE_EXPECTED_REPLICAS", 4, 1, 16)
 DATE_PROBE_TIMEOUT_SECONDS = _env_int("DATE_PROBE_TIMEOUT_SECONDS", 10, 3, 45)
 DATE_PROBE_POLL_MS = _env_int("DATE_PROBE_POLL_MS", 120, 50, 1000)
 DATE_MAX_AGE_DAYS = 4  # hard product limit: today + previous four days = five calendar dates
@@ -232,10 +238,10 @@ class RemoteDateManager:
         return f"{DATE_REDIS_PREFIX}:cache:{cache_id}"
 
     def pending_key(self, cache_id: str) -> str:
-        return f"{DATE_REDIS_PREFIX}:pending:{cache_id}"
+        return f"{DATE_RUNTIME_PREFIX}:pending:{cache_id}"
 
     def error_key(self, cache_id: str) -> str:
-        return f"{DATE_REDIS_PREFIX}:error:{cache_id}"
+        return f"{DATE_RUNTIME_PREFIX}:error:{cache_id}"
 
     @staticmethod
     def _predictor_namespace(base_url: str) -> str:
@@ -365,7 +371,7 @@ class RemoteDateManager:
             redis = await self.connect()
             now = time.time()
             count = 0
-            async for key in redis.scan_iter(match=f"{DATE_REDIS_PREFIX}:worker:*"):
+            async for key in redis.scan_iter(match=f"{DATE_RUNTIME_PREFIX}:worker:*"):
                 raw = await redis.get(key)
                 if not raw:
                     continue
@@ -830,6 +836,8 @@ class RemoteDateManager:
             "queue_depth": 0,
             "cache_ttl": DATE_CACHE_TTL_SECONDS,
             "max_age_days": DATE_MAX_AGE_DAYS,
+            "runtime_schema": DATE_RUNTIME_SCHEMA,
+            "expected_replicas": DATE_EXPECTED_REPLICAS,
             "predictor_ttl": DATE_PREDICTOR_TTL_SECONDS,
             "predictor_hits_total": self.predictor_hits_total,
             "predictor_misses_total": self.predictor_misses_total,
@@ -868,7 +876,7 @@ class RemoteDateManager:
             base["queue_depth"] = int(await redis.xlen(DATE_STREAM))
             now = time.time()
             workers: list[dict[str, Any]] = []
-            async for key in redis.scan_iter(match=f"{DATE_REDIS_PREFIX}:worker:*"):
+            async for key in redis.scan_iter(match=f"{DATE_RUNTIME_PREFIX}:worker:*"):
                 raw = await redis.get(key)
                 if not raw:
                     continue

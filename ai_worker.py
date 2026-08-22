@@ -726,9 +726,11 @@ class AIWorker:
                         candidate_id=int(candidate.id), event_type="winner",
                         payload_json=json.dumps({"from": old_stage, "score": candidate.current_score, "type": candidate.opportunity_type}, ensure_ascii=False),
                     ))
-                if old_outcome != candidate.outcome and candidate.outcome in {"confirmed", "rejected"}:
+                if old_outcome != candidate.outcome and candidate.outcome == "confirmed":
+                    # v4.6.2: only strong/positive events feed the unread AI Lab badge.
+                    # Rejected candidates stay visible in the Lab, but never create notification noise.
                     session.add(AIEarlyWinnerEvent(
-                        candidate_id=int(candidate.id), event_type=candidate.outcome,
+                        candidate_id=int(candidate.id), event_type="confirmed",
                         payload_json=json.dumps({"score": candidate.current_score, "target_hours": obs.target_hours, "type": candidate.opportunity_type}, ensure_ascii=False),
                     ))
             await session.commit()

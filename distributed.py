@@ -344,7 +344,7 @@ class DistributedCoordinator:
         # Browser-isolated workers should not all freeze because one independent
         # browser session received a temporary refusal. Keep the cooldown key local
         # to this worker process while still sharing the global concurrency tokens.
-        return f"{REDIS_PREFIX}:traffic:cooldown:{socket.gethostname()}:{os.getpid()}"
+        return f"{REDIS_PREFIX}:traffic:cooldown:{DIST_TRAFFIC_COOLDOWN_BUCKET}:{socket.gethostname()}:{os.getpid()}"
 
     async def acquire_traffic(self, kind: str, *, interval_seconds: float = 0.0) -> str:
         """Acquire a short Redis lease shared by every parser-worker replica.
