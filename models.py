@@ -195,6 +195,11 @@ class UserScan(Base):
     # v3.3.1: exact category keys that need a targeted recheck after a partial run.
     incomplete_category_keys: Mapped[str] = mapped_column(Text, default="")
 
+    # v4.9.0 launch trial. Trial scans are normal full-quality saved scans, but
+    # subscription-only follow-up work (repeat/update/auto-observations) stays gated.
+    is_trial: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    trial_credit_refunded: Mapped[bool] = mapped_column(Boolean, default=False)
+
 
 class ScanListing(Base):
     """Snapshot membership + view count at the moment a user scan completed."""
@@ -430,6 +435,10 @@ class BotUser(Base):
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     payments_count: Mapped[int] = mapped_column(Integer, default=0)
     paid_total_usdt: Mapped[float] = mapped_column(Float, default=0.0)
+
+    # v4.9.0 launch funnel: at most two free scans for never-paid users while
+    # the admin-controlled launch promotion is enabled.
+    trial_scans_used: Mapped[int] = mapped_column(Integer, default=0, index=True)
 
     # v3.3.0 product onboarding + subscription lifecycle notifications.
     onboarding_completed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)

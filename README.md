@@ -1,30 +1,33 @@
-# DT PARSER v4.8.6 — Coverage Complete
+# DT PARSER
 
-## v4.8.9 — Queue UX
+## v4.9.0 — Free Trial Launch
 
-- Existing 4-lane scan queue is now visible to users.
-- Queued cards show position, occupied slots, users ahead and waiting time.
-- Queue position refreshes automatically.
-- Queued action is explicitly `❌ Отменить очередь`; running jobs keep `⏹ Остановить парсер`.
-- Users who waited at least 8 seconds receive a one-time `🚀 Скан начался` notification when a lane opens.
-- Main menu has a `📥 Очередь` status button.
-- Parser/Date/Page/View core is unchanged from v4.8.8.
+Stable Kleinanzeigen Telegram parser with a launch funnel for new users.
 
+### Launch offer
+- 2 free scans for never-paid users
+- 1 category per free scan
+- 15 / 25 pages, maximum 25
+- real views, TOP-12 / TOP-50 and XLSX included
+- after the free credits: subscription required for new scans
 
-Основа: v4.8.5 Integrity Recovery / Golden Core.
+### Paid access keeps the full product
+- up to 50 pages
+- multiple categories
+- repeat/recheck/manual view refresh
+- +3 / +6 / +12h automatic measurements
 
-Главное изменение 4.8.6: integrity определяется по количеству реально подтверждённых target-date страниц. Если пользователь запросил 50 страниц и система действительно собрала 50 валидных страниц, единичный `repeated-content` в одном региональном feed не делает весь scan ложным partial — слабая страница не используется, а глубина добирается другой подтверждённой страницей.
+### Admin
+- `🎁 Бесплатные сканы` — ON/OFF without deploy
+- funnel: used trial / used both / converted / conversion %
+- `📣 Рассылка`
+- workers / active scans / users / plans / payments / access mode
 
-При настоящем shortfall Views не запускаются, partial сохраняет подтверждённые объявления без ложного `0`, а фоновые автозамеры не планируются до полного scan.
+### Access and history
+Expired users keep read-only access to their saved scans, TOP/history and XLSX. New parser/network work remains subscription-gated unless free-trial credits are available.
 
-Сохранены: resilient 403/429 traffic, Redis runtime isolation, fresh-jobs-first, dynamic page identity, 450ms Page wait, View sharding, Smart Date Hint, unique-page quality и чистый XLSX (`Цена, €` + `👁 Просмотры`).
+### Queue
+Up to 4 user scans run simultaneously; additional scans wait in the visible FIFO queue with position/status/cancel controls.
 
-Подробнее: `DEPLOY_V4_8_6_COVERAGE_COMPLETE.md`.
-
-## v4.8.7 Broadcast Launch
-
-The v4.8.6 known-good parser core is unchanged. Admins now have `📣 Рассылка` with preview + confirmation for text, photo, or photo with caption, plus delivery statistics.
-
-## v4.8.8 — Read-only History Access
-
-Expired subscribers keep read-only access to the main menu and their own saved scans/archive. New scans and network-refresh actions still require an active subscription. Parser core is unchanged.
+### Stable core
+v4.9.0 changes only product/access/database/UI layers. The parsing core and Date/Page/View worker protocols remain the known-good v4.8.6+ core.

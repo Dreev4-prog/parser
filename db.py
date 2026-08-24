@@ -256,6 +256,10 @@ async def init_db() -> None:
             await conn.execute(text("ALTER TABLE user_scans ADD COLUMN last_error VARCHAR(1000)"))
         if user_scan_columns and "incomplete_category_keys" not in user_scan_columns:
             await conn.execute(text("ALTER TABLE user_scans ADD COLUMN incomplete_category_keys TEXT DEFAULT ''"))
+        if user_scan_columns and "is_trial" not in user_scan_columns:
+            await conn.execute(text("ALTER TABLE user_scans ADD COLUMN is_trial BOOLEAN DEFAULT FALSE"))
+        if user_scan_columns and "trial_credit_refunded" not in user_scan_columns:
+            await conn.execute(text("ALTER TABLE user_scans ADD COLUMN trial_credit_refunded BOOLEAN DEFAULT FALSE"))
 
         bot_user_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "bot_users"))
         if bot_user_columns and "onboarding_completed" not in bot_user_columns:
@@ -267,6 +271,8 @@ async def init_db() -> None:
             await conn.execute(text("ALTER TABLE bot_users ADD COLUMN expiry_warning_sent_for TIMESTAMP"))
         if bot_user_columns and "expiry_expired_sent_for" not in bot_user_columns:
             await conn.execute(text("ALTER TABLE bot_users ADD COLUMN expiry_expired_sent_for TIMESTAMP"))
+        if bot_user_columns and "trial_scans_used" not in bot_user_columns:
+            await conn.execute(text("ALTER TABLE bot_users ADD COLUMN trial_scans_used INTEGER DEFAULT 0"))
 
         # v4.6: additive Product Opportunity Engine fields. Existing AI history is
         # preserved; old candidates receive neutral defaults and new runs populate them.

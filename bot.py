@@ -121,6 +121,15 @@ log = logging.getLogger("kleinanzeigen-bot")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
+# v4.9.0 Free Trial Launch. The promotion is intentionally a product/access
+# layer only: parser workers and scan algorithms remain untouched.
+FREE_TRIAL_SETTING_KEY = "free_trial_enabled"
+FREE_TRIAL_ENABLED_DEFAULT = os.getenv("FREE_TRIAL_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+FREE_TRIAL_SCAN_LIMIT = max(0, min(10, int(os.getenv("FREE_TRIAL_SCAN_LIMIT", "2"))))
+FREE_TRIAL_MAX_CATEGORIES = 1
+FREE_TRIAL_MAX_PAGES = 25
+_trial_credit_guard = asyncio.Lock()
+
 
 # v4.6.5: per-user RU/EN presentation layer.  The parser/business logic remains
 # language-neutral; all outgoing Telegram text/inline-button labels are localized
@@ -548,6 +557,132 @@ def allowed(user_id: int) -> bool:
     return has_access(int(user_id), ADMIN_IDS)
 
 
+@dataclass(slots=True)
+class TrialStatus:
+    enabled: bool
+    eligible: bool
+    used: int
+    remaining: int
+    limit: int = FREE_TRIAL_SCAN_LIMIT
+
+
+async def free_trial_enabled() -> bool:
+    async with SessionLocal() as session:
+        row = await session.get(AppSetting, FREE_TRIAL_SETTING_KEY)
+        if row is None:
+            return bool(FREE_TRIAL_ENABLED_DEFAULT)
+        return (row.value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def set_free_trial_enabled(enabled: bool) -> bool:
+    value = "1" if enabled else "0"
+    async with SessionLocal() as session:
+        row = await session.get(AppSetting, FREE_TRIAL_SETTING_KEY)
+        if row is None:
+            row = AppSetting(key=FREE_TRIAL_SETTING_KEY, value=value, updated_at=datetime.utcnow())
+            session.add(row)
+        else:
+            row.value = value
+            row.updated_at = datetime.utcnow()
+        await session.commit()
+    return bool(enabled)
+
+
+async def get_trial_status(user_id: int) -> TrialStatus:
+    uid = int(user_id)
+    enabled = await free_trial_enabled()
+    if uid in ADMIN_IDS or is_banned_cached(uid) or current_access_mode() != "subscription":
+        return TrialStatus(enabled=enabled, eligible=False, used=0, remaining=0)
+    async with SessionLocal() as session:
+        user = await session.get(BotUser, uid)
+        if user is None:
+            used = 0
+            payments_count = 0
+            access_until = None
+        else:
+            used = max(0, int(getattr(user, "trial_scans_used", 0) or 0))
+            payments_count = max(0, int(user.payments_count or 0))
+            access_until = user.access_until
+    has_active_subscription = bool(access_until and access_until > datetime.utcnow())
+    remaining = max(0, FREE_TRIAL_SCAN_LIMIT - used)
+    eligible = bool(
+        enabled and FREE_TRIAL_SCAN_LIMIT > 0 and remaining > 0
+        and payments_count == 0 and not has_active_subscription
+    )
+    return TrialStatus(enabled=enabled, eligible=eligible, used=used, remaining=remaining)
+
+
+async def trial_or_paid_scan_access(user_id: int) -> bool:
+    if allowed(user_id):
+        return True
+    return (await get_trial_status(user_id)).eligible
+
+
+async def _consume_trial_credit(user_id: int) -> TrialStatus | None:
+    """Atomically reserve one trial launch immediately before queueing it."""
+    uid = int(user_id)
+    async with _trial_credit_guard:
+        status = await get_trial_status(uid)
+        if not status.eligible:
+            return None
+        async with SessionLocal() as session:
+            # PostgreSQL row lock keeps the two-credit limit correct even if the
+            # Telegram service is later scaled to multiple replicas.
+            user = (await session.execute(
+                select(BotUser).where(BotUser.user_id == uid).with_for_update()
+            )).scalar_one_or_none()
+            if user is None:
+                now = datetime.utcnow()
+                user = BotUser(user_id=uid, joined_at=now, last_seen_at=now, trial_scans_used=0)
+                session.add(user)
+                await session.flush()
+            used = max(0, int(getattr(user, "trial_scans_used", 0) or 0))
+            if int(user.payments_count or 0) > 0 or used >= FREE_TRIAL_SCAN_LIMIT:
+                return None
+            if user.access_until and user.access_until > datetime.utcnow():
+                return None
+            user.trial_scans_used = used + 1
+            await session.commit()
+            remaining = max(0, FREE_TRIAL_SCAN_LIMIT - int(user.trial_scans_used or 0))
+            return TrialStatus(enabled=True, eligible=remaining > 0, used=int(user.trial_scans_used or 0), remaining=remaining)
+
+
+async def _refund_trial_credit_for_scan(scan_id: int) -> bool:
+    """Return a reserved credit only when a trial job never actually started."""
+    async with _trial_credit_guard:
+        async with SessionLocal() as session:
+            scan = (await session.execute(
+                select(UserScan).where(UserScan.id == int(scan_id)).with_for_update()
+            )).scalar_one_or_none()
+            if scan is None or not bool(getattr(scan, "is_trial", False)) or bool(getattr(scan, "trial_credit_refunded", False)):
+                return False
+            user = (await session.execute(
+                select(BotUser).where(BotUser.user_id == int(scan.user_id)).with_for_update()
+            )).scalar_one_or_none()
+            if user is not None:
+                user.trial_scans_used = max(0, int(getattr(user, "trial_scans_used", 0) or 0) - 1)
+            scan.trial_credit_refunded = True
+            await session.commit()
+            return True
+
+
+async def free_trial_stats() -> dict[str, int | bool]:
+    enabled = await free_trial_enabled()
+    async with SessionLocal() as session:
+        used_one = int((await session.execute(
+            select(func.count(BotUser.user_id)).where(BotUser.trial_scans_used >= 1)
+        )).scalar_one() or 0)
+        used_all = int((await session.execute(
+            select(func.count(BotUser.user_id)).where(BotUser.trial_scans_used >= FREE_TRIAL_SCAN_LIMIT)
+        )).scalar_one() or 0) if FREE_TRIAL_SCAN_LIMIT > 0 else 0
+        converted = int((await session.execute(
+            select(func.count(BotUser.user_id)).where(
+                BotUser.trial_scans_used >= 1, BotUser.payments_count >= 1
+            )
+        )).scalar_one() or 0)
+    return {"enabled": enabled, "used_one": used_one, "used_all": used_all, "converted": converted}
+
+
 def read_only_history_allowed(user_id: int) -> bool:
     """Allow expired subscribers to keep access to their own saved scan history.
 
@@ -564,7 +699,7 @@ def read_only_history_allowed(user_id: int) -> bool:
 
 def main_keyboard(
     selected_count: int = 0, *, admin: bool = False, auto_observations: bool | None = None,
-    access_active: bool = True,
+    access_active: bool = True, trial_remaining: int = 0,
 ) -> InlineKeyboardMarkup:
     """Product-style home screen with one clear primary action."""
     if auto_observations is True:
@@ -583,6 +718,15 @@ def main_keyboard(
             [InlineKeyboardButton(text="📥 Очередь", callback_data="queue_status"),
              InlineKeyboardButton(text=auto_label, callback_data="auto_obs_menu")],
             [InlineKeyboardButton(text="💎 Подписка", callback_data="subscription")],
+        ]
+    elif trial_remaining > 0:
+        rows = [
+            [InlineKeyboardButton(text=f"🎁 Бесплатный скан · осталось {trial_remaining}", callback_data="start_scan")],
+            [InlineKeyboardButton(text=f"🗂 Категория · {min(selected_count, FREE_TRIAL_MAX_CATEGORIES)}/{FREE_TRIAL_MAX_CATEGORIES}", callback_data="groups"),
+             InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
+            [InlineKeyboardButton(text="📥 Очередь", callback_data="queue_status"),
+             InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
+            [InlineKeyboardButton(text="💎 Полный доступ", callback_data="subscription")],
         ]
     else:
         rows = [
@@ -728,7 +872,7 @@ def _selected_group_children(group_key: str, selected_keys: set[str]) -> list:
     ]
 
 
-def groups_keyboard(selected_keys: set[str]) -> InlineKeyboardMarkup:
+def groups_keyboard(selected_keys: set[str], *, max_selected: int = MAX_SELECTED_CATEGORIES) -> InlineKeyboardMarkup:
     # v4.3.4: one long vertical list. A selected section shows not only a count,
     # but also the chosen subcategory names so the user can see the selection
     # without opening every section again.
@@ -745,9 +889,9 @@ def groups_keyboard(selected_keys: set[str]) -> InlineKeyboardMarkup:
             label = _button_text(f"▫️ {group.icon} {group.name}")
         rows.append([InlineKeyboardButton(text=label, callback_data=f"grp:{group.key}")])
 
-    counter_icon = "⚠️" if len(selected_keys) > MAX_SELECTED_CATEGORIES else "✅"
+    counter_icon = "⚠️" if len(selected_keys) > max_selected else "✅"
     rows.append([InlineKeyboardButton(
-        text=f"{counter_icon} Выбрано: {len(selected_keys)}/{MAX_SELECTED_CATEGORIES}",
+        text=f"{counter_icon} Выбрано: {len(selected_keys)}/{max_selected}",
         callback_data="selected",
     )])
     rows.append([InlineKeyboardButton(text="🧹 Очистить выбор", callback_data="clear_all")])
@@ -755,12 +899,14 @@ def groups_keyboard(selected_keys: set[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def category_keyboard(group_key: str, selected_keys: set[str]) -> InlineKeyboardMarkup:
+def category_keyboard(
+    group_key: str, selected_keys: set[str], *, max_selected: int = MAX_SELECTED_CATEGORIES
+) -> InlineKeyboardMarkup:
     # "Весь раздел" and bulk-select are intentionally gone. Only explicit
     # subcategory choices are shown, so every scan has a clear scope.
     cats = [cat for cat in categories_for_group(group_key) if not cat.is_group]
     chosen_here = [cat for cat in cats if cat.key in selected_keys]
-    header = f"✅ В разделе выбрано: {len(chosen_here)} · всего {len(selected_keys)}/{MAX_SELECTED_CATEGORIES}"
+    header = f"✅ В разделе выбрано: {len(chosen_here)} · всего {len(selected_keys)}/{max_selected}"
     rows = [[InlineKeyboardButton(text=_button_text(header), callback_data="selected")]]
     for cat in cats:
         marker = "✅" if cat.key in selected_keys else "▫️"
@@ -813,7 +959,16 @@ def scan_price_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def page_limit_keyboard() -> InlineKeyboardMarkup:
+def page_limit_keyboard(*, trial: bool = False) -> InlineKeyboardMarkup:
+    if trial:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="15 стр.", callback_data="scanpages:15"),
+             InlineKeyboardButton(text="🎁 25 стр.", callback_data="scanpages:25")],
+            [InlineKeyboardButton(text="🔒 50 стр. · подписка", callback_data="subscription")],
+            [InlineKeyboardButton(text="💶 Изменить цену", callback_data="scanprice_menu")],
+            [InlineKeyboardButton(text="⬅️ Другая дата", callback_data="start_scan"),
+             InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
+        ])
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="15 стр.", callback_data="scanpages:15"),
          InlineKeyboardButton(text="25 стр.", callback_data="scanpages:25"),
@@ -979,7 +1134,10 @@ def _validate_scan_category_count(category_keys: list[str]) -> list[str]:
     return validate_scan_category_keys(category_keys, set(CATEGORIES))
 
 
-async def create_user_scan(user_id: int, job_uid: str, category_keys: list[str], page_limit: int, target_date: str, price_filter: str = "any") -> UserScan:
+async def create_user_scan(
+    user_id: int, job_uid: str, category_keys: list[str], page_limit: int, target_date: str,
+    price_filter: str = "any", *, is_trial: bool = False,
+) -> UserScan:
     category_keys = _validate_scan_category_count(category_keys)
     scan = UserScan(
         job_uid=job_uid,
@@ -991,6 +1149,8 @@ async def create_user_scan(user_id: int, job_uid: str, category_keys: list[str],
         price_filter=(price_filter or "any"),
         status="queued",
         total_categories=len(category_keys),
+        is_trial=bool(is_trial),
+        trial_credit_refunded=False,
     )
     async with SessionLocal() as session:
         session.add(scan)
@@ -1314,6 +1474,10 @@ async def ensure_scan_observation_plan(
         async with SessionLocal() as session:
             scan = await session.get(UserScan, scan_id)
             if scan is None or scan.status not in {"done", "partial"}:
+                return
+            # Free-trial launches deliberately demonstrate the live scan itself,
+            # but never schedule the paid +3/+6/+12h observation workload.
+            if bool(getattr(scan, "is_trial", False)):
                 return
             scan_settings = await session.get(UserSettings, int(scan.user_id))
             if scan_settings is None or not bool(getattr(scan_settings, "auto_observations", False)):
@@ -3336,6 +3500,7 @@ class ScanJob:
     scan_id: int | None = None
     target_date: str = ""
     price_filter: str = "any"
+    is_trial: bool = False
     incomplete_categories: int = 0
     scan_notes: list[str] | None = None
     matched_ids: set[str] | None = None
@@ -3437,6 +3602,7 @@ def scan_job_from_record(scan: UserScan, *, recovered: bool = False) -> ScanJob:
         scan_id=int(scan.id),
         target_date=scan.target_date or _moscow_today_iso(),
         price_filter=(getattr(scan, "price_filter", "any") or "any"),
+        is_trial=bool(getattr(scan, "is_trial", False)),
         recovered=recovered,
     )
     job.completed_categories = int(scan.completed_categories or 0)
@@ -5369,6 +5535,30 @@ def stopped_job_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def trial_result_keyboard(scan_id: int | None, remaining: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if scan_id is not None:
+        rows.append([
+            InlineKeyboardButton(text="🔥 TOP-12", callback_data=f"scantop:{scan_id}"),
+            InlineKeyboardButton(text="📋 TOP-50", callback_data=f"scantop50:{scan_id}:0"),
+        ])
+        rows.append([InlineKeyboardButton(text="📊 Открыть скан", callback_data=f"scan:{scan_id}")])
+    if remaining > 0:
+        rows.append([InlineKeyboardButton(text="🎁 Использовать ещё 1 бесплатный скан", callback_data="start_scan")])
+    rows.append([InlineKeyboardButton(text="💎 Полный доступ", callback_data="subscription")])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def trial_conversion_keyboard(remaining: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if remaining > 0:
+        rows.append([InlineKeyboardButton(text="🎁 Второй бесплатный скан", callback_data="start_scan")])
+    rows.append([InlineKeyboardButton(text="💎 Получить полный доступ", callback_data="subscription")])
+    rows.append([InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def failed_job_keyboard(scan_id: int | None) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if scan_id is not None:
@@ -5946,11 +6136,17 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
                 "📄 <b>Результат скана</b>\n"
                 f"📅 {_date_label(job.target_date)} · 🗂 {job.completed_categories}/{len(job.category_keys)} категорий"
             )
+            trial_status = await get_trial_status(job.user_id) if job.is_trial else None
+            trial_remaining = (trial_status.remaining if trial_status is not None and trial_status.eligible else 0)
             adapter = BotChatAdapter(
                 bot,
                 job.chat_id,
                 prefix=result_prefix,
-                reply_markup=post_scan_keyboard(job.scan_id, recheck=False),
+                reply_markup=(
+                    trial_result_keyboard(job.scan_id, trial_remaining)
+                    if job.is_trial and trial_status is not None
+                    else post_scan_keyboard(job.scan_id, recheck=False)
+                ),
             )
             result_count = await send_smart_export(
                 adapter,
@@ -5997,11 +6193,14 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
         lines.append(f"🛡 Качество: <b>{quality_avg}/100</b>")
     lines.append(f"⏱ Время: <b>{elapsed_text}</b>")
     if not job.incomplete_categories:
-        auto_enabled = await auto_observations_enabled(job.user_id)
-        if auto_enabled:
-            lines.append("🔔 Автозамеры: <b>✅ ВКЛ · 3 · 6 · 12 ч</b>")
+        if job.is_trial:
+            lines.append("🎁 Пробный скан · <b>автозамеры доступны по подписке</b>")
         else:
-            lines.append("🔔 Автозамеры: <b>⛔ ВЫКЛ</b> · ручное обновление доступно всегда")
+            auto_enabled = await auto_observations_enabled(job.user_id)
+            if auto_enabled:
+                lines.append("🔔 Автозамеры: <b>✅ ВКЛ · 3 · 6 · 12 ч</b>")
+            else:
+                lines.append("🔔 Автозамеры: <b>⛔ ВЫКЛ</b> · ручное обновление доступно всегда")
     if job.incomplete_categories:
         result_tail = (
             "Подтверждённые объявления сохранены. Финальные фильтры по просмотрам и итоговый XLSX "
@@ -6015,6 +6214,29 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
         result_tail = "Данные сохранены в скане."
     lines += ["", result_tail]
     await edit_job_status(bot, job, "\n".join(lines), force=True)
+
+    if job.is_trial and not cancelled and not allowed(job.user_id):
+        try:
+            trial = await get_trial_status(job.user_id)
+            usable_remaining = trial.remaining if trial.eligible else 0
+            if usable_remaining > 0:
+                trial_text = (
+                    "🎁 <b>Бесплатный скан готов</b>\n\n"
+                    f"У тебя остался ещё <b>{usable_remaining}</b> бесплатный скан. "
+                    "Попробуй другую категорию или открой полный доступ без ограничений пробного режима."
+                )
+            else:
+                trial_text = (
+                    f"🔥 <b>{FREE_TRIAL_SCAN_LIMIT} бесплатных скана использованы</b>\n\n"
+                    "Твои результаты сохраняются в «Мои сканы». "
+                    "Чтобы продолжить сканирование, открой полный доступ."
+                )
+            await bot.send_message(
+                job.chat_id, trial_text, parse_mode=ParseMode.HTML,
+                reply_markup=trial_conversion_keyboard(usable_remaining),
+            )
+        except Exception:
+            log.exception("Could not send free-trial conversion card job=%s", job.job_id)
 
     if job.incomplete_categories:
         try:
@@ -6455,12 +6677,18 @@ async def cleanup_stale_distributed_queue_rows() -> int:
                 UserScan.created_at < cutoff,
             )
         )).scalars().all())
+        retired_trial_ids = [int(scan.id) for scan in rows if bool(getattr(scan, "is_trial", False))]
         for scan in rows:
             scan.status = "failed"
             scan.finished_at = now
             scan.last_error = "Старая очередь очищена после запуска Browser Fleet; повтори скан"
         if rows:
             await session.commit()
+    for scan_id in retired_trial_ids:
+        try:
+            await _refund_trial_credit_for_scan(scan_id)
+        except Exception:
+            log.exception("Could not refund stale queued trial scan=%s", scan_id)
     if rows:
         log.warning("Retired stale distributed queued scans: %s", len(rows))
     return len(rows)
@@ -6714,7 +6942,7 @@ async def distributed_scan_worker(bot: Bot, worker_id: str) -> None:
 
 async def enqueue_user_scan(
     message: Message, user_id: int, category_keys: list[str], page_limit: int, target_date: str,
-    *, price_filter: str = "any",
+    *, price_filter: str = "any", is_trial: bool = False,
 ) -> ScanJob | None:
     """Create a persistent scan card and queue the network job.
 
@@ -6724,6 +6952,16 @@ async def enqueue_user_scan(
     service is absent, misconfigured, or still booting.
     """
     category_keys = _validate_scan_category_count(category_keys)
+    if is_trial:
+        if len(category_keys) != FREE_TRIAL_MAX_CATEGORIES:
+            await message.answer("🎁 Бесплатный скан доступен только для одной категории.")
+            return None
+        if int(page_limit) > FREE_TRIAL_MAX_PAGES:
+            await message.answer(
+                f"🔒 В бесплатном режиме доступно до {FREE_TRIAL_MAX_PAGES} страниц. "
+                "50 страниц открываются по подписке."
+            )
+            return None
     try:
         requested_day = datetime.strptime(target_date, "%Y-%m-%d").date()
     except Exception:
@@ -6785,7 +7023,23 @@ async def enqueue_user_scan(
         )
 
     job_uid = uuid.uuid4().hex[:12]
-    scan = await create_user_scan(user_id, job_uid, category_keys, page_limit, target_date, price_filter=price_filter)
+    scan = await create_user_scan(
+        user_id, job_uid, category_keys, page_limit, target_date,
+        price_filter=price_filter, is_trial=is_trial,
+    )
+    if is_trial:
+        reserved = await _consume_trial_credit(user_id)
+        if reserved is None:
+            async with SessionLocal() as session:
+                doomed = await session.get(UserScan, int(scan.id))
+                if doomed is not None:
+                    await session.delete(doomed)
+                    await session.commit()
+            await message.answer(
+                "🎁 Бесплатные сканы уже использованы или акция выключена. Полный доступ можно открыть по подписке.",
+                reply_markup=await subscription_keyboard(user_id),
+            )
+            return None
     status = await message.answer("⏳ <b>Подготавливаю скан…</b>", parse_mode=ParseMode.HTML)
     await attach_user_scan_message(scan.id, message.chat.id, status.message_id)
     job = ScanJob(
@@ -6800,6 +7054,7 @@ async def enqueue_user_scan(
         scan_id=scan.id,
         target_date=target_date,
         price_filter=price_filter or "any",
+        is_trial=bool(is_trial),
     )
     if DISTRIBUTED_WORKERS:
         try:
@@ -6813,11 +7068,17 @@ async def enqueue_user_scan(
                     db_scan.finished_at = datetime.utcnow()
                     db_scan.last_error = f"Redis queue unavailable: {type(exc).__name__}"[:1000]
                     await session.commit()
-            await status.edit_text(
+            if is_trial:
+                await _refund_trial_credit_for_scan(scan.id)
+            queue_error_text = (
                 "⚠️ <b>Не удалось поставить скан в очередь</b>\n\n"
-                "Сервис очереди временно недоступен. Попробуй повторить запуск через несколько секунд.",
-                parse_mode=ParseMode.HTML,
+                + (
+                    "Сервис очереди временно недоступен. Бесплатный запуск не списан — попробуй ещё раз через несколько секунд."
+                    if is_trial else
+                    "Сервис очереди временно недоступен. Попробуй ещё раз через несколько секунд."
+                )
             )
+            await status.edit_text(queue_error_text, parse_mode=ParseMode.HTML)
             job.state = "failed"
             return job
     else:
@@ -6850,6 +7111,10 @@ async def recover_interrupted_user_scans(bot: Bot) -> int:
                 UserScan.finished_at.is_(None),
             )
         )).scalars().all())
+        queued_trial_ids = {
+            int(scan.id) for scan in rows
+            if scan.status == "queued" and bool(getattr(scan, "is_trial", False))
+        }
         for scan in rows:
             if scan.status == "cancelling":
                 scan.status = "cancelled"
@@ -6859,6 +7124,14 @@ async def recover_interrupted_user_scans(bot: Bot) -> int:
                 scan.last_error = "Скан прерван перезапуском Railway; повтори его вручную"
             scan.finished_at = now
         await session.commit()
+
+    # Jobs that were only waiting in the queue never consumed parser/network work.
+    # Return their launch credit after a Railway restart; the helper is idempotent.
+    for scan_id in queued_trial_ids:
+        try:
+            await _refund_trial_credit_for_scan(scan_id)
+        except Exception:
+            log.exception("Could not refund interrupted queued trial scan=%s", scan_id)
 
     for scan in rows:
         if not scan.chat_id or not scan.status_message_id:
@@ -6950,9 +7223,17 @@ async def subscription_text(user_id: int) -> str:
     methods_text = " · ".join(methods) if methods else "временно недоступна"
     pending_text = f"\n⏳ Ожидающих счетов: <b>{pending_count}</b>" if pending_count else ""
     admin_mode = f"\nРежим: <b>{_access_mode_label(mode)}</b>" if user_id in ADMIN_IDS else ""
+    trial_note = ""
+    if user_id not in ADMIN_IDS and mode == "subscription" and not allowed(user_id):
+        trial = await get_trial_status(user_id)
+        if trial.eligible:
+            trial_note = (
+                f"\n\n🎁 <b>Стартовая акция:</b> осталось <b>{trial.remaining}</b> "
+                f"бесплатных скан(а) · 1 категория · до {FREE_TRIAL_MAX_PAGES} страниц."
+            )
     return (
         "<b>💎 Подписка</b>\n\n"
-        f"{status}\n\n"
+        f"{status}{trial_note}\n\n"
         f"Оплата: <b>{methods_text}</b>{pending_text}{admin_mode}"
     )
 
@@ -6971,7 +7252,7 @@ async def subscription_keyboard(user_id: int) -> InlineKeyboardMarkup:
             )])
     rows.append([InlineKeyboardButton(text="💳 Мои платежи", callback_data="mypayments")])
     rows.append([InlineKeyboardButton(text="🌐 Язык", callback_data="language_settings")])
-    if allowed(user_id):
+    if read_only_history_allowed(user_id):
         rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -7021,6 +7302,7 @@ def admin_keyboard(ai_unread: int = 0, active_scans: int = 0) -> InlineKeyboardM
          InlineKeyboardButton(text="💳 Платежи", callback_data="adminpayments")],
         [InlineKeyboardButton(text="🎟 Тарифы", callback_data="adminplans"),
          InlineKeyboardButton(text="🔐 Режим доступа", callback_data="adminmode")],
+        [InlineKeyboardButton(text="🎁 Бесплатные сканы", callback_data="admintrial")],
         [InlineKeyboardButton(text="🔎 Найти пользователя", callback_data="adminusersearch")],
         [InlineKeyboardButton(text="📣 Рассылка", callback_data="adminbroadcast")],
         [InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
@@ -7030,6 +7312,15 @@ def admin_keyboard(ai_unread: int = 0, active_scans: int = 0) -> InlineKeyboardM
 def admin_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")]
+    ])
+
+
+def admin_trial_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    toggle = "⏸ Выключить акцию" if enabled else "▶️ Включить акцию"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle, callback_data="admintrial:toggle")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admintrial")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
     ])
 
 
@@ -7196,6 +7487,7 @@ async def render_admin_user(user_id: int) -> tuple[str, InlineKeyboardMarkup] | 
         f"Первый вход: <b>{_utc_to_msk_text(user.joined_at)} МСК</b>\n"
         f"Последняя активность: <b>{_utc_to_msk_text(user.last_seen_at)} МСК</b>\n\n"
         f"📊 Сканов: <b>{int(scans or 0)}</b>\n"
+        f"🎁 Пробные сканы: <b>{max(0, int(getattr(user, 'trial_scans_used', 0) or 0))}/{FREE_TRIAL_SCAN_LIMIT}</b>\n"
         f"Последний: <b>{html.escape(scan_line)}</b>\n"
         f"⚠️ Ошибок парсера: <b>{int(errors or 0)}</b>\n"
         f"💳 Оплат: <b>{int(paid or 0)}</b> · ожидают: <b>{int(pending or 0)}</b>\n"
@@ -7331,12 +7623,36 @@ class ActivityAccessMiddleware(BaseMiddleware):
         if uid in ADMIN_IDS or allowed(uid):
             return await handler(event, data)
 
+        trial = await get_trial_status(uid)
+
         # /start, the read-only home/history, and subscription/payment callbacks
-        # stay reachable after a subscription expires. Parser/network actions remain gated.
+        # stay reachable after a subscription expires. Trial users additionally get
+        # only the setup flow required for their two launch scans; repeat/update/
+        # auto-observation actions remain subscription-only.
         if isinstance(event, Message):
             text = (event.text or "").strip()
             public_commands = ("/start", "/menu", "/my_scans", "/admin", "/subscription", "/help", "/language")
             if text.startswith(public_commands):
+                return await handler(event, data)
+            if trial.eligible and text.startswith(("/new_scan", "/categories", "/settings")):
+                return await handler(event, data)
+            if text.startswith("/stop") and read_only_history_allowed(uid):
+                return await handler(event, data)
+            state = data.get("state") if isinstance(data, dict) else None
+            raw_state = None
+            if state is not None:
+                try:
+                    raw_state = await state.get_state()
+                except Exception:
+                    raw_state = None
+            if trial.eligible and raw_state and (
+                str(raw_state).startswith(f"{ScanInput.__name__}:")
+                or str(raw_state) in {
+                    f"{SettingsInput.__name__}:min_views",
+                    f"{SettingsInput.__name__}:include_words",
+                    f"{SettingsInput.__name__}:exclude_words",
+                }
+            ):
                 return await handler(event, data)
             await send_access_screen(event, uid)
             return None
@@ -7350,15 +7666,39 @@ class ActivityAccessMiddleware(BaseMiddleware):
                 await event.answer("Доступ заблокирован", show_alert=True)
                 return None
 
-            readonly_exact = {"home", "post_home", "my_scans", "archive_my_scans", "archive_noop"}
+            readonly_exact = {
+                "home", "post_home", "my_scans", "archive_my_scans", "archive_noop", "queue_status"
+            }
             readonly_prefixes = (
                 "scan_archive:", "scan:", "scanproducts:", "scantop:", "scantop50:",
-                "scangrowth:", "scangrowthexport:", "scanhistory:", "scanexport:",
+                "scangrowth:", "scangrowthexport:", "scanhistory:", "scanexport:", "cancel_scan:",
             )
             if read_only_history_allowed(uid) and (
                 callback_data in readonly_exact or callback_data.startswith(readonly_prefixes)
             ):
                 return await handler(event, data)
+
+            if trial.eligible:
+                # Explicitly keep every network follow-up outside the free trial.
+                if callback_data in {"auto_obs_menu", "toggle_auto_obs", "view_test"} or callback_data.startswith(
+                    ("scanrepeat:", "scanrecheck:", "scanviews:")
+                ):
+                    await event.answer("Эта функция доступна по подписке", show_alert=True)
+                    if event.message:
+                        await send_access_screen(event.message, uid)
+                    return None
+                trial_exact = {
+                    "start_scan", "groups", "clear_all", "selected", "settings", "post_settings",
+                    "mode_help", "set_mode", "set_period", "set_price", "set_min_views", "set_sort",
+                    "set_include", "set_exclude", "reset_settings", "toggle_dedupe", "toggle_noise",
+                    "scanprice_menu",
+                }
+                trial_prefixes = (
+                    "onboard:", "grp:", "cat:", "grpall:", "quickmode:", "mode:", "period:",
+                    "price:", "minviews:", "sort:", "scan_date:", "scanprice:", "scanpages:",
+                )
+                if callback_data in trial_exact or callback_data.startswith(trial_prefixes):
+                    return await handler(event, data)
 
             if callback_data == "start_scan" or callback_data.startswith(("scanrepeat:", "scanrecheck:", "scanviews:")):
                 alert = "Для этого действия нужна активная подписка"
@@ -8372,6 +8712,50 @@ async def admin_stats_handler(callback: CallbackQuery) -> None:
     await _edit_or_answer(callback.message, await _admin_dashboard_text(), reply_markup=await _admin_live_keyboard())
 
 
+async def _admin_trial_text() -> tuple[str, bool]:
+    stats = await free_trial_stats()
+    enabled = bool(stats["enabled"])
+    used_one = int(stats["used_one"] or 0)
+    used_all = int(stats["used_all"] or 0)
+    converted = int(stats["converted"] or 0)
+    conversion = (converted / used_one * 100.0) if used_one else 0.0
+    text = (
+        "<b>🎁 Бесплатные сканы · стартовая акция</b>\n\n"
+        f"Статус: <b>{'✅ ВКЛ' if enabled else '⏸ ВЫКЛ'}</b>\n"
+        f"Лимит: <b>{FREE_TRIAL_SCAN_LIMIT} скана</b> на нового пользователя\n"
+        f"Пробный запуск: <b>{FREE_TRIAL_MAX_CATEGORIES} категория · до {FREE_TRIAL_MAX_PAGES} страниц</b>\n"
+        "Включено: реальные просмотры · TOP · XLSX\n"
+        "По подписке: 50 страниц · несколько категорий · повторы · обновление просмотров · автозамеры\n\n"
+        f"👥 Использовали ≥1: <b>{used_one}</b>\n"
+        f"🎁 Использовали {FREE_TRIAL_SCAN_LIMIT}/{FREE_TRIAL_SCAN_LIMIT}: <b>{used_all}</b>\n"
+        f"💳 Купили после пробника: <b>{converted}</b>\n"
+        f"📈 Конверсия в оплату: <b>{conversion:.1f}%</b>"
+    )
+    return text, enabled
+
+
+@dp.callback_query(F.data == "admintrial")
+async def admin_trial_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    text, enabled = await _admin_trial_text()
+    await callback.answer()
+    await _edit_or_answer(callback.message, text, reply_markup=admin_trial_keyboard(enabled))
+
+
+@dp.callback_query(F.data == "admintrial:toggle")
+async def admin_trial_toggle_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    enabled = await free_trial_enabled()
+    await set_free_trial_enabled(not enabled)
+    text, current = await _admin_trial_text()
+    await callback.answer("Акция включена" if current else "Акция выключена")
+    await _edit_or_answer(callback.message, text, reply_markup=admin_trial_keyboard(current))
+
+
 @dp.callback_query(F.data == "adminworkers")
 async def admin_workers_handler(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
@@ -9341,7 +9725,18 @@ async def _show_onboarding(message: Message, user_id: int, step: int = 1) -> Non
     )
 
 
-def home_text(selected_count: int, auto_observations: bool = False, access_active: bool = True) -> str:
+def home_text(
+    selected_count: int, auto_observations: bool = False, access_active: bool = True, trial_remaining: int = 0
+) -> str:
+    if not access_active and trial_remaining > 0:
+        return (
+            "<b>🚀 DT PARSER · стартовая акция</b>\n\n"
+            f"🎁 У тебя <b>{trial_remaining} бесплатных скан(а)</b> из {FREE_TRIAL_SCAN_LIMIT}.\n"
+            f"Пробный запуск: <b>1 категория · до {FREE_TRIAL_MAX_PAGES} страниц</b>.\n\n"
+            "👁 Реальные просмотры, TOP и XLSX доступны полностью — это не урезанная демо-таблица.\n\n"
+            "Выбери категорию и попробуй DT PARSER на реальной выдаче Kleinanzeigen. "
+            "Повторные замеры, несколько категорий и 50 страниц открываются по подписке."
+        )
     if not access_active:
         return (
             "<b>🔎 Kleinanzeigen Analytics</b>\n\n"
@@ -9375,16 +9770,21 @@ def home_text(selected_count: int, auto_observations: bool = False, access_activ
 async def _send_home_message(message: Message, user_id: int, *, intro: bool = False) -> None:
     """Send the branded DT PARSER home card with low-latency navigation."""
     global _MENU_IMAGE_FILE_ID
-    selected, user_settings = await asyncio.gather(
+    selected, user_settings, trial = await asyncio.gather(
         get_selected(user_id),
         get_settings(user_id),
+        get_trial_status(user_id),
     )
     auto_enabled = bool(getattr(user_settings, "auto_observations", False))
     access_active = allowed(user_id)
+    trial_remaining = int(trial.remaining if (not access_active and trial.eligible) else 0)
     markup = main_keyboard(
-        len(selected), admin=_is_admin(user_id), auto_observations=auto_enabled, access_active=access_active
+        len(selected), admin=_is_admin(user_id), auto_observations=auto_enabled,
+        access_active=access_active, trial_remaining=trial_remaining,
     )
-    caption = home_text(len(selected), auto_enabled, access_active=access_active)
+    caption = home_text(
+        len(selected), auto_enabled, access_active=access_active, trial_remaining=trial_remaining
+    )
 
     if _MENU_IMAGE_FILE_ID:
         try:
@@ -9467,7 +9867,18 @@ async def _begin_scan_from_message(message: Message, state: FSMContext) -> None:
         await message.answer(
             "⚠️ <b>Сначала выбери хотя бы одну категорию.</b>",
             parse_mode=ParseMode.HTML,
-            reply_markup=groups_keyboard(selected_keys),
+            reply_markup=groups_keyboard(
+                selected_keys,
+                max_selected=(FREE_TRIAL_MAX_CATEGORIES if not allowed(user_id) else MAX_SELECTED_CATEGORIES),
+            ),
+        )
+        return
+    if not allowed(user_id) and len(selected_cats) > FREE_TRIAL_MAX_CATEGORIES:
+        await message.answer(
+            "🎁 <b>В бесплатном скане доступна 1 категория.</b>\n\n"
+            "Оставь одну категорию и запусти скан снова.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=groups_keyboard(selected_keys, max_selected=FREE_TRIAL_MAX_CATEGORIES),
         )
         return
 
@@ -9489,7 +9900,7 @@ async def _begin_scan_from_message(message: Message, state: FSMContext) -> None:
 @dp.callback_query(F.data.startswith("onboard:"))
 async def onboarding_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    if not allowed(callback.from_user.id):
+    if not await trial_or_paid_scan_access(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     action = callback.data.split(":", 1)[1]
@@ -9575,9 +9986,11 @@ async def popular_command(message: Message, state: FSMContext) -> None:
 async def categories_command(message: Message, state: FSMContext) -> None:
     await state.clear()
     selected = await get_selected(message.from_user.id)
+    trial_mode = bool(not allowed(message.from_user.id) and (await get_trial_status(message.from_user.id)).eligible)
+    limit = FREE_TRIAL_MAX_CATEGORIES if trial_mode else MAX_SELECTED_CATEGORIES
     await message.answer(
-        f"<b>🗂 Категории</b>\n\nВыбери до <b>{MAX_SELECTED_CATEGORIES}</b> категорий на один скан.",
-        reply_markup=groups_keyboard(selected),
+        f"<b>🗂 Категории</b>\n\nВыбери до <b>{limit}</b> категорий на один скан.",
+        reply_markup=groups_keyboard(selected, max_selected=limit),
         parse_mode=ParseMode.HTML,
     )
 
@@ -9647,7 +10060,7 @@ async def home(callback: CallbackQuery, state: FSMContext) -> None:
 @dp.callback_query(F.data == "post_settings")
 async def post_settings(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    if not allowed(callback.from_user.id):
+    if not await trial_or_paid_scan_access(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
     s = await get_settings(callback.from_user.id)
     await callback.answer()
@@ -9716,7 +10129,7 @@ async def toggle_auto_obs(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data == "settings")
 async def settings(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    if not allowed(callback.from_user.id):
+    if not await trial_or_paid_scan_access(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True); return
     await callback.answer()
     s = await get_settings(callback.from_user.id)
@@ -10968,13 +11381,15 @@ async def scan_recheck_partial(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data == "groups")
 async def groups(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    if not allowed(callback.from_user.id): await callback.answer("Нет доступа", show_alert=True); return
+    if not await trial_or_paid_scan_access(callback.from_user.id): await callback.answer("Нет доступа", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
+    trial_mode = bool(not allowed(callback.from_user.id) and (await get_trial_status(callback.from_user.id)).eligible)
+    limit = FREE_TRIAL_MAX_CATEGORIES if trial_mode else MAX_SELECTED_CATEGORIES
     await callback.answer()
     await _edit_or_answer(
         callback.message,
-        f"<b>🗂 Категории</b>\n\nВыбери до <b>{MAX_SELECTED_CATEGORIES}</b> категорий на один скан.",
-        reply_markup=groups_keyboard(selected),
+        f"<b>🗂 Категории</b>\n\nВыбери до <b>{limit}</b> категорий на один скан.",
+        reply_markup=groups_keyboard(selected, max_selected=limit),
     )
 
 
@@ -10984,11 +11399,13 @@ async def open_group(callback: CallbackQuery) -> None:
     if group_key not in GROUPS: await callback.answer("Раздел не найден", show_alert=True); return
     selected = await get_selected(callback.from_user.id)
     group = GROUPS[group_key]
+    trial_mode = bool(not allowed(callback.from_user.id) and (await get_trial_status(callback.from_user.id)).eligible)
+    limit = FREE_TRIAL_MAX_CATEGORIES if trial_mode else MAX_SELECTED_CATEGORIES
     await callback.answer()
     await callback.message.edit_text(
         f"<b>{group.icon} {html.escape(group.name)}</b>\n\n"
-        f"Отметь нужные подкатегории. Максимум за один запуск: <b>{MAX_SELECTED_CATEGORIES}</b>.",
-        reply_markup=category_keyboard(group_key, selected),
+        f"Отметь нужные подкатегории. Максимум за один запуск: <b>{limit}</b>.",
+        reply_markup=category_keyboard(group_key, selected, max_selected=limit),
         parse_mode=ParseMode.HTML,
     )
 
@@ -11000,6 +11417,23 @@ async def toggle_cat(callback: CallbackQuery) -> None:
     if CATEGORIES[key].is_group:
         await callback.answer("Выбор всего раздела убран. Выбери нужные подкатегории.", show_alert=True)
         return
+    trial_mode = bool(not allowed(callback.from_user.id) and (await get_trial_status(callback.from_user.id)).eligible)
+    if trial_mode:
+        selected = await get_selected(callback.from_user.id)
+        if key in selected:
+            selected = await _replace_selected_categories(callback.from_user.id, set())
+        else:
+            # One-tap replacement keeps the launch offer frictionless: choosing a
+            # different category simply replaces the previous free-trial choice.
+            selected = await _replace_selected_categories(callback.from_user.id, {key})
+        await callback.answer("Категория выбрана" if selected else "Категория снята")
+        await callback.message.edit_reply_markup(
+            reply_markup=category_keyboard(
+                CATEGORIES[key].group, selected, max_selected=FREE_TRIAL_MAX_CATEGORIES
+            )
+        )
+        return
+
     selected, limit_reached = await toggle_category(callback.from_user.id, key)
     if limit_reached:
         await callback.answer(
@@ -11024,21 +11458,25 @@ async def toggle_all_children(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data == "clear_all")
 async def clear_all(callback: CallbackQuery) -> None:
     await clear_selected(callback.from_user.id)
+    trial_mode = bool(not allowed(callback.from_user.id) and (await get_trial_status(callback.from_user.id)).eligible)
+    limit = FREE_TRIAL_MAX_CATEGORIES if trial_mode else MAX_SELECTED_CATEGORIES
     await callback.answer("Выбор очищен")
-    await callback.message.edit_reply_markup(reply_markup=groups_keyboard(set()))
+    await callback.message.edit_reply_markup(reply_markup=groups_keyboard(set(), max_selected=limit))
 
 
 @dp.callback_query(F.data == "selected")
 async def selected(callback: CallbackQuery) -> None:
     keys = await get_selected(callback.from_user.id)
     cats = [CATEGORIES[k] for k in CATEGORIES if k in keys]
+    trial_mode = bool(not allowed(callback.from_user.id) and (await get_trial_status(callback.from_user.id)).eligible)
+    limit = FREE_TRIAL_MAX_CATEGORIES if trial_mode else MAX_SELECTED_CATEGORIES
     if not cats:
         text = "<b>Категории пока не выбраны.</b>"
     else:
-        counter = f"{len(cats)}/{MAX_SELECTED_CATEGORIES}"
+        counter = f"{len(cats)}/{limit}"
         lines = [f"<b>Выбрано категорий: {counter}</b>", ""]
-        if len(cats) > MAX_SELECTED_CATEGORIES:
-            lines += [f"⚠️ Для нового запуска оставь максимум {MAX_SELECTED_CATEGORIES} категорий.", ""]
+        if len(cats) > limit:
+            lines += [f"⚠️ Для нового запуска оставь максимум {limit} категорий.", ""]
         for group in GROUPS.values():
             chosen = [cat for cat in cats if cat.group == group.key and not cat.is_group]
             if not chosen:
@@ -11068,7 +11506,7 @@ async def export_smart(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "queue_status")
 async def queue_status(callback: CallbackQuery) -> None:
-    if not allowed(callback.from_user.id):
+    if not read_only_history_allowed(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer()
@@ -11176,7 +11614,7 @@ async def request_user_scan_stop(user_id: int, job_id: str | None = None) -> tup
 @dp.message(Command("stop"))
 async def stop_scan_command(message: Message, state: FSMContext) -> None:
     await state.clear()
-    if not allowed(message.from_user.id):
+    if not read_only_history_allowed(message.from_user.id):
         await message.answer("Нет доступа.")
         return
     job, previous_state = await request_user_scan_stop(message.from_user.id)
@@ -11187,8 +11625,10 @@ async def stop_scan_command(message: Message, state: FSMContext) -> None:
         )
         return
     if previous_state == "queued":
+        refunded = bool(job.scan_id and await _refund_trial_credit_for_scan(job.scan_id))
         await message.answer(
-            "❌ <b>Скан удалён из очереди.</b> Задание отменено до начала сетевого сканирования.",
+            "❌ <b>Скан удалён из очереди.</b> Задание отменено до начала сетевого сканирования."
+            + ("\n🎁 Бесплатный запуск возвращён на баланс." if refunded else ""),
             parse_mode=ParseMode.HTML,
             reply_markup=stopped_job_keyboard(),
         )
@@ -11210,9 +11650,11 @@ async def cancel_scan(callback: CallbackQuery) -> None:
         return
 
     if previous_state == "queued":
+        refunded = bool(job.scan_id and await _refund_trial_credit_for_scan(job.scan_id))
         await callback.answer("Убрано из очереди")
         await callback.message.edit_text(
-            "❌ <b>Скан удалён из очереди</b>\n\nЗадание отменено до начала сканирования.",
+            "❌ <b>Скан удалён из очереди</b>\n\nЗадание отменено до начала сканирования."
+            + ("\n🎁 Бесплатный запуск возвращён на баланс." if refunded else ""),
             parse_mode=ParseMode.HTML,
             reply_markup=stopped_job_keyboard(),
         )
@@ -11228,7 +11670,7 @@ async def cancel_scan(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "start_scan")
 async def start_scan(callback: CallbackQuery, state: FSMContext) -> None:
-    if not allowed(callback.from_user.id):
+    if not await trial_or_paid_scan_access(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
 
@@ -11239,6 +11681,9 @@ async def start_scan(callback: CallbackQuery, state: FSMContext) -> None:
     selected_cats = [CATEGORIES[k] for k in CATEGORIES if k in selected_keys]
     if not selected_cats:
         await callback.answer("Сначала выбери хотя бы одну категорию", show_alert=True)
+        return
+    if not allowed(callback.from_user.id) and len(selected_cats) > FREE_TRIAL_MAX_CATEGORIES:
+        await callback.answer("🎁 В бесплатном скане можно выбрать 1 категорию", show_alert=True)
         return
     if len(selected_cats) > MAX_SELECTED_CATEGORIES:
         await callback.answer(
@@ -11293,13 +11738,24 @@ async def _show_scan_depth_choice(
         await state.clear()
         await message.answer("Сначала выбери хотя бы одну категорию.")
         return
-    if len(selected_cats) > MAX_SELECTED_CATEGORIES:
+
+    trial = await get_trial_status(user_id) if not allowed(user_id) else TrialStatus(False, False, 0, 0)
+    trial_mode = bool(not allowed(user_id) and trial.eligible)
+    category_limit = FREE_TRIAL_MAX_CATEGORIES if trial_mode else MAX_SELECTED_CATEGORIES
+    if len(selected_cats) > category_limit:
         await state.clear()
+        if trial_mode:
+            text = (
+                "🎁 <b>В бесплатном скане доступна 1 категория.</b>\n\n"
+                "Оставь одну категорию и вернись к запуску."
+            )
+        else:
+            text = (
+                f"⚠️ Сейчас выбрано <b>{len(selected_cats)}</b> категорий, а максимум для одного запуска — "
+                f"<b>{MAX_SELECTED_CATEGORIES}</b>. Убери лишние категории и запусти снова."
+            )
         await message.answer(
-            f"⚠️ Сейчас выбрано <b>{len(selected_cats)}</b> категорий, а максимум для одного запуска — "
-            f"<b>{MAX_SELECTED_CATEGORIES}</b>. Убери лишние категории и запусти снова.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=groups_keyboard(selected),
+            text, parse_mode=ParseMode.HTML, reply_markup=groups_keyboard(selected)
         )
         return
 
@@ -11312,26 +11768,35 @@ async def _show_scan_depth_choice(
     if exclude:
         extra_lines.append(f"🚫 Исключения: <b>{exclude}</b>")
     extras = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
+    trial_line = (
+        f"\n🎁 Пробный режим: <b>до {FREE_TRIAL_MAX_PAGES} страниц</b> · "
+        f"после запуска останется <b>{max(0, trial.remaining - 1)}</b> бесплатн. скан(а)"
+        if trial_mode else ""
+    )
     await message.answer(
         "<b>▶️ Новый скан</b>\n\n"
         "<b>3/3 · Глубина сканирования</b>\n"
         f"📅 Дата: <b>{_date_label(target_date)}</b>\n"
-        f"🗂 Категорий: <b>{len(selected_cats)}/{MAX_SELECTED_CATEGORIES}</b>\n"
+        f"🗂 Категорий: <b>{len(selected_cats)}/{category_limit}</b>\n"
         f"Режим: <b>{MODE_LABELS.get(scan_settings.output_mode, scan_settings.output_mode)}</b>\n"
         f"💶 Цена: <b>{price_filter_label(price_filter)}</b> · "
         f"👁 <b>{min_views_label(getattr(scan_settings, 'min_views', 0))}</b>\n"
         f"🧠 Дубли: <b>{'Вкл' if scan_settings.smart_dedupe else 'Выкл'}</b> · "
         f"🧹 Шум: <b>{'Вкл' if scan_settings.clean_noise else 'Выкл'}</b>"
-        f"{extras}\n\n"
-        "Выбери максимальное количество страниц общей выдачи для выбранной даты.",
+        f"{extras}{trial_line}\n\n"
+        + (
+            "Выбери глубину бесплатного скана."
+            if trial_mode else
+            "Выбери максимальное количество страниц общей выдачи для выбранной даты."
+        ),
         parse_mode=ParseMode.HTML,
-        reply_markup=page_limit_keyboard(),
+        reply_markup=page_limit_keyboard(trial=trial_mode),
     )
 
 
 @dp.callback_query(F.data.startswith("scan_date:"))
 async def choose_scan_date(callback: CallbackQuery, state: FSMContext) -> None:
-    if not allowed(callback.from_user.id):
+    if not await trial_or_paid_scan_access(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
 
@@ -11377,7 +11842,7 @@ async def choose_scan_date(callback: CallbackQuery, state: FSMContext) -> None:
 async def receive_scan_date(message: Message, state: FSMContext) -> None:
     # v4.3.38: typed dates are deliberately disabled. This handler only catches
     # stale FSM state left by a pre-upgrade message and returns the bounded picker.
-    if not allowed(message.from_user.id):
+    if not await trial_or_paid_scan_access(message.from_user.id):
         await state.clear()
         await message.answer("Нет доступа.")
         return
@@ -11400,7 +11865,7 @@ async def reopen_scan_price(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data.startswith("scanprice:"))
 async def choose_scan_price(callback: CallbackQuery, state: FSMContext) -> None:
-    if not allowed(callback.from_user.id):
+    if not await trial_or_paid_scan_access(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     choice = callback.data.split(":", 1)[1]
@@ -11427,7 +11892,7 @@ async def choose_scan_price(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(ScanInput.custom_price)
 async def receive_scan_price(message: Message, state: FSMContext) -> None:
-    if not allowed(message.from_user.id):
+    if not await trial_or_paid_scan_access(message.from_user.id):
         await state.clear()
         await message.answer("Нет доступа.")
         return
@@ -11445,7 +11910,7 @@ async def receive_scan_price(message: Message, state: FSMContext) -> None:
 
 @dp.callback_query(F.data.startswith("scanpages:"))
 async def start_scan_with_pages(callback: CallbackQuery, state: FSMContext) -> None:
-    if not allowed(callback.from_user.id):
+    if not await trial_or_paid_scan_access(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
 
@@ -11458,6 +11923,21 @@ async def start_scan_with_pages(callback: CallbackQuery, state: FSMContext) -> N
         await callback.answer("Выбери 15, 25 или 50 страниц", show_alert=True)
         return
 
+    is_trial = not allowed(callback.from_user.id)
+    trial = await get_trial_status(callback.from_user.id) if is_trial else TrialStatus(False, False, 0, 0)
+    if is_trial and not trial.eligible:
+        await callback.answer("Бесплатные сканы закончились", show_alert=True)
+        if callback.message:
+            await callback.message.answer(
+                await subscription_text(callback.from_user.id),
+                parse_mode=ParseMode.HTML,
+                reply_markup=await subscription_keyboard(callback.from_user.id),
+            )
+        return
+    if is_trial and page_limit > FREE_TRIAL_MAX_PAGES:
+        await callback.answer(f"В пробном режиме максимум {FREE_TRIAL_MAX_PAGES} страниц", show_alert=True)
+        return
+
     data = await state.get_data()
     target_date = data.get("target_date") or _moscow_today_iso()
     price_filter = (data.get("price_filter") or "any").strip()
@@ -11466,9 +11946,12 @@ async def start_scan_with_pages(callback: CallbackQuery, state: FSMContext) -> N
     if not selected_cats:
         await callback.answer("Сначала выбери хотя бы одну категорию", show_alert=True)
         return
-    if len(selected_cats) > MAX_SELECTED_CATEGORIES:
+    category_limit = FREE_TRIAL_MAX_CATEGORIES if is_trial else MAX_SELECTED_CATEGORIES
+    if len(selected_cats) > category_limit:
         await callback.answer(
-            f"Сейчас выбрано {len(selected_cats)} категорий. В новой версии максимум {MAX_SELECTED_CATEGORIES} за один запуск — убери лишние или очисти выбор.",
+            "🎁 В бесплатном скане можно выбрать только 1 категорию"
+            if is_trial else
+            f"Сейчас выбрано {len(selected_cats)} категорий. Максимум {MAX_SELECTED_CATEGORIES} за один запуск — убери лишние или очисти выбор.",
             show_alert=True,
         )
         return
@@ -11482,10 +11965,10 @@ async def start_scan_with_pages(callback: CallbackQuery, state: FSMContext) -> N
 
     await update_setting(callback.from_user.id, "page_limit", page_limit)
     await state.clear()
-    await callback.answer("Скан запущен")
+    await callback.answer("🎁 Бесплатный скан запущен" if is_trial else "Скан запущен")
     await enqueue_user_scan(
         callback.message, callback.from_user.id, [cat.key for cat in selected_cats], page_limit, target_date,
-        price_filter=price_filter,
+        price_filter=price_filter, is_trial=is_trial,
     )
 
 
