@@ -940,34 +940,62 @@ def radar_list_keyboard(items, *, mode: str, page: int, total: int, category_key
             nav.append(InlineKeyboardButton(text="➡️", callback_data=f"radarlist:{mode}:{page+1}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton(
-        text="⬅️ Категории" if category_key else "⬅️ DT Radar",
-        callback_data="radarcats:0" if category_key else "radar_home",
-    )])
+    if category_key:
+        cat = CATEGORIES.get(category_key)
+        group = GROUPS.get(cat.group) if cat is not None else None
+        rows.append([InlineKeyboardButton(
+            text=_button_text(f"⬅️ {group.name}" if group is not None else "⬅️ Категории"),
+            callback_data=f"radargroup:{cat.group}" if cat is not None and cat.group in GROUPS else "radarcats:0",
+        )])
+    else:
+        rows.append([InlineKeyboardButton(text="⬅️ DT Radar", callback_data="radar_home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def radar_categories_keyboard(items: list[tuple[str, int, int]], page: int = 0, page_size: int = 10) -> InlineKeyboardMarkup:
-    page = max(0, int(page))
-    start = page * page_size
-    shown = items[start:start + page_size]
+def _radar_category_stats(items: list[tuple[str, int, int]]) -> dict[str, tuple[int, int]]:
+    """Small lookup used by the hierarchical Radar category navigator."""
+    return {str(key): (int(count or 0), int(score or 0)) for key, count, score in items}
+
+
+def radar_groups_keyboard(items: list[tuple[str, int, int]]) -> InlineKeyboardMarkup:
+    """First Radar category level: only the large Kleinanzeigen sections.
+
+    Product counts are aggregated from leaf categories.  DT Score is intentionally
+    kept for the product list instead of turning the navigator into another stats
+    table.
+    """
+    stats = _radar_category_stats(items)
+    group_counts: dict[str, int] = {key: 0 for key in GROUPS}
+    for category_key, (count, _score) in stats.items():
+        cat = CATEGORIES.get(category_key)
+        if cat is None or cat.is_group or cat.group not in GROUPS:
+            continue
+        group_counts[cat.group] = int(group_counts.get(cat.group, 0)) + int(count)
+
     rows: list[list[InlineKeyboardButton]] = []
-    for key, count, score in shown:
-        cat = CATEGORIES.get(key)
-        name = cat.name if cat is not None else key
-        icon = GROUPS.get(cat.group).icon if cat is not None and cat.group in GROUPS else "📂"
+    for group_key, group in GROUPS.items():
+        count = int(group_counts.get(group_key, 0))
         rows.append([InlineKeyboardButton(
-            text=f"{icon} {name[:30]} · {count} · ⭐{score}",
-            callback_data=f"radarcat:{key}:0",
+            text=_button_text(f"{group.icon} {group.name} · {count}"),
+            callback_data=f"radargroup:{group_key}",
         )])
-    nav: list[InlineKeyboardButton] = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"radarcats:{page-1}"))
-    if start + page_size < len(items):
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"radarcats:{page+1}"))
-    if nav:
-        rows.append(nav)
     rows.append([InlineKeyboardButton(text="⬅️ DT Radar", callback_data="radar_home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def radar_group_keyboard(group_key: str, items: list[tuple[str, int, int]]) -> InlineKeyboardMarkup:
+    """Second Radar category level: leaf subcategories inside one large section."""
+    stats = _radar_category_stats(items)
+    rows: list[list[InlineKeyboardButton]] = []
+    for cat in categories_for_group(group_key):
+        if cat.is_group:
+            continue
+        count, _score = stats.get(cat.key, (0, 0))
+        rows.append([InlineKeyboardButton(
+            text=_button_text(f"📂 {cat.name} · {count}"),
+            callback_data=f"radarcat:{cat.key}:0",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Все разделы", callback_data="radarcats:0")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -11686,7 +11714,11 @@ async def _radar_list_payload(user_id: int, mode: str, page: int, category_key: 
     }
     if category_key:
         cat = CATEGORIES.get(category_key)
-        heading = f"🗂 {cat.name if cat is not None else category_key}"
+        if cat is not None and cat.group in GROUPS:
+            group = GROUPS[cat.group]
+            heading = f"{group.icon} {group.name} · {cat.name}"
+        else:
+            heading = f"🗂 {cat.name if cat is not None else category_key}"
     else:
         heading = titles.get(mode, "📡 DT Radar")
     lines = [f"<b>{html.escape(heading)}</b>", ""]
@@ -11804,18 +11836,38 @@ async def radar_list_handler(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("radarcats:"))
 async def radar_categories_handler(callback: CallbackQuery) -> None:
-    try:
-        page = max(0, int(callback.data.split(":", 1)[1]))
-    except Exception:
-        page = 0
     items = await radar_categories()
     await callback.answer()
     text = (
         "🗂 <b>DT Radar · Категории</b>\n\n"
-        "Все накопленные товары распределены по исходным категориям Kleinanzeigen. "
-        "Число справа — сколько товарных семейств уже знает Radar и лучший текущий Score."
+        "Сначала выбери <b>большой раздел</b>. Затем Radar покажет только его подкатегории.\n\n"
+        "Число справа — сколько товаров уже накоплено в этом разделе."
     )
-    await _edit_or_answer(callback.message, text, reply_markup=radar_categories_keyboard(items, page))
+    await _edit_or_answer(callback.message, text, reply_markup=radar_groups_keyboard(items))
+
+
+@dp.callback_query(F.data.startswith("radargroup:"))
+async def radar_group_handler(callback: CallbackQuery) -> None:
+    group_key = callback.data.split(":", 1)[1] if ":" in callback.data else ""
+    group = GROUPS.get(group_key)
+    if group is None:
+        await callback.answer("Раздел не найден", show_alert=True)
+        return
+    items = await radar_categories()
+    stats = _radar_category_stats(items)
+    total = sum(
+        stats.get(cat.key, (0, 0))[0]
+        for cat in categories_for_group(group_key)
+        if not cat.is_group
+    )
+    await callback.answer()
+    text = (
+        f"{group.icon} <b>{html.escape(group.name)}</b>\n\n"
+        "Выбери нужную <b>подкатегорию</b>.\n"
+        f"Всего в разделе Radar сейчас: <b>{int(total)}</b> товаров.\n\n"
+        "⭐ DT Score останется в списке товаров — здесь мы оставили только простую навигацию."
+    )
+    await _edit_or_answer(callback.message, text, reply_markup=radar_group_keyboard(group_key, items))
 
 
 @dp.callback_query(F.data.startswith("radarcat:"))
@@ -13549,7 +13601,7 @@ async def main() -> None:
             f"v4.9.1 expected {GUARANTEED_LOCAL_PARSER_LANES} scan workers, got {len(worker_tasks)}"
         )
     log.warning(
-        "v4.11.1 DT Radar AutoScan Error Recovery + Page Cache Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
+        "v4.11.2 DT Radar Category Navigator + AutoScan Error Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
         "trial_and_paid_same_queue=True | railway_lane_overrides_ignored=True",
         GUARANTEED_LOCAL_PARSER_LANES,
     )

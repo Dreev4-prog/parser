@@ -1,5 +1,21 @@
 # DT PARSER
 
+## v4.11.2 — DT Radar Category Navigator
+
+v4.11.2 keeps the full **v4.11.1 AutoScan Error Recovery** release and simplifies the user-facing DT Radar category browser.
+
+### Hierarchical categories
+- `Категории` now opens one clean list of the 15 large Kleinanzeigen sections
+- opening a section shows only its own leaf subcategories
+- the old flat 141-category Radar list is removed from the user flow
+- section buttons show only the accumulated product count; DT Score remains where it is useful — on product lists/cards
+- a product list returns to its parent section instead of throwing the user back to the root category list
+- no Radar scoring, database, AutoScan, parser or worker logic is changed
+
+See `DEPLOY_V4_11_2_RADAR_CATEGORY_NAVIGATOR.md` for rollout and smoke tests.
+
+---
+
 ## v4.11.1 — DT Radar AutoScan Error Recovery
 
 v4.11.1 keeps the stable **v4.11.0 AutoScan + v4.10.2 parser core** and adds targeted recovery for categories that did not finish completely.
