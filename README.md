@@ -1,5 +1,27 @@
 # DT PARSER
 
+## v4.11.1 — DT Radar AutoScan Error Recovery
+
+v4.11.1 keeps the stable **v4.11.0 AutoScan + v4.10.2 parser core** and adds targeted recovery for categories that did not finish completely.
+
+### AutoScan error recovery
+- every failed/partial AutoScan category is persisted with category name, reason and verified page count
+- completion report shows category coverage and page coverage from the requested maximum
+- `⚠️ Ошибки круга` opens a paged list of failed categories and their reasons
+- `🔁 Повторить только ошибки` starts a low-priority retry round containing only failed categories
+- repeated retries keep shrinking to the remaining failures; successful categories are never rescanned
+- after a retry, total logical coverage is recomputed against the original round (for example 124/141 + 17 recovered => 141/141)
+- completion notification contains direct error/retry buttons when failures remain
+- retry uses the same target date as the source round and still yields to foreground user scans
+- PostgreSQL state persists the failure list and retry chain across Railway restarts
+
+### Compatibility
+A round completed on v4.11.0 contains only the failure count, not the individual category keys. v4.11.1 can display that legacy count, but targeted retry becomes available after a v4.11.1 round has recorded the detailed failures.
+
+See `DEPLOY_V4_11_1_DT_RADAR_ERROR_RECOVERY.md` for rollout and smoke tests.
+
+---
+
 ## v4.11.0 — DT Radar AutoScan
 
 v4.11.0 keeps the stable **v4.10.2 DT Radar + Page Cache Recovery** core and adds a persistent low-priority Radar crawler.

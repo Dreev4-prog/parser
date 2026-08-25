@@ -147,7 +147,7 @@ FREE_TRIAL_MAX_CATEGORIES = 1
 FREE_TRIAL_MAX_PAGES = 25
 _trial_credit_guard = asyncio.Lock()
 
-# v4.11.0 DT Radar AutoScan.  This is a low-priority background producer for
+# v4.11.1 DT Radar AutoScan Error Recovery.  This is a low-priority background producer for
 # Radar: one leaf category at a time, 15 pages for the current Moscow date.
 # It never occupies one of the four user queue consumers and only starts a new
 # category while the foreground queue is idle.  If a user arrives mid-category,
@@ -3364,6 +3364,10 @@ def _radar_autoscan_default_state() -> dict:
         "listings_seen": 0,
         "new_listings": 0,
         "radar_saved": 0,
+        "failed_categories": [],
+        "retry_parent_total": 0,
+        "retry_parent_successful": 0,
+        "retry_parent_round_id": "",
         "started_at": "",
         "updated_at": _radar_autoscan_now_iso(),
         "last_completed_date": "",
@@ -3386,6 +3390,23 @@ def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
     state["stop_requested"] = bool(state.get("stop_requested"))
     state["waiting_for_users"] = bool(state.get("waiting_for_users"))
     state["history"] = list(state.get("history") or [])[:RADAR_AUTOSCAN_HISTORY_LIMIT]
+    failures = []
+    for item in list(state.get("failed_categories") or []):
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "")
+        if key not in CATEGORIES or bool(getattr(CATEGORIES[key], "is_group", False)):
+            continue
+        failures.append({
+            "key": key,
+            "name": str(item.get("name") or CATEGORIES[key].name)[:160],
+            "reason": str(item.get("reason") or "partial")[:300],
+            "verified_pages": max(0, int(item.get("verified_pages") or 0)),
+        })
+    state["failed_categories"] = failures[:500]
+    state["retry_parent_total"] = max(0, int(state.get("retry_parent_total") or 0))
+    state["retry_parent_successful"] = max(0, int(state.get("retry_parent_successful") or 0))
+    state["retry_parent_round_id"] = str(state.get("retry_parent_round_id") or "")[:80]
     keys = [str(x) for x in (state.get("category_keys") or []) if str(x) in CATEGORIES and not CATEGORIES[str(x)].is_group]
     if not keys:
         keys = [cat.key for cat in _radar_autoscan_categories()]
@@ -3459,6 +3480,63 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
         "listings_seen": 0,
         "new_listings": 0,
         "radar_saved": 0,
+        "failed_categories": [],
+        "retry_parent_total": 0,
+        "retry_parent_successful": 0,
+        "retry_parent_round_id": "",
+        "started_at": now.replace(microsecond=0).isoformat(),
+    })
+    return new_state
+
+
+def _radar_autoscan_retry_round(state: dict) -> dict | None:
+    """Create one low-priority round containing only failures from the last report."""
+    last = dict(state.get("last_summary") or {})
+    failures = [item for item in list(last.get("failed_categories") or []) if isinstance(item, dict)]
+    keys: list[str] = []
+    for item in failures:
+        key = str(item.get("key") or "")
+        if key in CATEGORIES and not bool(getattr(CATEGORIES[key], "is_group", False)) and key not in keys:
+            keys.append(key)
+    if not keys:
+        return None
+    now = datetime.now(MOSCOW)
+    keep = {
+        "daily_enabled": bool(state.get("daily_enabled")),
+        "daily_time": str(state.get("daily_time") or RADAR_AUTOSCAN_DEFAULT_TIME),
+        "skip_daily_if_completed_today": bool(state.get("skip_daily_if_completed_today", True)),
+        "last_completed_date": str(state.get("last_completed_date") or ""),
+        "last_daily_date": str(state.get("last_daily_date") or ""),
+        "last_summary": last,
+        "history": list(state.get("history") or [])[:RADAR_AUTOSCAN_HISTORY_LIMIT],
+    }
+    new_state = _radar_autoscan_default_state()
+    new_state.update(keep)
+    coverage_total = int(last.get("coverage_total") or last.get("total") or len(_radar_autoscan_categories()))
+    coverage_success = int(last.get("coverage_successful") or last.get("successful") or 0)
+    new_state.update({
+        "status": "running",
+        "stop_requested": False,
+        "waiting_for_users": False,
+        "round_id": f"retry-{now.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:5]}",
+        "mode": "retry",
+        "target_date": str(last.get("target_date") or now.date().isoformat()),
+        "category_keys": keys,
+        "current_index": 0,
+        "current_category_key": "",
+        "current_category_name": "",
+        "total": len(keys),
+        "processed": 0,
+        "successful": 0,
+        "failed": 0,
+        "pages_verified": 0,
+        "listings_seen": 0,
+        "new_listings": 0,
+        "radar_saved": 0,
+        "failed_categories": [],
+        "retry_parent_total": max(coverage_total, len(keys)),
+        "retry_parent_successful": max(0, coverage_success),
+        "retry_parent_round_id": str(last.get("round_id") or ""),
         "started_at": now.replace(microsecond=0).isoformat(),
     })
     return new_state
@@ -3471,10 +3549,12 @@ async def _radar_foreground_counts() -> tuple[int, int]:
     return int(running), int(queued)
 
 
-async def _notify_radar_autoscan_admins(bot: Bot, text: str) -> None:
+async def _notify_radar_autoscan_admins(
+    bot: Bot, text: str, reply_markup: InlineKeyboardMarkup | None = None
+) -> None:
     for admin_id in sorted(ADMIN_IDS):
         try:
-            await bot.send_message(int(admin_id), text, parse_mode=ParseMode.HTML)
+            await bot.send_message(int(admin_id), text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
         except (TelegramForbiddenError, TelegramBadRequest):
             log.debug("Could not notify Radar AutoScan admin=%s", admin_id)
         except Exception:
@@ -3535,12 +3615,14 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
     else:
         status_text = "🔴 не запущен"
     current = str(state.get("current_category_name") or "—")
-    mode_label = "Ежедневный" if state.get("mode") == "daily" else ("Ручной" if state.get("mode") == "manual" else "—")
+    mode_label = "Ежедневный" if state.get("mode") == "daily" else ("Повтор ошибок" if state.get("mode") == "retry" else ("Ручной" if state.get("mode") == "manual" else "—"))
     last = dict(state.get("last_summary") or {})
     if last:
+        coverage_total = int(last.get("coverage_total") or last.get("total") or 0)
+        coverage_success = int(last.get("coverage_successful") or last.get("successful") or 0)
         last_line = (
             f"#{html.escape(str(last.get('round_id') or '—'))} · "
-            f"{int(last.get('successful') or 0)}/{int(last.get('total') or 0)} успешно · "
+            f"{coverage_success}/{coverage_total} покрыто · "
             f"Radar +{int(last.get('radar_saved') or 0)}"
         )
     else:
@@ -3563,10 +3645,49 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         f"Время: <b>{html.escape(str(state.get('daily_time') or RADAR_AUTOSCAN_DEFAULT_TIME))} МСК</b>\n"
         f"Следующий запуск: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>\n"
         f"Если полный ручной круг уже прошёл сегодня: <b>{'пропустить автокруг' if state.get('skip_daily_if_completed_today', True) else 'всё равно запустить'}</b>\n\n"
-        f"Последний круг: <b>{last_line}</b>\n\n"
-        "AutoScan низкоприоритетный: новый 15-страничный блок начинается только когда пользовательская очередь свободна."
+        f"Последний круг: <b>{last_line}</b>\n"
+        + (
+            f"📊 Покрытие последнего: <b>{int(last.get('category_coverage_pct') or 0)}% категорий</b> · "
+            f"<b>{int(last.get('page_coverage_pct') or 0)}% страниц от максимума</b>\n\n"
+            if last else "\n"
+        )
+        + "AutoScan низкоприоритетный: новый 15-страничный блок начинается только когда пользовательская очередь свободна."
     )
     return text, state
+
+
+def _radar_autoscan_failure_list(state: dict) -> list[dict]:
+    last = dict(state.get("last_summary") or {})
+    return [item for item in list(last.get("failed_categories") or []) if isinstance(item, dict)]
+
+
+async def _radar_autoscan_errors_text(page: int = 0, per_page: int = 15) -> tuple[str, dict, int, int]:
+    state = await load_radar_autoscan_state()
+    failures = _radar_autoscan_failure_list(state)
+    total = len(failures)
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(pages - 1, int(page or 0)))
+    lines = ["<b>⚠️ DT Radar · ошибки последнего круга</b>"]
+    if not failures:
+        legacy_failed = int(dict(state.get("last_summary") or {}).get("failed") or 0)
+        if legacy_failed:
+            lines += ["", f"В последнем круге было <b>{legacy_failed}</b> ошибок, но он выполнен на v4.11.0, которая ещё не сохраняла список категорий.",
+                      "Начиная с v4.11.1 причины и категории сохраняются автоматически."]
+        else:
+            lines += ["", "Ошибок в последнем круге нет."]
+        return "\n".join(lines), state, page, pages
+    start = page * per_page
+    for idx, item in enumerate(failures[start:start + per_page], start=start + 1):
+        reason = str(item.get("reason") or "partial").replace("\n", " ").strip()
+        if len(reason) > 120:
+            reason = reason[:117] + "…"
+        lines += [
+            "",
+            f"<b>{idx}. {html.escape(str(item.get('name') or item.get('key') or '—'))}</b>",
+            f"📄 {int(item.get('verified_pages') or 0)}/{RADAR_AUTOSCAN_DEPTH} · {html.escape(reason)}",
+        ]
+    lines += ["", f"Страница <b>{page + 1}/{pages}</b> · ошибок <b>{total}</b>"]
+    return "\n".join(lines), state, page, pages
 
 
 async def _radar_autoscan_history_text() -> str:
@@ -3577,11 +3698,12 @@ async def _radar_autoscan_history_text() -> str:
         lines += ["", "Кругов пока не было."]
         return "\n".join(lines)
     for item in history:
-        mode = "авто" if item.get("mode") == "daily" else "ручной"
+        mode = "авто" if item.get("mode") == "daily" else ("повтор" if item.get("mode") == "retry" else "ручной")
         lines += [
             "",
             f"<b>#{html.escape(str(item.get('round_id') or '—'))}</b> · {mode}",
-            f"✅ {int(item.get('successful') or 0)}/{int(item.get('total') or 0)} · ⚠️ {int(item.get('failed') or 0)}",
+            f"✅ {int(item.get('coverage_successful') or item.get('successful') or 0)}/{int(item.get('coverage_total') or item.get('total') or 0)} · ⚠️ {int(item.get('failed') or 0)}",
+            f"📊 {int(item.get('category_coverage_pct') or 0)}% кат. · {int(item.get('page_coverage_pct') or 0)}% стр. от max",
             f"📄 {int(item.get('pages_verified') or 0)} стр. · 🧾 {int(item.get('listings_seen') or 0)} объявлений",
             f"📡 Radar +{int(item.get('radar_saved') or 0)} · ⏱ {_human_duration(int(item.get('duration_seconds') or 0))}",
             f"🕒 {html.escape(str(item.get('finished_at_text') or '—'))}",
@@ -3592,20 +3714,49 @@ async def _radar_autoscan_history_text() -> str:
 async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
     now = datetime.now(MOSCOW)
     duration = _radar_autoscan_duration_seconds(str(state.get("started_at") or ""))
-    total = int(state.get("total") or 0)
+    run_total = int(state.get("total") or 0)
+    run_successful = int(state.get("successful") or 0)
     failed = int(state.get("failed") or 0)
+    mode = str(state.get("mode") or "manual")
+    retry_parent_total = int(state.get("retry_parent_total") or 0)
+    retry_parent_successful = int(state.get("retry_parent_successful") or 0)
+    if mode == "retry" and retry_parent_total:
+        coverage_total = retry_parent_total
+        coverage_successful = min(coverage_total, retry_parent_successful + run_successful)
+    else:
+        coverage_total = run_total
+        coverage_successful = run_successful
+    category_coverage_pct = int(round((coverage_successful / max(1, coverage_total)) * 100))
+    if mode == "retry":
+        parent = dict(state.get("last_summary") or {})
+        parent_failures = [x for x in list(parent.get("failed_categories") or []) if isinstance(x, dict)]
+        parent_pages = int(parent.get("coverage_pages_verified") or parent.get("pages_verified") or 0)
+        replaced_partial_pages = sum(max(0, int(x.get("verified_pages") or 0)) for x in parent_failures)
+        coverage_pages_verified = max(0, parent_pages - replaced_partial_pages + int(state.get("pages_verified") or 0))
+    else:
+        coverage_pages_verified = int(state.get("pages_verified") or 0)
+    page_coverage_pct = int(round((coverage_pages_verified / max(1, coverage_total * RADAR_AUTOSCAN_DEPTH)) * 100))
+    page_coverage_pct = max(0, min(100, page_coverage_pct))
+    failed_categories = list(state.get("failed_categories") or [])
     summary = {
         "round_id": str(state.get("round_id") or ""),
-        "mode": str(state.get("mode") or "manual"),
+        "mode": mode,
         "target_date": str(state.get("target_date") or ""),
-        "total": total,
+        "total": run_total,
         "processed": int(state.get("processed") or 0),
-        "successful": int(state.get("successful") or 0),
+        "successful": run_successful,
         "failed": failed,
+        "coverage_total": coverage_total,
+        "coverage_successful": coverage_successful,
+        "category_coverage_pct": max(0, min(100, category_coverage_pct)),
+        "page_coverage_pct": page_coverage_pct,
+        "coverage_pages_verified": coverage_pages_verified,
         "pages_verified": int(state.get("pages_verified") or 0),
         "listings_seen": int(state.get("listings_seen") or 0),
         "new_listings": int(state.get("new_listings") or 0),
         "radar_saved": int(state.get("radar_saved") or 0),
+        "failed_categories": failed_categories,
+        "retry_parent_round_id": str(state.get("retry_parent_round_id") or ""),
         "duration_seconds": duration,
         "finished_at": now.replace(microsecond=0).isoformat(),
         "finished_at_text": now.strftime("%d.%m.%Y %H:%M МСК"),
@@ -3613,11 +3764,9 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
     state["history"] = [summary] + list(state.get("history") or [])
     state["history"] = state["history"][:RADAR_AUTOSCAN_HISTORY_LIMIT]
     state["last_summary"] = summary
-    if int(state.get("processed") or 0) >= total and failed == 0:
+    if coverage_successful >= coverage_total and failed == 0:
         state["last_completed_date"] = now.date().isoformat()
-    if state.get("mode") == "daily":
-        # Once per day means once per day even if a few categories were partial;
-        # the report exposes those errors instead of instantly starting an endless retry loop.
+    if mode == "daily":
         state["last_daily_date"] = now.date().isoformat()
     state["status"] = "idle"
     state["stop_requested"] = False
@@ -3626,17 +3775,31 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
     state["current_category_name"] = ""
     state = await save_radar_autoscan_state(state)
     icon = "✅" if failed == 0 else "⚠️"
+    if mode == "retry":
+        headline = f"📡 <b>DT Radar — повтор ошибок завершён {icon}</b>"
+        scope_line = f"Повторено: <b>{run_successful}/{run_total}</b> успешно" + (f" · осталось ошибок <b>{failed}</b>" if failed else "")
+    else:
+        headline = f"📡 <b>DT Radar — круг завершён {icon}</b>"
+        scope_line = f"Категории: <b>{run_successful}/{run_total}</b> успешно" + (f" · ошибок <b>{failed}</b>" if failed else "")
+    notify_keyboard = None
+    if failed_categories:
+        notify_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"⚠️ Ошибки круга — {len(failed_categories)}", callback_data="adminradarauto:errors:0")],
+            [InlineKeyboardButton(text="🔁 Повторить только ошибки", callback_data="adminradarauto:retry")],
+        ])
     await _notify_radar_autoscan_admins(
         bot,
-        f"📡 <b>DT Radar — круг завершён {icon}</b>\n\n"
-        f"Категории: <b>{int(summary['successful'])}/{total}</b> успешно"
-        + (f" · ошибок <b>{failed}</b>" if failed else "")
-        + f"\n📄 Подтверждено страниц: <b>{int(summary['pages_verified'])}</b>"
-        f"\n🧾 Объявлений даты: <b>{int(summary['listings_seen'])}</b> · новых <b>{int(summary['new_listings'])}</b>"
-        f"\n📡 Radar-сигналов: <b>+{int(summary['radar_saved'])}</b>"
-        f"\n⏱ Время: <b>{_human_duration(duration)}</b>"
-        f"\n\nAutoScan остановлен."
+        headline + "\n\n"
+        + scope_line
+        + f"\n📊 Покрытие категорий: <b>{coverage_successful}/{coverage_total} · {category_coverage_pct}%</b>"
+        + f"\n📊 Страниц от максимума: <b>{page_coverage_pct}%</b> · <b>{coverage_pages_verified}/{coverage_total * RADAR_AUTOSCAN_DEPTH}</b>"
+        + f"\n📄 Подтверждено страниц в этом запуске: <b>{int(summary['pages_verified'])}</b>"
+        + f"\n🧾 Объявлений даты: <b>{int(summary['listings_seen'])}</b> · новых <b>{int(summary['new_listings'])}</b>"
+        + f"\n📡 Radar-сигналов: <b>+{int(summary['radar_saved'])}</b>"
+        + f"\n⏱ Время: <b>{_human_duration(duration)}</b>"
+        + "\n\nAutoScan остановлен."
         + (f" Следующий ежедневный запуск: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>." if state.get("daily_enabled") else ""),
+        reply_markup=notify_keyboard,
     )
     return state
 
@@ -3696,6 +3859,9 @@ async def _run_radar_autoscan_round(bot: Bot) -> None:
             state["current_index"] = idx + 1
             state["processed"] = int(state.get("processed") or 0) + 1
             state["failed"] = int(state.get("failed") or 0) + 1
+            state.setdefault("failed_categories", []).append({
+                "key": str(key), "name": str(key), "reason": "категория недоступна", "verified_pages": 0
+            })
             state = await save_radar_autoscan_state(state)
             continue
 
@@ -3749,8 +3915,15 @@ async def _run_radar_autoscan_round(bot: Bot) -> None:
             else:
                 state["failed"] = int(state.get("failed") or 0) + 1
                 error_text = result.reason or "partial"
+                state.setdefault("failed_categories", []).append({
+                    "key": cat.key, "name": cat.name, "reason": error_text,
+                    "verified_pages": min(RADAR_AUTOSCAN_DEPTH, max(0, int(result.verified_pages or 0))),
+                })
         else:
             state["failed"] = int(state.get("failed") or 0) + 1
+            state.setdefault("failed_categories", []).append({
+                "key": cat.key, "name": cat.name, "reason": error_text or "ошибка выполнения", "verified_pages": 0,
+            })
         log.info(
             "DT Radar AutoScan category finish round=%s index=%s/%s category=%s complete=%s radar_saved=%s error=%s",
             state.get("round_id"), idx + 1, total, cat.name,
@@ -8125,6 +8298,13 @@ def admin_radar_autoscan_keyboard(state: dict) -> InlineKeyboardMarkup:
                      InlineKeyboardButton(text="🔄 Новый круг", callback_data="adminradarauto:start")])
     else:
         rows.append([InlineKeyboardButton(text="▶️ Запустить 1 круг", callback_data="adminradarauto:start")])
+        last = dict(state.get("last_summary") or {})
+        last_failed = int(last.get("failed") or 0)
+        failure_details = [x for x in list(last.get("failed_categories") or []) if isinstance(x, dict)]
+        if last_failed:
+            rows.append([InlineKeyboardButton(text=f"⚠️ Ошибки последнего круга: {last_failed}", callback_data="adminradarauto:errors:0")])
+        if failure_details:
+            rows.append([InlineKeyboardButton(text="🔁 Повторить только ошибки", callback_data="adminradarauto:retry")])
     rows.append([InlineKeyboardButton(
         text=f"🔄 Ежедневный автокруг: {'ВКЛ' if daily_enabled else 'ВЫКЛ'}",
         callback_data="adminradarauto:daily",
@@ -8140,6 +8320,21 @@ def admin_radar_autoscan_keyboard(state: dict) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="📜 История кругов", callback_data="adminradarauto:history"),
                  InlineKeyboardButton(text="🔄 Обновить", callback_data="adminradarauto")])
     rows.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_radar_autoscan_errors_keyboard(state: dict, page: int, pages: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adminradarauto:errors:{page - 1}"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adminradarauto:errors:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    if _radar_autoscan_failure_list(state) and str(state.get("status") or "idle") == "idle":
+        rows.append([InlineKeyboardButton(text="🔁 Повторить только ошибки", callback_data="adminradarauto:retry")])
+    rows.append([InlineKeyboardButton(text="⬅️ Radar AutoScan", callback_data="adminradarauto")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -9615,6 +9810,41 @@ async def admin_radar_autoscan_start_handler(callback: CallbackQuery) -> None:
         state = await save_radar_autoscan_state(state)
     _radar_autoscan_wakeup.set()
     await callback.answer("Один круг запущен")
+    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
+
+
+@dp.callback_query(F.data.startswith("adminradarauto:errors:"))
+async def admin_radar_autoscan_errors_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        page = int(str(callback.data or "").rsplit(":", 1)[-1])
+    except Exception:
+        page = 0
+    text, state, page, pages = await _radar_autoscan_errors_text(page)
+    await callback.answer()
+    await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_errors_keyboard(state, page, pages))
+
+
+@dp.callback_query(F.data == "adminradarauto:retry")
+async def admin_radar_autoscan_retry_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    async with _radar_autoscan_guard:
+        state = await load_radar_autoscan_state()
+        if state.get("status") != "idle":
+            await callback.answer("Сначала останови текущий круг", show_alert=True)
+            return
+        retry_state = _radar_autoscan_retry_round(state)
+        if retry_state is None:
+            await callback.answer("Нет сохранённого списка ошибок для повтора", show_alert=True)
+            return
+        state = await save_radar_autoscan_state(retry_state)
+    _radar_autoscan_wakeup.set()
+    await callback.answer(f"Повторяю только ошибки: {len(state.get('category_keys') or [])}")
     text, state = await _radar_autoscan_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
@@ -13319,7 +13549,7 @@ async def main() -> None:
             f"v4.9.1 expected {GUARANTEED_LOCAL_PARSER_LANES} scan workers, got {len(worker_tasks)}"
         )
     log.warning(
-        "v4.11.0 DT Radar AutoScan + Page Cache Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
+        "v4.11.1 DT Radar AutoScan Error Recovery + Page Cache Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
         "trial_and_paid_same_queue=True | railway_lane_overrides_ignored=True",
         GUARANTEED_LOCAL_PARSER_LANES,
     )
