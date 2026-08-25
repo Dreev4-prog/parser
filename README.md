@@ -1,8 +1,8 @@
 # DT PARSER
 
-## v4.10.1 — DT Radar Reliability Fix
+## v4.10.2 — DT Radar Page Cache Recovery
 
-v4.10.1 keeps the full **DT Radar** release from v4.10.0 and adds two production fixes discovered under live load.
+v4.10.2 keeps the full **DT Radar** release and all v4.10.1 reliability fixes, then fixes poisoned Page Worker cache replay discovered under live load.
 
 ### View Speed Fix
 - large view batches (40+ URLs) are always sharded into small Redis jobs for the four View Worker replicas
@@ -82,3 +82,10 @@ v4.9.1 keeps the v4.9.0 Free Trial Launch and hardens the main Telegram parser s
 
 ### Worker architecture unchanged
 Date Worker / Page Worker / View Worker remain separate Redis-backed helper services and keep their existing replica logic. The four-lane guarantee applies only to the main Telegram `parser` service. Parsing/date/page/view algorithms were not rewritten in this release.
+
+
+### v4.10.2 live-load fix
+
+If a prefetched Page Worker response duplicates a page already seen in the same scan, DT Parser now invalidates that Redis cache entry and forces the affected page through the local stable parser. This prevents stable retries and BrowserContext resets from replaying the same poisoned remote page.
+
+See `DEPLOY_V4_10_2_PAGE_CACHE_RECOVERY.md`.

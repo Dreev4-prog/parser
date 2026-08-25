@@ -4113,6 +4113,12 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         nonlocal repeated_pages, low_quality_pages, verified_pages
         cache: dict[int, object] = {}
         fingerprints: dict[str, int] = {}
+        # v4.10.2: if a Page Worker cache entry duplicates a page already seen
+        # in this exact category scan, never replay that Redis value through
+        # stable_fetch retries. The page is forced through the local stable
+        # parser for the remainder of this locator so retry/reset can actually
+        # obtain fresh content instead of reading the same poisoned cache.
+        remote_repeat_bypass_pages: set[int] = set()
         effective_limit = PUBLIC_SEARCH_PAGE_CAP
         site_max_page: int | None = None
         discovered_shards: list[tuple[str, int | None]] = []
@@ -4168,7 +4174,11 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     # v4.3.21 Page Worker. Date-location probes stay on the proven
                     # local parser. Only the post-locator collection phase may consume
                     # the 180-second Redis page cache warmed by dedicated workers.
-                    if phase == "collecting" and REMOTE_PAGE_WORKER_ENABLED:
+                    if (
+                        phase == "collecting"
+                        and REMOTE_PAGE_WORKER_ENABLED
+                        and page not in remote_repeat_bypass_pages
+                    ):
                         try:
                             info = await REMOTE_PAGE_MANAGER.get_cached_wait(requested_url, page)
                             remote_page = info is not None
@@ -4287,6 +4297,30 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     valid = False
                     repeated = True
                     invalid_note = f"страница {page} повторила содержимое страницы {previous}"
+
+            # v4.10.2 Page Worker poison recovery. v4.10.1 correctly detected
+            # repeated-content, but stable_fetch() only popped the in-process
+            # cache. A bad prefetched Redis page was therefore replayed on every
+            # retry and even after BrowserContext reset. Once a remote page is
+            # proven to duplicate an earlier page, delete that shared cache entry
+            # and pin this page to the local parser for all subsequent retries.
+            # A healthy local retry will clear the repeated-page quality marker
+            # below; a genuinely repeated local page still follows the bounded
+            # repeated-content recovery path.
+            if repeated and remote_page:
+                remote_repeat_bypass_pages.add(int(page))
+                try:
+                    await REMOTE_PAGE_MANAGER.invalidate_cached(page_url(base_url, page), page)
+                except Exception:
+                    log.debug(
+                        "Could not invalidate repeated Page Worker cache category=%s page=%s",
+                        cat.key, page, exc_info=True,
+                    )
+                log.warning(
+                    "Repeated Page Worker cache invalidated category=%s page=%s previous=%s; forcing local retry",
+                    cat.name, page, previous,
+                )
+
             if fresh:
                 metric_key = (str(base_url), int(page))
                 current_metrics = {
@@ -12591,7 +12625,7 @@ async def main() -> None:
             f"v4.9.1 expected {GUARANTEED_LOCAL_PARSER_LANES} scan workers, got {len(worker_tasks)}"
         )
     log.warning(
-        "v4.10.1 DT Radar + View Speed + Repeated Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
+        "v4.10.2 DT Radar + View Speed + Page Cache Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
         "trial_and_paid_same_queue=True | railway_lane_overrides_ignored=True",
         GUARANTEED_LOCAL_PARSER_LANES,
     )
