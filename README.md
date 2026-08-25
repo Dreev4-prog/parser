@@ -1,5 +1,43 @@
 # DT PARSER
 
+## v4.11.4 — DT Radar Category Feed
+
+v4.11.4 keeps the full **v4.11.3 Simple Home + v4.11.2 Category Navigator + v4.11.1 AutoScan Error Recovery** release and makes category browsing useful as an accumulated curated catalogue instead of a 24-hour-only feed.
+
+### Category feed
+- `Категории` still uses the simple two-level structure: large section -> leaf subcategory
+- each section count shows the total number of products that have passed DT Radar selection
+- each leaf subcategory shows `total · 🆕 new today` when new products were added on the current Moscow day
+- opening a subcategory now shows **all Radar-selected products** in that category; historical accepted products are no longer hidden by a 24-hour filter
+- default sorting is **newest first** using `first_radar_at`, so an old product cannot jump to the top only because its score was refreshed
+- products added within 3 hours are marked `🆕 Новое`; products added earlier today are marked `🟢 Сегодня`; older products show `вчера`, `N дн назад`, or the date
+- one simple toggle switches between `🔥 Сначала лучшие` (DT Score) and `🆕 Сначала новые`
+- DT Score remains visible on every product
+- no database migration, parser algorithm, AutoScan, Page/View/Date/AI worker or subscription changes
+
+See `DEPLOY_V4_11_4_RADAR_CATEGORY_FEED.md` for rollout and smoke tests.
+
+---
+
+## v4.11.3 — DT Radar Simple Home
+
+v4.11.3 keeps the full **v4.11.2 Category Navigator + v4.11.1 AutoScan Error Recovery** release and simplifies the mass-market DT Radar entry flow.
+
+### Simple Radar UX
+- Radar home now has four primary actions only: `Лучшие сейчас`, `Поиск`, `Категории`, `Мой Radar`
+- Hot / Rising / AI Picks move under `Лучшие сейчас`; all-time history becomes secondary `Рекорды Radar`
+- Rising no longer duplicates Hot products
+- Radar search finds accumulated products by title/model and keeps DT Score ordering
+- product lists and product cards show a human freshness label
+- category/subcategory counters now show fresh Radar activity from the last 24 hours
+- opening a subcategory shows the same current 24-hour feed instead of the whole historical accumulation
+- historical Radar data is preserved and remains available through Search and Records
+- no parser, AutoScan, DT Score, database schema or worker architecture changes
+
+See `DEPLOY_V4_11_3_RADAR_SIMPLE_HOME.md` for rollout and smoke tests.
+
+---
+
 ## v4.11.2 — DT Radar Category Navigator
 
 v4.11.2 keeps the full **v4.11.1 AutoScan Error Recovery** release and simplifies the user-facing DT Radar category browser.

@@ -5,9 +5,10 @@ import json
 import logging
 import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select, text
+from sqlalchemy import case, func, select, text
 
 from db import SessionLocal
 from early_winner import opportunity_family_key
@@ -463,6 +464,13 @@ async def list_radar_products(
     *, mode: str = "hot", category_key: str | None = None, page: int = 0,
     page_size: int = RADAR_PAGE_SIZE, user_id: int | None = None,
 ) -> tuple[list[RadarProduct], int]:
+    """Return Radar products for the requested user-facing feed.
+
+    v4.11.4 deliberately treats the category browser as the accumulated curated
+    Radar catalogue.  No 24-hour filter is applied there: every product that was
+    accepted into Radar remains visible.  The default category order is newest
+    first, while ``category_best`` switches to DT Score ordering.
+    """
     page = max(0, int(page))
     page_size = max(1, min(20, int(page_size)))
     async with SessionLocal() as session:
@@ -475,7 +483,7 @@ async def list_radar_products(
             conditions.append(RadarProduct.status == "hot")
             order = (RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
         elif mode == "rising":
-            conditions.append(RadarProduct.status.in_(["hot", "rising"]))
+            conditions.append(RadarProduct.status == "rising")
             order = (RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
         elif mode == "ai":
             conditions.extend([
@@ -489,6 +497,10 @@ async def list_radar_products(
             fav_ids = select(RadarFavorite.product_id).where(RadarFavorite.user_id == int(user_id))
             conditions.append(RadarProduct.id.in_(fav_ids))
             order = (RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
+        elif mode == "category_best" and category_key:
+            order = (RadarProduct.current_score.desc(), RadarProduct.first_radar_at.desc(), RadarProduct.last_signal_at.desc())
+        elif mode == "category_new" and category_key:
+            order = (RadarProduct.first_radar_at.desc(), RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
         else:
             order = (RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
         if conditions:
@@ -501,19 +513,59 @@ async def list_radar_products(
         return rows, total
 
 
-async def radar_categories() -> list[tuple[str, int, int]]:
+async def search_radar_products(
+    query_text: str, *, page: int = 0, page_size: int = RADAR_PAGE_SIZE,
+) -> tuple[list[RadarProduct], int]:
+    """Simple mass-market Radar search by product title/model."""
+    clean = " ".join(str(query_text or "").split()).strip()[:80]
+    if len(clean) < 2:
+        return [], 0
+    page = max(0, int(page))
+    page_size = max(1, min(20, int(page_size)))
+    pattern = f"%{clean}%"
+    async with SessionLocal() as session:
+        condition = RadarProduct.title.ilike(pattern)
+        total = int((await session.execute(
+            select(func.count(RadarProduct.id)).where(condition)
+        )).scalar_one() or 0)
+        rows = list((await session.execute(
+            select(RadarProduct)
+            .where(condition)
+            .order_by(RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
+            .offset(page * page_size).limit(page_size)
+        )).scalars().all())
+    return rows, total
+
+
+async def radar_categories() -> list[tuple[str, int, int, int]]:
+    """Return accumulated category counts plus products newly added today.
+
+    Tuple shape: ``(category_key, total_products, new_today, max_score)``.
+    ``new_today`` uses the Moscow calendar day and ``first_radar_at`` so an old
+    product receiving a fresh signal is not incorrectly presented as newly found.
+    """
+    moscow = ZoneInfo("Europe/Moscow")
+    start_moscow = datetime.now(moscow).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_after_utc = start_moscow.astimezone(timezone.utc).replace(tzinfo=None)
+    new_today_expr = func.sum(
+        case((RadarProduct.first_radar_at >= today_after_utc, 1), else_=0)
+    )
     async with SessionLocal() as session:
         rows = (await session.execute(
             select(
                 RadarProduct.category_key,
                 func.count(RadarProduct.id),
+                new_today_expr,
                 func.max(RadarProduct.current_score),
             )
             .where(RadarProduct.category_key != "")
             .group_by(RadarProduct.category_key)
-            .order_by(func.max(RadarProduct.current_score).desc(), func.count(RadarProduct.id).desc())
+            .order_by(func.count(RadarProduct.id).desc(), func.max(RadarProduct.current_score).desc())
         )).all()
-    return [(str(key), int(count or 0), int(score or 0)) for key, count, score in rows]
+    return [
+        (str(key), int(total or 0), int(new_today or 0), int(score or 0))
+        for key, total, new_today, score in rows
+    ]
 
 
 async def get_radar_product(product_id: int) -> tuple[RadarProduct | None, Listing | None, list[RadarSnapshot]]:
