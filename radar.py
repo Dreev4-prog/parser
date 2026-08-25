@@ -1,0 +1,538 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+from sqlalchemy import func, select, text
+
+from db import SessionLocal
+from early_winner import opportunity_family_key
+from models import (
+    AIEarlyWinnerCandidate,
+    AppSetting,
+    Listing,
+    RadarFavorite,
+    RadarProduct,
+    RadarProductListing,
+    RadarSnapshot,
+    ScanListing,
+    UserScan,
+)
+
+log = logging.getLogger("dtparser-radar")
+
+RADAR_BACKFILL_SETTING = "dt_radar_v1_backfill_complete"
+RADAR_SCAN_TOP_LIMIT = 12
+RADAR_PAGE_SIZE = 8
+_radar_lock = asyncio.Lock()
+
+
+@dataclass(frozen=True)
+class RadarStats:
+    total: int
+    hot: int
+    rising: int
+    ai_picks: int
+    categories: int
+    signals: int
+
+
+def _clamp_score(value: int | float) -> int:
+    return max(0, min(100, int(round(float(value)))))
+
+
+def radar_product_key(listing: Listing, cohort_key: str | None = None) -> str:
+    """Stable family key shared by scan TOPs and the AI worker."""
+    if cohort_key:
+        value = str(cohort_key).strip()
+        if value:
+            return value[:600]
+    if listing.identity_key and int(listing.identity_confidence or 0) >= 70:
+        return f"id:{listing.identity_key}"[:600]
+    family = opportunity_family_key(str(listing.title or ""), str(listing.category_key or "unknown"))
+    if family:
+        return family[:600]
+    return f"listing:{listing.external_id}"[:600]
+
+
+def _status_for_score(score: int) -> str:
+    if score >= 85:
+        return "hot"
+    if score >= 72:
+        return "rising"
+    if score >= 58:
+        return "stable"
+    if score >= 38:
+        return "cooling"
+    return "historical"
+
+
+def _effective_score(product: RadarProduct, now: datetime) -> int:
+    """Fresh signals rise; old signals cool but never disappear from Radar."""
+    raw = int(product.last_signal_score or product.current_score or 0)
+    if product.last_signal_at is None:
+        return _clamp_score(raw)
+    age_hours = max(0.0, (now - product.last_signal_at).total_seconds() / 3600.0)
+    # Give a signal three full days before cooling. Afterwards the live score loses
+    # two points/day, while repeatability/confirmed evidence contributes a small,
+    # bounded durable bonus. Peak score is never reduced.
+    decay = max(0.0, age_hours - 72.0) / 24.0 * 2.0
+    repeat_bonus = min(6.0, math.log2(max(1, int(product.signal_count or 0)) + 1) * 1.5)
+    confirmed_bonus = min(6.0, float(int(product.confirmed_count or 0)) * 2.0)
+    return _clamp_score(raw + repeat_bonus + confirmed_bonus - decay)
+
+
+async def _upsert_signal(
+    *,
+    source_key: str,
+    source: str,
+    listing: Listing,
+    product_key: str,
+    score: int,
+    confidence: int = 0,
+    stage: str = "",
+    outcome: str = "",
+    opportunity_type: str = "spark",
+    scan_id: int | None = None,
+    candidate_id: int | None = None,
+    view_count: int | None = None,
+    views_per_hour: float | None = None,
+    reasons: list[str] | tuple[str, ...] | None = None,
+    recorded_at: datetime | None = None,
+) -> int | None:
+    """Append one idempotent Radar snapshot and refresh its aggregate product."""
+    now = recorded_at or datetime.utcnow()
+    score = _clamp_score(score)
+    confidence = _clamp_score(confidence)
+    reason_list = [str(x) for x in (reasons or []) if str(x).strip()]
+    latest_reason = (reason_list[0] if reason_list else "")[:800]
+
+    async with _radar_lock:
+        async with SessionLocal() as session:
+            # Main Bot and AI Worker are separate Railway processes. Serialize only
+            # writes for the same product family so both can safely discover a new
+            # Radar product at the same time without a unique-key race.
+            bind = session.get_bind()
+            if bind is not None and bind.dialect.name == "postgresql":
+                await session.execute(
+                    text("SELECT pg_advisory_xact_lock(CAST(hashtext(:radar_key) AS bigint))"),
+                    {"radar_key": product_key},
+                )
+            duplicate = (await session.execute(
+                select(RadarSnapshot.id).where(RadarSnapshot.source_key == source_key).limit(1)
+            )).scalar_one_or_none()
+            if duplicate is not None:
+                return None
+
+            product = (await session.execute(
+                select(RadarProduct).where(RadarProduct.product_key == product_key).limit(1)
+            )).scalar_one_or_none()
+            if product is None:
+                product = RadarProduct(
+                    product_key=product_key,
+                    category_key=str(listing.category_key or ""),
+                    title=str(listing.identity_label or listing.title or "")[:500],
+                    representative_external_id=str(listing.external_id),
+                    first_seen_at=listing.first_seen_at or now,
+                    last_seen_at=listing.last_seen_at or now,
+                    first_radar_at=now,
+                    last_signal_at=now,
+                    last_signal_score=score,
+                    current_score=score,
+                    peak_score=score,
+                    confidence=confidence,
+                    status=_status_for_score(score),
+                    opportunity_type=(opportunity_type or "spark")[:32],
+                    signal_count=0,
+                    confirmed_count=0,
+                    listing_count=0,
+                    best_views=max(0, int(view_count or 0)),
+                    best_views_per_hour=max(0.0, float(views_per_hour or 0.0)),
+                    min_price_eur=listing.price_eur,
+                    max_price_eur=listing.price_eur,
+                    latest_reason=latest_reason,
+                    latest_source=source[:32],
+                    last_ai_candidate_id=candidate_id,
+                    updated_at=now,
+                )
+                session.add(product)
+                await session.flush()
+
+            assoc = (await session.execute(
+                select(RadarProductListing).where(
+                    RadarProductListing.product_id == int(product.id),
+                    RadarProductListing.external_id == str(listing.external_id),
+                ).limit(1)
+            )).scalar_one_or_none()
+            if assoc is None:
+                assoc = RadarProductListing(
+                    product_id=int(product.id),
+                    external_id=str(listing.external_id),
+                    first_seen_at=listing.first_seen_at or now,
+                    last_seen_at=listing.last_seen_at or now,
+                    best_views=max(0, int(view_count or 0)),
+                    last_price_eur=listing.price_eur,
+                )
+                session.add(assoc)
+                product.listing_count = int(product.listing_count or 0) + 1
+            else:
+                assoc.last_seen_at = max(assoc.last_seen_at or now, listing.last_seen_at or now)
+                assoc.best_views = max(int(assoc.best_views or 0), int(view_count or 0))
+                assoc.last_price_eur = listing.price_eur
+
+            was_confirmed = False
+            if candidate_id is not None and outcome == "confirmed":
+                was_confirmed = bool((await session.execute(
+                    select(RadarSnapshot.id).where(
+                        RadarSnapshot.product_id == int(product.id),
+                        RadarSnapshot.candidate_id == int(candidate_id),
+                        RadarSnapshot.outcome == "confirmed",
+                    ).limit(1)
+                )).scalar_one_or_none())
+
+            session.add(RadarSnapshot(
+                source_key=source_key[:160],
+                product_id=int(product.id),
+                external_id=str(listing.external_id),
+                scan_id=scan_id,
+                candidate_id=candidate_id,
+                source=source[:32],
+                score=score,
+                confidence=confidence,
+                stage=stage[:24],
+                outcome=outcome[:24],
+                opportunity_type=(opportunity_type or "")[:32],
+                view_count=view_count,
+                views_per_hour=views_per_hour,
+                price_eur=listing.price_eur,
+                reasons_json=json.dumps(reason_list, ensure_ascii=False),
+                recorded_at=now,
+            ))
+
+            product.signal_count = int(product.signal_count or 0) + 1
+            if candidate_id is not None and outcome == "confirmed" and not was_confirmed:
+                product.confirmed_count = int(product.confirmed_count or 0) + 1
+            product.category_key = str(listing.category_key or product.category_key or "")
+            if listing.identity_label:
+                product.title = str(listing.identity_label)[:500]
+            elif not product.title:
+                product.title = str(listing.title or "")[:500]
+            product.representative_external_id = str(listing.external_id)
+            product.first_seen_at = min(product.first_seen_at or now, listing.first_seen_at or now)
+            product.last_seen_at = max(product.last_seen_at or now, listing.last_seen_at or now)
+            if now >= (product.last_signal_at or now):
+                product.last_signal_at = now
+                product.last_signal_score = score
+                product.confidence = max(int(product.confidence or 0), confidence)
+                product.opportunity_type = (opportunity_type or product.opportunity_type or "spark")[:32]
+                product.latest_reason = latest_reason or product.latest_reason
+                product.latest_source = source[:32]
+                if candidate_id is not None:
+                    product.last_ai_candidate_id = int(candidate_id)
+            product.best_views = max(int(product.best_views or 0), int(view_count or 0))
+            product.best_views_per_hour = max(float(product.best_views_per_hour or 0.0), float(views_per_hour or 0.0))
+            if listing.price_eur is not None:
+                price = int(listing.price_eur)
+                product.min_price_eur = price if product.min_price_eur is None else min(int(product.min_price_eur), price)
+                product.max_price_eur = price if product.max_price_eur is None else max(int(product.max_price_eur), price)
+            product.peak_score = max(int(product.peak_score or 0), score)
+
+            # Product-level live score is based on the newest signal for each
+            # distinct listing, then takes the strongest currently observed listing.
+            # A later lower AI checkpoint can therefore cool one listing, while a
+            # second independently strong listing can keep the product family hot.
+            await session.flush()
+            recent_snapshots = list((await session.execute(
+                select(RadarSnapshot)
+                .where(RadarSnapshot.product_id == int(product.id))
+                .order_by(RadarSnapshot.recorded_at.desc(), RadarSnapshot.id.desc())
+                .limit(300)
+            )).scalars().all())
+            latest_by_listing: dict[str, RadarSnapshot] = {}
+            for snap in recent_snapshots:
+                ext = str(snap.external_id or f"snapshot:{snap.id}")
+                if ext not in latest_by_listing:
+                    latest_by_listing[ext] = snap
+            if latest_by_listing:
+                product.last_signal_score = max(int(x.score or 0) for x in latest_by_listing.values())
+                product.last_signal_at = max(x.recorded_at for x in latest_by_listing.values() if x.recorded_at is not None)
+            product.current_score = _effective_score(product, now)
+            product.status = _status_for_score(int(product.current_score or 0))
+            product.updated_at = now
+            await session.commit()
+            return int(product.id)
+
+
+async def record_scan_hot(scan_id: int, limit: int = RADAR_SCAN_TOP_LIMIT) -> int:
+    """Merge the scan's TOP-by-real-views into the global persistent Radar."""
+    async with SessionLocal() as session:
+        scan = await session.get(UserScan, int(scan_id))
+        if scan is None or scan.status != "done" or not scan.target_complete:
+            return 0
+        pairs = (await session.execute(
+            select(Listing, ScanListing)
+            .join(ScanListing, Listing.external_id == ScanListing.external_id)
+            .where(ScanListing.scan_id == int(scan_id), Listing.is_promoted.is_(False))
+        )).all()
+    ranked = [(listing, snap) for listing, snap in pairs if snap.initial_view_count is not None]
+    ranked.sort(key=lambda item: (int(item[1].initial_view_count or 0), item[0].first_seen_at), reverse=True)
+    ranked = ranked[: max(1, int(limit))]
+    if not ranked:
+        return 0
+    saved = 0
+    n = len(ranked)
+    for index, (listing, snap) in enumerate(ranked):
+        percentile = 1.0 if n == 1 else 1.0 - (index / max(1, n - 1))
+        views = max(0, int(snap.initial_view_count or 0))
+        view_bonus = min(8, int(round(math.log10(max(1, views) + 1) * 2.5)))
+        score = _clamp_score(58 + percentile * 20 + view_bonus)
+        result = await _upsert_signal(
+            source_key=f"scan-hot:{scan_id}:{listing.external_id}",
+            source="scan_hot",
+            listing=listing,
+            product_key=radar_product_key(listing),
+            score=score,
+            confidence=55,
+            stage="rising" if score >= 72 else "watch",
+            opportunity_type="hot_product" if score >= 82 else "spark",
+            scan_id=int(scan_id),
+            view_count=views,
+            reasons=[f"TOP-{index + 1} по реальным просмотрам в завершённом скане"],
+            recorded_at=snap.captured_at,
+        )
+        if result is not None:
+            saved += 1
+    if saved:
+        log.info("DT Radar scan merge scan=%s products=%s", scan_id, saved)
+    return saved
+
+
+async def record_ai_candidate(candidate_id: int, *, source_key: str | None = None, source: str = "ai") -> int | None:
+    """Merge the latest AI state into Radar. Control candidates never enter Radar."""
+    async with SessionLocal() as session:
+        candidate = await session.get(AIEarlyWinnerCandidate, int(candidate_id))
+        if candidate is None or candidate.is_control:
+            return None
+        listing = (await session.execute(
+            select(Listing).where(Listing.external_id == candidate.external_id).limit(1)
+        )).scalar_one_or_none()
+        if listing is None:
+            return None
+        try:
+            reasons = json.loads(candidate.latest_reasons_json or candidate.reasons_json or "[]")
+            if not isinstance(reasons, list):
+                reasons = []
+        except Exception:
+            reasons = []
+        key = radar_product_key(listing, candidate.cohort_key)
+        vph = None
+        if candidate.latest_at and candidate.baseline_at and int(candidate.latest_views or 0) >= int(candidate.baseline_views or 0):
+            hours = max(0.25, (candidate.latest_at - candidate.baseline_at).total_seconds() / 3600.0)
+            vph = max(0.0, (int(candidate.latest_views or 0) - int(candidate.baseline_views or 0)) / hours)
+        recorded_at = candidate.latest_at or candidate.created_at or datetime.utcnow()
+        return await _upsert_signal(
+            source_key=source_key or f"ai-state:{candidate.id}:{int(recorded_at.timestamp())}",
+            source=source,
+            listing=listing,
+            product_key=key,
+            score=int(candidate.current_score or candidate.initial_score or 0),
+            confidence=int(candidate.confidence or 0),
+            stage=str(candidate.stage or ""),
+            outcome=str(candidate.outcome or ""),
+            opportunity_type=str(candidate.opportunity_type or "spark"),
+            scan_id=int(candidate.scan_id),
+            candidate_id=int(candidate.id),
+            view_count=int(candidate.latest_views or candidate.baseline_views or 0),
+            views_per_hour=vph if vph is not None else float(candidate.initial_views_per_hour or 0.0),
+            reasons=[str(x) for x in reasons],
+            recorded_at=recorded_at,
+        )
+
+
+async def refresh_radar_scores() -> int:
+    """Apply age cooling to current score without deleting historical products."""
+    now = datetime.utcnow()
+    changed = 0
+    async with _radar_lock:
+        async with SessionLocal() as session:
+            products = list((await session.execute(
+                select(RadarProduct).where(
+                    (RadarProduct.status != "historical") | (RadarProduct.current_score > 25)
+                )
+            )).scalars().all())
+            for product in products:
+                new_score = _effective_score(product, now)
+                new_status = _status_for_score(new_score)
+                if int(product.current_score or 0) != new_score or product.status != new_status:
+                    product.current_score = new_score
+                    product.status = new_status
+                    product.updated_at = now
+                    changed += 1
+            if changed:
+                await session.commit()
+    return changed
+
+
+async def radar_stats() -> RadarStats:
+    async with SessionLocal() as session:
+        total = int((await session.execute(select(func.count(RadarProduct.id)))).scalar_one() or 0)
+        hot = int((await session.execute(select(func.count(RadarProduct.id)).where(RadarProduct.status == "hot"))).scalar_one() or 0)
+        rising = int((await session.execute(select(func.count(RadarProduct.id)).where(RadarProduct.status == "rising"))).scalar_one() or 0)
+        ai_picks = int((await session.execute(select(func.count(RadarProduct.id)).where(
+            RadarProduct.opportunity_type.in_(["hot_product", "hidden_gem", "emerging"]),
+            RadarProduct.confidence >= 55,
+        ))).scalar_one() or 0)
+        categories = int((await session.execute(select(func.count(func.distinct(RadarProduct.category_key))))).scalar_one() or 0)
+        signals = int((await session.execute(select(func.count(RadarSnapshot.id)))).scalar_one() or 0)
+    return RadarStats(total, hot, rising, ai_picks, categories, signals)
+
+
+async def list_radar_products(
+    *, mode: str = "hot", category_key: str | None = None, page: int = 0,
+    page_size: int = RADAR_PAGE_SIZE, user_id: int | None = None,
+) -> tuple[list[RadarProduct], int]:
+    page = max(0, int(page))
+    page_size = max(1, min(20, int(page_size)))
+    async with SessionLocal() as session:
+        query = select(RadarProduct)
+        count_query = select(func.count(RadarProduct.id))
+        conditions = []
+        if category_key:
+            conditions.append(RadarProduct.category_key == category_key)
+        if mode == "hot":
+            conditions.append(RadarProduct.status == "hot")
+            order = (RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
+        elif mode == "rising":
+            conditions.append(RadarProduct.status.in_(["hot", "rising"]))
+            order = (RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
+        elif mode == "ai":
+            conditions.extend([
+                RadarProduct.opportunity_type.in_(["hot_product", "hidden_gem", "emerging"]),
+                RadarProduct.confidence >= 55,
+            ])
+            order = (RadarProduct.current_score.desc(), RadarProduct.confidence.desc(), RadarProduct.last_signal_at.desc())
+        elif mode == "alltime":
+            order = (RadarProduct.peak_score.desc(), RadarProduct.signal_count.desc(), RadarProduct.last_signal_at.desc())
+        elif mode == "favorites" and user_id is not None:
+            fav_ids = select(RadarFavorite.product_id).where(RadarFavorite.user_id == int(user_id))
+            conditions.append(RadarProduct.id.in_(fav_ids))
+            order = (RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
+        else:
+            order = (RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
+        if conditions:
+            query = query.where(*conditions)
+            count_query = count_query.where(*conditions)
+        total = int((await session.execute(count_query)).scalar_one() or 0)
+        rows = list((await session.execute(
+            query.order_by(*order).offset(page * page_size).limit(page_size)
+        )).scalars().all())
+        return rows, total
+
+
+async def radar_categories() -> list[tuple[str, int, int]]:
+    async with SessionLocal() as session:
+        rows = (await session.execute(
+            select(
+                RadarProduct.category_key,
+                func.count(RadarProduct.id),
+                func.max(RadarProduct.current_score),
+            )
+            .where(RadarProduct.category_key != "")
+            .group_by(RadarProduct.category_key)
+            .order_by(func.max(RadarProduct.current_score).desc(), func.count(RadarProduct.id).desc())
+        )).all()
+    return [(str(key), int(count or 0), int(score or 0)) for key, count, score in rows]
+
+
+async def get_radar_product(product_id: int) -> tuple[RadarProduct | None, Listing | None, list[RadarSnapshot]]:
+    async with SessionLocal() as session:
+        product = await session.get(RadarProduct, int(product_id))
+        if product is None:
+            return None, None, []
+        listing = None
+        if product.representative_external_id:
+            listing = (await session.execute(select(Listing).where(
+                Listing.external_id == product.representative_external_id
+            ).limit(1))).scalar_one_or_none()
+        snapshots = list((await session.execute(
+            select(RadarSnapshot).where(RadarSnapshot.product_id == int(product_id))
+            .order_by(RadarSnapshot.recorded_at.desc()).limit(8)
+        )).scalars().all())
+        return product, listing, snapshots
+
+
+async def is_radar_favorite(user_id: int, product_id: int) -> bool:
+    async with SessionLocal() as session:
+        return bool((await session.execute(select(RadarFavorite.id).where(
+            RadarFavorite.user_id == int(user_id), RadarFavorite.product_id == int(product_id)
+        ).limit(1))).scalar_one_or_none())
+
+
+async def toggle_radar_favorite(user_id: int, product_id: int) -> bool:
+    async with _radar_lock:
+        async with SessionLocal() as session:
+            existing = (await session.execute(select(RadarFavorite).where(
+                RadarFavorite.user_id == int(user_id), RadarFavorite.product_id == int(product_id)
+            ).limit(1))).scalar_one_or_none()
+            if existing is not None:
+                await session.delete(existing)
+                await session.commit()
+                return False
+            product = await session.get(RadarProduct, int(product_id))
+            if product is None:
+                return False
+            session.add(RadarFavorite(user_id=int(user_id), product_id=int(product_id)))
+            await session.commit()
+            return True
+
+
+async def backfill_radar_once() -> tuple[int, int]:
+    """One-time migration of already saved scans + existing AI history into Radar."""
+    async with SessionLocal() as session:
+        setting = await session.get(AppSetting, RADAR_BACKFILL_SETTING)
+        if setting is not None and str(setting.value or "").strip() == "1":
+            return 0, 0
+        candidate_ids = list((await session.execute(
+            select(AIEarlyWinnerCandidate.id)
+            .where(AIEarlyWinnerCandidate.is_control.is_(False))
+            .order_by(AIEarlyWinnerCandidate.created_at.asc())
+        )).scalars().all())
+        scan_ids = list((await session.execute(
+            select(UserScan.id).where(
+                UserScan.status == "done", UserScan.target_complete.is_(True), UserScan.result_count > 0
+            ).order_by(UserScan.finished_at.asc())
+        )).scalars().all())
+
+    ai_saved = 0
+    for index, candidate_id in enumerate(candidate_ids, 1):
+        try:
+            if await record_ai_candidate(int(candidate_id), source_key=f"ai-backfill:{candidate_id}", source="ai_backfill") is not None:
+                ai_saved += 1
+        except Exception:
+            log.exception("DT Radar AI backfill failed candidate=%s", candidate_id)
+        if index % 100 == 0:
+            await asyncio.sleep(0)
+
+    scan_saved = 0
+    for index, scan_id in enumerate(scan_ids, 1):
+        try:
+            scan_saved += await record_scan_hot(int(scan_id))
+        except Exception:
+            log.exception("DT Radar scan backfill failed scan=%s", scan_id)
+        if index % 50 == 0:
+            await asyncio.sleep(0)
+
+    async with SessionLocal() as session:
+        setting = await session.get(AppSetting, RADAR_BACKFILL_SETTING)
+        if setting is None:
+            session.add(AppSetting(key=RADAR_BACKFILL_SETTING, value="1", updated_at=datetime.utcnow()))
+        else:
+            setting.value = "1"
+            setting.updated_at = datetime.utcnow()
+        await session.commit()
+    log.warning("DT Radar backfill complete | ai=%s scan_signals=%s", ai_saved, scan_saved)
+    return ai_saved, scan_saved
