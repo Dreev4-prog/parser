@@ -117,7 +117,7 @@ from view_manager import REMOTE_VIEW_MANAGER, REMOTE_VIEW_WORKER_ENABLED
 from ai_manager import AI_MANAGER
 from radar import (
     RADAR_PAGE_SIZE, backfill_radar_once, get_radar_product, is_radar_favorite,
-    list_radar_products, radar_categories, radar_stats, record_scan_hot,
+    list_radar_products, radar_categories, radar_stats, record_autoscan_hot, record_scan_hot,
     refresh_radar_scores, toggle_radar_favorite,
 )
 from page_manager import (
@@ -146,6 +146,21 @@ FREE_TRIAL_SCAN_LIMIT = max(0, min(10, int(os.getenv("FREE_TRIAL_SCAN_LIMIT", "2
 FREE_TRIAL_MAX_CATEGORIES = 1
 FREE_TRIAL_MAX_PAGES = 25
 _trial_credit_guard = asyncio.Lock()
+
+# v4.11.0 DT Radar AutoScan.  This is a low-priority background producer for
+# Radar: one leaf category at a time, 15 pages for the current Moscow date.
+# It never occupies one of the four user queue consumers and only starts a new
+# category while the foreground queue is idle.  If a user arrives mid-category,
+# that small 15-page block finishes and AutoScan yields before the next category.
+RADAR_AUTOSCAN_SETTING_KEY = "dt_radar_autoscan_v1"
+RADAR_AUTOSCAN_DEPTH = 15
+RADAR_AUTOSCAN_USER_ID = -411000001
+RADAR_AUTOSCAN_DEFAULT_TIME = "05:00"
+RADAR_AUTOSCAN_POLL_SECONDS = 10
+RADAR_AUTOSCAN_HISTORY_LIMIT = 20
+RADAR_AUTOSCAN_TIME_CHOICES = ("03:00", "05:00", "08:00", "12:00", "18:00", "23:00")
+_radar_autoscan_guard = asyncio.Lock()
+_radar_autoscan_wakeup = asyncio.Event()
 
 
 # v4.6.5: per-user RU/EN presentation layer.  The parser/business logic remains
@@ -3314,6 +3329,494 @@ async def radar_maintenance_scheduler() -> None:
         except Exception:
             log.exception("DT Radar maintenance loop error")
             await asyncio.sleep(300)
+
+
+def _radar_autoscan_categories() -> list:
+    """All real selectable leaf categories; group-root aliases are intentionally excluded."""
+    return [cat for cat in CATEGORIES.values() if not bool(getattr(cat, "is_group", False))]
+
+
+def _radar_autoscan_now_iso() -> str:
+    return datetime.now(MOSCOW).replace(microsecond=0).isoformat()
+
+
+def _radar_autoscan_default_state() -> dict:
+    categories = _radar_autoscan_categories()
+    return {
+        "daily_enabled": False,
+        "daily_time": RADAR_AUTOSCAN_DEFAULT_TIME,
+        "skip_daily_if_completed_today": True,
+        "status": "idle",              # idle | running | paused
+        "stop_requested": False,
+        "waiting_for_users": False,
+        "round_id": "",
+        "mode": "",                   # manual | daily
+        "target_date": "",
+        "category_keys": [cat.key for cat in categories],
+        "current_index": 0,
+        "current_category_key": "",
+        "current_category_name": "",
+        "total": len(categories),
+        "processed": 0,
+        "successful": 0,
+        "failed": 0,
+        "pages_verified": 0,
+        "listings_seen": 0,
+        "new_listings": 0,
+        "radar_saved": 0,
+        "started_at": "",
+        "updated_at": _radar_autoscan_now_iso(),
+        "last_completed_date": "",
+        "last_daily_date": "",
+        "last_summary": {},
+        "history": [],
+    }
+
+
+def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
+    state = _radar_autoscan_default_state()
+    if isinstance(raw, dict):
+        state.update(raw)
+    if str(state.get("daily_time") or "") not in RADAR_AUTOSCAN_TIME_CHOICES:
+        state["daily_time"] = RADAR_AUTOSCAN_DEFAULT_TIME
+    if str(state.get("status") or "idle") not in {"idle", "running", "paused"}:
+        state["status"] = "idle"
+    state["daily_enabled"] = bool(state.get("daily_enabled"))
+    state["skip_daily_if_completed_today"] = bool(state.get("skip_daily_if_completed_today", True))
+    state["stop_requested"] = bool(state.get("stop_requested"))
+    state["waiting_for_users"] = bool(state.get("waiting_for_users"))
+    state["history"] = list(state.get("history") or [])[:RADAR_AUTOSCAN_HISTORY_LIMIT]
+    keys = [str(x) for x in (state.get("category_keys") or []) if str(x) in CATEGORIES and not CATEGORIES[str(x)].is_group]
+    if not keys:
+        keys = [cat.key for cat in _radar_autoscan_categories()]
+    state["category_keys"] = keys
+    state["total"] = len(keys)
+    state["current_index"] = max(0, min(len(keys), int(state.get("current_index") or 0)))
+    for key in ("processed", "successful", "failed", "pages_verified", "listings_seen", "new_listings", "radar_saved"):
+        state[key] = max(0, int(state.get(key) or 0))
+    return state
+
+
+async def load_radar_autoscan_state() -> dict:
+    async with SessionLocal() as session:
+        row = await session.get(AppSetting, RADAR_AUTOSCAN_SETTING_KEY)
+        if row is None or not str(row.value or "").strip():
+            return _radar_autoscan_default_state()
+        try:
+            raw = json.loads(row.value)
+        except Exception:
+            log.exception("DT Radar AutoScan state JSON is invalid; using defaults")
+            return _radar_autoscan_default_state()
+    return _radar_autoscan_normalize_state(raw)
+
+
+async def save_radar_autoscan_state(state: dict) -> dict:
+    state = _radar_autoscan_normalize_state(state)
+    state["updated_at"] = _radar_autoscan_now_iso()
+    payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    async with SessionLocal() as session:
+        row = await session.get(AppSetting, RADAR_AUTOSCAN_SETTING_KEY)
+        if row is None:
+            row = AppSetting(key=RADAR_AUTOSCAN_SETTING_KEY, value=payload, updated_at=datetime.utcnow())
+            session.add(row)
+        else:
+            row.value = payload
+            row.updated_at = datetime.utcnow()
+        await session.commit()
+    return state
+
+
+def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
+    keys = [cat.key for cat in _radar_autoscan_categories()]
+    now = datetime.now(MOSCOW)
+    keep = {
+        "daily_enabled": bool(state.get("daily_enabled")),
+        "daily_time": str(state.get("daily_time") or RADAR_AUTOSCAN_DEFAULT_TIME),
+        "skip_daily_if_completed_today": bool(state.get("skip_daily_if_completed_today", True)),
+        "last_completed_date": str(state.get("last_completed_date") or ""),
+        "last_daily_date": str(state.get("last_daily_date") or ""),
+        "last_summary": dict(state.get("last_summary") or {}),
+        "history": list(state.get("history") or [])[:RADAR_AUTOSCAN_HISTORY_LIMIT],
+    }
+    new_state = _radar_autoscan_default_state()
+    new_state.update(keep)
+    new_state.update({
+        "status": "running",
+        "stop_requested": False,
+        "waiting_for_users": False,
+        "round_id": f"{now.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:5]}",
+        "mode": "daily" if mode == "daily" else "manual",
+        "target_date": now.date().isoformat(),
+        "category_keys": keys,
+        "current_index": 0,
+        "current_category_key": "",
+        "current_category_name": "",
+        "total": len(keys),
+        "processed": 0,
+        "successful": 0,
+        "failed": 0,
+        "pages_verified": 0,
+        "listings_seen": 0,
+        "new_listings": 0,
+        "radar_saved": 0,
+        "started_at": now.replace(microsecond=0).isoformat(),
+    })
+    return new_state
+
+
+async def _radar_foreground_counts() -> tuple[int, int]:
+    async with job_guard:
+        running = sum(1 for job in active_jobs.values() if job.state == "running" and not job.cancel_requested)
+        queued = sum(1 for job in active_jobs.values() if job.state == "queued" and not job.cancel_requested)
+    return int(running), int(queued)
+
+
+async def _notify_radar_autoscan_admins(bot: Bot, text: str) -> None:
+    for admin_id in sorted(ADMIN_IDS):
+        try:
+            await bot.send_message(int(admin_id), text, parse_mode=ParseMode.HTML)
+        except (TelegramForbiddenError, TelegramBadRequest):
+            log.debug("Could not notify Radar AutoScan admin=%s", admin_id)
+        except Exception:
+            log.exception("Radar AutoScan admin notification failed admin=%s", admin_id)
+
+
+def _radar_autoscan_duration_seconds(started_at: str) -> int:
+    try:
+        started = datetime.fromisoformat(str(started_at))
+        now = datetime.now(MOSCOW)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=MOSCOW)
+        return max(0, int((now - started.astimezone(MOSCOW)).total_seconds()))
+    except Exception:
+        return 0
+
+
+def _human_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds or 0))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours} ч {minutes} мин"
+    if minutes:
+        return f"{minutes} мин {secs} сек"
+    return f"{secs} сек"
+
+
+def _radar_autoscan_next_run_text(state: dict) -> str:
+    if not bool(state.get("daily_enabled")):
+        return "—"
+    now = datetime.now(MOSCOW)
+    try:
+        hh, mm = [int(x) for x in str(state.get("daily_time") or RADAR_AUTOSCAN_DEFAULT_TIME).split(":", 1)]
+    except Exception:
+        hh, mm = 5, 0
+    candidate = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if state.get("last_daily_date") == now.date().isoformat():
+        candidate += timedelta(days=1)
+    elif candidate <= now:
+        return "сегодня · при первой свободной возможности"
+    return candidate.strftime("%d.%m · %H:%M МСК")
+
+
+async def _radar_autoscan_text() -> tuple[str, dict]:
+    state = await load_radar_autoscan_state()
+    total = max(1, int(state.get("total") or len(_radar_autoscan_categories()) or 1))
+    processed = min(total, int(state.get("processed") or 0))
+    pct = int(round(processed / total * 100))
+    status = str(state.get("status") or "idle")
+    if status == "running":
+        if state.get("waiting_for_users"):
+            status_text = "🟡 ждёт освобождения пользовательских сканов"
+        else:
+            status_text = "🟢 идёт круг"
+    elif status == "paused":
+        status_text = "⏸ круг остановлен"
+    else:
+        status_text = "🔴 не запущен"
+    current = str(state.get("current_category_name") or "—")
+    mode_label = "Ежедневный" if state.get("mode") == "daily" else ("Ручной" if state.get("mode") == "manual" else "—")
+    last = dict(state.get("last_summary") or {})
+    if last:
+        last_line = (
+            f"#{html.escape(str(last.get('round_id') or '—'))} · "
+            f"{int(last.get('successful') or 0)}/{int(last.get('total') or 0)} успешно · "
+            f"Radar +{int(last.get('radar_saved') or 0)}"
+        )
+    else:
+        last_line = "—"
+    text = (
+        "<b>📡 DT Radar AutoScan</b>\n\n"
+        f"Статус: <b>{status_text}</b>\n"
+        f"Режим круга: <b>{mode_label}</b>\n"
+        f"Глубина: <b>{RADAR_AUTOSCAN_DEPTH} страниц на категорию</b>\n"
+        f"Категории: <b>{len(_radar_autoscan_categories())}</b> листовых категорий\n"
+        f"Прогресс: <b>{processed}/{total} · {pct}%</b>\n"
+        f"Сейчас: <b>{html.escape(current)}</b>\n\n"
+        f"✅ Успешно: <b>{int(state.get('successful') or 0)}</b> · "
+        f"⚠️ ошибок: <b>{int(state.get('failed') or 0)}</b>\n"
+        f"📄 Подтверждено страниц: <b>{int(state.get('pages_verified') or 0)}</b>\n"
+        f"🧾 Объявлений даты: <b>{int(state.get('listings_seen') or 0)}</b> · "
+        f"новых: <b>{int(state.get('new_listings') or 0)}</b>\n"
+        f"📡 Добавлено Radar-сигналов: <b>{int(state.get('radar_saved') or 0)}</b>\n\n"
+        f"Ежедневный круг: <b>{'✅ ВКЛ' if state.get('daily_enabled') else '⏸ ВЫКЛ'}</b>\n"
+        f"Время: <b>{html.escape(str(state.get('daily_time') or RADAR_AUTOSCAN_DEFAULT_TIME))} МСК</b>\n"
+        f"Следующий запуск: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>\n"
+        f"Если полный ручной круг уже прошёл сегодня: <b>{'пропустить автокруг' if state.get('skip_daily_if_completed_today', True) else 'всё равно запустить'}</b>\n\n"
+        f"Последний круг: <b>{last_line}</b>\n\n"
+        "AutoScan низкоприоритетный: новый 15-страничный блок начинается только когда пользовательская очередь свободна."
+    )
+    return text, state
+
+
+async def _radar_autoscan_history_text() -> str:
+    state = await load_radar_autoscan_state()
+    history = list(state.get("history") or [])[:10]
+    lines = ["<b>📜 DT Radar · история кругов</b>"]
+    if not history:
+        lines += ["", "Кругов пока не было."]
+        return "\n".join(lines)
+    for item in history:
+        mode = "авто" if item.get("mode") == "daily" else "ручной"
+        lines += [
+            "",
+            f"<b>#{html.escape(str(item.get('round_id') or '—'))}</b> · {mode}",
+            f"✅ {int(item.get('successful') or 0)}/{int(item.get('total') or 0)} · ⚠️ {int(item.get('failed') or 0)}",
+            f"📄 {int(item.get('pages_verified') or 0)} стр. · 🧾 {int(item.get('listings_seen') or 0)} объявлений",
+            f"📡 Radar +{int(item.get('radar_saved') or 0)} · ⏱ {_human_duration(int(item.get('duration_seconds') or 0))}",
+            f"🕒 {html.escape(str(item.get('finished_at_text') or '—'))}",
+        ]
+    return "\n".join(lines)
+
+
+async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
+    now = datetime.now(MOSCOW)
+    duration = _radar_autoscan_duration_seconds(str(state.get("started_at") or ""))
+    total = int(state.get("total") or 0)
+    failed = int(state.get("failed") or 0)
+    summary = {
+        "round_id": str(state.get("round_id") or ""),
+        "mode": str(state.get("mode") or "manual"),
+        "target_date": str(state.get("target_date") or ""),
+        "total": total,
+        "processed": int(state.get("processed") or 0),
+        "successful": int(state.get("successful") or 0),
+        "failed": failed,
+        "pages_verified": int(state.get("pages_verified") or 0),
+        "listings_seen": int(state.get("listings_seen") or 0),
+        "new_listings": int(state.get("new_listings") or 0),
+        "radar_saved": int(state.get("radar_saved") or 0),
+        "duration_seconds": duration,
+        "finished_at": now.replace(microsecond=0).isoformat(),
+        "finished_at_text": now.strftime("%d.%m.%Y %H:%M МСК"),
+    }
+    state["history"] = [summary] + list(state.get("history") or [])
+    state["history"] = state["history"][:RADAR_AUTOSCAN_HISTORY_LIMIT]
+    state["last_summary"] = summary
+    if int(state.get("processed") or 0) >= total and failed == 0:
+        state["last_completed_date"] = now.date().isoformat()
+    if state.get("mode") == "daily":
+        # Once per day means once per day even if a few categories were partial;
+        # the report exposes those errors instead of instantly starting an endless retry loop.
+        state["last_daily_date"] = now.date().isoformat()
+    state["status"] = "idle"
+    state["stop_requested"] = False
+    state["waiting_for_users"] = False
+    state["current_category_key"] = ""
+    state["current_category_name"] = ""
+    state = await save_radar_autoscan_state(state)
+    icon = "✅" if failed == 0 else "⚠️"
+    await _notify_radar_autoscan_admins(
+        bot,
+        f"📡 <b>DT Radar — круг завершён {icon}</b>\n\n"
+        f"Категории: <b>{int(summary['successful'])}/{total}</b> успешно"
+        + (f" · ошибок <b>{failed}</b>" if failed else "")
+        + f"\n📄 Подтверждено страниц: <b>{int(summary['pages_verified'])}</b>"
+        f"\n🧾 Объявлений даты: <b>{int(summary['listings_seen'])}</b> · новых <b>{int(summary['new_listings'])}</b>"
+        f"\n📡 Radar-сигналов: <b>+{int(summary['radar_saved'])}</b>"
+        f"\n⏱ Время: <b>{_human_duration(duration)}</b>"
+        f"\n\nAutoScan остановлен."
+        + (f" Следующий ежедневный запуск: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>." if state.get("daily_enabled") else ""),
+    )
+    return state
+
+
+async def _run_radar_autoscan_round(bot: Bot) -> None:
+    """Run/resume one persistent low-priority round until complete or paused."""
+    state = await load_radar_autoscan_state()
+    if state.get("status") != "running":
+        return
+    keys = list(state.get("category_keys") or [])
+    total = len(keys)
+    state["total"] = total
+    if not state.get("target_date"):
+        state["target_date"] = datetime.now(MOSCOW).date().isoformat()
+        state = await save_radar_autoscan_state(state)
+
+    while int(state.get("current_index") or 0) < total:
+        # Reload on every category boundary so admin Stop/Resume changes are observed.
+        state = await load_radar_autoscan_state()
+        if state.get("status") != "running":
+            return
+        if state.get("stop_requested"):
+            state["status"] = "paused"
+            state["stop_requested"] = False
+            state["waiting_for_users"] = False
+            state = await save_radar_autoscan_state(state)
+            await _notify_radar_autoscan_admins(
+                bot,
+                f"⏸ <b>DT Radar AutoScan остановлен</b>\n\n"
+                f"Прогресс сохранён: <b>{int(state.get('processed') or 0)}/{total}</b>. "
+                "Можно продолжить круг с сохранённого места.",
+            )
+            return
+
+        # User scans are always first. Do not start a fresh category while any
+        # foreground scan is running or queued. The current 15-page block is never
+        # killed mid-request; this preserves parser integrity and lets users start normally.
+        running, queued = await _radar_foreground_counts()
+        if running or queued:
+            if not state.get("waiting_for_users"):
+                state["waiting_for_users"] = True
+                state["current_category_name"] = "Ожидание пользовательских сканов"
+                state = await save_radar_autoscan_state(state)
+                log.info("DT Radar AutoScan yielding to users running=%s queued=%s", running, queued)
+            await asyncio.sleep(5)
+            continue
+        if state.get("waiting_for_users"):
+            state["waiting_for_users"] = False
+            state = await save_radar_autoscan_state(state)
+
+        idx = int(state.get("current_index") or 0)
+        if idx >= total:
+            break
+        key = keys[idx]
+        cat = CATEGORIES.get(key)
+        if cat is None or bool(getattr(cat, "is_group", False)):
+            state["current_index"] = idx + 1
+            state["processed"] = int(state.get("processed") or 0) + 1
+            state["failed"] = int(state.get("failed") or 0) + 1
+            state = await save_radar_autoscan_state(state)
+            continue
+
+        state["current_category_key"] = cat.key
+        state["current_category_name"] = cat.name
+        state = await save_radar_autoscan_state(state)
+        log.info(
+            "DT Radar AutoScan category start round=%s index=%s/%s category=%s depth=%s target=%s",
+            state.get("round_id"), idx + 1, total, cat.name, RADAR_AUTOSCAN_DEPTH, state.get("target_date"),
+        )
+
+        result = None
+        radar_saved = 0
+        error_text = ""
+        await TRAFFIC.scan_job_started()
+        parser = KleinanzeigenParser()
+        parser_token = JOB_PARSER.set(parser)
+        try:
+            result = await scan_one_category(
+                parser, cat, RADAR_AUTOSCAN_USER_ID, RADAR_AUTOSCAN_DEPTH, str(state.get("target_date"))
+            )
+            if result.date_complete:
+                radar_saved = await record_autoscan_hot(
+                    str(state.get("round_id") or "round"), cat.key, result.matched_ids or []
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error_text = str(exc)
+            log.exception("DT Radar AutoScan category failed round=%s category=%s", state.get("round_id"), cat.name)
+        finally:
+            JOB_PARSER.reset(parser_token)
+            try:
+                await parser.close()
+            finally:
+                await TRAFFIC.scan_job_finished()
+
+        state = await load_radar_autoscan_state()
+        # A Stop pressed during the category is honored after this bookkeeping.
+        state["current_index"] = idx + 1
+        state["processed"] = int(state.get("processed") or 0) + 1
+        if result is not None:
+            state["pages_verified"] = int(state.get("pages_verified") or 0) + min(
+                RADAR_AUTOSCAN_DEPTH, max(0, int(result.verified_pages or 0))
+            )
+            state["listings_seen"] = int(state.get("listings_seen") or 0) + max(0, int(result.today_seen or 0))
+            state["new_listings"] = int(state.get("new_listings") or 0) + max(0, int(result.new_count or 0))
+            state["radar_saved"] = int(state.get("radar_saved") or 0) + max(0, int(radar_saved or 0))
+            if result.date_complete:
+                state["successful"] = int(state.get("successful") or 0) + 1
+            else:
+                state["failed"] = int(state.get("failed") or 0) + 1
+                error_text = result.reason or "partial"
+        else:
+            state["failed"] = int(state.get("failed") or 0) + 1
+        log.info(
+            "DT Radar AutoScan category finish round=%s index=%s/%s category=%s complete=%s radar_saved=%s error=%s",
+            state.get("round_id"), idx + 1, total, cat.name,
+            bool(result and result.date_complete), radar_saved, error_text[:240],
+        )
+        state["current_category_key"] = ""
+        state["current_category_name"] = ""
+        state = await save_radar_autoscan_state(state)
+        await asyncio.sleep(0)
+
+    state = await load_radar_autoscan_state()
+    if state.get("status") == "running" and int(state.get("current_index") or 0) >= total:
+        await _radar_autoscan_finish_round(bot, state)
+
+
+async def radar_autoscan_scheduler(bot: Bot) -> None:
+    """Resume a persisted round or start one configured daily round in Moscow time."""
+    await asyncio.sleep(12)
+    while True:
+        try:
+            state = await load_radar_autoscan_state()
+            if state.get("status") == "running":
+                await _run_radar_autoscan_round(bot)
+                continue
+
+            now = datetime.now(MOSCOW)
+            today = now.date().isoformat()
+            if state.get("daily_enabled") and state.get("status") == "idle" and state.get("last_daily_date") != today:
+                try:
+                    hh, mm = [int(x) for x in str(state.get("daily_time") or RADAR_AUTOSCAN_DEFAULT_TIME).split(":", 1)]
+                except Exception:
+                    hh, mm = 5, 0
+                due = now >= now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                if due:
+                    if state.get("skip_daily_if_completed_today", True) and state.get("last_completed_date") == today:
+                        state["last_daily_date"] = today
+                        state = await save_radar_autoscan_state(state)
+                        await _notify_radar_autoscan_admins(
+                            bot,
+                            "📡 <b>DT Radar — ежедневный круг пропущен</b>\n\n"
+                            "Сегодня уже был полностью завершён ручной круг. Следующий автозапуск — завтра.",
+                        )
+                    else:
+                        async with _radar_autoscan_guard:
+                            current = await load_radar_autoscan_state()
+                            if current.get("status") == "idle":
+                                current = _radar_autoscan_new_round(current, "daily")
+                                await save_radar_autoscan_state(current)
+                                await _notify_radar_autoscan_admins(
+                                    bot,
+                                    f"📡 <b>DT Radar — ежедневный круг запущен</b>\n\n"
+                                    f"{len(current.get('category_keys') or [])} категорий × {RADAR_AUTOSCAN_DEPTH} страниц. "
+                                    "Пользовательские сканы имеют приоритет.",
+                                )
+                                continue
+
+            try:
+                await asyncio.wait_for(_radar_autoscan_wakeup.wait(), timeout=RADAR_AUTOSCAN_POLL_SECONDS)
+                _radar_autoscan_wakeup.clear()
+            except asyncio.TimeoutError:
+                pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("DT Radar AutoScan scheduler error")
+            await asyncio.sleep(RADAR_AUTOSCAN_POLL_SECONDS)
 
 
 async def send_smart_export(
@@ -7588,6 +8091,7 @@ def admin_keyboard(ai_unread: int = 0, active_scans: int = 0) -> InlineKeyboardM
         [InlineKeyboardButton(text="🎟 Тарифы", callback_data="adminplans"),
          InlineKeyboardButton(text="🔐 Режим доступа", callback_data="adminmode")],
         [InlineKeyboardButton(text="🎁 Бесплатные сканы", callback_data="admintrial")],
+        [InlineKeyboardButton(text="📡 Radar AutoScan", callback_data="adminradarauto")],
         [InlineKeyboardButton(text="🔎 Найти пользователя", callback_data="adminusersearch")],
         [InlineKeyboardButton(text="📣 Рассылка", callback_data="adminbroadcast")],
         [InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
@@ -7607,6 +8111,51 @@ def admin_trial_keyboard(enabled: bool) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="admintrial")],
         [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
     ])
+
+
+def admin_radar_autoscan_keyboard(state: dict) -> InlineKeyboardMarkup:
+    status = str(state.get("status") or "idle")
+    daily_enabled = bool(state.get("daily_enabled"))
+    skip_today = bool(state.get("skip_daily_if_completed_today", True))
+    rows: list[list[InlineKeyboardButton]] = []
+    if status == "running":
+        rows.append([InlineKeyboardButton(text="⏹ Остановить после категории", callback_data="adminradarauto:stop")])
+    elif status == "paused":
+        rows.append([InlineKeyboardButton(text="▶️ Продолжить круг", callback_data="adminradarauto:resume"),
+                     InlineKeyboardButton(text="🔄 Новый круг", callback_data="adminradarauto:start")])
+    else:
+        rows.append([InlineKeyboardButton(text="▶️ Запустить 1 круг", callback_data="adminradarauto:start")])
+    rows.append([InlineKeyboardButton(
+        text=f"🔄 Ежедневный автокруг: {'ВКЛ' if daily_enabled else 'ВЫКЛ'}",
+        callback_data="adminradarauto:daily",
+    )])
+    rows.append([InlineKeyboardButton(
+        text=f"🕐 Время: {state.get('daily_time') or RADAR_AUTOSCAN_DEFAULT_TIME}",
+        callback_data="adminradarauto:time",
+    )])
+    rows.append([InlineKeyboardButton(
+        text=f"✅ Пропускать автокруг после ручного: {'ДА' if skip_today else 'НЕТ'}",
+        callback_data="adminradarauto:skipday",
+    )])
+    rows.append([InlineKeyboardButton(text="📜 История кругов", callback_data="adminradarauto:history"),
+                 InlineKeyboardButton(text="🔄 Обновить", callback_data="adminradarauto")])
+    rows.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_radar_autoscan_time_keyboard(current: str) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for value in RADAR_AUTOSCAN_TIME_CHOICES:
+        label = ("✅ " if value == current else "") + value
+        row.append(InlineKeyboardButton(text=label, callback_data=f"adminradarauto:settime:{value}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="⬅️ Radar AutoScan", callback_data="adminradarauto")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_broadcast_preview_keyboard() -> InlineKeyboardMarkup:
@@ -9040,6 +9589,151 @@ async def admin_trial_toggle_handler(callback: CallbackQuery) -> None:
     text, current = await _admin_trial_text()
     await callback.answer("Акция включена" if current else "Акция выключена")
     await _edit_or_answer(callback.message, text, reply_markup=admin_trial_keyboard(current))
+
+
+@dp.callback_query(F.data == "adminradarauto")
+async def admin_radar_autoscan_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    text, state = await _radar_autoscan_text()
+    await callback.answer()
+    await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
+
+
+@dp.callback_query(F.data == "adminradarauto:start")
+async def admin_radar_autoscan_start_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    async with _radar_autoscan_guard:
+        state = await load_radar_autoscan_state()
+        if state.get("status") == "running":
+            await callback.answer("Круг уже идёт", show_alert=True)
+            return
+        state = _radar_autoscan_new_round(state, "manual")
+        state = await save_radar_autoscan_state(state)
+    _radar_autoscan_wakeup.set()
+    await callback.answer("Один круг запущен")
+    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
+
+
+@dp.callback_query(F.data == "adminradarauto:stop")
+async def admin_radar_autoscan_stop_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    async with _radar_autoscan_guard:
+        state = await load_radar_autoscan_state()
+        if state.get("status") != "running":
+            await callback.answer("Сейчас круг не идёт", show_alert=True)
+            return
+        state["stop_requested"] = True
+        state = await save_radar_autoscan_state(state)
+    _radar_autoscan_wakeup.set()
+    await callback.answer("Остановлю после текущей категории")
+    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
+
+
+@dp.callback_query(F.data == "adminradarauto:resume")
+async def admin_radar_autoscan_resume_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    async with _radar_autoscan_guard:
+        state = await load_radar_autoscan_state()
+        if state.get("status") != "paused":
+            await callback.answer("Нет остановленного круга", show_alert=True)
+            return
+        state["status"] = "running"
+        state["stop_requested"] = False
+        state["waiting_for_users"] = False
+        state = await save_radar_autoscan_state(state)
+    _radar_autoscan_wakeup.set()
+    await callback.answer("Круг продолжен")
+    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
+
+
+@dp.callback_query(F.data == "adminradarauto:daily")
+async def admin_radar_autoscan_daily_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    async with _radar_autoscan_guard:
+        state = await load_radar_autoscan_state()
+        state["daily_enabled"] = not bool(state.get("daily_enabled"))
+        state = await save_radar_autoscan_state(state)
+    _radar_autoscan_wakeup.set()
+    await callback.answer("Ежедневный круг включён" if state.get("daily_enabled") else "Ежедневный круг выключен")
+    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
+
+
+@dp.callback_query(F.data == "adminradarauto:skipday")
+async def admin_radar_autoscan_skipday_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    async with _radar_autoscan_guard:
+        state = await load_radar_autoscan_state()
+        state["skip_daily_if_completed_today"] = not bool(state.get("skip_daily_if_completed_today", True))
+        state = await save_radar_autoscan_state(state)
+    _radar_autoscan_wakeup.set()
+    await callback.answer("Настройка сохранена")
+    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
+
+
+@dp.callback_query(F.data == "adminradarauto:time")
+async def admin_radar_autoscan_time_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    state = await load_radar_autoscan_state()
+    current = str(state.get("daily_time") or RADAR_AUTOSCAN_DEFAULT_TIME)
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message,
+        "<b>🕐 Время ежедневного DT Radar AutoScan</b>\n\nВыбери время запуска по Москве.",
+        reply_markup=admin_radar_autoscan_time_keyboard(current),
+    )
+
+
+@dp.callback_query(F.data.startswith("adminradarauto:settime:"))
+async def admin_radar_autoscan_settime_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    value = str(callback.data or "").removeprefix("adminradarauto:settime:")
+    if value not in RADAR_AUTOSCAN_TIME_CHOICES:
+        await callback.answer("Некорректное время", show_alert=True)
+        return
+    async with _radar_autoscan_guard:
+        state = await load_radar_autoscan_state()
+        state["daily_time"] = value
+        state = await save_radar_autoscan_state(state)
+    _radar_autoscan_wakeup.set()
+    await callback.answer(f"Время: {value} МСК")
+    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
+
+
+@dp.callback_query(F.data == "adminradarauto:history")
+async def admin_radar_autoscan_history_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message,
+        await _radar_autoscan_history_text(),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Radar AutoScan", callback_data="adminradarauto")]
+        ]),
+    )
 
 
 @dp.callback_query(F.data == "adminworkers")
@@ -12625,7 +13319,7 @@ async def main() -> None:
             f"v4.9.1 expected {GUARANTEED_LOCAL_PARSER_LANES} scan workers, got {len(worker_tasks)}"
         )
     log.warning(
-        "v4.10.2 DT Radar + View Speed + Page Cache Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
+        "v4.11.0 DT Radar AutoScan + Page Cache Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
         "trial_and_paid_same_queue=True | railway_lane_overrides_ignored=True",
         GUARANTEED_LOCAL_PARSER_LANES,
     )
@@ -12641,6 +13335,7 @@ async def main() -> None:
     )
     archive_task = asyncio.create_task(scan_archive_scheduler(), name="scan-archive-scheduler")
     radar_task = asyncio.create_task(radar_maintenance_scheduler(), name="dt-radar-maintenance")
+    radar_autoscan_task = asyncio.create_task(radar_autoscan_scheduler(bot), name="dt-radar-autoscan")
     observation_tasks = [] if DISTRIBUTED_WORKERS else [
         asyncio.create_task(observation_scheduler(bot, i), name=f"view-observation-worker-{i}")
         for i in range(1, OBSERVATION_CONCURRENCY + 1)
@@ -12656,11 +13351,12 @@ async def main() -> None:
         subscription_task.cancel()
         archive_task.cancel()
         radar_task.cancel()
+        radar_autoscan_task.cancel()
         for task in observation_tasks:
             task.cancel()
         for task in worker_tasks:
             task.cancel()
-        shutdown_tasks = [payment_task, subscription_task, archive_task, radar_task, *observation_tasks, *worker_tasks]
+        shutdown_tasks = [payment_task, subscription_task, archive_task, radar_task, radar_autoscan_task, *observation_tasks, *worker_tasks]
         if distributed_queue_ticker_task is not None:
             shutdown_tasks.insert(0, distributed_queue_ticker_task)
         if ticker_task is not None:

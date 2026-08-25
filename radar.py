@@ -311,6 +311,74 @@ async def record_scan_hot(scan_id: int, limit: int = RADAR_SCAN_TOP_LIMIT) -> in
     return saved
 
 
+async def record_autoscan_hot(
+    round_id: str,
+    category_key: str,
+    matched_ids: list[str] | tuple[str, ...] | set[str],
+    *,
+    limit: int = RADAR_SCAN_TOP_LIMIT,
+) -> int:
+    """Merge one Radar AutoScan category into the persistent global Radar.
+
+    AutoScan is intentionally not represented as a fake UserScan.  The crawler
+    writes normal Listing/ViewHistory rows, then this helper promotes only the
+    strongest verified-view listings into Radar, exactly like completed user
+    scans do.  ``source_key`` contains the round id, so retries/restarts are
+    idempotent and cannot duplicate a Radar signal.
+    """
+    ids = [str(x).strip() for x in matched_ids if str(x).strip()]
+    if not ids:
+        return 0
+    # Preserve order-independent uniqueness without generating an unbounded IN.
+    ids = list(dict.fromkeys(ids))[:5000]
+    async with SessionLocal() as session:
+        rows = list((await session.execute(
+            select(Listing).where(
+                Listing.external_id.in_(ids),
+                Listing.category_key == str(category_key),
+                Listing.is_promoted.is_(False),
+                Listing.view_count.is_not(None),
+            )
+        )).scalars().all())
+    rows.sort(
+        key=lambda listing: (int(listing.view_count or 0), listing.first_seen_at or datetime.min),
+        reverse=True,
+    )
+    ranked = rows[: max(1, int(limit))]
+    if not ranked:
+        return 0
+
+    saved = 0
+    n = len(ranked)
+    clean_round = str(round_id or "round").replace(":", "-")[:48]
+    for index, listing in enumerate(ranked):
+        percentile = 1.0 if n == 1 else 1.0 - (index / max(1, n - 1))
+        views = max(0, int(listing.view_count or 0))
+        view_bonus = min(8, int(round(math.log10(max(1, views) + 1) * 2.5)))
+        score = _clamp_score(58 + percentile * 20 + view_bonus)
+        result = await _upsert_signal(
+            source_key=f"autoscan:{clean_round}:{listing.external_id}",
+            source="radar_autoscan",
+            listing=listing,
+            product_key=radar_product_key(listing),
+            score=score,
+            confidence=55,
+            stage="rising" if score >= 72 else "watch",
+            opportunity_type="hot_product" if score >= 82 else "spark",
+            view_count=views,
+            reasons=[f"TOP-{index + 1} по реальным просмотрам в автокруге DT Radar"],
+            recorded_at=listing.views_checked_at or listing.last_seen_at or datetime.utcnow(),
+        )
+        if result is not None:
+            saved += 1
+    if saved:
+        log.info(
+            "DT Radar autoscan merge round=%s category=%s products=%s candidates=%s",
+            clean_round, category_key, saved, len(ranked),
+        )
+    return saved
+
+
 async def record_ai_candidate(candidate_id: int, *, source_key: str | None = None, source: str = "ai") -> int | None:
     """Merge the latest AI state into Radar. Control candidates never enter Radar."""
     async with SessionLocal() as session:

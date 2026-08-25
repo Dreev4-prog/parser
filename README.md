@@ -1,5 +1,24 @@
 # DT PARSER
 
+## v4.11.0 — DT Radar AutoScan
+
+v4.11.0 keeps the stable **v4.10.2 DT Radar + Page Cache Recovery** core and adds a persistent low-priority Radar crawler.
+
+### Radar AutoScan
+- manual **one round and stop** mode
+- optional **one automatic round per day** with admin on/off
+- configurable Moscow launch time: 03:00 / 05:00 / 08:00 / 12:00 / 18:00 / 23:00
+- scans all 141 leaf categories at **15 pages per category**
+- user scans always have priority; AutoScan waits before the next category while foreground scans are active/queued
+- real verified views feed category TOP-12 directly into DT Radar without fake user scan cards
+- PostgreSQL-persisted progress survives Railway restart and supports Stop / Continue
+- admin progress screen, last-20 history and completion notifications
+- optional skip of the daily run when a full manual round already completed today
+
+See `DEPLOY_V4_11_0_DT_RADAR_AUTOSCAN.md` for rollout and behavior.
+
+---
+
 ## v4.10.2 — DT Radar Page Cache Recovery
 
 v4.10.2 keeps the full **DT Radar** release and all v4.10.1 reliability fixes, then fixes poisoned Page Worker cache replay discovered under live load.
