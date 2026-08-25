@@ -40,8 +40,8 @@ VIEW_REDIS_PREFIX = os.getenv("VIEW_REDIS_PREFIX", "dtparser:viewcounter").strip
 # v4.8.3: every release gets a fresh ephemeral view runtime. Old streams/jobs
 # can expire naturally without being reclaimed by a newly deployed worker fleet.
 VIEW_RUNTIME_PREFIX = os.getenv(
-    "VIEW_RUNTIME_PREFIX", f"{VIEW_REDIS_PREFIX}:runtime:v491"
-).strip() or f"{VIEW_REDIS_PREFIX}:runtime:v491"
+    "VIEW_RUNTIME_PREFIX", f"{VIEW_REDIS_PREFIX}:runtime:v4101"
+).strip() or f"{VIEW_REDIS_PREFIX}:runtime:v4101"
 VIEW_STREAM = f"{VIEW_RUNTIME_PREFIX}:jobs"
 VIEW_GROUP = f"{VIEW_RUNTIME_PREFIX}:workers"
 VIEW_HEARTBEAT_KEY = f"{VIEW_RUNTIME_PREFIX}:heartbeat"

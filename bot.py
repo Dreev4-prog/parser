@@ -33,6 +33,18 @@ os.environ["TRAFFIC_MAX_COOLDOWN_SECONDS"] = "3"
 os.environ["TRAFFIC_RECOVERY_SUCCESS_COUNT"] = "10"
 os.environ["TRAFFIC_RECOVERY_QUIET_SECONDS"] = "10"
 
+# v4.9.1 FOUR-LANE QUEUE GUARANTEE.
+# The Telegram parser service is the owner of the four user-facing scan lanes.
+# Railway variables must not be able to silently switch this service back to a
+# one/two-lane distributed parser profile. Dedicated Date/Page/View entrypoints
+# set STABLE_SINGLE_SERVICE_MODE=0 inside their own processes before imports, so
+# they keep using Redis exactly as before. Trial and paid scans share these same
+# four FIFO lanes.
+GUARANTEED_LOCAL_PARSER_LANES = 4
+os.environ["STABLE_SINGLE_SERVICE_MODE"] = "1"
+os.environ["MULTIUSER_STABLE_MODE"] = "1"
+os.environ["MULTIUSER_LOCAL_WORKERS"] = str(GUARANTEED_LOCAL_PARSER_LANES)
+
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
@@ -103,6 +115,11 @@ from parser import (
 )
 from view_manager import REMOTE_VIEW_MANAGER, REMOTE_VIEW_WORKER_ENABLED
 from ai_manager import AI_MANAGER
+from radar import (
+    RADAR_PAGE_SIZE, backfill_radar_once, get_radar_product, is_radar_favorite,
+    list_radar_products, radar_categories, radar_stats, record_scan_hot,
+    refresh_radar_scores, toggle_radar_favorite,
+)
 from page_manager import (
     PAGE_PREFETCH_EXTRA_PAGES, PAGE_PREFETCH_LOW_WATER_PAGES, PAGE_PREFETCH_WINDOW_PAGES,
     REMOTE_PAGE_MANAGER, REMOTE_PAGE_WORKER_ENABLED, rolling_prefetch_range,
@@ -239,13 +256,20 @@ AVAILABILITY_CONCURRENCY = max(1, min(8, int(os.getenv("AVAILABILITY_CONCURRENCY
 STABLE_SCAN_ENGINE = os.getenv("STABLE_SCAN_ENGINE", "1").strip().lower() not in {"0", "false", "no", "off"}
 STABLE_PAGE_RETRIES = max(1, min(5, int(os.getenv("STABLE_PAGE_RETRIES", "3"))))
 STABLE_PAGE_RETRY_SECONDS = max(0.2, min(10.0, float(os.getenv("STABLE_PAGE_RETRY_SECONDS", "1.2"))))
+# v4.10.1: one persistently repeated nationwide page must not abort an otherwise
+# healthy category. After the normal retries + one clean BrowserContext recycle,
+# skip only repeated-content defects and replace the missing verified depth with
+# later nationwide pages (or, at the public cap, one verified regional page).
+# Keep the allowance bounded so a genuinely stuck/looping feed still fails partial.
+DIRECT_REPEATED_RECOVERY_LIMIT = max(1, min(5, int(os.getenv("DIRECT_REPEATED_RECOVERY_LIMIT", "3"))))
 # v4.3.x Multi-User Stable keeps the proven single Railway service / Stable Engine
 # path, but allows a small local worker pool. All jobs share ONE Chromium process
 # while every KleinanzeigenParser owns an isolated BrowserContext.
-MULTIUSER_STABLE_MODE = os.getenv("MULTIUSER_STABLE_MODE", "1").strip().lower() not in {
-    "0", "false", "no", "off",
-}
-MULTIUSER_LOCAL_WORKERS = max(1, min(5, int(os.getenv("MULTIUSER_LOCAL_WORKERS", "4"))))
+# v4.9.1: the main bot is intentionally pinned to the production-safe four-lane
+# profile above. Keep these as explicit constants too, so a future refactor cannot
+# accidentally re-read a stale Railway value after startup.
+MULTIUSER_STABLE_MODE = True
+MULTIUSER_LOCAL_WORKERS = GUARANTEED_LOCAL_PARSER_LANES
 # v4.3.3: process-wide foreground public-view lane. v4.3.0 still inherited the
 # old global traffic limit of three view requests, so three simultaneous scans
 # were forced to share only three slots. Six keeps two fast official-counter
@@ -281,10 +305,10 @@ os.environ["PRIMARY_SCAN_INLINE_VIEWS"] = "1"
 # of jobs are processed at once, while category scans are shared globally.
 MAX_CONCURRENT_JOBS = max(1, min(12, int(os.getenv("MAX_CONCURRENT_JOBS", "5"))))
 if STABLE_SINGLE_SERVICE_MODE:
-    # Stable single-service no longer means a single user lane. v4.3.2 keeps
-    # three bounded local workers by default; set MULTIUSER_STABLE_MODE=0 for an
-    # instant rollback to the exact one-worker v4.2.5 execution model.
-    MAX_CONCURRENT_JOBS = MULTIUSER_LOCAL_WORKERS if MULTIUSER_STABLE_MODE else 1
+    # v4.9.1 hard guarantee: exactly four local user-facing parser consumers.
+    # The fifth and later launch stays in scan_queue FIFO until one consumer is free.
+    # Trial and paid scans use this same queue; there is no separate trial cap.
+    MAX_CONCURRENT_JOBS = GUARANTEED_LOCAL_PARSER_LANES
 MAX_QUEUE_SIZE = max(10, int(os.getenv("MAX_QUEUE_SIZE", "200")))
 QUEUE_START_NOTIFY_AFTER_SECONDS = max(0, min(300, int(os.getenv("QUEUE_START_NOTIFY_AFTER_SECONDS", "8"))))
 PARSER_WORKER_CONCURRENCY = max(1, min(8, int(os.getenv("PARSER_WORKER_CONCURRENCY", "1"))))
@@ -712,7 +736,8 @@ def main_keyboard(
         rows = [
             [InlineKeyboardButton(text="▶️ Новый скан", callback_data="start_scan")],
             [InlineKeyboardButton(text="🔥 Популярное", callback_data="popular_now"),
-             InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
+             InlineKeyboardButton(text="📡 DT Radar", callback_data="radar_home")],
+            [InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
             [InlineKeyboardButton(text=f"🗂 Категории · {selected_count}/{MAX_SELECTED_CATEGORIES}", callback_data="groups"),
              InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
             [InlineKeyboardButton(text="📥 Очередь", callback_data="queue_status"),
@@ -724,14 +749,16 @@ def main_keyboard(
             [InlineKeyboardButton(text=f"🎁 Бесплатный скан · осталось {trial_remaining}", callback_data="start_scan")],
             [InlineKeyboardButton(text=f"🗂 Категория · {min(selected_count, FREE_TRIAL_MAX_CATEGORIES)}/{FREE_TRIAL_MAX_CATEGORIES}", callback_data="groups"),
              InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
-            [InlineKeyboardButton(text="📥 Очередь", callback_data="queue_status"),
+            [InlineKeyboardButton(text="📡 DT Radar · 🔒", callback_data="radar_locked"),
              InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
+            [InlineKeyboardButton(text="📥 Очередь", callback_data="queue_status")],
             [InlineKeyboardButton(text="💎 Полный доступ", callback_data="subscription")],
         ]
     else:
         rows = [
             [InlineKeyboardButton(text="🔒 Новый скан", callback_data="start_scan")],
-            [InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
+            [InlineKeyboardButton(text="📡 DT Radar · 🔒", callback_data="radar_locked"),
+             InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
             [InlineKeyboardButton(text="💎 Продлить подписку", callback_data="subscription")],
         ]
     if admin:
@@ -830,6 +857,116 @@ def popular_category_keyboard(scan_id: int, category_key: str) -> InlineKeyboard
         [InlineKeyboardButton(text="⬅️ Категории", callback_data="popular_now"),
          InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
     ])
+
+
+RADAR_STATUS_ICON = {
+    "hot": "🔥",
+    "rising": "🚀",
+    "stable": "✅",
+    "cooling": "💤",
+    "historical": "🗄",
+}
+RADAR_STATUS_LABEL = {
+    "hot": "Горячий сейчас",
+    "rising": "Набирает обороты",
+    "stable": "Стабильный",
+    "cooling": "Остывает",
+    "historical": "История",
+}
+RADAR_TYPE_LABEL = {
+    "hot_product": "🔥 Hot Product",
+    "hidden_gem": "💎 Hidden Gem",
+    "emerging": "🚀 Emerging",
+    "saturated": "⚫ Saturated",
+    "spark": "⚡ Signal",
+}
+
+
+def radar_home_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔥 Горячие сейчас", callback_data="radarlist:hot:0"),
+         InlineKeyboardButton(text="🚀 Набирают", callback_data="radarlist:rising:0")],
+        [InlineKeyboardButton(text="🧠 AI Picks", callback_data="radarlist:ai:0"),
+         InlineKeyboardButton(text="🏆 Лучшие за всё время", callback_data="radarlist:alltime:0")],
+        [InlineKeyboardButton(text="🗂 Категории", callback_data="radarcats:0"),
+         InlineKeyboardButton(text="⭐ Мой Radar", callback_data="radarlist:favorites:0")],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
+    ])
+
+
+def radar_locked_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Открыть DT Radar", callback_data="subscription")],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
+    ])
+
+
+def radar_list_keyboard(items, *, mode: str, page: int, total: int, category_key: str | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for product in items:
+        icon = RADAR_STATUS_ICON.get(str(product.status or ""), "📡")
+        title = " ".join(str(product.title or "Товар").split())
+        if len(title) > 32:
+            title = title[:31].rstrip() + "…"
+        rows.append([InlineKeyboardButton(
+            text=f"{icon} {int(product.current_score or 0)} · {title}",
+            callback_data=f"radaritem:{int(product.id)}",
+        )])
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        if category_key:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"radarcat:{category_key}:{page-1}"))
+        else:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"radarlist:{mode}:{page-1}"))
+    if (page + 1) * RADAR_PAGE_SIZE < total:
+        if category_key:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"radarcat:{category_key}:{page+1}"))
+        else:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"radarlist:{mode}:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(
+        text="⬅️ Категории" if category_key else "⬅️ DT Radar",
+        callback_data="radarcats:0" if category_key else "radar_home",
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def radar_categories_keyboard(items: list[tuple[str, int, int]], page: int = 0, page_size: int = 10) -> InlineKeyboardMarkup:
+    page = max(0, int(page))
+    start = page * page_size
+    shown = items[start:start + page_size]
+    rows: list[list[InlineKeyboardButton]] = []
+    for key, count, score in shown:
+        cat = CATEGORIES.get(key)
+        name = cat.name if cat is not None else key
+        icon = GROUPS.get(cat.group).icon if cat is not None and cat.group in GROUPS else "📂"
+        rows.append([InlineKeyboardButton(
+            text=f"{icon} {name[:30]} · {count} · ⭐{score}",
+            callback_data=f"radarcat:{key}:0",
+        )])
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"radarcats:{page-1}"))
+    if start + page_size < len(items):
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"radarcats:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⬅️ DT Radar", callback_data="radar_home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def radar_product_keyboard(product_id: int, *, favorite: bool, listing_url: str | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [[
+        InlineKeyboardButton(
+            text="★ Убрать из Моего Radar" if favorite else "⭐ Добавить в Мой Radar",
+            callback_data=f"radarfav:{int(product_id)}",
+        )
+    ]]
+    if listing_url:
+        rows.append([InlineKeyboardButton(text="🔗 Открыть актуальное объявление", url=listing_url)])
+    rows.append([InlineKeyboardButton(text="⬅️ DT Radar", callback_data="radar_home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 class BotChatAdapter:
@@ -1573,6 +1710,13 @@ async def backfill_recent_observation_plans() -> int:
     return len(rows)
 
 
+async def _safe_record_scan_hot(scan_id: int) -> None:
+    try:
+        await record_scan_hot(int(scan_id))
+    except Exception:
+        log.exception("DT Radar scan merge failed scan=%s", scan_id)
+
+
 async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None:
     if job.scan_id is None:
         return
@@ -1663,6 +1807,16 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
             await session.commit()
 
     if not cancelled and job.incomplete_categories == 0:
+        # v4.10.0 DT Radar: every completed scan contributes its TOP real-view
+        # products to the global persistent knowledge base. This is DB-only and
+        # never performs additional Kleinanzeigen requests.
+        # Never hold the user's completion card on Radar bookkeeping. Missed
+        # background merges are recovered by the one-time/history backfill.
+        asyncio.create_task(
+            _safe_record_scan_hot(job.scan_id),
+            name=f"dt-radar-scan-{job.scan_id}",
+        )
+
         # v4.8.6: automatic view observations belong only to a fully confirmed
         # snapshot. A partial scan must not start background view rounds behind
         # the integrity gate.
@@ -3135,6 +3289,33 @@ async def scan_archive_scheduler() -> None:
             await asyncio.sleep(SCAN_ARCHIVE_SWEEP_SECONDS)
 
 
+async def radar_maintenance_scheduler() -> None:
+    """Backfill historical strong products once, then cool live scores hourly."""
+    try:
+        # Let Telegram polling come online first. Radar migration is DB-only and
+        # idempotent, so a large historical base never delays bot availability.
+        await asyncio.sleep(8)
+        ai_saved, scan_saved = await backfill_radar_once()
+        if ai_saved or scan_saved:
+            log.warning("DT Radar historical base imported | ai=%s scan_signals=%s", ai_saved, scan_saved)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("DT Radar initial backfill failed")
+
+    while True:
+        try:
+            changed = await refresh_radar_scores()
+            if changed:
+                log.info("DT Radar score maintenance changed=%s", changed)
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("DT Radar maintenance loop error")
+            await asyncio.sleep(300)
+
+
 async def send_smart_export(
     message: Message | BotChatAdapter,
     user_id: int,
@@ -3936,6 +4117,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         site_max_page: int | None = None
         discovered_shards: list[tuple[str, int | None]] = []
         invalid_note = ""
+        last_invalid_kind = ""
 
         def locator_result(status: str, reason_text: str = "", candidate_page: int | None = None):
             # v4.0.4: the Stable Engine must actually use its per-page retry wrapper
@@ -3950,10 +4132,13 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 "limit": effective_limit, "site_max_page": site_max_page,
                 "candidate": candidate_page, "shards": list(discovered_shards),
                 "base_url": base_url,
+                # Expose the final stable-fetch defect class without widening the
+                # fetch() tuple used by the date locator and regional collector.
+                "last_invalid_kind": lambda: last_invalid_kind,
             }
 
         async def fetch(page: int, phase: str):
-            nonlocal network_requests, effective_limit, site_max_page, discovered_shards, invalid_note
+            nonlocal network_requests, effective_limit, site_max_page, discovered_shards, invalid_note, last_invalid_kind
             nonlocal cards_seen, listings_parsed, missing_date_count, missing_price_count
             nonlocal promoted_filtered, duplicate_count, invalid_pages, repeated_pages
             nonlocal low_quality_pages, verified_pages
@@ -4089,6 +4274,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     await asyncio.sleep(DATE_JUMP_PROBE_DELAY_SECONDS)
 
             items = info.items
+            last_invalid_kind = ""
             relation, pairs, days, profile = classify(items)
             valid = bool(getattr(info, "request_matches_page", True)) and not bool(getattr(info, "suspicious", False))
             fp = getattr(info, "fingerprint", "") or ""
@@ -4194,6 +4380,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     invalid_reason = "repeated-content"
                 else:
                     invalid_reason = invalid_note or "unknown"
+            last_invalid_kind = invalid_reason
             log.info(
                 "category=%s feed=%s phase=%s page=%s relation=%s actual=%s max=%s verified=%s "
                 "date_cov=%.0f%% parsed=%s missing_date=%s raw=%s promoted=%s duplicates=%s valid=%s "
@@ -4862,6 +5049,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         page = candidate
         weak_streak = 0
         weak_pages = 0
+        repeated_recovery_skips = 0
         # Small look-ahead compensates for weak card-template pages without
         # silently reducing the requested 15/25/50-page depth.
         # Recent dates may start many pages below page 1. For them the requested
@@ -4877,8 +5065,37 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             target_on_page = any(d == target_day for d in days)
 
             if relation == "invalid":
-                # A persistent invalid page is a genuine page/transport failure. The
-                # per-page retry wrapper has already exhausted its attempts.
+                # v4.10.1 Repeated Page Recovery. A stable repeated-content verdict
+                # means this exact page duplicated another page even after the normal
+                # retries and a clean BrowserContext recycle. It contributes NO rows
+                # and NO confirmed depth, but one isolated duplicate must not abort
+                # the whole category. Walk to the next nationwide page and replace
+                # the missing verified page later. Other invalid classes (challenge,
+                # page identity, transport/normalization) remain strict failures.
+                invalid_kind_getter = locator.get("last_invalid_kind")
+                invalid_kind = invalid_kind_getter() if callable(invalid_kind_getter) else ""
+                if invalid_kind == "repeated-content":
+                    repeated_recovery_skips += 1
+                    log.warning(
+                        "Repeated page recovery skip category=%s page=%s skip=%s/%s confirmed=%s/%s",
+                        cat.name, page, repeated_recovery_skips, DIRECT_REPEATED_RECOVERY_LIMIT,
+                        direct_pages_collected, depth,
+                    )
+                    if repeated_recovery_skips > DIRECT_REPEATED_RECOVERY_LIMIT:
+                        hit_limit = True
+                        reason = (
+                            f"слишком много повторяющихся страниц выдачи: "
+                            f"{repeated_recovery_skips} за проход"
+                        )
+                        return "invalid_stop", direct_pages_collected
+                    await top_up_direct_prefetch(page)
+                    page += 1
+                    if PAGE_DELAY_SECONDS:
+                        await asyncio.sleep(min(PAGE_DELAY_SECONDS, 0.25))
+                    continue
+
+                # A persistent non-repeat invalid page is a genuine page/transport
+                # failure. The per-page retry wrapper has already exhausted attempts.
                 hit_limit = True
                 reason = f"страница {page} не была корректно получена после повторов"
                 return "invalid_stop", direct_pages_collected
@@ -5274,8 +5491,19 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
 
                 outcome, direct_pages_collected = await collect_direct(nationwide)
                 if outcome == "needs_hidden" and not request_complete:
-                    if REGIONAL_HIDDEN_FILL_ENABLED:
-                        remaining = max(0, depth - direct_pages_collected)
+                    remaining = max(0, depth - direct_pages_collected)
+                    # v4.10.1: if the nationwide pass lost verified depth specifically
+                    # to repeated-content, recover only that shortfall from independent
+                    # regional feeds. This is integrity replacement, not the old broad
+                    # historical hidden-fill mode. Ordinary clean nationwide scans keep
+                    # REGIONAL_HIDDEN_FILL_ENABLED=0 and therefore keep their fast path.
+                    repeated_shortfall = max(0, int(repeated_pages or 0))
+                    if REGIONAL_HIDDEN_FILL_ENABLED or (remaining > 0 and repeated_shortfall > 0):
+                        if remaining > 0 and repeated_shortfall > 0 and not REGIONAL_HIDDEN_FILL_ENABLED:
+                            log.info(
+                                "Repeated page recovery regional replacement category=%s remaining=%s repeats=%s",
+                                cat.name, remaining, repeated_shortfall,
+                            )
                         await hidden_fill(remaining)
                     else:
                         # The selected date is still present at the end of the public
@@ -6592,6 +6820,26 @@ async def process_scan_job(bot: Bot, job: ScanJob, worker_id: int) -> None:
     await finish_job(bot, job, cancelled=job.cancel_requested)
 
 
+async def _mark_local_job_running_on_claim(job: ScanJob, worker_id: int) -> None:
+    """Persist the local worker claim before parser/browser setup begins.
+
+    v4.9.0 only changed PostgreSQL to ``running`` inside process_scan_job(). If
+    browser/parser setup ever took noticeable time, admin diagnostics could show a
+    worker-owned job as still queued. v4.9.1 makes the claim atomic from the UI's
+    point of view: once one of the four consumers takes a job, PostgreSQL immediately
+    says ``running``.
+    """
+    job.state = "running"
+    job.worker_id = worker_id
+    if job.scan_id is None:
+        return
+    async with SessionLocal() as session:
+        scan = await session.get(UserScan, int(job.scan_id))
+        if scan is not None and scan.status == "queued":
+            scan.status = "running"
+            await session.commit()
+
+
 async def scan_worker(bot: Bot, worker_id: int) -> None:
     log.info("Scan worker #%s started", worker_id)
     while True:
@@ -6609,6 +6857,9 @@ async def scan_worker(bot: Bot, worker_id: int) -> None:
             if job.cancel_requested:
                 await finish_job(bot, job, cancelled=True)
             else:
+                # Persist the slot claim before any parser/browser setup. This keeps
+                # admin status truthful and makes all four local lanes visible at once.
+                await _mark_local_job_running_on_claim(job, worker_id)
                 await TRAFFIC.scan_job_started()
                 parser = KleinanzeigenParser()
                 parser_token = JOB_PARSER.set(parser)
@@ -7667,7 +7918,8 @@ class ActivityAccessMiddleware(BaseMiddleware):
                 return None
 
             readonly_exact = {
-                "home", "post_home", "my_scans", "archive_my_scans", "archive_noop", "queue_status"
+                "home", "post_home", "my_scans", "archive_my_scans", "archive_noop", "queue_status",
+                "radar_locked",
             }
             readonly_prefixes = (
                 "scan_archive:", "scan:", "scanproducts:", "scantop:", "scantop50:",
@@ -7845,7 +8097,7 @@ async def _admin_active_scans_text(limit: int = 20) -> str:
     lines = [
         "<b>👀 КТО СЕЙЧАС ПАРСИТ</b>",
         "",
-        f"🟢 Парсят сейчас: <b>{len(running)}</b> · 🟡 в очереди: <b>{len(queued)}</b>",
+        f"🟢 Парсят сейчас: <b>{len(running)}/{GUARANTEED_LOCAL_PARSER_LANES}</b> · 🟡 в очереди: <b>{len(queued)}</b>",
     ]
     if cancelling:
         lines[-1] += f" · 🟠 останавливаются: <b>{len(cancelling)}</b>"
@@ -9561,6 +9813,7 @@ def user_commands_for_language(language: str = LANG_RU) -> list[BotCommand]:
             BotCommand(command="stop", description="⏹ Stop parser"),
             BotCommand(command="my_scans", description="📊 My scans"),
             BotCommand(command="popular", description="🔥 Popular"),
+            BotCommand(command="radar", description="📡 DT Radar"),
             BotCommand(command="categories", description="🗂 Categories"),
             BotCommand(command="settings", description="⚙️ Settings"),
             BotCommand(command="subscription", description="💎 Subscription"),
@@ -9573,6 +9826,7 @@ def user_commands_for_language(language: str = LANG_RU) -> list[BotCommand]:
         BotCommand(command="stop", description="⏹ Остановить парсер"),
         BotCommand(command="my_scans", description="📊 Мои сканы"),
         BotCommand(command="popular", description="🔥 Популярное"),
+        BotCommand(command="radar", description="📡 DT Radar"),
         BotCommand(command="categories", description="🗂 Категории"),
         BotCommand(command="settings", description="⚙️ Настройки"),
         BotCommand(command="subscription", description="💎 Подписка"),
@@ -10442,6 +10696,209 @@ async def run_view_test(message: Message, state: FSMContext) -> None:
         reply_markup=main_keyboard(len(selected)),
         disable_web_page_preview=True,
     )
+
+
+
+async def _radar_home_text() -> str:
+    stats = await radar_stats()
+    return (
+        "📡 <b>DT Radar</b>\n\n"
+        "Глобальная база сильных товаров, найденных сканами DT Parser и DT AI. "
+        "Товар <b>не удаляется</b>: его рейтинг меняется по новым сигналам, а пиковый результат и история остаются.\n\n"
+        f"📦 Товаров в базе: <b>{stats.total}</b>\n"
+        f"🔥 Горячих сейчас: <b>{stats.hot}</b>\n"
+        f"🚀 Набирают обороты: <b>{stats.rising}</b>\n"
+        f"🧠 AI Picks: <b>{stats.ai_picks}</b>\n"
+        f"🗂 Категорий: <b>{stats.categories}</b>\n"
+        f"📈 Сигналов накоплено: <b>{stats.signals}</b>\n\n"
+        "⭐ <b>DT Score</b> — текущая сила товара. <b>Peak</b> показывает его лучший исторический рейтинг."
+    )
+
+
+async def _radar_list_payload(user_id: int, mode: str, page: int, category_key: str | None = None):
+    rows, total = await list_radar_products(
+        mode=mode, category_key=category_key, page=page, user_id=user_id
+    )
+    titles = {
+        "hot": "🔥 Горячие сейчас",
+        "rising": "🚀 Набирают обороты",
+        "ai": "🧠 AI Picks",
+        "alltime": "🏆 Лучшие за всё время",
+        "favorites": "⭐ Мой Radar",
+    }
+    if category_key:
+        cat = CATEGORIES.get(category_key)
+        heading = f"🗂 {cat.name if cat is not None else category_key}"
+    else:
+        heading = titles.get(mode, "📡 DT Radar")
+    lines = [f"<b>{html.escape(heading)}</b>", ""]
+    if not rows:
+        lines.append("Пока здесь нет товаров. База пополняется автоматически после завершённых сканов и AI-анализа.")
+    else:
+        start = page * RADAR_PAGE_SIZE
+        for index, product in enumerate(rows, start + 1):
+            icon = RADAR_STATUS_ICON.get(str(product.status or ""), "📡")
+            cat = CATEGORIES.get(str(product.category_key or ""))
+            cat_name = cat.name if cat is not None else str(product.category_key or "—")
+            lines.append(
+                f"{icon} <b>{index}. {html.escape(str(product.title or 'Товар')[:70])}</b>\n"
+                f"⭐ <b>{int(product.current_score or 0)}</b>/100 · Peak <b>{int(product.peak_score or 0)}</b> · "
+                f"📂 {html.escape(cat_name)}\n"
+                f"🔁 сигналов: <b>{int(product.signal_count or 0)}</b> · объявлений: <b>{int(product.listing_count or 0)}</b>"
+            )
+    if total:
+        pages = max(1, (total + RADAR_PAGE_SIZE - 1) // RADAR_PAGE_SIZE)
+        lines += ["", f"Страница <b>{page + 1}/{pages}</b> · всего <b>{total}</b>"]
+    return "\n\n".join(lines), radar_list_keyboard(
+        rows, mode=mode, page=page, total=total, category_key=category_key
+    )
+
+
+async def _radar_product_payload(user_id: int, product_id: int):
+    product, listing, snapshots = await get_radar_product(product_id)
+    if product is None:
+        return None, None
+    favorite = await is_radar_favorite(user_id, product_id)
+    status = RADAR_STATUS_LABEL.get(str(product.status or ""), str(product.status or "—"))
+    status_icon = RADAR_STATUS_ICON.get(str(product.status or ""), "📡")
+    cat = CATEGORIES.get(str(product.category_key or ""))
+    cat_name = cat.name if cat is not None else str(product.category_key or "—")
+    type_label = RADAR_TYPE_LABEL.get(str(product.opportunity_type or ""), str(product.opportunity_type or "—"))
+    price = "—"
+    if product.min_price_eur is not None and product.max_price_eur is not None:
+        if int(product.min_price_eur) == int(product.max_price_eur):
+            price = f"{int(product.min_price_eur)} €"
+        else:
+            price = f"{int(product.min_price_eur)}–{int(product.max_price_eur)} €"
+    lines = [
+        f"📡 <b>{html.escape(str(product.title or 'Товар'))}</b>",
+        "",
+        f"{status_icon} Статус: <b>{html.escape(status)}</b>",
+        f"⭐ DT Score: <b>{int(product.current_score or 0)}/100</b>",
+        f"🏆 Peak Score: <b>{int(product.peak_score or 0)}/100</b>",
+        f"🧠 Сигнал: <b>{html.escape(type_label)}</b> · уверенность <b>{int(product.confidence or 0)}%</b>",
+        f"🗂 Категория: <b>{html.escape(cat_name)}</b>",
+        f"💶 Диапазон замеченных цен: <b>{html.escape(price)}</b>",
+        f"👀 Лучший замер: <b>{int(product.best_views or 0)}</b> просмотров",
+        f"⚡ Лучший рост: <b>{float(product.best_views_per_hour or 0.0):.1f}/ч</b>",
+        f"🔁 Сильных сигналов: <b>{int(product.signal_count or 0)}</b>",
+        f"✅ AI-подтверждений: <b>{int(product.confirmed_count or 0)}</b>",
+        f"📦 Разных объявлений: <b>{int(product.listing_count or 0)}</b>",
+        f"🕒 В Radar с: <b>{html.escape(_moscow_text(product.first_radar_at))}</b>",
+        f"📡 Последний сигнал: <b>{html.escape(_moscow_text(product.last_signal_at))}</b>",
+    ]
+    if product.latest_reason:
+        lines += ["", f"💡 <b>Почему в Radar:</b> {html.escape(str(product.latest_reason)[:500])}"]
+    if snapshots:
+        lines += ["", "<b>Последние изменения рейтинга:</b>"]
+        for snap in snapshots[:5]:
+            icon = "🧠" if str(snap.source or "").startswith("ai") else "👀"
+            lines.append(
+                f"{icon} {_moscow_text(snap.recorded_at)} · ⭐ <b>{int(snap.score or 0)}</b> · "
+                f"{html.escape(RADAR_TYPE_LABEL.get(str(snap.opportunity_type or ''), str(snap.stage or 'signal')))}"
+            )
+    listing_url = str(listing.url) if listing is not None and listing.url else None
+    return "\n".join(lines), radar_product_keyboard(product_id, favorite=favorite, listing_url=listing_url)
+
+
+@dp.callback_query(F.data == "radar_locked")
+async def radar_locked(callback: CallbackQuery) -> None:
+    stats = await radar_stats()
+    await callback.answer()
+    text = (
+        "📡 <b>DT Radar</b>\n\n"
+        "Единая накопительная база сильных товаров DT Parser. Рейтинг товаров обновляется, история не удаляется.\n\n"
+        f"📦 Уже в базе: <b>{stats.total}</b>\n"
+        f"🔥 Горячих сейчас: <b>{stats.hot}</b>\n"
+        f"🧠 AI Picks: <b>{stats.ai_picks}</b>\n\n"
+        "🔒 Полный список, рейтинги, категории и Мой Radar доступны по активной подписке."
+    )
+    await _edit_or_answer(callback.message, text, reply_markup=radar_locked_keyboard())
+
+
+@dp.callback_query(F.data == "radar_home")
+async def radar_home(callback: CallbackQuery) -> None:
+    await callback.answer()
+    # Score cooling is maintained hourly in the background. Opening Radar stays a
+    # small indexed read even after the accumulated base grows very large.
+    await _edit_or_answer(callback.message, await _radar_home_text(), reply_markup=radar_home_keyboard())
+
+
+@dp.message(Command("radar"))
+async def radar_command(message: Message) -> None:
+    await message.answer(await _radar_home_text(), parse_mode=ParseMode.HTML, reply_markup=radar_home_keyboard())
+
+
+@dp.callback_query(F.data.startswith("radarlist:"))
+async def radar_list_handler(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    mode = parts[1] if len(parts) > 1 else "hot"
+    try:
+        page = max(0, int(parts[2])) if len(parts) > 2 else 0
+    except Exception:
+        page = 0
+    if mode not in {"hot", "rising", "ai", "alltime", "favorites"}:
+        mode = "hot"
+    await callback.answer()
+    text, markup = await _radar_list_payload(callback.from_user.id, mode, page)
+    await _edit_or_answer(callback.message, text, reply_markup=markup)
+
+
+@dp.callback_query(F.data.startswith("radarcats:"))
+async def radar_categories_handler(callback: CallbackQuery) -> None:
+    try:
+        page = max(0, int(callback.data.split(":", 1)[1]))
+    except Exception:
+        page = 0
+    items = await radar_categories()
+    await callback.answer()
+    text = (
+        "🗂 <b>DT Radar · Категории</b>\n\n"
+        "Все накопленные товары распределены по исходным категориям Kleinanzeigen. "
+        "Число справа — сколько товарных семейств уже знает Radar и лучший текущий Score."
+    )
+    await _edit_or_answer(callback.message, text, reply_markup=radar_categories_keyboard(items, page))
+
+
+@dp.callback_query(F.data.startswith("radarcat:"))
+async def radar_category_handler(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    if len(parts) < 2:
+        await callback.answer("Категория не найдена", show_alert=True); return
+    category_key = parts[1]
+    try:
+        page = max(0, int(parts[2])) if len(parts) > 2 else 0
+    except Exception:
+        page = 0
+    await callback.answer()
+    text, markup = await _radar_list_payload(callback.from_user.id, "all", page, category_key=category_key)
+    await _edit_or_answer(callback.message, text, reply_markup=markup)
+
+
+@dp.callback_query(F.data.startswith("radaritem:"))
+async def radar_item_handler(callback: CallbackQuery) -> None:
+    try:
+        product_id = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("Товар не найден", show_alert=True); return
+    text, markup = await _radar_product_payload(callback.from_user.id, product_id)
+    if text is None:
+        await callback.answer("Товар не найден", show_alert=True); return
+    await callback.answer()
+    await _edit_or_answer(callback.message, text, reply_markup=markup)
+
+
+@dp.callback_query(F.data.startswith("radarfav:"))
+async def radar_favorite_handler(callback: CallbackQuery) -> None:
+    try:
+        product_id = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("Товар не найден", show_alert=True); return
+    favorite = await toggle_radar_favorite(callback.from_user.id, product_id)
+    await callback.answer("Добавлено в Мой Radar ⭐" if favorite else "Убрано из Моего Radar")
+    text, markup = await _radar_product_payload(callback.from_user.id, product_id)
+    if text is not None:
+        await _edit_or_answer(callback.message, text, reply_markup=markup)
 
 
 @dp.callback_query(F.data == "popular_now")
@@ -12023,6 +12480,19 @@ async def _start_embedded_fleet_fallback(bot: Bot) -> tuple[list[asyncio.Task], 
 async def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
+    # v4.9.1 fail-fast guard. If a future change breaks the four-lane contract,
+    # Railway should restart visibly instead of silently serving only 1–2 users.
+    if (
+        not STABLE_SINGLE_SERVICE_MODE
+        or DISTRIBUTED_WORKERS
+        or not MULTIUSER_STABLE_MODE
+        or MAX_CONCURRENT_JOBS != GUARANTEED_LOCAL_PARSER_LANES
+    ):
+        raise RuntimeError(
+            "v4.9.1 four-lane guarantee violated: "
+            f"stable={STABLE_SINGLE_SERVICE_MODE} distributed={DISTRIBUTED_WORKERS} "
+            f"multiuser={MULTIUSER_STABLE_MODE} lanes={MAX_CONCURRENT_JOBS}"
+        )
     if DISTRIBUTED_CONFIG_ERROR:
         raise RuntimeError(
             "Railway production requires REDIS_URL. Add a Railway Redis service and "
@@ -12116,6 +12586,15 @@ async def main() -> None:
         asyncio.create_task(scan_worker(bot, i), name=f"scan-worker-{i}")
         for i in range(1, MAX_CONCURRENT_JOBS + 1)
     ]
+    if len(worker_tasks) != GUARANTEED_LOCAL_PARSER_LANES:
+        raise RuntimeError(
+            f"v4.9.1 expected {GUARANTEED_LOCAL_PARSER_LANES} scan workers, got {len(worker_tasks)}"
+        )
+    log.warning(
+        "v4.10.1 DT Radar + View Speed + Repeated Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
+        "trial_and_paid_same_queue=True | railway_lane_overrides_ignored=True",
+        GUARANTEED_LOCAL_PARSER_LANES,
+    )
     ticker_task = None if DISTRIBUTED_WORKERS else asyncio.create_task(
         progress_ticker(bot), name="user-progress-ticker"
     )
@@ -12127,6 +12606,7 @@ async def main() -> None:
         subscription_lifecycle_scheduler(bot), name="subscription-lifecycle-scheduler"
     )
     archive_task = asyncio.create_task(scan_archive_scheduler(), name="scan-archive-scheduler")
+    radar_task = asyncio.create_task(radar_maintenance_scheduler(), name="dt-radar-maintenance")
     observation_tasks = [] if DISTRIBUTED_WORKERS else [
         asyncio.create_task(observation_scheduler(bot, i), name=f"view-observation-worker-{i}")
         for i in range(1, OBSERVATION_CONCURRENCY + 1)
@@ -12141,11 +12621,12 @@ async def main() -> None:
         payment_task.cancel()
         subscription_task.cancel()
         archive_task.cancel()
+        radar_task.cancel()
         for task in observation_tasks:
             task.cancel()
         for task in worker_tasks:
             task.cancel()
-        shutdown_tasks = [payment_task, subscription_task, archive_task, *observation_tasks, *worker_tasks]
+        shutdown_tasks = [payment_task, subscription_task, archive_task, radar_task, *observation_tasks, *worker_tasks]
         if distributed_queue_ticker_task is not None:
             shutdown_tasks.insert(0, distributed_queue_ticker_task)
         if ticker_task is not None:
