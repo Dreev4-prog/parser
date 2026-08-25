@@ -40,8 +40,8 @@ VIEW_REDIS_PREFIX = os.getenv("VIEW_REDIS_PREFIX", "dtparser:viewcounter").strip
 # v4.8.3: every release gets a fresh ephemeral view runtime. Old streams/jobs
 # can expire naturally without being reclaimed by a newly deployed worker fleet.
 VIEW_RUNTIME_PREFIX = os.getenv(
-    "VIEW_RUNTIME_PREFIX", f"{VIEW_REDIS_PREFIX}:runtime:v483"
-).strip() or f"{VIEW_REDIS_PREFIX}:runtime:v483"
+    "VIEW_RUNTIME_PREFIX", f"{VIEW_REDIS_PREFIX}:runtime:v491"
+).strip() or f"{VIEW_REDIS_PREFIX}:runtime:v491"
 VIEW_STREAM = f"{VIEW_RUNTIME_PREFIX}:jobs"
 VIEW_GROUP = f"{VIEW_RUNTIME_PREFIX}:workers"
 VIEW_HEARTBEAT_KEY = f"{VIEW_RUNTIME_PREFIX}:heartbeat"
@@ -55,12 +55,27 @@ VIEW_PROGRESS_POLL_MS = _env_int("VIEW_PROGRESS_POLL_MS", 500, 100, 3000)
 # Redis jobs so multiple Railway View Worker replicas can process one scan at
 # the same time. The exact view extraction algorithm remains inside the same
 # known-good worker/parser code.
-VIEW_SHARDING_ENABLED = _env_bool("VIEW_SHARDING_ENABLED", True)
-VIEW_SHARD_MIN_URLS = _env_int("VIEW_SHARD_MIN_URLS", 40, 20, 5000)
-VIEW_SHARD_SIZE = _env_int("VIEW_SHARD_SIZE", 18, 8, 1000)
-VIEW_SHARD_MAX_COUNT = _env_int("VIEW_SHARD_MAX_COUNT", 8, 2, 64)
-VIEW_SHARDS_PER_WORKER = _env_int("VIEW_SHARDS_PER_WORKER", 1, 1, 4)
-VIEW_EXPECTED_WORKERS = _env_int("VIEW_EXPECTED_WORKERS", 4, 1, 16)
+# v4.9.1 View Speed Fix. Large foreground batches must never silently fall
+# back to a single 100+ URL Redis job because an old Railway variable or a
+# transient heartbeat/status read disagreed with the real four-replica fleet.
+# The queue is safe even with fewer live workers: small shards are simply
+# consumed sequentially until replicas recover. Legacy tuning remains available
+# only through an explicit opt-in for diagnostics.
+_ALLOW_LEGACY_VIEW_SHARD_TUNING = _env_bool("DT_ALLOW_LEGACY_VIEW_SHARD_TUNING", False)
+if _ALLOW_LEGACY_VIEW_SHARD_TUNING:
+    VIEW_SHARDING_ENABLED = _env_bool("VIEW_SHARDING_ENABLED", True)
+    VIEW_SHARD_MIN_URLS = _env_int("VIEW_SHARD_MIN_URLS", 40, 20, 5000)
+    VIEW_SHARD_SIZE = _env_int("VIEW_SHARD_SIZE", 18, 8, 1000)
+    VIEW_SHARD_MAX_COUNT = _env_int("VIEW_SHARD_MAX_COUNT", 8, 2, 64)
+    VIEW_SHARDS_PER_WORKER = _env_int("VIEW_SHARDS_PER_WORKER", 1, 1, 4)
+    VIEW_EXPECTED_WORKERS = _env_int("VIEW_EXPECTED_WORKERS", 4, 1, 16)
+else:
+    VIEW_SHARDING_ENABLED = True
+    VIEW_SHARD_MIN_URLS = 40
+    VIEW_SHARD_SIZE = 18
+    VIEW_SHARD_MAX_COUNT = 8
+    VIEW_SHARDS_PER_WORKER = 1
+    VIEW_EXPECTED_WORKERS = 4
 
 
 @dataclass
@@ -396,25 +411,22 @@ class RemoteViewManager:
         if not await self.worker_alive():
             return None
 
-        # Count currently healthy replicas. If the second replica is down, stay
-        # on the proven single-job path instead of introducing shard overhead.
-        worker_count = 1
+        # v4.9.1: large jobs are sharded by batch size, not by a momentary
+        # heartbeat count. A status read may briefly see one replica during a
+        # Railway rollout even though four workers are configured. That must not
+        # turn a 149/500 URL scan into one giant worker job. If fewer replicas are
+        # actually alive, Redis safely lets them consume the same small shards
+        # sequentially.
+        worker_count = VIEW_EXPECTED_WORKERS
         if VIEW_SHARDING_ENABLED and len(urls) >= VIEW_SHARD_MIN_URLS:
             try:
                 live_status = await self.status()
-                live_workers = max(1, len(live_status.get("workers") or []))
-                # A just-redeployed fourth replica can miss the first heartbeat by a
-                # few seconds. Sharding into the configured fleet size is still safe:
-                # fewer live workers simply consume the small shards sequentially.
-                worker_count = max(live_workers, VIEW_EXPECTED_WORKERS)
+                live_workers = len(live_status.get("workers") or [])
+                worker_count = max(VIEW_EXPECTED_WORKERS, live_workers or 0)
             except Exception:
-                worker_count = 1
+                worker_count = VIEW_EXPECTED_WORKERS
 
-        should_shard = (
-            VIEW_SHARDING_ENABLED
-            and worker_count >= 2
-            and len(urls) >= VIEW_SHARD_MIN_URLS
-        )
+        should_shard = VIEW_SHARDING_ENABLED and len(urls) >= VIEW_SHARD_MIN_URLS
         if not should_shard:
             self.last_shard_count = 1
             self.last_shard_total = len(urls)

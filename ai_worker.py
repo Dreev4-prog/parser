@@ -42,7 +42,6 @@ from models import (
     ViewHistory,
 )
 from view_manager import REMOTE_VIEW_MANAGER
-from radar import record_ai_candidate
 
 try:
     from redis.asyncio import Redis  # type: ignore
@@ -512,7 +511,6 @@ class AIWorker:
                     selected_ids = [x for x in selected_ids if x not in repeated]
                     controls.difference_update(repeated)
 
-            created_candidate_ids: list[int] = []
             async with SessionLocal() as session:
                 db_run = await session.get(AIEarlyWinnerRun, int(run.id))
                 if db_run is None:
@@ -571,8 +569,6 @@ class AIWorker:
                     )
                     session.add(candidate)
                     await session.flush()
-                    if not candidate.is_control:
-                        created_candidate_ids.append(int(candidate.id))
                     if not candidate.is_control and candidate.stage == "early_winner":
                         session.add(AIEarlyWinnerEvent(
                             candidate_id=int(candidate.id),
@@ -589,17 +585,6 @@ class AIWorker:
                 db_run.status = "done"
                 db_run.finished_at = datetime.utcnow()
                 await session.commit()
-
-            # v4.10.0 DT Radar: every real AI candidate becomes a persistent
-            # product signal. Radar has its own append-only history and never
-            # deletes products when an AI candidate later cools or resolves.
-            for candidate_id in created_candidate_ids:
-                try:
-                    await record_ai_candidate(
-                        candidate_id, source_key=f"ai-initial:{candidate_id}", source="ai_initial"
-                    )
-                except Exception:
-                    log.exception("DT Radar initial AI merge failed candidate=%s", candidate_id)
 
             self.analyzed_runs += 1
             self.created_candidates += len(selected_ids)
@@ -748,21 +733,7 @@ class AIWorker:
                         candidate_id=int(candidate.id), event_type="confirmed",
                         payload_json=json.dumps({"score": candidate.current_score, "target_hours": obs.target_hours, "type": candidate.opportunity_type}, ensure_ascii=False),
                     ))
-            radar_candidate_id = int(candidate.id)
-            radar_observation_id = int(obs.id)
             await session.commit()
-
-        # Persist the changed AI score into DT Radar after the AI transaction is
-        # committed, so users can see the rating move without touching AI worker
-        # correctness if Radar ever has a transient DB/UI error.
-        try:
-            await record_ai_candidate(
-                radar_candidate_id,
-                source_key=f"ai-observation:{radar_observation_id}",
-                source="ai_observation",
-            )
-        except Exception:
-            log.exception("DT Radar AI observation merge failed candidate=%s obs=%s", radar_candidate_id, radar_observation_id)
 
         self.observations_done += 1
 

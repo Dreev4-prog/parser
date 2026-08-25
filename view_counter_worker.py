@@ -74,10 +74,12 @@ ADAPTIVE_BACKOFF_SECONDS = _env_float("VIEW_WORKER_ADAPTIVE_BACKOFF_SECONDS", 3.
 ADAPTIVE_FALLBACK_WARN_RATIO = _env_float("VIEW_WORKER_ADAPTIVE_FALLBACK_WARN_RATIO", 0.12, 0.01, 1.0)
 ADAPTIVE_UNKNOWN_WARN_RATIO = _env_float("VIEW_WORKER_ADAPTIVE_UNKNOWN_WARN_RATIO", 0.05, 0.0, 1.0)
 
-# v4.3.36 FOUR-USER VIEW FLEET GUARD.
-# Four Railway View Worker replicas share one Redis traffic budget. Adding the
-# fourth replica increases distribution/recovery capacity, not request pressure:
-# the fleet-wide view budget stays capped at 16 while refusal backoff stays local to each replica.
+# v4.9.1 FOUR-USER VIEW FLEET SPEED GUARD.
+# Four Railway View Worker replicas share one Redis traffic budget. Official
+# HTTP counters stay capped at 16 fleet-wide. Chromium remains one-at-a-time
+# inside each replica, but up to two different replicas may run a verified
+# fallback concurrently so a handful of transient misses cannot serialize the
+# entire scan for minutes.
 # Main bot / Date / Page workers keep their existing proven traffic modes.
 os.environ["STABLE_SINGLE_SERVICE_MODE"] = "0"
 os.environ["DIST_TRAFFIC_VIEW_BUCKET"] = "view"
@@ -86,7 +88,7 @@ os.environ["DIST_TRAFFIC_GLOBAL_BUCKET"] = "view-fleet"
 os.environ["DIST_TRAFFIC_COOLDOWN_BUCKET"] = "view-fleet"
 os.environ["DIST_TRAFFIC_VIEW_LIMIT"] = "16"
 os.environ["DIST_TRAFFIC_GLOBAL_LIMIT"] = "16"
-os.environ["DIST_TRAFFIC_BROWSER_LIMIT"] = "1"
+os.environ["DIST_TRAFFIC_BROWSER_LIMIT"] = "2"
 
 os.environ["DIST_TRAFFIC_SHARED_COOLDOWN"] = "0"
 os.environ["TRAFFIC_MAX_PENALTY_LEVEL"] = "1"

@@ -67,6 +67,15 @@ ACCURATE_VIEW_BROWSER_CONCURRENCY = max(1, min(4, int(os.getenv("ACCURATE_VIEW_B
 ACCURATE_VIEW_HTTP_CONCURRENCY = max(2, min(24, int(os.getenv("ACCURATE_VIEW_HTTP_CONCURRENCY", "12"))))
 ACCURATE_VIEW_DOM_TIMEOUT_MS = max(500, min(8000, int(os.getenv("ACCURATE_VIEW_DOM_TIMEOUT_MS", "2500"))))
 ACCURATE_VIEW_RETRIES = max(1, min(3, int(os.getenv("ACCURATE_VIEW_RETRIES", "2"))))
+# v4.9.1: a short-lived 403/429 from the cheap official counter endpoint is
+# retried once before paying the much larger Chromium cost. Only explicit
+# refusals are retried; unparsed/missing counters still go directly to the
+# verified browser lane. Exact-value acceptance rules are unchanged.
+ACCURATE_VIEW_REFUSAL_HTTP_RETRY = os.getenv("ACCURATE_VIEW_REFUSAL_HTTP_RETRY", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+ACCURATE_VIEW_REFUSAL_RETRY_CONCURRENCY = max(1, min(4, int(os.getenv("ACCURATE_VIEW_REFUSAL_RETRY_CONCURRENCY", "2"))))
+ACCURATE_VIEW_REFUSAL_RETRY_DELAY_SECONDS = max(0.0, min(3.0, float(os.getenv("ACCURATE_VIEW_REFUSAL_RETRY_DELAY_SECONDS", "0.35"))))
 
 # v3.7.0 Hybrid Transport. A foreground scan can use one short Chromium navigation
 # to establish a normal public browser session and then switch to Playwright's
@@ -2760,6 +2769,55 @@ class KleinanzeigenParser:
                     direct_errors[url] = direct.error or direct.source
 
             await asyncio.gather(*(direct_phase(url) for url in urls))
+
+            # v4.9.1 refusal recovery: direct 403/429 responses are often brief
+            # soft refusals while neighboring official-counter requests are still
+            # healthy. Retry only those URLs once with a tiny pool before opening
+            # Chromium. This preserves exactness because success is accepted only
+            # from the same explicit official counter payload as phase 1.
+            retry_candidates = [
+                url for url in fallback_urls
+                if "HTTP 403" in str(direct_errors.get(url) or "")
+                or "HTTP 429" in str(direct_errors.get(url) or "")
+            ]
+            retry_recovered: set[str] = set()
+            if ACCURATE_VIEW_REFUSAL_HTTP_RETRY and retry_candidates:
+                if ACCURATE_VIEW_REFUSAL_RETRY_DELAY_SECONDS > 0:
+                    await asyncio.sleep(ACCURATE_VIEW_REFUSAL_RETRY_DELAY_SECONDS)
+                retry_sem = asyncio.Semaphore(ACCURATE_VIEW_REFUSAL_RETRY_CONCURRENCY)
+
+                async def retry_refusal(url: str):
+                    nonlocal done_count, singleflight_hits
+                    async with retry_sem:
+                        direct, shared = await self._direct_view_http_shared(
+                            url, traffic_priority=traffic_priority
+                        )
+                    if shared:
+                        singleflight_hits += 1
+                    if direct.views is None:
+                        direct_errors[url] = direct.error or direct.source
+                        return
+                    results[url] = ViewCountResult(
+                        int(direct.views),
+                        direct.raw_text,
+                        f"verified-official:{direct.source}",
+                        direct.final_url,
+                        direct.page_title,
+                        None,
+                    )
+                    retry_recovered.add(url)
+                    async with done_lock:
+                        done_count += 1
+                    await report_progress()
+
+                await asyncio.gather(*(retry_refusal(url) for url in retry_candidates))
+                if retry_recovered:
+                    fallback_urls = [url for url in fallback_urls if url not in retry_recovered]
+                log.info(
+                    "Accurate views refusal retry candidates=%s recovered=%s browser_remaining=%s",
+                    len(retry_candidates), len(retry_recovered), len(fallback_urls),
+                )
+
             valid_total = sum(1 for url in urls if _allowed_url(url) and "/s-anzeige/" in url)
             phase1_elapsed = max(0.001, time.monotonic() - phase1_started)
             log.info(
