@@ -1198,6 +1198,18 @@ class KleinanzeigenParser:
         self._scan_page_checkpoints: dict[tuple[str, int], tuple[float, CategoryPageInfo]] = {}
         self._scan_page_checkpoint_hits = 0
 
+    def prepare_category_scan(self) -> None:
+        """Reset per-category recovery budgets while preserving the reusable session.
+
+        AutoScan v4.11.5 keeps one parser/browser context across many categories. Page
+        checkpoints and the hybrid browser-fallback budget are category-local state, so
+        they must not accumulate across that long-lived round. Cookies/http/browser
+        session state intentionally remains warm.
+        """
+        self._scan_page_checkpoints.clear()
+        self._scan_page_checkpoint_hits = 0
+        self._hybrid_browser_fallbacks = 0
+
     async def close(self) -> None:
         try:
             if self._hybrid_request_context is not None:

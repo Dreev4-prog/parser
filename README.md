@@ -1,5 +1,43 @@
 # DT PARSER
 
+## v4.11.6 — Free Radar Preview
+
+v4.11.6 keeps the full **v4.11.5 AutoScan Stability + v4.11.4 Radar Category Feed** release and adds a conversion-focused read-only Radar preview for users without an active subscription.
+
+### Free Radar Preview
+- non-subscribers can open `DT Radar -> Лучшие сейчас` instead of seeing a fully locked Radar screen
+- `Горячие`, `Набирают` and `AI Picks` each expose only the first **5 real current products**
+- preview products keep DT Score, freshness, category, detail analytics and the current Kleinanzeigen listing link
+- after the preview, the UI shows how many products remain locked and offers full Radar access
+- Search, Categories, My Radar, Records, pagination and the rest of each feed remain subscription-only
+- locked Radar features stay visible with a lock marker so users can understand the paid value before purchase
+- existing two free scans remain separate and are still offered when credits remain; Radar preview consumes no trial credit
+- active subscribers keep the full Radar UI unchanged
+- no database migration, worker change, parser-core change or new Railway variable
+
+See `DEPLOY_V4_11_6_FREE_RADAR_PREVIEW.md` for rollout and smoke tests.
+
+---
+
+## v4.11.5 — Radar AutoScan Stability
+
+v4.11.5 keeps the full **v4.11.4 Radar Category Feed** product UX and hardens the background DT Radar producer after live full-circle testing.
+
+### AutoScan stability
+- new circles scan **84 product-oriented leaf categories** instead of all 141 Kleinanzeigen leaves
+- Immobilien, Jobs, Dienstleistungen, Unterricht/Kurse, Nachbarschaftshilfe and service-like leaves are excluded from AutoScan only; normal user parsing remains available
+- one warm `KleinanzeigenParser` session is reused across the round instead of being recreated for every category
+- per-category recovery/checkpoint budgets are reset without discarding the warm session
+- partial categories trigger bounded cooldown; unexpected system failures recycle the parser
+- admin telemetry separates `⚠️ допроверка` from `❌ системных`
+- AutoScan view collection uses the exact official counter for all listings and bounds the heavy browser fallback to 24 misses/category; unresolved stale counters are cleared
+- foreground/user scans, DT Score, Radar Category Feed, Page/Date/View/AI workers and the four user lanes are unchanged
+- no database migration and no new Railway variables
+
+See `DEPLOY_V4_11_5_AUTOSCAN_STABILITY.md` for rollout and smoke tests.
+
+---
+
 ## v4.11.4 — DT Radar Category Feed
 
 v4.11.4 keeps the full **v4.11.3 Simple Home + v4.11.2 Category Navigator + v4.11.1 AutoScan Error Recovery** release and makes category browsing useful as an accumulated curated catalogue instead of a 24-hour-only feed.

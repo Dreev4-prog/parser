@@ -145,20 +145,43 @@ FREE_TRIAL_ENABLED_DEFAULT = os.getenv("FREE_TRIAL_ENABLED", "1").strip().lower(
 FREE_TRIAL_SCAN_LIMIT = max(0, min(10, int(os.getenv("FREE_TRIAL_SCAN_LIMIT", "2"))))
 FREE_TRIAL_MAX_CATEGORIES = 1
 FREE_TRIAL_MAX_PAGES = 25
+# v4.11.6 Free Radar Preview: non-subscribers can inspect a small live sample
+# without gaining Search/Categories/My Radar or pagination access.
+FREE_RADAR_PREVIEW_LIMIT = 5
 _trial_credit_guard = asyncio.Lock()
 
-# v4.11.1 DT Radar AutoScan Error Recovery.  This is a low-priority background producer for
-# Radar: one leaf category at a time, 15 pages for the current Moscow date.
-# It never occupies one of the four user queue consumers and only starts a new
-# category while the foreground queue is idle.  If a user arrives mid-category,
-# that small 15-page block finishes and AutoScan yields before the next category.
+# v4.11.5 DT Radar AutoScan Stability. AutoScan is a low-priority product-feed producer:
+# it scans only product-oriented leaf categories, reuses one parser/browser session across
+# the whole round, yields to foreground users between categories, and applies bounded
+# backoff after partial/system failures. Non-product/service categories remain available
+# to the normal parser; they are excluded only from the automatic Radar seeding round.
 RADAR_AUTOSCAN_SETTING_KEY = "dt_radar_autoscan_v1"
+RADAR_AUTOSCAN_POLICY_VERSION = 2
 RADAR_AUTOSCAN_DEPTH = 15
 RADAR_AUTOSCAN_USER_ID = -411000001
 RADAR_AUTOSCAN_DEFAULT_TIME = "05:00"
 RADAR_AUTOSCAN_POLL_SECONDS = 10
 RADAR_AUTOSCAN_HISTORY_LIMIT = 20
 RADAR_AUTOSCAN_TIME_CHOICES = ("03:00", "05:00", "08:00", "12:00", "18:00", "23:00")
+RADAR_AUTOSCAN_EXCLUDED_GROUPS = frozenset({"immobilien", "jobs", "services", "kurse", "hilfe"})
+RADAR_AUTOSCAN_EXCLUDED_CATEGORY_KEYS = frozenset({
+    "auto_reparatur",       # Reparaturen & Dienstleistungen
+    "hg_service",           # Dienstleistungen Haus & Garten
+    "el_service",           # Dienstleistungen Elektronik
+    "ti_betreuung",         # Tierbetreuung & Training
+    "ti_vermisst",          # Vermisste Tiere
+    "fa_alten",             # Altenpflege
+    "fa_babysit",           # Babysitter/-in & Kinderbetreuung
+    "fr_aktiv",             # Freizeitaktivitäten
+    "fr_kuenstler",         # Künstler/-in & Musiker/-in
+    "fr_reise",             # Reise & Eventservices
+    "fr_verloren",          # Verloren & Gefunden
+})
+RADAR_AUTOSCAN_PARTIAL_BACKOFF_BASE_SECONDS = 3.0
+RADAR_AUTOSCAN_SYSTEM_BACKOFF_BASE_SECONDS = 8.0
+RADAR_AUTOSCAN_MAX_BACKOFF_SECONDS = 30.0
+RADAR_AUTOSCAN_SUCCESS_GAP_SECONDS = 0.25
+RADAR_AUTOSCAN_BROWSER_FALLBACK_LIMIT = 24
 _radar_autoscan_guard = asyncio.Lock()
 _radar_autoscan_wakeup = asyncio.Event()
 
@@ -661,6 +684,18 @@ async def trial_or_paid_scan_access(user_id: int) -> bool:
     return (await get_trial_status(user_id)).eligible
 
 
+def free_radar_preview_allowed(user_id: int) -> bool:
+    """Public read-only DT Radar preview for subscription mode.
+
+    Active subscribers/admins already have full access through ``allowed``.
+    Banned users and admin-only mode never receive the preview.
+    """
+    uid = int(user_id)
+    if allowed(uid) or is_banned_cached(uid):
+        return False
+    return current_access_mode() == "subscription"
+
+
 async def _consume_trial_credit(user_id: int) -> TrialStatus | None:
     """Atomically reserve one trial launch immediately before queueing it."""
     uid = int(user_id)
@@ -768,7 +803,7 @@ def main_keyboard(
             [InlineKeyboardButton(text=f"🎁 Бесплатный скан · осталось {trial_remaining}", callback_data="start_scan")],
             [InlineKeyboardButton(text=f"🗂 Категория · {min(selected_count, FREE_TRIAL_MAX_CATEGORIES)}/{FREE_TRIAL_MAX_CATEGORIES}", callback_data="groups"),
              InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
-            [InlineKeyboardButton(text="📡 DT Radar · 🔒", callback_data="radar_locked"),
+            [InlineKeyboardButton(text="📡 DT Radar · 🎁", callback_data="radar_home"),
              InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
             [InlineKeyboardButton(text="📥 Очередь", callback_data="queue_status")],
             [InlineKeyboardButton(text="💎 Полный доступ", callback_data="subscription")],
@@ -776,7 +811,7 @@ def main_keyboard(
     else:
         rows = [
             [InlineKeyboardButton(text="🔒 Новый скан", callback_data="start_scan")],
-            [InlineKeyboardButton(text="📡 DT Radar · 🔒", callback_data="radar_locked"),
+            [InlineKeyboardButton(text="📡 DT Radar · 🎁", callback_data="radar_home"),
              InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
             [InlineKeyboardButton(text="💎 Продлить подписку", callback_data="subscription")],
         ]
@@ -901,25 +936,36 @@ RADAR_TYPE_LABEL = {
 }
 
 
-def radar_home_keyboard() -> InlineKeyboardMarkup:
-    # v4.11.3: four obvious entry points. Analytics stay one level deeper.
+def radar_home_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
+    # Paid users see all four destinations.  Free preview keeps the same shape so
+    # the value of the full product is visible without granting the locked data.
+    full = bool(user_id is not None and allowed(int(user_id)))
+    search_cb = "radarsearch" if full else "radar_locked:search"
+    cats_cb = "radarcats:0" if full else "radar_locked:categories"
+    favorites_cb = "radarlist:favorites:0" if full else "radar_locked:favorites"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔥 Лучшие сейчас", callback_data="radarbest"),
-         InlineKeyboardButton(text="🔎 Поиск", callback_data="radarsearch")],
-        [InlineKeyboardButton(text="🗂 Категории", callback_data="radarcats:0"),
-         InlineKeyboardButton(text="⭐ Мой Radar", callback_data="radarlist:favorites:0")],
+         InlineKeyboardButton(text="🔎 Поиск" + ("" if full else " · 🔒"), callback_data=search_cb)],
+        [InlineKeyboardButton(text="🗂 Категории" + ("" if full else " · 🔒"), callback_data=cats_cb),
+         InlineKeyboardButton(text="⭐ Мой Radar" + ("" if full else " · 🔒"), callback_data=favorites_cb)],
         [InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
     ])
 
 
-def radar_best_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def radar_best_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
+    full = bool(user_id is not None and allowed(int(user_id)))
+    rows = [
         [InlineKeyboardButton(text="🔥 Горячие", callback_data="radarlist:hot:0"),
          InlineKeyboardButton(text="🚀 Набирают", callback_data="radarlist:rising:0")],
         [InlineKeyboardButton(text="🧠 AI Picks", callback_data="radarlist:ai:0")],
-        [InlineKeyboardButton(text="🏆 Рекорды Radar", callback_data="radarlist:alltime:0")],
-        [InlineKeyboardButton(text="⬅️ DT Radar", callback_data="radar_home")],
-    ])
+    ]
+    if full:
+        rows.append([InlineKeyboardButton(text="🏆 Рекорды Radar", callback_data="radarlist:alltime:0")])
+    else:
+        rows.append([InlineKeyboardButton(text="🏆 Рекорды Radar · 🔒", callback_data="radar_locked:records")])
+        rows.append([InlineKeyboardButton(text="💎 Открыть полный DT Radar", callback_data="subscription")])
+    rows.append([InlineKeyboardButton(text="⬅️ DT Radar", callback_data="radar_home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def radar_search_keyboard(items, *, page: int, total: int) -> InlineKeyboardMarkup:
@@ -944,11 +990,42 @@ def radar_search_keyboard(items, *, page: int, total: int) -> InlineKeyboardMark
     rows.append([InlineKeyboardButton(text="⬅️ DT Radar", callback_data="radar_home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+
 def radar_locked_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Открыть DT Radar", callback_data="subscription")],
-        [InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
+        [InlineKeyboardButton(text="💎 Открыть полный DT Radar", callback_data="subscription")],
+        [InlineKeyboardButton(text="🔥 Посмотреть 5 бесплатных находок", callback_data="radarbest")],
+        [InlineKeyboardButton(text="⬅️ DT Radar", callback_data="radar_home")],
     ])
+
+
+def radar_preview_list_keyboard(
+    items, *, mode: str, total: int, trial_remaining: int = 0,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for product in items:
+        icon = RADAR_STATUS_ICON.get(str(product.status or ""), "📡")
+        title = " ".join(str(product.title or "Товар").split())
+        if len(title) > 32:
+            title = title[:31].rstrip() + "…"
+        rows.append([InlineKeyboardButton(
+            text=f"{icon} {int(product.current_score or 0)} · {title}",
+            callback_data=f"radarpreviewitem:{mode}:{int(product.id)}",
+        )])
+    if total > len(items):
+        rows.append([InlineKeyboardButton(
+            text=f"🔒 Ещё {max(0, int(total) - len(items))} · открыть полный Radar",
+            callback_data="subscription",
+        )])
+    else:
+        rows.append([InlineKeyboardButton(text="💎 Открыть полный DT Radar", callback_data="subscription")])
+    if int(trial_remaining) > 0:
+        rows.append([InlineKeyboardButton(
+            text=f"🎁 Бесплатный скан · осталось {int(trial_remaining)}", callback_data="start_scan"
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Лучшие сейчас", callback_data="radarbest")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 
 def radar_list_keyboard(items, *, mode: str, page: int, total: int, category_key: str | None = None) -> InlineKeyboardMarkup:
@@ -1045,16 +1122,23 @@ def radar_group_keyboard(group_key: str, items: list[tuple[str, int, int, int]])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def radar_product_keyboard(product_id: int, *, favorite: bool, listing_url: str | None = None) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = [[
-        InlineKeyboardButton(
+def radar_product_keyboard(
+    product_id: int, *, favorite: bool = False, listing_url: str | None = None,
+    preview_mode: str | None = None,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if preview_mode is None:
+        rows.append([InlineKeyboardButton(
             text="★ Убрать из Моего Radar" if favorite else "⭐ Добавить в Мой Radar",
             callback_data=f"radarfav:{int(product_id)}",
-        )
-    ]]
+        )])
     if listing_url:
         rows.append([InlineKeyboardButton(text="🔗 Открыть актуальное объявление", url=listing_url)])
-    rows.append([InlineKeyboardButton(text="⬅️ DT Radar", callback_data="radar_home")])
+    if preview_mode is not None:
+        rows.append([InlineKeyboardButton(text="💎 Открыть полный DT Radar", callback_data="subscription")])
+        rows.append([InlineKeyboardButton(text="⬅️ К бесплатным находкам", callback_data=f"radarlist:{preview_mode}:0")])
+    else:
+        rows.append([InlineKeyboardButton(text="⬅️ DT Radar", callback_data="radar_home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -3074,6 +3158,145 @@ async def enrich_page_view_counts(
     return len(targets), updated, failed
 
 
+async def enrich_autoscan_view_counts(
+    parser: KleinanzeigenParser,
+    items: list[ParsedListing],
+    live: CategoryLiveProgress | None = None,
+) -> tuple[int, int, int]:
+    """Low-pressure exact view collection for Radar AutoScan.
+
+    The public official counter endpoint is queried for every matched listing. Values
+    parsed from its explicit ``numVisits`` payload are exact and can be ranked directly.
+    Only a bounded set of endpoint misses is sent to the heavier verified browser path.
+    Rows that cannot be freshly verified are cleared, so stale counters never enter the
+    AutoScan TOP-12. This keeps every Radar-promoted counter exact without opening a
+    Chromium fallback for hundreds of weak listings in each background category.
+    """
+    if not items:
+        return 0, 0, 0
+
+    unique = {item.external_id: item for item in items if item.url}
+    if not unique:
+        return 0, 0, 0
+
+    async with SessionLocal() as session:
+        result = await session.execute(select(Listing).where(Listing.external_id.in_(list(unique))))
+        rows = {row.external_id: row for row in result.scalars().all()}
+        targets = [unique[eid] for eid in rows if eid in unique]
+        previous_views = {eid: int(row.view_count or -1) for eid, row in rows.items()}
+
+    if not targets:
+        return 0, 0, 0
+
+    urls = [item.url for item in targets]
+    url_to_id = {item.url: item.external_id for item in targets}
+    total = len(urls)
+    base_ready = int(live.views_ready or 0) if live is not None else 0
+
+    async def direct_progress(done: int, _total: int) -> None:
+        if live is None:
+            return
+        live.views_ready = base_ready + min(total, max(0, int(done)))
+        if done == _total or (done > 0 and done % 50 == 0):
+            log.info(
+                "Radar AutoScan views direct category=%s checked=%s/%s",
+                live.category_name, min(total, int(done)), total,
+            )
+
+    direct_results = await parser.fetch_public_view_counts(
+        urls,
+        concurrency=max(2, min(12, VIEW_COUNT_CONCURRENCY)),
+        progress_cb=direct_progress,
+        traffic_priority="background",
+        browser_fallback=False,
+        direct_http_only=True,
+        accurate=False,
+        batch_size=80,
+        batch_pause_seconds=0.05,
+    )
+
+    unresolved = [url for url in urls if direct_results.get(url) is None or direct_results[url].views is None]
+    # Prefer browser recovery for listings that were historically strong, then preserve
+    # category-feed order for brand-new rows. The bounded recovery is a safety net, not a
+    # second full measurement pass.
+    original_index = {url: index for index, url in enumerate(urls)}
+    unresolved.sort(
+        key=lambda url: (
+            previous_views.get(url_to_id.get(url, ""), -1),
+            -original_index.get(url, 0),
+        ),
+        reverse=True,
+    )
+    fallback_urls = unresolved[:RADAR_AUTOSCAN_BROWSER_FALLBACK_LIMIT]
+    exact_fallback: dict[str, ViewCountResult] = {}
+    if fallback_urls:
+        async def fallback_progress(done: int, _total: int) -> None:
+            if live is None:
+                return
+            # The direct phase already completed every URL; this is recovery telemetry.
+            live.views_ready = base_ready + total
+            if done == _total:
+                log.info(
+                    "Radar AutoScan views fallback category=%s recovered_checked=%s/%s",
+                    live.category_name, int(done), len(fallback_urls),
+                )
+
+        exact_fallback = await fetch_exact_views_v438_compatible(
+            parser,
+            fallback_urls,
+            concurrency=max(1, min(2, VIEW_COUNT_CONCURRENCY)),
+            progress_cb=fallback_progress,
+            traffic_priority="background",
+        )
+
+    combined = dict(direct_results)
+    for url, result in exact_fallback.items():
+        if result.views is not None:
+            combined[url] = result
+
+    now = datetime.utcnow()
+    updated = 0
+    failed = 0
+    async with db_write_lock:
+        async with SessionLocal() as session:
+            db_result = await session.execute(
+                select(Listing).where(Listing.external_id.in_([item.external_id for item in targets]))
+            )
+            db_rows = {row.external_id: row for row in db_result.scalars().all()}
+            for url in urls:
+                external_id = url_to_id.get(url)
+                row = db_rows.get(external_id) if external_id else None
+                if row is None:
+                    continue
+                vr = combined.get(url)
+                if vr is None or vr.views is None:
+                    failed += 1
+                    row.view_count = None
+                    row.views_checked_at = now
+                    continue
+                old = row.view_count
+                row.view_count = int(vr.views)
+                row.views_checked_at = now
+                if old != row.view_count:
+                    session.add(ViewHistory(
+                        external_id=row.external_id,
+                        view_count=row.view_count,
+                        recorded_at=now,
+                    ))
+                updated += 1
+            await session.commit()
+
+    if live is not None:
+        live.views_ready = base_ready + total
+        live.views_failed += failed
+    log.info(
+        "Radar AutoScan views complete category=%s total=%s exact=%s unresolved=%s browser_recovery=%s/%s",
+        (live.category_name if live is not None else "autoscan"), total, updated, failed,
+        sum(1 for value in exact_fallback.values() if value.views is not None), len(fallback_urls),
+    )
+    return total, updated, failed
+
+
 async def refresh_view_counts(
     rows: list[Listing], message: Message | BotChatAdapter | None = None, *,
     force: bool = False, max_age_seconds: int | None = None,
@@ -3405,10 +3628,18 @@ async def radar_maintenance_scheduler() -> None:
             await asyncio.sleep(300)
 
 
-def _radar_autoscan_categories() -> list:
-    """All real selectable leaf categories; group-root aliases are intentionally excluded."""
-    return [cat for cat in CATEGORIES.values() if not bool(getattr(cat, "is_group", False))]
+def _radar_autoscan_category_allowed(cat) -> bool:
+    """Return True only for product-oriented leaves eligible for automatic Radar seeding."""
+    if cat is None or bool(getattr(cat, "is_group", False)):
+        return False
+    if str(getattr(cat, "group", "")) in RADAR_AUTOSCAN_EXCLUDED_GROUPS:
+        return False
+    return str(getattr(cat, "key", "")) not in RADAR_AUTOSCAN_EXCLUDED_CATEGORY_KEYS
 
+
+def _radar_autoscan_categories() -> list:
+    """Product-oriented leaf categories only; normal parser categories are untouched."""
+    return [cat for cat in CATEGORIES.values() if _radar_autoscan_category_allowed(cat)]
 
 def _radar_autoscan_now_iso() -> str:
     return datetime.now(MOSCOW).replace(microsecond=0).isoformat()
@@ -3417,6 +3648,7 @@ def _radar_autoscan_now_iso() -> str:
 def _radar_autoscan_default_state() -> dict:
     categories = _radar_autoscan_categories()
     return {
+        "policy_version": RADAR_AUTOSCAN_POLICY_VERSION,
         "daily_enabled": False,
         "daily_time": RADAR_AUTOSCAN_DEFAULT_TIME,
         "skip_daily_if_completed_today": True,
@@ -3433,7 +3665,10 @@ def _radar_autoscan_default_state() -> dict:
         "total": len(categories),
         "processed": 0,
         "successful": 0,
-        "failed": 0,
+        "needs_review": 0,
+        "system_errors": 0,
+        "skipped_nonproduct": 0,
+        "failed": 0,  # compatibility total = needs_review + system_errors
         "pages_verified": 0,
         "listings_seen": 0,
         "new_listings": 0,
@@ -3453,8 +3688,8 @@ def _radar_autoscan_default_state() -> dict:
 
 def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
     state = _radar_autoscan_default_state()
-    if isinstance(raw, dict):
-        state.update(raw)
+    raw_state = raw if isinstance(raw, dict) else {}
+    state.update(raw_state)
     if str(state.get("daily_time") or "") not in RADAR_AUTOSCAN_TIME_CHOICES:
         state["daily_time"] = RADAR_AUTOSCAN_DEFAULT_TIME
     if str(state.get("status") or "idle") not in {"idle", "running", "paused"}:
@@ -3464,31 +3699,69 @@ def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
     state["stop_requested"] = bool(state.get("stop_requested"))
     state["waiting_for_users"] = bool(state.get("waiting_for_users"))
     state["history"] = list(state.get("history") or [])[:RADAR_AUTOSCAN_HISTORY_LIMIT]
+
     failures = []
+    inferred_review = 0
+    inferred_system = 0
     for item in list(state.get("failed_categories") or []):
         if not isinstance(item, dict):
             continue
         key = str(item.get("key") or "")
         if key not in CATEGORIES or bool(getattr(CATEGORIES[key], "is_group", False)):
             continue
+        kind = str(item.get("kind") or "").strip().lower()
+        if kind not in {"partial", "system"}:
+            # Legacy v4.11.1-v4.11.4 entries did not carry a kind. A category with
+            # parser evidence/verified pages is a partial crawl; zero-page generic
+            # execution failures are treated as system errors.
+            reason = str(item.get("reason") or "partial").lower()
+            system_hint = any(token in reason for token in ("traceback", "exception", "ошибка выполнения", "runtimeerror"))
+            kind = "system" if system_hint and int(item.get("verified_pages") or 0) <= 0 else "partial"
+        if kind == "system":
+            inferred_system += 1
+        else:
+            inferred_review += 1
         failures.append({
             "key": key,
             "name": str(item.get("name") or CATEGORIES[key].name)[:160],
             "reason": str(item.get("reason") or "partial")[:300],
             "verified_pages": max(0, int(item.get("verified_pages") or 0)),
+            "kind": kind,
         })
     state["failed_categories"] = failures[:500]
     state["retry_parent_total"] = max(0, int(state.get("retry_parent_total") or 0))
     state["retry_parent_successful"] = max(0, int(state.get("retry_parent_successful") or 0))
     state["retry_parent_round_id"] = str(state.get("retry_parent_round_id") or "")[:80]
-    keys = [str(x) for x in (state.get("category_keys") or []) if str(x) in CATEGORIES and not CATEGORIES[str(x)].is_group]
+
+    # Existing in-progress v4.11.4 rounds keep their exact old key order so a Railway
+    # deploy cannot corrupt current_index/counters midway through a persisted round.
+    # Every new/retry round uses policy v2 and only product-oriented categories.
+    stored_policy = max(0, int(raw_state.get("policy_version") or 0))
+    legacy_active = stored_policy < RADAR_AUTOSCAN_POLICY_VERSION and str(state.get("status") or "idle") in {"running", "paused"} and bool(raw_state.get("category_keys"))
+    if legacy_active:
+        keys = [str(x) for x in (state.get("category_keys") or []) if str(x) in CATEGORIES and not CATEGORIES[str(x)].is_group]
+        state["legacy_policy_round"] = True
+        state["policy_version"] = stored_policy
+    else:
+        keys = [str(x) for x in (state.get("category_keys") or []) if str(x) in CATEGORIES and _radar_autoscan_category_allowed(CATEGORIES[str(x)])]
+        state["legacy_policy_round"] = False
+        state["policy_version"] = RADAR_AUTOSCAN_POLICY_VERSION
     if not keys:
         keys = [cat.key for cat in _radar_autoscan_categories()]
     state["category_keys"] = keys
     state["total"] = len(keys)
     state["current_index"] = max(0, min(len(keys), int(state.get("current_index") or 0)))
-    for key in ("processed", "successful", "failed", "pages_verified", "listings_seen", "new_listings", "radar_saved"):
+
+    for key in ("processed", "successful", "failed", "skipped_nonproduct", "pages_verified", "listings_seen", "new_listings", "radar_saved"):
         state[key] = max(0, int(state.get(key) or 0))
+    # New counters are authoritative when present; otherwise infer legacy failures.
+    if "needs_review" in raw_state or "system_errors" in raw_state:
+        state["needs_review"] = max(0, int(state.get("needs_review") or 0))
+        state["system_errors"] = max(0, int(state.get("system_errors") or 0))
+    else:
+        state["needs_review"] = inferred_review
+        state["system_errors"] = inferred_system
+    state["failed"] = max(state["failed"], state["needs_review"] + state["system_errors"])
     return state
 
 
@@ -3536,6 +3809,7 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
     new_state = _radar_autoscan_default_state()
     new_state.update(keep)
     new_state.update({
+        "policy_version": RADAR_AUTOSCAN_POLICY_VERSION,
         "status": "running",
         "stop_requested": False,
         "waiting_for_users": False,
@@ -3549,6 +3823,9 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
         "total": len(keys),
         "processed": 0,
         "successful": 0,
+        "needs_review": 0,
+        "system_errors": 0,
+        "skipped_nonproduct": 0,
         "failed": 0,
         "pages_verified": 0,
         "listings_seen": 0,
@@ -3570,7 +3847,7 @@ def _radar_autoscan_retry_round(state: dict) -> dict | None:
     keys: list[str] = []
     for item in failures:
         key = str(item.get("key") or "")
-        if key in CATEGORIES and not bool(getattr(CATEGORIES[key], "is_group", False)) and key not in keys:
+        if key in CATEGORIES and _radar_autoscan_category_allowed(CATEGORIES[key]) and key not in keys:
             keys.append(key)
     if not keys:
         return None
@@ -3589,6 +3866,7 @@ def _radar_autoscan_retry_round(state: dict) -> dict | None:
     coverage_total = int(last.get("coverage_total") or last.get("total") or len(_radar_autoscan_categories()))
     coverage_success = int(last.get("coverage_successful") or last.get("successful") or 0)
     new_state.update({
+        "policy_version": RADAR_AUTOSCAN_POLICY_VERSION,
         "status": "running",
         "stop_requested": False,
         "waiting_for_users": False,
@@ -3602,6 +3880,9 @@ def _radar_autoscan_retry_round(state: dict) -> dict | None:
         "total": len(keys),
         "processed": 0,
         "successful": 0,
+        "needs_review": 0,
+        "system_errors": 0,
+        "skipped_nonproduct": 0,
         "failed": 0,
         "pages_verified": 0,
         "listings_seen": 0,
@@ -3706,12 +3987,14 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         f"Статус: <b>{status_text}</b>\n"
         f"Режим круга: <b>{mode_label}</b>\n"
         f"Глубина: <b>{RADAR_AUTOSCAN_DEPTH} страниц на категорию</b>\n"
-        f"Категории: <b>{len(_radar_autoscan_categories())}</b> листовых категорий\n"
+        f"Категории: <b>{len(_radar_autoscan_categories())}</b> товарных категорий\n"
         f"Прогресс: <b>{processed}/{total} · {pct}%</b>\n"
         f"Сейчас: <b>{html.escape(current)}</b>\n\n"
         f"✅ Успешно: <b>{int(state.get('successful') or 0)}</b> · "
-        f"⚠️ ошибок: <b>{int(state.get('failed') or 0)}</b>\n"
-        f"📄 Подтверждено страниц: <b>{int(state.get('pages_verified') or 0)}</b>\n"
+        f"⚠️ допроверка: <b>{int(state.get('needs_review') or 0)}</b> · "
+        f"❌ системных: <b>{int(state.get('system_errors') or 0)}</b>\n"
+        + (f"⏭ Нетоварных пропущено: <b>{int(state.get('skipped_nonproduct') or 0)}</b>\n" if int(state.get("skipped_nonproduct") or 0) else "")
+        + f"📄 Подтверждено страниц: <b>{int(state.get('pages_verified') or 0)}</b>\n"
         f"🧾 Объявлений даты: <b>{int(state.get('listings_seen') or 0)}</b> · "
         f"новых: <b>{int(state.get('new_listings') or 0)}</b>\n"
         f"📡 Добавлено Radar-сигналов: <b>{int(state.get('radar_saved') or 0)}</b>\n\n"
@@ -3725,6 +4008,7 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
             f"<b>{int(last.get('page_coverage_pct') or 0)}% страниц от максимума</b>\n\n"
             if last else "\n"
         )
+        + ("⚠️ Текущий круг начат на старой политике 141 категорий. После его завершения/перезапуска новые круги используют только товарные категории.\n\n" if state.get("legacy_policy_round") else "")
         + "AutoScan низкоприоритетный: новый 15-страничный блок начинается только когда пользовательская очередь свободна."
     )
     return text, state
@@ -3741,7 +4025,7 @@ async def _radar_autoscan_errors_text(page: int = 0, per_page: int = 15) -> tupl
     total = len(failures)
     pages = max(1, (total + per_page - 1) // per_page)
     page = max(0, min(pages - 1, int(page or 0)))
-    lines = ["<b>⚠️ DT Radar · ошибки последнего круга</b>"]
+    lines = ["<b>⚠️ DT Radar · категории для допроверки</b>"]
     if not failures:
         legacy_failed = int(dict(state.get("last_summary") or {}).get("failed") or 0)
         if legacy_failed:
@@ -3755,12 +4039,15 @@ async def _radar_autoscan_errors_text(page: int = 0, per_page: int = 15) -> tupl
         reason = str(item.get("reason") or "partial").replace("\n", " ").strip()
         if len(reason) > 120:
             reason = reason[:117] + "…"
+        kind = str(item.get("kind") or "partial")
+        icon = "❌" if kind == "system" else "⚠️"
+        label = "системная" if kind == "system" else "допроверка"
         lines += [
             "",
-            f"<b>{idx}. {html.escape(str(item.get('name') or item.get('key') or '—'))}</b>",
-            f"📄 {int(item.get('verified_pages') or 0)}/{RADAR_AUTOSCAN_DEPTH} · {html.escape(reason)}",
+            f"<b>{icon} {idx}. {html.escape(str(item.get('name') or item.get('key') or '—'))}</b>",
+            f"📄 {int(item.get('verified_pages') or 0)}/{RADAR_AUTOSCAN_DEPTH} · {label} · {html.escape(reason)}",
         ]
-    lines += ["", f"Страница <b>{page + 1}/{pages}</b> · ошибок <b>{total}</b>"]
+    lines += ["", f"Страница <b>{page + 1}/{pages}</b> · проблемных категорий <b>{total}</b>"]
     return "\n".join(lines), state, page, pages
 
 
@@ -3776,7 +4063,7 @@ async def _radar_autoscan_history_text() -> str:
         lines += [
             "",
             f"<b>#{html.escape(str(item.get('round_id') or '—'))}</b> · {mode}",
-            f"✅ {int(item.get('coverage_successful') or item.get('successful') or 0)}/{int(item.get('coverage_total') or item.get('total') or 0)} · ⚠️ {int(item.get('failed') or 0)}",
+            f"✅ {int(item.get('coverage_successful') or item.get('successful') or 0)}/{int(item.get('coverage_total') or item.get('total') or 0)} · ⚠️ {int(item.get('needs_review') or 0)} · ❌ {int(item.get('system_errors') or 0)}",
             f"📊 {int(item.get('category_coverage_pct') or 0)}% кат. · {int(item.get('page_coverage_pct') or 0)}% стр. от max",
             f"📄 {int(item.get('pages_verified') or 0)} стр. · 🧾 {int(item.get('listings_seen') or 0)} объявлений",
             f"📡 Radar +{int(item.get('radar_saved') or 0)} · ⏱ {_human_duration(int(item.get('duration_seconds') or 0))}",
@@ -3790,7 +4077,10 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
     duration = _radar_autoscan_duration_seconds(str(state.get("started_at") or ""))
     run_total = int(state.get("total") or 0)
     run_successful = int(state.get("successful") or 0)
-    failed = int(state.get("failed") or 0)
+    needs_review = int(state.get("needs_review") or 0)
+    system_errors = int(state.get("system_errors") or 0)
+    failed = max(int(state.get("failed") or 0), needs_review + system_errors)
+    skipped_nonproduct = int(state.get("skipped_nonproduct") or 0)
     mode = str(state.get("mode") or "manual")
     retry_parent_total = int(state.get("retry_parent_total") or 0)
     retry_parent_successful = int(state.get("retry_parent_successful") or 0)
@@ -3819,6 +4109,9 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         "total": run_total,
         "processed": int(state.get("processed") or 0),
         "successful": run_successful,
+        "needs_review": needs_review,
+        "system_errors": system_errors,
+        "skipped_nonproduct": skipped_nonproduct,
         "failed": failed,
         "coverage_total": coverage_total,
         "coverage_successful": coverage_successful,
@@ -3851,15 +4144,23 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
     icon = "✅" if failed == 0 else "⚠️"
     if mode == "retry":
         headline = f"📡 <b>DT Radar — повтор ошибок завершён {icon}</b>"
-        scope_line = f"Повторено: <b>{run_successful}/{run_total}</b> успешно" + (f" · осталось ошибок <b>{failed}</b>" if failed else "")
+        scope_line = f"Повторено: <b>{run_successful}/{run_total}</b> успешно"
+        if needs_review:
+            scope_line += f" · ⚠️ допроверка <b>{needs_review}</b>"
+        if system_errors:
+            scope_line += f" · ❌ системных <b>{system_errors}</b>"
     else:
         headline = f"📡 <b>DT Radar — круг завершён {icon}</b>"
-        scope_line = f"Категории: <b>{run_successful}/{run_total}</b> успешно" + (f" · ошибок <b>{failed}</b>" if failed else "")
+        scope_line = f"Категории: <b>{run_successful}/{run_total}</b> успешно"
+        if needs_review:
+            scope_line += f" · ⚠️ допроверка <b>{needs_review}</b>"
+        if system_errors:
+            scope_line += f" · ❌ системных <b>{system_errors}</b>"
     notify_keyboard = None
     if failed_categories:
         notify_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"⚠️ Ошибки круга — {len(failed_categories)}", callback_data="adminradarauto:errors:0")],
-            [InlineKeyboardButton(text="🔁 Повторить только ошибки", callback_data="adminradarauto:retry")],
+            [InlineKeyboardButton(text=f"⚠️ Требуют внимания — {len(failed_categories)}", callback_data="adminradarauto:errors:0")],
+            [InlineKeyboardButton(text="🔁 Повторить проблемные", callback_data="adminradarauto:retry")],
         ])
     await _notify_radar_autoscan_admins(
         bot,
@@ -3867,6 +4168,7 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         + scope_line
         + f"\n📊 Покрытие категорий: <b>{coverage_successful}/{coverage_total} · {category_coverage_pct}%</b>"
         + f"\n📊 Страниц от максимума: <b>{page_coverage_pct}%</b> · <b>{coverage_pages_verified}/{coverage_total * RADAR_AUTOSCAN_DEPTH}</b>"
+        + (f"\n⏭ Нетоварных пропущено: <b>{skipped_nonproduct}</b>" if skipped_nonproduct else "")
         + f"\n📄 Подтверждено страниц в этом запуске: <b>{int(summary['pages_verified'])}</b>"
         + f"\n🧾 Объявлений даты: <b>{int(summary['listings_seen'])}</b> · новых <b>{int(summary['new_listings'])}</b>"
         + f"\n📡 Radar-сигналов: <b>+{int(summary['radar_saved'])}</b>"
@@ -3879,7 +4181,13 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
 
 
 async def _run_radar_autoscan_round(bot: Bot) -> None:
-    """Run/resume one persistent low-priority round until complete or paused."""
+    """Run/resume one persistent low-priority round until complete or paused.
+
+    v4.11.5 keeps one parser/http/browser session for the whole round instead of
+    constructing/closing Chromium context state 80+ times. The session is recycled only
+    after an unexpected system error; partial page/date evidence gets a clean browser
+    context plus bounded cooldown before the next category.
+    """
     state = await load_radar_autoscan_state()
     if state.get("status") != "running":
         return
@@ -3890,127 +4198,212 @@ async def _run_radar_autoscan_round(bot: Bot) -> None:
         state["target_date"] = datetime.now(MOSCOW).date().isoformat()
         state = await save_radar_autoscan_state(state)
 
-    while int(state.get("current_index") or 0) < total:
-        # Reload on every category boundary so admin Stop/Resume changes are observed.
-        state = await load_radar_autoscan_state()
-        if state.get("status") != "running":
-            return
-        if state.get("stop_requested"):
-            state["status"] = "paused"
-            state["stop_requested"] = False
-            state["waiting_for_users"] = False
-            state = await save_radar_autoscan_state(state)
-            await _notify_radar_autoscan_admins(
-                bot,
-                f"⏸ <b>DT Radar AutoScan остановлен</b>\n\n"
-                f"Прогресс сохранён: <b>{int(state.get('processed') or 0)}/{total}</b>. "
-                "Можно продолжить круг с сохранённого места.",
-            )
-            return
-
-        # User scans are always first. Do not start a fresh category while any
-        # foreground scan is running or queued. The current 15-page block is never
-        # killed mid-request; this preserves parser integrity and lets users start normally.
-        running, queued = await _radar_foreground_counts()
-        if running or queued:
-            if not state.get("waiting_for_users"):
-                state["waiting_for_users"] = True
-                state["current_category_name"] = "Ожидание пользовательских сканов"
+    parser = KleinanzeigenParser()
+    issue_streak = 0
+    try:
+        while int(state.get("current_index") or 0) < total:
+            # Reload on every category boundary so admin Stop/Resume changes are observed.
+            state = await load_radar_autoscan_state()
+            if state.get("status") != "running":
+                return
+            if state.get("stop_requested"):
+                state["status"] = "paused"
+                state["stop_requested"] = False
+                state["waiting_for_users"] = False
                 state = await save_radar_autoscan_state(state)
-                log.info("DT Radar AutoScan yielding to users running=%s queued=%s", running, queued)
-            await asyncio.sleep(5)
-            continue
-        if state.get("waiting_for_users"):
-            state["waiting_for_users"] = False
-            state = await save_radar_autoscan_state(state)
-
-        idx = int(state.get("current_index") or 0)
-        if idx >= total:
-            break
-        key = keys[idx]
-        cat = CATEGORIES.get(key)
-        if cat is None or bool(getattr(cat, "is_group", False)):
-            state["current_index"] = idx + 1
-            state["processed"] = int(state.get("processed") or 0) + 1
-            state["failed"] = int(state.get("failed") or 0) + 1
-            state.setdefault("failed_categories", []).append({
-                "key": str(key), "name": str(key), "reason": "категория недоступна", "verified_pages": 0
-            })
-            state = await save_radar_autoscan_state(state)
-            continue
-
-        state["current_category_key"] = cat.key
-        state["current_category_name"] = cat.name
-        state = await save_radar_autoscan_state(state)
-        log.info(
-            "DT Radar AutoScan category start round=%s index=%s/%s category=%s depth=%s target=%s",
-            state.get("round_id"), idx + 1, total, cat.name, RADAR_AUTOSCAN_DEPTH, state.get("target_date"),
-        )
-
-        result = None
-        radar_saved = 0
-        error_text = ""
-        await TRAFFIC.scan_job_started()
-        parser = KleinanzeigenParser()
-        parser_token = JOB_PARSER.set(parser)
-        try:
-            result = await scan_one_category(
-                parser, cat, RADAR_AUTOSCAN_USER_ID, RADAR_AUTOSCAN_DEPTH, str(state.get("target_date"))
-            )
-            if result.date_complete:
-                radar_saved = await record_autoscan_hot(
-                    str(state.get("round_id") or "round"), cat.key, result.matched_ids or []
+                await _notify_radar_autoscan_admins(
+                    bot,
+                    f"⏸ <b>DT Radar AutoScan остановлен</b>\n\n"
+                    f"Прогресс сохранён: <b>{int(state.get('processed') or 0)}/{total}</b>. "
+                    "Можно продолжить круг с сохранённого места.",
                 )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            error_text = str(exc)
-            log.exception("DT Radar AutoScan category failed round=%s category=%s", state.get("round_id"), cat.name)
-        finally:
-            JOB_PARSER.reset(parser_token)
+                return
+
+            # User scans are always first. Do not start a fresh category while any
+            # foreground scan is running or queued. A category already in progress is
+            # allowed to finish so parser integrity is never sacrificed.
+            running, queued = await _radar_foreground_counts()
+            if running or queued:
+                if not state.get("waiting_for_users"):
+                    state["waiting_for_users"] = True
+                    state["current_category_name"] = "Ожидание пользовательских сканов"
+                    state = await save_radar_autoscan_state(state)
+                    log.info("DT Radar AutoScan yielding to users running=%s queued=%s", running, queued)
+                await asyncio.sleep(5)
+                continue
+            if state.get("waiting_for_users"):
+                state["waiting_for_users"] = False
+                state = await save_radar_autoscan_state(state)
+
+            idx = int(state.get("current_index") or 0)
+            if idx >= total:
+                break
+            key = keys[idx]
+            cat = CATEGORIES.get(key)
+            if cat is None or bool(getattr(cat, "is_group", False)):
+                state["current_index"] = idx + 1
+                state["processed"] = int(state.get("processed") or 0) + 1
+                state["system_errors"] = int(state.get("system_errors") or 0) + 1
+                state["failed"] = int(state.get("failed") or 0) + 1
+                state.setdefault("failed_categories", []).append({
+                    "key": str(key), "name": str(key), "reason": "категория недоступна",
+                    "verified_pages": 0, "kind": "system",
+                })
+                state = await save_radar_autoscan_state(state)
+                issue_streak += 1
+                await asyncio.sleep(min(RADAR_AUTOSCAN_MAX_BACKOFF_SECONDS, RADAR_AUTOSCAN_SYSTEM_BACKOFF_BASE_SECONDS * (2 ** min(2, issue_streak - 1))))
+                continue
+
+            # A persisted v4.11.4 round may still contain all 141 categories. Do not
+            # waste new traffic on the remaining non-product/service leaves after deploy;
+            # skip them cleanly without calling the parser. Fresh rounds contain only the
+            # product policy set from the start.
+            if not _radar_autoscan_category_allowed(cat):
+                state["current_index"] = idx + 1
+                state["processed"] = int(state.get("processed") or 0) + 1
+                state["skipped_nonproduct"] = int(state.get("skipped_nonproduct") or 0) + 1
+                state["current_category_key"] = ""
+                state["current_category_name"] = ""
+                state = await save_radar_autoscan_state(state)
+                log.info(
+                    "DT Radar AutoScan skipped non-product category round=%s index=%s/%s category=%s group=%s",
+                    state.get("round_id"), idx + 1, total, cat.name, cat.group,
+                )
+                await asyncio.sleep(0)
+                continue
+
+            state["current_category_key"] = cat.key
+            state["current_category_name"] = cat.name
+            state = await save_radar_autoscan_state(state)
+            log.info(
+                "DT Radar AutoScan category start round=%s index=%s/%s category=%s depth=%s target=%s parser_reused=True",
+                state.get("round_id"), idx + 1, total, cat.name, RADAR_AUTOSCAN_DEPTH, state.get("target_date"),
+            )
+
+            result = None
+            radar_saved = 0
+            error_text = ""
+            failure_kind = ""
+            recycle_parser = False
+            await TRAFFIC.scan_job_started()
+            parser.prepare_category_scan()
+            parser_token = JOB_PARSER.set(parser)
             try:
-                await parser.close()
+                result = await scan_one_category(
+                    parser, cat, RADAR_AUTOSCAN_USER_ID, RADAR_AUTOSCAN_DEPTH, str(state.get("target_date"))
+                )
+                if result.date_complete:
+                    radar_saved = await record_autoscan_hot(
+                        str(state.get("round_id") or "round"), cat.key, result.matched_ids or []
+                    )
+                else:
+                    failure_kind = "partial"
+                    error_text = result.reason or "нужно повторно подтвердить категорию"
+            except asyncio.CancelledError:
+                raise
+            except TemporaryAccessError as exc:
+                # Public-site pressure is not a code/system crash. Keep it in the retry
+                # list and cool down before touching the next category.
+                failure_kind = "partial"
+                error_text = str(exc)
+                log.warning(
+                    "DT Radar AutoScan temporary access category=%s round=%s error=%s",
+                    cat.name, state.get("round_id"), error_text,
+                )
+            except (TimeoutError, asyncio.TimeoutError) as exc:
+                failure_kind = "partial"
+                error_text = f"временный таймаут: {exc}"[:300]
+                log.warning(
+                    "DT Radar AutoScan timeout category=%s round=%s error=%s",
+                    cat.name, state.get("round_id"), error_text,
+                )
+            except Exception as exc:
+                failure_kind = "system"
+                error_text = str(exc) or exc.__class__.__name__
+                recycle_parser = True
+                log.exception("DT Radar AutoScan system failure round=%s category=%s", state.get("round_id"), cat.name)
             finally:
+                JOB_PARSER.reset(parser_token)
                 await TRAFFIC.scan_job_finished()
 
-        state = await load_radar_autoscan_state()
-        # A Stop pressed during the category is honored after this bookkeeping.
-        state["current_index"] = idx + 1
-        state["processed"] = int(state.get("processed") or 0) + 1
-        if result is not None:
-            state["pages_verified"] = int(state.get("pages_verified") or 0) + min(
-                RADAR_AUTOSCAN_DEPTH, max(0, int(result.verified_pages or 0))
-            )
-            state["listings_seen"] = int(state.get("listings_seen") or 0) + max(0, int(result.today_seen or 0))
-            state["new_listings"] = int(state.get("new_listings") or 0) + max(0, int(result.new_count or 0))
-            state["radar_saved"] = int(state.get("radar_saved") or 0) + max(0, int(radar_saved or 0))
-            if result.date_complete:
+            state = await load_radar_autoscan_state()
+            # A Stop pressed during the category is honored after this bookkeeping.
+            state["current_index"] = idx + 1
+            state["processed"] = int(state.get("processed") or 0) + 1
+            if result is not None:
+                state["pages_verified"] = int(state.get("pages_verified") or 0) + min(
+                    RADAR_AUTOSCAN_DEPTH, max(0, int(result.verified_pages or 0))
+                )
+                state["listings_seen"] = int(state.get("listings_seen") or 0) + max(0, int(result.today_seen or 0))
+                state["new_listings"] = int(state.get("new_listings") or 0) + max(0, int(result.new_count or 0))
+                state["radar_saved"] = int(state.get("radar_saved") or 0) + max(0, int(radar_saved or 0))
+
+            if result is not None and result.date_complete:
                 state["successful"] = int(state.get("successful") or 0) + 1
+                issue_streak = 0
             else:
                 state["failed"] = int(state.get("failed") or 0) + 1
-                error_text = result.reason or "partial"
+                if failure_kind == "system":
+                    state["system_errors"] = int(state.get("system_errors") or 0) + 1
+                else:
+                    failure_kind = "partial"
+                    state["needs_review"] = int(state.get("needs_review") or 0) + 1
                 state.setdefault("failed_categories", []).append({
-                    "key": cat.key, "name": cat.name, "reason": error_text,
-                    "verified_pages": min(RADAR_AUTOSCAN_DEPTH, max(0, int(result.verified_pages or 0))),
+                    "key": cat.key,
+                    "name": cat.name,
+                    "reason": error_text or "нужно повторно подтвердить категорию",
+                    "verified_pages": min(
+                        RADAR_AUTOSCAN_DEPTH,
+                        max(0, int(result.verified_pages or 0)) if result is not None else 0,
+                    ),
+                    "kind": failure_kind,
                 })
-        else:
-            state["failed"] = int(state.get("failed") or 0) + 1
-            state.setdefault("failed_categories", []).append({
-                "key": cat.key, "name": cat.name, "reason": error_text or "ошибка выполнения", "verified_pages": 0,
-            })
-        log.info(
-            "DT Radar AutoScan category finish round=%s index=%s/%s category=%s complete=%s radar_saved=%s error=%s",
-            state.get("round_id"), idx + 1, total, cat.name,
-            bool(result and result.date_complete), radar_saved, error_text[:240],
-        )
-        state["current_category_key"] = ""
-        state["current_category_name"] = ""
-        state = await save_radar_autoscan_state(state)
-        await asyncio.sleep(0)
+                issue_streak += 1
 
-    state = await load_radar_autoscan_state()
-    if state.get("status") == "running" and int(state.get("current_index") or 0) >= total:
-        await _radar_autoscan_finish_round(bot, state)
+            log.info(
+                "DT Radar AutoScan category finish round=%s index=%s/%s category=%s complete=%s radar_saved=%s kind=%s error=%s",
+                state.get("round_id"), idx + 1, total, cat.name,
+                bool(result and result.date_complete), radar_saved, failure_kind or "ok", error_text[:240],
+            )
+            state["current_category_key"] = ""
+            state["current_category_name"] = ""
+            state = await save_radar_autoscan_state(state)
+
+            if result is not None and not result.date_complete and not recycle_parser:
+                # Keep the long-lived HTTP client/cookies, but drop any bad browser page
+                # verdict before the next category. The parser itself stays reusable.
+                try:
+                    await parser.reset_scan_browser_context()
+                except Exception:
+                    log.debug("DT Radar AutoScan browser context reset failed", exc_info=True)
+
+            if recycle_parser:
+                try:
+                    await parser.close()
+                except Exception:
+                    log.debug("DT Radar AutoScan parser close during recycle failed", exc_info=True)
+                parser = KleinanzeigenParser()
+                log.warning("DT Radar AutoScan parser recycled after system error category=%s", cat.name)
+
+            if failure_kind:
+                base = RADAR_AUTOSCAN_SYSTEM_BACKOFF_BASE_SECONDS if failure_kind == "system" else RADAR_AUTOSCAN_PARTIAL_BACKOFF_BASE_SECONDS
+                cooldown = min(RADAR_AUTOSCAN_MAX_BACKOFF_SECONDS, base * (2 ** min(3, max(0, issue_streak - 1))))
+                log.info(
+                    "DT Radar AutoScan cooldown kind=%s streak=%s seconds=%.1f category=%s",
+                    failure_kind, issue_streak, cooldown, cat.name,
+                )
+                await asyncio.sleep(cooldown)
+            else:
+                await asyncio.sleep(RADAR_AUTOSCAN_SUCCESS_GAP_SECONDS)
+
+        state = await load_radar_autoscan_state()
+        if state.get("status") == "running" and int(state.get("current_index") or 0) >= total:
+            await _radar_autoscan_finish_round(bot, state)
+    finally:
+        try:
+            await parser.close()
+        except Exception:
+            log.debug("DT Radar AutoScan persistent parser close failed", exc_info=True)
 
 
 async def radar_autoscan_scheduler(bot: Bot) -> None:
@@ -4049,7 +4442,7 @@ async def radar_autoscan_scheduler(bot: Bot) -> None:
                                 await _notify_radar_autoscan_admins(
                                     bot,
                                     f"📡 <b>DT Radar — ежедневный круг запущен</b>\n\n"
-                                    f"{len(current.get('category_keys') or [])} категорий × {RADAR_AUTOSCAN_DEPTH} страниц. "
+                                    f"{len(current.get('category_keys') or [])} товарных категорий × {RADAR_AUTOSCAN_DEPTH} страниц. "
                                     "Пользовательские сканы имеют приоритет.",
                                 )
                                 continue
@@ -6359,9 +6752,14 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 live.today_seen = today_seen
                 live.page_limit = depth
             try:
-                _, _, failed_views = await enrich_page_view_counts(
-                    parser, list(deferred_view_items.values()), live
-                )
+                if user_id == RADAR_AUTOSCAN_USER_ID:
+                    _, _, failed_views = await enrich_autoscan_view_counts(
+                        parser, list(deferred_view_items.values()), live
+                    )
+                else:
+                    _, _, failed_views = await enrich_page_view_counts(
+                        parser, list(deferred_view_items.values()), live
+                    )
                 view_failures += failed_views
             except Exception:
                 # A view-threshold result will naturally exclude rows without a
@@ -8376,9 +8774,9 @@ def admin_radar_autoscan_keyboard(state: dict) -> InlineKeyboardMarkup:
         last_failed = int(last.get("failed") or 0)
         failure_details = [x for x in list(last.get("failed_categories") or []) if isinstance(x, dict)]
         if last_failed:
-            rows.append([InlineKeyboardButton(text=f"⚠️ Ошибки последнего круга: {last_failed}", callback_data="adminradarauto:errors:0")])
+            rows.append([InlineKeyboardButton(text=f"⚠️ Требуют внимания: {last_failed}", callback_data="adminradarauto:errors:0")])
         if failure_details:
-            rows.append([InlineKeyboardButton(text="🔁 Повторить только ошибки", callback_data="adminradarauto:retry")])
+            rows.append([InlineKeyboardButton(text="🔁 Повторить проблемные", callback_data="adminradarauto:retry")])
     rows.append([InlineKeyboardButton(
         text=f"🔄 Ежедневный автокруг: {'ВКЛ' if daily_enabled else 'ВЫКЛ'}",
         callback_data="adminradarauto:daily",
@@ -8407,7 +8805,7 @@ def admin_radar_autoscan_errors_keyboard(state: dict, page: int, pages: int) -> 
     if nav:
         rows.append(nav)
     if _radar_autoscan_failure_list(state) and str(state.get("status") or "idle") == "idle":
-        rows.append([InlineKeyboardButton(text="🔁 Повторить только ошибки", callback_data="adminradarauto:retry")])
+        rows.append([InlineKeyboardButton(text="🔁 Повторить проблемные", callback_data="adminradarauto:retry")])
     rows.append([InlineKeyboardButton(text="⬅️ Radar AutoScan", callback_data="adminradarauto")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -8737,6 +9135,8 @@ class ActivityAccessMiddleware(BaseMiddleware):
             public_commands = ("/start", "/menu", "/my_scans", "/admin", "/subscription", "/help", "/language")
             if text.startswith(public_commands):
                 return await handler(event, data)
+            if text.startswith("/radar") and free_radar_preview_allowed(uid):
+                return await handler(event, data)
             if trial.eligible and text.startswith(("/new_scan", "/categories", "/settings")):
                 return await handler(event, data)
             if text.startswith("/stop") and read_only_history_allowed(uid):
@@ -8768,6 +9168,12 @@ class ActivityAccessMiddleware(BaseMiddleware):
             if is_banned_cached(uid):
                 await event.answer("Доступ заблокирован", show_alert=True)
                 return None
+
+            if free_radar_preview_allowed(uid):
+                radar_public_exact = {"radar_home", "radarbest", "radar_locked"}
+                radar_public_prefixes = ("radar_locked:", "radarlist:", "radarpreviewitem:")
+                if callback_data in radar_public_exact or callback_data.startswith(radar_public_prefixes):
+                    return await handler(event, data)
 
             readonly_exact = {
                 "home", "post_home", "my_scans", "archive_my_scans", "archive_noop", "queue_status",
@@ -9918,7 +10324,7 @@ async def admin_radar_autoscan_retry_handler(callback: CallbackQuery) -> None:
             return
         state = await save_radar_autoscan_state(retry_state)
     _radar_autoscan_wakeup.set()
-    await callback.answer(f"Повторяю только ошибки: {len(state.get('category_keys') or [])}")
+    await callback.answer(f"Повторяю проблемные категории: {len(state.get('category_keys') or [])}")
     text, state = await _radar_autoscan_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
@@ -11787,8 +12193,18 @@ def _radar_added_label(value: datetime | None) -> str:
         return "давно"
 
 
-async def _radar_home_text() -> str:
+async def _radar_home_text(user_id: int | None = None) -> str:
     stats = await radar_stats()
+    full = bool(user_id is not None and allowed(int(user_id)))
+    if not full:
+        return (
+            "📡 <b>DT Radar</b>\n\n"
+            "Посмотри, как Radar отбирает сильные товары из тысяч объявлений.\n\n"
+            f"🎁 <b>Бесплатно:</b> первые {FREE_RADAR_PREVIEW_LIMIT} находок в каждом режиме «Лучшие сейчас».\n"
+            "🔒 Поиск, Категории, Мой Radar и полные ленты открываются с подпиской.\n\n"
+            f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих · 🚀 <b>{stats.rising}</b> набирают.\n\n"
+            "⭐ <b>DT Score</b> показывает силу каждого товара."
+        )
     return (
         "📡 <b>DT Radar</b>\n\n"
         "Найди сильные товары без лишней сложности. Выбери, что хочешь сделать:\n\n"
@@ -11801,10 +12217,18 @@ async def _radar_home_text() -> str:
     )
 
 
-async def _radar_list_payload(user_id: int, mode: str, page: int, category_key: str | None = None):
-    rows, total = await list_radar_products(
-        mode=mode, category_key=category_key, page=page, user_id=user_id
-    )
+async def _radar_list_payload(
+    user_id: int, mode: str, page: int, category_key: str | None = None, *, preview: bool = False,
+):
+    if preview:
+        page = 0
+        rows, total = await list_radar_products(
+            mode=mode, category_key=None, page=0, page_size=FREE_RADAR_PREVIEW_LIMIT, user_id=None
+        )
+    else:
+        rows, total = await list_radar_products(
+            mode=mode, category_key=category_key, page=page, user_id=user_id
+        )
     titles = {
         "hot": "🔥 Горячие сейчас",
         "rising": "🚀 Набирают обороты",
@@ -11822,7 +12246,14 @@ async def _radar_list_payload(user_id: int, mode: str, page: int, category_key: 
     else:
         heading = titles.get(mode, "📡 DT Radar")
     lines = [f"<b>{html.escape(heading)}</b>", ""]
-    if category_key:
+    if preview:
+        shown = min(len(rows), FREE_RADAR_PREVIEW_LIMIT)
+        lines += [
+            f"🎁 <b>Бесплатный просмотр: {shown}/{FREE_RADAR_PREVIEW_LIMIT}</b>",
+            "Это реальные актуальные находки из полной базы DT Radar.",
+            "",
+        ]
+    elif category_key:
         if mode == "category_best":
             lines += [
                 "🔥 Сортировка: <b>сначала лучшие по DT Score</b>.",
@@ -11838,14 +12269,14 @@ async def _radar_list_payload(user_id: int, mode: str, page: int, category_key: 
     if not rows:
         lines.append("Пока здесь нет товаров. База пополняется автоматически после завершённых сканов и AI-анализа.")
     else:
-        start = page * RADAR_PAGE_SIZE
-        for index, product in enumerate(rows, start + 1):
+        start_index = 0 if preview else page * RADAR_PAGE_SIZE
+        for index, product in enumerate(rows, start_index + 1):
             icon = RADAR_STATUS_ICON.get(str(product.status or ""), "📡")
             cat = CATEGORIES.get(str(product.category_key or ""))
             cat_name = cat.name if cat is not None else str(product.category_key or "—")
             freshness = (
                 _radar_added_label(product.first_radar_at)
-                if category_key
+                if category_key and not preview
                 else _radar_freshness(product.last_signal_at)
             )
             lines.append(
@@ -11855,6 +12286,18 @@ async def _radar_list_payload(user_id: int, mode: str, page: int, category_key: 
                 f"🕐 <b>{html.escape(freshness)}</b> · "
                 f"🔁 сигналов: <b>{int(product.signal_count or 0)}</b> · объявлений: <b>{int(product.listing_count or 0)}</b>"
             )
+    if preview:
+        hidden = max(0, int(total) - len(rows))
+        if hidden:
+            lines += [
+                "",
+                f"🔒 Ещё <b>{hidden}</b> товаров в этом режиме доступны в полном DT Radar.",
+                "Полный доступ открывает все результаты, 🔎 Поиск, 🗂 Категории и ⭐ Мой Radar.",
+            ]
+        trial = await get_trial_status(user_id)
+        return "\n\n".join(lines), radar_preview_list_keyboard(
+            rows, mode=mode, total=total, trial_remaining=(trial.remaining if trial.eligible else 0)
+        )
     if total:
         pages = max(1, (total + RADAR_PAGE_SIZE - 1) // RADAR_PAGE_SIZE)
         lines += ["", f"Страница <b>{page + 1}/{pages}</b> · всего <b>{total}</b>"]
@@ -11863,11 +12306,11 @@ async def _radar_list_payload(user_id: int, mode: str, page: int, category_key: 
     )
 
 
-async def _radar_product_payload(user_id: int, product_id: int):
+async def _radar_product_payload(user_id: int, product_id: int, *, preview_mode: str | None = None):
     product, listing, snapshots = await get_radar_product(product_id)
     if product is None:
         return None, None
-    favorite = await is_radar_favorite(user_id, product_id)
+    favorite = False if preview_mode is not None else await is_radar_favorite(user_id, product_id)
     status = RADAR_STATUS_LABEL.get(str(product.status or ""), str(product.status or "—"))
     status_icon = RADAR_STATUS_ICON.get(str(product.status or ""), "📡")
     cat = CATEGORIES.get(str(product.category_key or ""))
@@ -11908,7 +12351,18 @@ async def _radar_product_payload(user_id: int, product_id: int):
                 f"{html.escape(RADAR_TYPE_LABEL.get(str(snap.opportunity_type or ''), str(snap.stage or 'signal')))}"
             )
     listing_url = str(listing.url) if listing is not None and listing.url else None
-    return "\n".join(lines), radar_product_keyboard(product_id, favorite=favorite, listing_url=listing_url)
+    if preview_mode is not None:
+        lines += ["", "🎁 <b>Бесплатная находка DT Radar</b> · полный доступ открывает всю базу, поиск и категории."]
+    return "\n".join(lines), radar_product_keyboard(
+        product_id, favorite=favorite, listing_url=listing_url, preview_mode=preview_mode
+    )
+
+
+async def _radar_preview_product_allowed(product_id: int, mode: str) -> bool:
+    if mode not in {"hot", "rising", "ai"}:
+        return False
+    rows, _total = await list_radar_products(mode=mode, page=0, page_size=FREE_RADAR_PREVIEW_LIMIT)
+    return any(int(product.id) == int(product_id) for product in rows)
 
 
 async def _radar_search_payload(query: str, page: int = 0):
@@ -11934,17 +12388,34 @@ async def _radar_search_payload(query: str, page: int = 0):
     return "\n\n".join(lines), radar_search_keyboard(rows, page=page, total=total)
 
 
-@dp.callback_query(F.data == "radar_locked")
+@dp.callback_query(F.data.startswith("radar_locked"))
 async def radar_locked(callback: CallbackQuery) -> None:
+    if allowed(callback.from_user.id):
+        await callback.answer("Полный DT Radar уже открыт ✅")
+        await _edit_or_answer(
+            callback.message, await _radar_home_text(callback.from_user.id),
+            reply_markup=radar_home_keyboard(callback.from_user.id),
+        )
+        return
     stats = await radar_stats()
     await callback.answer()
+    feature = ""
+    if ":" in str(callback.data or ""):
+        feature = str(callback.data or "").split(":", 1)[1]
+    labels = {
+        "search": "🔎 Поиск",
+        "categories": "🗂 Категории",
+        "favorites": "⭐ Мой Radar",
+        "records": "🏆 Рекорды Radar",
+    }
+    title = labels.get(feature, "Полный DT Radar")
     text = (
-        "📡 <b>DT Radar</b>\n\n"
-        "Единая накопительная база сильных товаров DT Parser. Рейтинг товаров обновляется, история не удаляется.\n\n"
-        f"📦 Уже в базе: <b>{stats.total}</b>\n"
-        f"🔥 Горячих сейчас: <b>{stats.hot}</b>\n"
-        f"🧠 AI Picks: <b>{stats.ai_picks}</b>\n\n"
-        "🔒 Полный список, рейтинги, категории и Мой Radar доступны по активной подписке."
+        f"🔒 <b>{html.escape(title)}</b>\n\n"
+        f"Эта функция доступна в полном DT Radar. Бесплатно можно посмотреть первые <b>{FREE_RADAR_PREVIEW_LIMIT}</b> "
+        "реальных находок в каждом режиме «Лучшие сейчас».\n\n"
+        f"📦 В Radar уже: <b>{stats.total}</b> товаров\n"
+        f"🔥 Горячих: <b>{stats.hot}</b> · 🚀 Набирают: <b>{stats.rising}</b> · 🧠 AI Picks: <b>{stats.ai_picks}</b>\n\n"
+        "💎 Полный доступ открывает все результаты, поиск, категории, сохранения и историю Radar."
     )
     await _edit_or_answer(callback.message, text, reply_markup=radar_locked_keyboard())
 
@@ -11955,27 +12426,45 @@ async def radar_home(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     # Score cooling is maintained hourly in the background. Opening Radar stays a
     # small indexed read even after the accumulated base grows very large.
-    await _edit_or_answer(callback.message, await _radar_home_text(), reply_markup=radar_home_keyboard())
+    await _edit_or_answer(
+        callback.message, await _radar_home_text(callback.from_user.id),
+        reply_markup=radar_home_keyboard(callback.from_user.id),
+    )
 
 
 @dp.message(Command("radar"))
 async def radar_command(message: Message) -> None:
-    await message.answer(await _radar_home_text(), parse_mode=ParseMode.HTML, reply_markup=radar_home_keyboard())
+    await message.answer(
+        await _radar_home_text(message.from_user.id), parse_mode=ParseMode.HTML,
+        reply_markup=radar_home_keyboard(message.from_user.id),
+    )
 
 
 @dp.callback_query(F.data == "radarbest")
 async def radar_best_handler(callback: CallbackQuery) -> None:
     stats = await radar_stats()
+    full = allowed(callback.from_user.id)
     await callback.answer()
-    text = (
-        "🔥 <b>Лучшие сейчас</b>\n\n"
-        "Выбери, какие сильные товары хочешь посмотреть:\n\n"
-        f"🔥 Горячие: <b>{stats.hot}</b>\n"
-        f"🚀 Набирают: <b>{stats.rising}</b>\n"
-        f"🧠 AI Picks: <b>{stats.ai_picks}</b>\n\n"
-        "🏆 Рекорды Radar оставлены ниже как дополнительная история."
-    )
-    await _edit_or_answer(callback.message, text, reply_markup=radar_best_keyboard())
+    if full:
+        text = (
+            "🔥 <b>Лучшие сейчас</b>\n\n"
+            "Выбери, какие сильные товары хочешь посмотреть:\n\n"
+            f"🔥 Горячие: <b>{stats.hot}</b>\n"
+            f"🚀 Набирают: <b>{stats.rising}</b>\n"
+            f"🧠 AI Picks: <b>{stats.ai_picks}</b>\n\n"
+            "🏆 Рекорды Radar оставлены ниже как дополнительная история."
+        )
+    else:
+        text = (
+            "🔥 <b>Лучшие сейчас</b>\n\n"
+            "Мы уже отобрали сильные товары из DT Radar.\n"
+            f"🎁 <b>Бесплатно покажем первые {FREE_RADAR_PREVIEW_LIMIT} находок</b> в выбранном режиме.\n\n"
+            f"🔥 Горячие: <b>{stats.hot}</b>\n"
+            f"🚀 Набирают: <b>{stats.rising}</b>\n"
+            f"🧠 AI Picks: <b>{stats.ai_picks}</b>\n\n"
+            "Выбери режим и посмотри реальные результаты Radar."
+        )
+    await _edit_or_answer(callback.message, text, reply_markup=radar_best_keyboard(callback.from_user.id))
 
 
 @dp.callback_query(F.data == "radarsearch")
@@ -12029,8 +12518,52 @@ async def radar_list_handler(callback: CallbackQuery) -> None:
         page = 0
     if mode not in {"hot", "rising", "ai", "alltime", "favorites"}:
         mode = "hot"
+    full = allowed(callback.from_user.id)
+    if not full:
+        if not free_radar_preview_allowed(callback.from_user.id) or mode not in {"hot", "rising", "ai"} or page != 0:
+            await callback.answer("Доступно в полном DT Radar", show_alert=True)
+            if callback.message:
+                stats = await radar_stats()
+                text = (
+                    "🔒 <b>Полный DT Radar</b>\n\n"
+                    f"Бесплатно доступны первые <b>{FREE_RADAR_PREVIEW_LIMIT}</b> находок в Горячих, Набирают и AI Picks.\n"
+                    f"В полной базе уже <b>{stats.total}</b> товаров.\n\n"
+                    "💎 Подписка открывает все результаты, поиск, категории и Мой Radar."
+                )
+                await _edit_or_answer(callback.message, text, reply_markup=radar_locked_keyboard())
+            return
+        await callback.answer()
+        text, markup = await _radar_list_payload(callback.from_user.id, mode, 0, preview=True)
+        await _edit_or_answer(callback.message, text, reply_markup=markup)
+        return
     await callback.answer()
     text, markup = await _radar_list_payload(callback.from_user.id, mode, page)
+    await _edit_or_answer(callback.message, text, reply_markup=markup)
+
+
+@dp.callback_query(F.data.startswith("radarpreviewitem:"))
+async def radar_preview_item_handler(callback: CallbackQuery) -> None:
+    parts = str(callback.data or "").split(":")
+    if len(parts) != 3:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+    mode = parts[1]
+    try:
+        product_id = int(parts[2])
+    except Exception:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+    if allowed(callback.from_user.id):
+        text, markup = await _radar_product_payload(callback.from_user.id, product_id)
+    else:
+        if not free_radar_preview_allowed(callback.from_user.id) or not await _radar_preview_product_allowed(product_id, mode):
+            await callback.answer("Эта находка доступна в полном DT Radar", show_alert=True)
+            return
+        text, markup = await _radar_product_payload(callback.from_user.id, product_id, preview_mode=mode)
+    if text is None:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+    await callback.answer()
     await _edit_or_answer(callback.message, text, reply_markup=markup)
 
 
@@ -13821,7 +14354,7 @@ async def main() -> None:
             f"v4.9.1 expected {GUARANTEED_LOCAL_PARSER_LANES} scan workers, got {len(worker_tasks)}"
         )
     log.warning(
-        "v4.11.4 Radar Category Feed + Simple Home + AutoScan Error Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
+        "v4.11.6 Free Radar Preview + AutoScan Stability + Radar Category Feed online | parser_lanes=%s | fifth_plus=FIFO | "
         "trial_and_paid_same_queue=True | railway_lane_overrides_ignored=True",
         GUARANTEED_LOCAL_PARSER_LANES,
     )
