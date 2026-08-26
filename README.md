@@ -1,5 +1,25 @@
 # DT PARSER
 
+## v4.11.7 — Free Funnel Analytics
+
+v4.11.7 keeps the full **v4.11.6 Free Radar Preview + v4.11.5 AutoScan Stability** release and adds admin-only conversion analytics for the free Radar demo.
+
+### Free Radar funnel
+- records only non-subscriber preview actions: Radar open, Best Now, mode open, preview-product open, locked-feature interest and full-access click
+- admin funnel shows 24h / all-time distinct-user stages and Radar -> payment conversion
+- `5/5` completion is based on 5 unique preview products opened in at least one mode
+- recent visitor list shows @username/id, Hot/Rising/AI preview progress, trial-scan usage, upgrade click and payment-after-Radar status
+- confirmed payment is attributed only when `paid_at` is after the recorded free Radar visit, so old customers are not falsely counted as conversions
+- analytics live inside `Админ-панель -> Бесплатные сканы -> Воронка бесплатного Radar`
+- adds the small `free_radar_events` PostgreSQL table automatically; no manual migration or new Railway variable
+- public free Radar, paid Radar, AutoScan, DT Score and parser/worker algorithms remain unchanged
+
+Analytics start collecting after v4.11.7 is deployed; earlier v4.11.6 preview activity is not retroactive.
+
+See `DEPLOY_V4_11_7_FREE_FUNNEL_ANALYTICS.md` for rollout and smoke tests.
+
+---
+
 ## v4.11.6 — Free Radar Preview
 
 v4.11.6 keeps the full **v4.11.5 AutoScan Stability + v4.11.4 Radar Category Feed** release and adds a conversion-focused read-only Radar preview for users without an active subscription.

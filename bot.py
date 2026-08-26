@@ -75,7 +75,7 @@ from filters import (
 )
 from models import (
     AIEarlyWinnerCandidate, AIEarlyWinnerEvent, AIEarlyWinnerObservation, AIEarlyWinnerRun,
-    AppSetting, BotUser, CategoryScanState, Listing, ParserRun, PriceHistory, ScanListing,
+    AppSetting, BotUser, CategoryScanState, FreeRadarEvent, Listing, ParserRun, PriceHistory, ScanListing,
     ScanObservation, ScanViewHistory, SelectedCategory, StableCategoryJob, StablePageCheckpoint,
     SubscriptionPayment, SubscriptionPlan, UserScan, UserSettings, ViewHistory,
 )
@@ -761,6 +761,179 @@ async def free_trial_stats() -> dict[str, int | bool]:
     return {"enabled": enabled, "used_one": used_one, "used_all": used_all, "converted": converted}
 
 
+async def record_free_radar_event(
+    user_id: int, event_type: str, *, mode: str = "", feature: str = "",
+    product_id: int | None = None, item_count: int = 0,
+) -> None:
+    """Persist one anonymous-by-default free Radar funnel action.
+
+    The event is intentionally best-effort: analytics must never block the user's
+    Radar experience. Paid/admin users are not recorded here because this funnel
+    measures only the public preview. Usernames/names are read later from BotUser,
+    where normal bot activity already keeps them up to date.
+    """
+    uid = int(user_id)
+    if not free_radar_preview_allowed(uid):
+        return
+    try:
+        async with SessionLocal() as session:
+            session.add(FreeRadarEvent(
+                user_id=uid,
+                event_type=str(event_type or "")[:32],
+                mode=str(mode or "")[:24],
+                feature=str(feature or "")[:40],
+                product_id=(int(product_id) if product_id is not None else None),
+                item_count=max(0, int(item_count or 0)),
+                created_at=datetime.utcnow(),
+            ))
+            await session.commit()
+    except Exception:
+        log.exception("Could not record free Radar event user=%s event=%s", uid, event_type)
+
+
+async def free_radar_funnel_stats(since: datetime | None = None) -> dict[str, int]:
+    """Return distinct-user funnel counters for the free Radar preview."""
+    async with SessionLocal() as session:
+        def event_users(event_type: str):
+            q = select(func.count(func.distinct(FreeRadarEvent.user_id))).where(
+                FreeRadarEvent.event_type == event_type
+            )
+            if since is not None:
+                q = q.where(FreeRadarEvent.created_at >= since)
+            return q
+
+        opened = int((await session.execute(event_users("radar_open"))).scalar_one() or 0)
+        best = int((await session.execute(event_users("best_open"))).scalar_one() or 0)
+        mode_opened = int((await session.execute(event_users("mode_open"))).scalar_one() or 0)
+        viewed_item = int((await session.execute(event_users("preview_item"))).scalar_one() or 0)
+        upgrade = int((await session.execute(event_users("upgrade_click"))).scalar_one() or 0)
+
+        completed_q = select(FreeRadarEvent.user_id).where(
+            FreeRadarEvent.event_type == "preview_item",
+            FreeRadarEvent.product_id.is_not(None),
+        )
+        if since is not None:
+            completed_q = completed_q.where(FreeRadarEvent.created_at >= since)
+        completed_q = completed_q.group_by(FreeRadarEvent.user_id, FreeRadarEvent.mode).having(
+            func.count(func.distinct(FreeRadarEvent.product_id)) >= FREE_RADAR_PREVIEW_LIMIT
+        ).subquery()
+        completed = int((await session.execute(
+            select(func.count(func.distinct(completed_q.c.user_id))).select_from(completed_q)
+        )).scalar_one() or 0)
+
+        visitors_q = select(
+            FreeRadarEvent.user_id.label("user_id"),
+            func.min(FreeRadarEvent.created_at).label("first_open_at"),
+        ).where(FreeRadarEvent.event_type == "radar_open")
+        if since is not None:
+            visitors_q = visitors_q.where(FreeRadarEvent.created_at >= since)
+        visitors_q = visitors_q.group_by(FreeRadarEvent.user_id).subquery()
+        converted = int((await session.execute(
+            select(func.count(func.distinct(visitors_q.c.user_id))).select_from(
+                visitors_q.join(SubscriptionPayment, SubscriptionPayment.user_id == visitors_q.c.user_id)
+            ).where(
+                SubscriptionPayment.status == "paid",
+                SubscriptionPayment.paid_at.is_not(None),
+                SubscriptionPayment.paid_at >= visitors_q.c.first_open_at,
+            )
+        )).scalar_one() or 0)
+
+    return {
+        "opened": opened,
+        "best": best,
+        "mode_opened": mode_opened,
+        "viewed_item": viewed_item,
+        "completed_five": completed,
+        "upgrade_click": upgrade,
+        "converted": converted,
+    }
+
+
+async def free_radar_recent_visitors(page: int = 0, page_size: int = 6) -> tuple[list[dict], int]:
+    """Return recent free-preview visitors with compact per-user behavior."""
+    page = max(0, int(page or 0))
+    page_size = max(1, min(20, int(page_size or 6)))
+    async with SessionLocal() as session:
+        activity = select(
+            FreeRadarEvent.user_id.label("user_id"),
+            func.min(FreeRadarEvent.created_at).label("first_event_at"),
+            func.max(FreeRadarEvent.created_at).label("last_event_at"),
+        ).group_by(FreeRadarEvent.user_id).subquery()
+        total = int((await session.execute(
+            select(func.count()).select_from(activity)
+        )).scalar_one() or 0)
+        rows = (await session.execute(
+            select(
+                activity.c.user_id, activity.c.first_event_at, activity.c.last_event_at,
+                BotUser.username, BotUser.first_name, BotUser.trial_scans_used,
+                BotUser.payments_count, BotUser.paid_total_usdt,
+            ).select_from(
+                activity.outerjoin(BotUser, BotUser.user_id == activity.c.user_id)
+            ).order_by(activity.c.last_event_at.desc()).offset(page * page_size).limit(page_size)
+        )).all()
+        ids = [int(row.user_id) for row in rows]
+        events = []
+        paid_rows = []
+        if ids:
+            events = (await session.execute(
+                select(FreeRadarEvent).where(FreeRadarEvent.user_id.in_(ids)).order_by(FreeRadarEvent.created_at.asc())
+            )).scalars().all()
+            paid_rows = (await session.execute(
+                select(SubscriptionPayment.user_id, SubscriptionPayment.paid_at).where(
+                    SubscriptionPayment.user_id.in_(ids),
+                    SubscriptionPayment.status == "paid",
+                    SubscriptionPayment.paid_at.is_not(None),
+                )
+            )).all()
+
+    by_user: dict[int, dict] = {}
+    for row in rows:
+        uid = int(row.user_id)
+        by_user[uid] = {
+            "user_id": uid,
+            "username": row.username,
+            "first_name": row.first_name,
+            "first_event_at": row.first_event_at,
+            "last_event_at": row.last_event_at,
+            "trial_scans_used": max(0, int(row.trial_scans_used or 0)),
+            "payments_count": max(0, int(row.payments_count or 0)),
+            "paid_total_usdt": float(row.paid_total_usdt or 0.0),
+            "radar_opens": 0,
+            "best_opens": 0,
+            "mode_opens": {"hot": 0, "rising": 0, "ai": 0},
+            "preview_products": {"hot": set(), "rising": set(), "ai": set()},
+            "upgrade_clicks": 0,
+            "locked_features": set(),
+            "converted_after_radar": False,
+        }
+    for paid_row in paid_rows:
+        data = by_user.get(int(paid_row.user_id))
+        if data is None or paid_row.paid_at is None:
+            continue
+        first_event_at = data.get("first_event_at")
+        if first_event_at is not None and paid_row.paid_at >= first_event_at:
+            data["converted_after_radar"] = True
+    for event in events:
+        data = by_user.get(int(event.user_id))
+        if data is None:
+            continue
+        event_type = str(event.event_type or "")
+        mode = str(event.mode or "")
+        if event_type == "radar_open":
+            data["radar_opens"] += 1
+        elif event_type == "best_open":
+            data["best_opens"] += 1
+        elif event_type == "mode_open" and mode in data["mode_opens"]:
+            data["mode_opens"][mode] += 1
+        elif event_type == "preview_item" and mode in data["preview_products"] and event.product_id is not None:
+            data["preview_products"][mode].add(int(event.product_id))
+        elif event_type == "upgrade_click":
+            data["upgrade_clicks"] += 1
+        elif event_type == "locked_feature" and event.feature:
+            data["locked_features"].add(str(event.feature))
+    return [by_user[int(row.user_id)] for row in rows], total
+
+
 def read_only_history_allowed(user_id: int) -> bool:
     """Allow expired subscribers to keep access to their own saved scan history.
 
@@ -963,7 +1136,7 @@ def radar_best_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="🏆 Рекорды Radar", callback_data="radarlist:alltime:0")])
     else:
         rows.append([InlineKeyboardButton(text="🏆 Рекорды Radar · 🔒", callback_data="radar_locked:records")])
-        rows.append([InlineKeyboardButton(text="💎 Открыть полный DT Radar", callback_data="subscription")])
+        rows.append([InlineKeyboardButton(text="💎 Открыть полный DT Radar", callback_data="radar_upgrade:best")])
     rows.append([InlineKeyboardButton(text="⬅️ DT Radar", callback_data="radar_home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -993,7 +1166,7 @@ def radar_search_keyboard(items, *, page: int, total: int) -> InlineKeyboardMark
 
 def radar_locked_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Открыть полный DT Radar", callback_data="subscription")],
+        [InlineKeyboardButton(text="💎 Открыть полный DT Radar", callback_data="radar_upgrade:locked")],
         [InlineKeyboardButton(text="🔥 Посмотреть 5 бесплатных находок", callback_data="radarbest")],
         [InlineKeyboardButton(text="⬅️ DT Radar", callback_data="radar_home")],
     ])
@@ -1015,10 +1188,10 @@ def radar_preview_list_keyboard(
     if total > len(items):
         rows.append([InlineKeyboardButton(
             text=f"🔒 Ещё {max(0, int(total) - len(items))} · открыть полный Radar",
-            callback_data="subscription",
+            callback_data="radar_upgrade:preview",
         )])
     else:
-        rows.append([InlineKeyboardButton(text="💎 Открыть полный DT Radar", callback_data="subscription")])
+        rows.append([InlineKeyboardButton(text="💎 Открыть полный DT Radar", callback_data="radar_upgrade:preview")])
     if int(trial_remaining) > 0:
         rows.append([InlineKeyboardButton(
             text=f"🎁 Бесплатный скан · осталось {int(trial_remaining)}", callback_data="start_scan"
@@ -1135,7 +1308,7 @@ def radar_product_keyboard(
     if listing_url:
         rows.append([InlineKeyboardButton(text="🔗 Открыть актуальное объявление", url=listing_url)])
     if preview_mode is not None:
-        rows.append([InlineKeyboardButton(text="💎 Открыть полный DT Radar", callback_data="subscription")])
+        rows.append([InlineKeyboardButton(text="💎 Открыть полный DT Radar", callback_data="radar_upgrade:item")])
         rows.append([InlineKeyboardButton(text="⬅️ К бесплатным находкам", callback_data=f"radarlist:{preview_mode}:0")])
     else:
         rows.append([InlineKeyboardButton(text="⬅️ DT Radar", callback_data="radar_home")])
@@ -8753,9 +8926,32 @@ def admin_trial_keyboard(enabled: bool) -> InlineKeyboardMarkup:
     toggle = "⏸ Выключить акцию" if enabled else "▶️ Включить акцию"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=toggle, callback_data="admintrial:toggle")],
+        [InlineKeyboardButton(text="📡 Воронка бесплатного Radar", callback_data="adminradarfunnel:0")],
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="admintrial")],
         [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
     ])
+
+
+def admin_radar_funnel_keyboard(visitors: list[dict], page: int, pages: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for visitor in visitors:
+        uid = int(visitor.get("user_id") or 0)
+        username = str(visitor.get("username") or "").strip()
+        first_name = str(visitor.get("first_name") or "").strip()
+        label = f"@{username}" if username else (first_name or str(uid))
+        if len(label) > 30:
+            label = label[:29].rstrip() + "…"
+        rows.append([InlineKeyboardButton(text=f"👤 {label}", callback_data=f"adminuser:{uid}")])
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adminradarfunnel:{page - 1}"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adminradarfunnel:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"adminradarfunnel:{page}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Бесплатные сканы", callback_data="admintrial")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_radar_autoscan_keyboard(state: dict) -> InlineKeyboardMarkup:
@@ -9171,7 +9367,7 @@ class ActivityAccessMiddleware(BaseMiddleware):
 
             if free_radar_preview_allowed(uid):
                 radar_public_exact = {"radar_home", "radarbest", "radar_locked"}
-                radar_public_prefixes = ("radar_locked:", "radarlist:", "radarpreviewitem:")
+                radar_public_prefixes = ("radar_locked:", "radarlist:", "radarpreviewitem:", "radar_upgrade:")
                 if callback_data in radar_public_exact or callback_data.startswith(radar_public_prefixes):
                     return await handler(event, data)
 
@@ -9925,6 +10121,20 @@ async def _edit_or_answer(target: Message, text: str, *, reply_markup=None) -> N
         await target.answer(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
 
 
+@dp.callback_query(F.data.startswith("radar_upgrade:"))
+async def radar_upgrade_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    source = str(callback.data or "").split(":", 1)[1] if ":" in str(callback.data or "") else "radar"
+    if free_radar_preview_allowed(callback.from_user.id):
+        await record_free_radar_event(callback.from_user.id, "upgrade_click", feature=source)
+    await state.clear()
+    await callback.answer()
+    text, markup = await asyncio.gather(
+        subscription_text(callback.from_user.id),
+        subscription_keyboard(callback.from_user.id),
+    )
+    await _edit_or_answer(callback.message, text, reply_markup=markup)
+
+
 @dp.callback_query(F.data == "subscription")
 async def subscription_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
@@ -10223,12 +10433,18 @@ async def admin_stats_handler(callback: CallbackQuery) -> None:
 
 
 async def _admin_trial_text() -> tuple[str, bool]:
-    stats = await free_trial_stats()
+    stats, radar_funnel = await asyncio.gather(
+        free_trial_stats(), free_radar_funnel_stats()
+    )
     enabled = bool(stats["enabled"])
     used_one = int(stats["used_one"] or 0)
     used_all = int(stats["used_all"] or 0)
     converted = int(stats["converted"] or 0)
     conversion = (converted / used_one * 100.0) if used_one else 0.0
+    radar_opened = int(radar_funnel.get("opened", 0) or 0)
+    radar_upgrade = int(radar_funnel.get("upgrade_click", 0) or 0)
+    radar_converted = int(radar_funnel.get("converted", 0) or 0)
+    radar_conversion = (radar_converted / radar_opened * 100.0) if radar_opened else 0.0
     text = (
         "<b>🎁 Бесплатные сканы · стартовая акция</b>\n\n"
         f"Статус: <b>{'✅ ВКЛ' if enabled else '⏸ ВЫКЛ'}</b>\n"
@@ -10239,9 +10455,84 @@ async def _admin_trial_text() -> tuple[str, bool]:
         f"👥 Использовали ≥1: <b>{used_one}</b>\n"
         f"🎁 Использовали {FREE_TRIAL_SCAN_LIMIT}/{FREE_TRIAL_SCAN_LIMIT}: <b>{used_all}</b>\n"
         f"💳 Купили после пробника: <b>{converted}</b>\n"
-        f"📈 Конверсия в оплату: <b>{conversion:.1f}%</b>"
+        f"📈 Конверсия в оплату: <b>{conversion:.1f}%</b>\n\n"
+        "<b>📡 Бесплатный DT Radar</b>\n"
+        f"👥 Зашли посмотреть: <b>{radar_opened}</b>\n"
+        f"💎 Нажали полный доступ: <b>{radar_upgrade}</b>\n"
+        f"💳 Купили после Radar: <b>{radar_converted}</b>\n"
+        f"📈 Radar → оплата: <b>{radar_conversion:.1f}%</b>"
     )
     return text, enabled
+
+
+async def _admin_radar_funnel_text(page: int = 0) -> tuple[str, list[dict], int, int]:
+    page = max(0, int(page or 0))
+    day_since = datetime.utcnow() - timedelta(hours=24)
+    all_stats, day_stats, visitor_result = await asyncio.gather(
+        free_radar_funnel_stats(),
+        free_radar_funnel_stats(day_since),
+        free_radar_recent_visitors(page, 6),
+    )
+    visitors, total_visitors = visitor_result
+    pages = max(1, (int(total_visitors) + 5) // 6)
+    if page >= pages:
+        page = pages - 1
+        visitors, total_visitors = await free_radar_recent_visitors(page, 6)
+
+    def conversion(stats: dict) -> float:
+        opened = int(stats.get("opened", 0) or 0)
+        converted = int(stats.get("converted", 0) or 0)
+        return (converted / opened * 100.0) if opened else 0.0
+
+    lines = [
+        "<b>📡 Бесплатный DT Radar · воронка</b>",
+        "",
+        "<b>За 24 часа / за всё время</b>",
+        f"👥 Открыли Radar: <b>{int(day_stats['opened'])} / {int(all_stats['opened'])}</b>",
+        f"🔥 Открыли «Лучшие сейчас»: <b>{int(day_stats['best'])} / {int(all_stats['best'])}</b>",
+        f"📂 Выбрали режим: <b>{int(day_stats['mode_opened'])} / {int(all_stats['mode_opened'])}</b>",
+        f"👁 Открыли хотя бы 1 товар: <b>{int(day_stats['viewed_item'])} / {int(all_stats['viewed_item'])}</b>",
+        f"✅ Посмотрели все {FREE_RADAR_PREVIEW_LIMIT}: <b>{int(day_stats['completed_five'])} / {int(all_stats['completed_five'])}</b>",
+        f"💎 Нажали полный доступ: <b>{int(day_stats['upgrade_click'])} / {int(all_stats['upgrade_click'])}</b>",
+        f"💳 Купили после Radar: <b>{int(day_stats['converted'])} / {int(all_stats['converted'])}</b>",
+        f"📈 Radar → оплата: <b>{conversion(day_stats):.1f}% / {conversion(all_stats):.1f}%</b>",
+        "",
+        "<b>👥 Последние посетители</b>",
+    ]
+    if not visitors:
+        lines.append("Пока никто не открывал бесплатный Radar.")
+    else:
+        feature_labels = {
+            "search": "Поиск", "categories": "Категории",
+            "favorites": "Мой Radar", "records": "Рекорды",
+        }
+        for visitor in visitors:
+            uid = int(visitor.get("user_id") or 0)
+            username = str(visitor.get("username") or "").strip()
+            first_name = str(visitor.get("first_name") or "").strip()
+            label = f"@{username}" if username else (first_name or f"ID {uid}")
+            products = visitor.get("preview_products") or {}
+            hot = min(FREE_RADAR_PREVIEW_LIMIT, len(products.get("hot", set())))
+            rising = min(FREE_RADAR_PREVIEW_LIMIT, len(products.get("rising", set())))
+            ai = min(FREE_RADAR_PREVIEW_LIMIT, len(products.get("ai", set())))
+            locked = visitor.get("locked_features") or set()
+            locked_text = ", ".join(feature_labels.get(x, x) for x in sorted(locked))
+            trial_used = int(visitor.get("trial_scans_used", 0) or 0)
+            converted_after_radar = bool(visitor.get("converted_after_radar"))
+            last_at = visitor.get("last_event_at")
+            lines.extend([
+                "",
+                f"👤 <b>{html.escape(label)}</b> · <code>{uid}</code>",
+                f"🕐 {_utc_to_msk_text(last_at)} МСК · Radar ×{int(visitor.get('radar_opens', 0) or 0)} · Лучшие ×{int(visitor.get('best_opens', 0) or 0)}",
+                f"🔥 {hot}/{FREE_RADAR_PREVIEW_LIMIT} · 🚀 {rising}/{FREE_RADAR_PREVIEW_LIMIT} · 🧠 {ai}/{FREE_RADAR_PREVIEW_LIMIT}",
+                f"💎 Полный доступ: <b>{'нажал' if int(visitor.get('upgrade_clicks', 0) or 0) > 0 else '—'}</b> · "
+                f"🎁 сканы {trial_used}/{FREE_TRIAL_SCAN_LIMIT} · 💳 после Radar: <b>{'купил' if converted_after_radar else '—'}</b>",
+            ])
+            if locked_text:
+                lines.append(f"🔒 Интересовался: {html.escape(locked_text)}")
+        if pages > 1:
+            lines += ["", f"Страница <b>{page + 1}/{pages}</b> · посетителей <b>{total_visitors}</b>"]
+    return "\n".join(lines), visitors, page, pages
 
 
 @dp.callback_query(F.data == "admintrial")
@@ -10264,6 +10555,23 @@ async def admin_trial_toggle_handler(callback: CallbackQuery) -> None:
     text, current = await _admin_trial_text()
     await callback.answer("Акция включена" if current else "Акция выключена")
     await _edit_or_answer(callback.message, text, reply_markup=admin_trial_keyboard(current))
+
+
+@dp.callback_query(F.data.startswith("adminradarfunnel:"))
+async def admin_radar_funnel_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        page = max(0, int(str(callback.data or "").split(":", 1)[1]))
+    except Exception:
+        page = 0
+    text, visitors, page, pages = await _admin_radar_funnel_text(page)
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message, text,
+        reply_markup=admin_radar_funnel_keyboard(visitors, page, pages),
+    )
 
 
 @dp.callback_query(F.data == "adminradarauto")
@@ -12408,6 +12716,8 @@ async def radar_locked(callback: CallbackQuery) -> None:
         "favorites": "⭐ Мой Radar",
         "records": "🏆 Рекорды Radar",
     }
+    if free_radar_preview_allowed(callback.from_user.id):
+        await record_free_radar_event(callback.from_user.id, "locked_feature", feature=feature)
     title = labels.get(feature, "Полный DT Radar")
     text = (
         f"🔒 <b>{html.escape(title)}</b>\n\n"
@@ -12423,6 +12733,8 @@ async def radar_locked(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data == "radar_home")
 async def radar_home(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(None)
+    if free_radar_preview_allowed(callback.from_user.id):
+        await record_free_radar_event(callback.from_user.id, "radar_open", feature="home")
     await callback.answer()
     # Score cooling is maintained hourly in the background. Opening Radar stays a
     # small indexed read even after the accumulated base grows very large.
@@ -12434,6 +12746,8 @@ async def radar_home(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(Command("radar"))
 async def radar_command(message: Message) -> None:
+    if free_radar_preview_allowed(message.from_user.id):
+        await record_free_radar_event(message.from_user.id, "radar_open", feature="command")
     await message.answer(
         await _radar_home_text(message.from_user.id), parse_mode=ParseMode.HTML,
         reply_markup=radar_home_keyboard(message.from_user.id),
@@ -12444,6 +12758,8 @@ async def radar_command(message: Message) -> None:
 async def radar_best_handler(callback: CallbackQuery) -> None:
     stats = await radar_stats()
     full = allowed(callback.from_user.id)
+    if not full and free_radar_preview_allowed(callback.from_user.id):
+        await record_free_radar_event(callback.from_user.id, "best_open")
     await callback.answer()
     if full:
         text = (
@@ -12534,6 +12850,7 @@ async def radar_list_handler(callback: CallbackQuery) -> None:
             return
         await callback.answer()
         text, markup = await _radar_list_payload(callback.from_user.id, mode, 0, preview=True)
+        await record_free_radar_event(callback.from_user.id, "mode_open", mode=mode, item_count=FREE_RADAR_PREVIEW_LIMIT)
         await _edit_or_answer(callback.message, text, reply_markup=markup)
         return
     await callback.answer()
@@ -12563,6 +12880,10 @@ async def radar_preview_item_handler(callback: CallbackQuery) -> None:
     if text is None:
         await callback.answer("Товар не найден", show_alert=True)
         return
+    if not allowed(callback.from_user.id) and free_radar_preview_allowed(callback.from_user.id):
+        await record_free_radar_event(
+            callback.from_user.id, "preview_item", mode=mode, product_id=product_id
+        )
     await callback.answer()
     await _edit_or_answer(callback.message, text, reply_markup=markup)
 

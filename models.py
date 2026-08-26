@@ -535,6 +535,27 @@ class BotUser(Base):
     expiry_expired_sent_for: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class FreeRadarEvent(Base):
+    """Privacy-light product analytics for the public DT Radar preview.
+
+    Only Telegram user id and in-product actions are stored. Product clicks keep
+    the internal Radar product id so the admin can see whether a visitor actually
+    consumed the five-item demo. No message text or external browsing data is
+    collected.
+    """
+
+    __tablename__ = "free_radar_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    event_type: Mapped[str] = mapped_column(String(32), index=True)
+    mode: Mapped[str] = mapped_column(String(24), default="", index=True)
+    feature: Mapped[str] = mapped_column(String(40), default="", index=True)
+    product_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    item_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
 class SubscriptionPlan(Base):
     """Admin-editable subscription plans priced in USDT."""
 

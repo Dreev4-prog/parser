@@ -123,6 +123,32 @@ async def wait_for_database() -> None:
 async def init_db() -> None:
     await wait_for_database()
     async with engine.begin() as conn:
+        # v4.11.7: this table is created explicitly with IF NOT EXISTS before the
+        # metadata pass. Railway starts parser/date/page/view services close together;
+        # the explicit PostgreSQL DDL avoids a create_all check/create race on the new
+        # funnel table during a multi-service deploy. SQLite keeps the normal metadata
+        # creation path used by local tests.
+        if _IS_POSTGRES:
+            await conn.execute(text(
+                """
+                CREATE TABLE IF NOT EXISTS free_radar_events (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    event_type VARCHAR(32) NOT NULL,
+                    mode VARCHAR(24) NOT NULL DEFAULT '',
+                    feature VARCHAR(40) NOT NULL DEFAULT '',
+                    product_id INTEGER,
+                    item_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            ))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_free_radar_events_user_id ON free_radar_events (user_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_free_radar_events_event_type ON free_radar_events (event_type)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_free_radar_events_mode ON free_radar_events (mode)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_free_radar_events_feature ON free_radar_events (feature)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_free_radar_events_product_id ON free_radar_events (product_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_free_radar_events_created_at ON free_radar_events (created_at)"))
         await conn.run_sync(Base.metadata.create_all)
 
         # Lightweight additive migrations so existing PostgreSQL databases can be
