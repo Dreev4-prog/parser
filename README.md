@@ -1,3 +1,18 @@
+## v4.11.9 — AutoScan View Deadlock Recovery
+
+v4.11.9 keeps the full **v4.11.8 AutoScan Launch Recovery + v4.11.7 Free Funnel Analytics + v4.11.6 Free Radar Preview + v4.11.5 AutoScan Stability** release and fixes a deterministic AutoScan stall after the last collected page.
+
+### What was fixed
+- Stable single-service mode intentionally sets `TRAFFIC.background_during_scans=0` so background view work never steals capacity from foreground user scans.
+- AutoScan also registers its category as an active scan job. Its deferred exact-view phase was using `traffic_priority=background`, so after page 15 the AutoScan could wait forever for a background view lease that its own active scan job prohibited.
+- AutoScan deferred views now use a bounded safe lane (`concurrency=4`) only when background lanes are disabled. The global traffic limits and user-facing scan protection remain unchanged.
+- Added `Radar AutoScan views start ...` logging before the first counter request so the phase is visible immediately in Railway logs.
+- Browser recovery remains capped at 24 unresolved listings and still accepts exact verified counts only.
+
+No database migration and no new Railway variables. Redeploy the **parser** service only.
+
+See `DEPLOY_V4_11_9_AUTOSCAN_VIEW_DEADLOCK_RECOVERY.md` for rollout and smoke tests.
+
 # DT PARSER
 
 ## v4.11.8 — AutoScan Launch Recovery

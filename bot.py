@@ -182,6 +182,11 @@ RADAR_AUTOSCAN_SYSTEM_BACKOFF_BASE_SECONDS = 8.0
 RADAR_AUTOSCAN_MAX_BACKOFF_SECONDS = 30.0
 RADAR_AUTOSCAN_SUCCESS_GAP_SECONDS = 0.25
 RADAR_AUTOSCAN_BROWSER_FALLBACK_LIMIT = 24
+# v4.11.9: in stable single-service mode TRAFFIC.background_during_scans is forced to 0
+# to protect user-facing scans. AutoScan itself is wrapped in scan_job_started(), so using
+# background priority for its own deferred views creates a self-deadlock after the last
+# category page. Use a small normal-priority lane only for this AutoScan view phase.
+RADAR_AUTOSCAN_SAFE_VIEW_CONCURRENCY = 4
 RADAR_AUTOSCAN_LAUNCH_WATCHDOG_SECONDS = 20
 _radar_autoscan_guard = asyncio.Lock()
 # Serializes the actual round runner. The scheduler and a manual admin kick may race,
@@ -3381,11 +3386,24 @@ async def enrich_autoscan_view_counts(
                 live.category_name, min(total, int(done)), total,
             )
 
+    # v4.11.9 AutoScan View Deadlock Recovery. In the main parser service
+    # stable mode intentionally sets TRAFFIC.background_during_scans=0. Because the
+    # whole AutoScan category is also registered as an active scan job, a background
+    # view lease can never be acquired here: page 15 finishes and the coroutine waits
+    # forever before even one counter request starts. Keep global user-scan protection
+    # intact and give only this deferred AutoScan phase a small normal-priority lane.
+    autoscan_view_priority = "normal" if int(getattr(TRAFFIC, "background_during_scans", 0)) <= 0 else "background"
+    autoscan_view_concurrency = max(1, min(RADAR_AUTOSCAN_SAFE_VIEW_CONCURRENCY, VIEW_COUNT_CONCURRENCY))
+    log.info(
+        "Radar AutoScan views start category=%s total=%s priority=%s concurrency=%s scan_jobs_active_safe_mode=%s",
+        (live.category_name if live is not None else "autoscan"), total, autoscan_view_priority,
+        autoscan_view_concurrency, int(getattr(TRAFFIC, "background_during_scans", 0)) <= 0,
+    )
     direct_results = await parser.fetch_public_view_counts(
         urls,
-        concurrency=max(2, min(12, VIEW_COUNT_CONCURRENCY)),
+        concurrency=autoscan_view_concurrency,
         progress_cb=direct_progress,
-        traffic_priority="background",
+        traffic_priority=autoscan_view_priority,
         browser_fallback=False,
         direct_http_only=True,
         accurate=False,
@@ -3422,9 +3440,9 @@ async def enrich_autoscan_view_counts(
         exact_fallback = await fetch_exact_views_v438_compatible(
             parser,
             fallback_urls,
-            concurrency=max(1, min(2, VIEW_COUNT_CONCURRENCY)),
+            concurrency=max(1, min(2, autoscan_view_concurrency)),
             progress_cb=fallback_progress,
-            traffic_priority="background",
+            traffic_priority=autoscan_view_priority,
         )
 
     combined = dict(direct_results)
@@ -14754,7 +14772,7 @@ async def main() -> None:
             f"v4.9.1 expected {GUARANTEED_LOCAL_PARSER_LANES} scan workers, got {len(worker_tasks)}"
         )
     log.warning(
-        "v4.11.8 AutoScan Launch Recovery + Free Funnel Analytics + Free Radar Preview online | parser_lanes=%s | fifth_plus=FIFO | "
+        "v4.11.9 AutoScan View Deadlock Recovery + AutoScan Launch Recovery + Free Funnel Analytics online | parser_lanes=%s | fifth_plus=FIFO | "
         "trial_and_paid_same_queue=True | railway_lane_overrides_ignored=True",
         GUARANTEED_LOCAL_PARSER_LANES,
     )
