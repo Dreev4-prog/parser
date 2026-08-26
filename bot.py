@@ -182,8 +182,13 @@ RADAR_AUTOSCAN_SYSTEM_BACKOFF_BASE_SECONDS = 8.0
 RADAR_AUTOSCAN_MAX_BACKOFF_SECONDS = 30.0
 RADAR_AUTOSCAN_SUCCESS_GAP_SECONDS = 0.25
 RADAR_AUTOSCAN_BROWSER_FALLBACK_LIMIT = 24
+RADAR_AUTOSCAN_LAUNCH_WATCHDOG_SECONDS = 20
 _radar_autoscan_guard = asyncio.Lock()
+# Serializes the actual round runner. The scheduler and a manual admin kick may race,
+# but only one parser round is ever allowed to execute at a time.
+_radar_autoscan_run_guard = asyncio.Lock()
 _radar_autoscan_wakeup = asyncio.Event()
+_radar_autoscan_kick_task: asyncio.Task | None = None
 
 
 # v4.6.5: per-user RU/EN presentation layer.  The parser/business logic remains
@@ -3992,7 +3997,7 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
         "category_keys": keys,
         "current_index": 0,
         "current_category_key": "",
-        "current_category_name": "",
+        "current_category_name": "Запуск первой категории…",
         "total": len(keys),
         "processed": 0,
         "successful": 0,
@@ -4353,7 +4358,7 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
     return state
 
 
-async def _run_radar_autoscan_round(bot: Bot) -> None:
+async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
     """Run/resume one persistent low-priority round until complete or paused.
 
     v4.11.5 keeps one parser/http/browser session for the whole round instead of
@@ -4577,6 +4582,70 @@ async def _run_radar_autoscan_round(bot: Bot) -> None:
             await parser.close()
         except Exception:
             log.debug("DT Radar AutoScan persistent parser close failed", exc_info=True)
+
+
+async def _run_radar_autoscan_round(bot: Bot) -> None:
+    """Single-flight wrapper for all AutoScan launch paths."""
+    async with _radar_autoscan_run_guard:
+        state = await load_radar_autoscan_state()
+        if state.get("status") != "running":
+            return
+        log.info(
+            "DT Radar AutoScan runner entered round=%s index=%s/%s mode=%s",
+            state.get("round_id"), int(state.get("current_index") or 0),
+            int(state.get("total") or 0), state.get("mode"),
+        )
+        await _run_radar_autoscan_round_inner(bot)
+
+
+def _kick_radar_autoscan(bot: Bot, reason: str) -> None:
+    """Start the runner immediately without depending only on scheduler wake-up."""
+    global _radar_autoscan_kick_task
+    if _radar_autoscan_kick_task is not None and not _radar_autoscan_kick_task.done():
+        log.info("DT Radar AutoScan kick already active reason=%s", reason)
+        return
+
+    async def _runner() -> None:
+        try:
+            log.info("DT Radar AutoScan immediate kick reason=%s", reason)
+            await _run_radar_autoscan_round(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("DT Radar AutoScan immediate kick failed reason=%s", reason)
+
+    _radar_autoscan_kick_task = asyncio.create_task(
+        _runner(), name=f"dt-radar-autoscan-kick-{reason}"
+    )
+
+
+def _schedule_radar_autoscan_launch_watchdog(bot: Bot, round_id: str) -> None:
+    """Re-kick a manual round if it is still untouched after the launch grace period."""
+    async def _watch() -> None:
+        await asyncio.sleep(RADAR_AUTOSCAN_LAUNCH_WATCHDOG_SECONDS)
+        try:
+            state = await load_radar_autoscan_state()
+            if str(state.get("round_id") or "") != str(round_id or ""):
+                return
+            if state.get("status") != "running" or state.get("waiting_for_users"):
+                return
+            untouched = (
+                int(state.get("current_index") or 0) == 0
+                and not str(state.get("current_category_key") or "").strip()
+                and int(state.get("processed") or 0) == 0
+            )
+            if untouched:
+                log.warning(
+                    "DT Radar AutoScan launch watchdog re-kick round=%s after=%ss",
+                    round_id, RADAR_AUTOSCAN_LAUNCH_WATCHDOG_SECONDS,
+                )
+                _kick_radar_autoscan(bot, "watchdog")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("DT Radar AutoScan launch watchdog failed round=%s", round_id)
+
+    asyncio.create_task(_watch(), name=f"dt-radar-autoscan-watchdog-{round_id}")
 
 
 async def radar_autoscan_scheduler(bot: Bot) -> None:
@@ -10597,7 +10666,13 @@ async def admin_radar_autoscan_start_handler(callback: CallbackQuery) -> None:
         state = _radar_autoscan_new_round(state, "manual")
         state = await save_radar_autoscan_state(state)
     _radar_autoscan_wakeup.set()
-    await callback.answer("Один круг запущен")
+    _kick_radar_autoscan(callback.bot, "manual-start")
+    _schedule_radar_autoscan_launch_watchdog(callback.bot, str(state.get("round_id") or ""))
+    running, queued = await _radar_foreground_counts()
+    if running or queued:
+        await callback.answer(f"Круг запущен · ждёт пользовательские сканы: {running + queued}")
+    else:
+        await callback.answer("Круг запущен · первая категория стартует сейчас")
     text, state = await _radar_autoscan_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
@@ -10632,6 +10707,8 @@ async def admin_radar_autoscan_retry_handler(callback: CallbackQuery) -> None:
             return
         state = await save_radar_autoscan_state(retry_state)
     _radar_autoscan_wakeup.set()
+    _kick_radar_autoscan(callback.bot, "retry")
+    _schedule_radar_autoscan_launch_watchdog(callback.bot, str(state.get("round_id") or ""))
     await callback.answer(f"Повторяю проблемные категории: {len(state.get('category_keys') or [])}")
     text, state = await _radar_autoscan_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
@@ -10670,6 +10747,8 @@ async def admin_radar_autoscan_resume_handler(callback: CallbackQuery) -> None:
         state["waiting_for_users"] = False
         state = await save_radar_autoscan_state(state)
     _radar_autoscan_wakeup.set()
+    _kick_radar_autoscan(callback.bot, "resume")
+    _schedule_radar_autoscan_launch_watchdog(callback.bot, str(state.get("round_id") or ""))
     await callback.answer("Круг продолжен")
     text, state = await _radar_autoscan_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
@@ -14675,7 +14754,7 @@ async def main() -> None:
             f"v4.9.1 expected {GUARANTEED_LOCAL_PARSER_LANES} scan workers, got {len(worker_tasks)}"
         )
     log.warning(
-        "v4.11.6 Free Radar Preview + AutoScan Stability + Radar Category Feed online | parser_lanes=%s | fifth_plus=FIFO | "
+        "v4.11.8 AutoScan Launch Recovery + Free Funnel Analytics + Free Radar Preview online | parser_lanes=%s | fifth_plus=FIFO | "
         "trial_and_paid_same_queue=True | railway_lane_overrides_ignored=True",
         GUARANTEED_LOCAL_PARSER_LANES,
     )

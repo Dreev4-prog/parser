@@ -1,5 +1,22 @@
 # DT PARSER
 
+## v4.11.8 — AutoScan Launch Recovery
+
+v4.11.8 keeps the full **v4.11.7 Free Funnel Analytics + v4.11.6 Free Radar Preview + v4.11.5 AutoScan Stability** release and hardens only AutoScan launch orchestration.
+
+### AutoScan launch recovery
+- manual Start, Resume and Retry immediately kick the AutoScan runner instead of relying only on the background scheduler wake-up
+- a single-flight runner lock prevents scheduler/manual races from ever creating two simultaneous AutoScan circles
+- a 20-second launch watchdog self-retries a round that remains running but untouched
+- fresh circles show `Запуск первой категории…` immediately
+- the admin receives explicit feedback when AutoScan is starting now versus waiting for foreground user scans
+- parser algorithms, 84-category policy, worker fleet, DT Radar, free preview and funnel analytics remain unchanged
+- no DB migration or new Railway variable
+
+See `DEPLOY_V4_11_8_AUTOSCAN_LAUNCH_RECOVERY.md` for rollout and smoke tests.
+
+---
+
 ## v4.11.7 — Free Funnel Analytics
 
 v4.11.7 keeps the full **v4.11.6 Free Radar Preview + v4.11.5 AutoScan Stability** release and adds admin-only conversion analytics for the free Radar demo.
