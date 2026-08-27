@@ -11429,11 +11429,11 @@ async def _broadcast_recipient_ids() -> list[int]:
 
 
 @dp.callback_query(F.data == "admindailyradar")
-async def admin_daily_radar_handler(callback: CallbackQuery, fsm: FSMContext) -> None:
+async def admin_daily_radar_handler(callback: CallbackQuery, state: FSMContext) -> None:
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    await fsm.clear()
+    await state.clear()
     # v4.12.2: acknowledge before any database aggregates. In v4.12.1 slow/busy
     # Radar queries ran first, so Telegram looked as if the button did nothing.
     await callback.answer("Открываю Daily Radar…")
@@ -11445,10 +11445,10 @@ async def admin_daily_radar_handler(callback: CallbackQuery, fsm: FSMContext) ->
         ]]),
     )
     log.info("Daily Radar admin panel open requested admin=%s", callback.from_user.id)
-    state, state_fresh = await _load_radar_daily_digest_state_bounded()
-    metrics, metrics_fresh = await _radar_daily_digest_metrics_bounded(state)
-    status = "✅ ВКЛ" if state.get("enabled", True) else "⏸ ВЫКЛ"
-    last = str(state.get("last_sent_at") or "—")
+    digest_state, state_fresh = await _load_radar_daily_digest_state_bounded()
+    metrics, metrics_fresh = await _radar_daily_digest_metrics_bounded(digest_state)
+    status = "✅ ВКЛ" if digest_state.get("enabled", True) else "⏸ ВЫКЛ"
+    last = str(digest_state.get("last_sent_at") or "—")
     if last != "—":
         try:
             last_dt = datetime.fromisoformat(last)
@@ -11459,17 +11459,17 @@ async def admin_daily_radar_handler(callback: CallbackQuery, fsm: FSMContext) ->
             pass
     freshness = ""
     if not state_fresh or not metrics_fresh:
-        cached_at = str(state.get("last_metrics_at") or "")
+        cached_at = str(digest_state.get("last_metrics_at") or "")
         suffix = f" · кэш {html.escape(cached_at)}" if cached_at else ""
         freshness = f"\n\n⚠️ <b>Живые цифры временно недоступны</b>{suffix}. Управление рассылкой работает; нажми «Обновить цифры» позже."
     text = (
         "<b>📨 Daily Radar</b>\n\n"
         "Ежедневная продающая сводка с живыми цифрами DT Radar. Отправляется всем зарегистрированным пользователям, кроме заблокированных.\n\n"
         f"Статус: <b>{status}</b>\n"
-        f"Время: <b>{html.escape(str(state.get('time') or RADAR_DAILY_DIGEST_DEFAULT_TIME))} МСК</b>\n"
-        f"Следующая: <b>{html.escape(_daily_digest_next_run_text(state))}</b>\n"
+        f"Время: <b>{html.escape(str(digest_state.get('time') or RADAR_DAILY_DIGEST_DEFAULT_TIME))} МСК</b>\n"
+        f"Следующая: <b>{html.escape(_daily_digest_next_run_text(digest_state))}</b>\n"
         f"Последняя: <b>{html.escape(last)}</b>\n"
-        f"Доставлено в прошлый раз: <b>{int(state.get('last_delivered') or 0)}</b>\n\n"
+        f"Доставлено в прошлый раз: <b>{int(digest_state.get('last_delivered') or 0)}</b>\n\n"
         "<b>Живые цифры для сегодняшнего поста:</b>\n"
         f"🔎 Проверено: <b>{_digest_n(metrics.get('listings_seen', 0))}</b>\n"
         f"📡 Сигналов сегодня: <b>+{_digest_n(metrics.get('signals_today', 0))}</b>\n"
@@ -11477,7 +11477,7 @@ async def admin_daily_radar_handler(callback: CallbackQuery, fsm: FSMContext) ->
         f"🧠 AI Picks: <b>{_digest_n(metrics.get('ai_picks', 0))}</b> · 📦 база: <b>{_digest_n(metrics.get('radar_total', 0))}</b>"
         + freshness
     )
-    await _edit_or_answer(callback.message, text, reply_markup=admin_daily_radar_keyboard(state))
+    await _edit_or_answer(callback.message, text, reply_markup=admin_daily_radar_keyboard(digest_state))
 
 
 @dp.callback_query(F.data == "admindailyradar:toggle")
@@ -15540,7 +15540,7 @@ async def main() -> None:
             f"v4.9.1 expected {GUARANTEED_LOCAL_PARSER_LANES} scan workers, got {len(worker_tasks)}"
         )
     log.warning(
-        "v4.12.2 Daily Radar Instant UI + Manual Control + Growth Loop + AutoScan View Deadlock Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
+        "v4.12.3 Daily Radar FSM Hotfix + Instant UI + Manual Control + Growth Loop + AutoScan View Deadlock Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
         "trial_and_paid_same_queue=True | railway_lane_overrides_ignored=True",
         GUARANTEED_LOCAL_PARSER_LANES,
     )

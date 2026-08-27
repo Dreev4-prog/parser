@@ -1,3 +1,9 @@
+# DT PARSER 4.12.3 — Daily Radar FSM Hotfix
+
+**Base:** 4.12.2 Daily Radar Instant UI.
+
+Fixes the aiogram 3 callback crash `admin_daily_radar_handler() missing 1 required positional argument: 'fsm'`. The handler now receives the injected FSM context as `state: FSMContext`; its Daily Radar config is kept separately as `digest_state`. No Radar/AutoScan/Page/Date/View/AI algorithm changes. Redeploy parser only.
+
 # DT PARSER 4.12.2 — Daily Radar Instant UI
 
 **Base:** 4.12.1 Daily Radar Manual Control.
