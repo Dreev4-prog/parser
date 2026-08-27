@@ -1,3 +1,22 @@
+## v4.12.0 — Daily Radar Growth Loop
+
+v4.12.0 keeps the full **v4.11.9 AutoScan View Deadlock Recovery + v4.11.8 Launch Recovery + Free Radar funnel** and adds a permanent daily growth loop around DT Radar.
+
+### Daily Radar
+- sends one factual Radar digest per day to every registered, non-banned user
+- default schedule: **20:00 MSK**; admin can choose 12:00 / 18:00 / 20:00 / 22:00
+- uses live AutoScan + persistent Radar database numbers: checked/new listings, daily signals, new Radar products, Hot, Rising, AI Picks, total Radar base and best DT Score
+- free users are sent directly into the existing 5-item Radar preview; paid users go to full Radar
+- Daily Radar clicks are attributed inside the existing free Radar funnel (`📨 Пришли из Daily Radar`)
+- admin section `📨 Daily Radar` provides on/off, time selection, live counters and a test-to-self button
+- send date is persisted in `app_settings`, preventing duplicate same-day campaigns after Railway restarts
+- admin-only access mode suppresses the commercial digest
+- no DB migration, no new Railway variables, and no parser/Page/Date/View/AI algorithm changes
+
+See `DEPLOY_V4_12_0_DAILY_RADAR_GROWTH_LOOP.md` for deployment and smoke tests.
+
+---
+
 ## v4.11.9 — AutoScan View Deadlock Recovery
 
 v4.11.9 keeps the full **v4.11.8 AutoScan Launch Recovery + v4.11.7 Free Funnel Analytics + v4.11.6 Free Radar Preview + v4.11.5 AutoScan Stability** release and fixes a deterministic AutoScan stall after the last collected page.
