@@ -198,6 +198,12 @@ RADAR_DAILY_DIGEST_DEFAULT_TIME = "20:00"
 RADAR_DAILY_DIGEST_TIME_CHOICES = ("12:00", "18:00", "20:00", "22:00")
 RADAR_DAILY_DIGEST_TIME_RE = re.compile(r"^(?:[01]?\d|2[0-3]):[0-5]\d$")
 RADAR_DAILY_DIGEST_POLL_SECONDS = 30
+# v4.12.2: admin controls must never look dead while Radar tables are busy. UI reads
+# use short bounded waits and can fall back to the last successfully cached metrics.
+RADAR_DAILY_DIGEST_STATE_TIMEOUT_SECONDS = 4.0
+RADAR_DAILY_DIGEST_UI_METRICS_TIMEOUT_SECONDS = 8.0
+RADAR_DAILY_DIGEST_SEND_METRICS_TIMEOUT_SECONDS = 20.0
+RADAR_DAILY_DIGEST_RECIPIENTS_TIMEOUT_SECONDS = 8.0
 _RADAR_DAILY_DIGEST_SEND_LOCK = asyncio.Lock()
 
 _radar_autoscan_guard = asyncio.Lock()
@@ -11055,6 +11061,8 @@ def _daily_digest_default_state(*, initialize: bool = False) -> dict:
         "last_delivered": 0,
         "last_blocked": 0,
         "last_failed": 0,
+        "last_metrics": {},
+        "last_metrics_at": "",
     }
 
 
@@ -11137,6 +11145,84 @@ def _daily_digest_msk_date(value: str) -> str:
         return dt.astimezone(MOSCOW).date().isoformat()
     except Exception:
         return ""
+
+
+def _radar_daily_digest_zero_metrics() -> dict[str, int]:
+    return {
+        "listings_seen": 0,
+        "new_listings": 0,
+        "pages_verified": 0,
+        "categories_processed": 0,
+        "signals_today": 0,
+        "products_today": 0,
+        "best_score_today": 0,
+        "radar_total": 0,
+        "hot": 0,
+        "rising": 0,
+        "ai_picks": 0,
+        "categories": 0,
+    }
+
+
+def _radar_daily_digest_cached_metrics(state: dict | None) -> dict[str, int]:
+    result = _radar_daily_digest_zero_metrics()
+    raw = (state or {}).get("last_metrics") or {}
+    if isinstance(raw, dict):
+        for key in result:
+            try:
+                result[key] = max(0, int(raw.get(key) or 0))
+            except Exception:
+                pass
+    return result
+
+
+async def _load_radar_daily_digest_state_bounded() -> tuple[dict, bool]:
+    try:
+        state = await asyncio.wait_for(
+            load_radar_daily_digest_state(),
+            timeout=RADAR_DAILY_DIGEST_STATE_TIMEOUT_SECONDS,
+        )
+        return state, True
+    except Exception:
+        log.exception("Daily Radar state load failed/timeout")
+        return _daily_digest_default_state(), False
+
+
+async def _radar_daily_digest_metrics_bounded(
+    state: dict | None,
+    *,
+    timeout_seconds: float = RADAR_DAILY_DIGEST_UI_METRICS_TIMEOUT_SECONDS,
+    cache_success: bool = True,
+) -> tuple[dict[str, int], bool]:
+    """Return live metrics without allowing an admin callback to hang indefinitely."""
+    try:
+        metrics = await asyncio.wait_for(
+            radar_daily_digest_metrics(),
+            timeout=max(1.0, float(timeout_seconds)),
+        )
+    except Exception:
+        log.exception("Daily Radar metrics failed/timeout timeout=%.1fs", float(timeout_seconds))
+        return _radar_daily_digest_cached_metrics(state), False
+
+    clean = _radar_daily_digest_zero_metrics()
+    for key in clean:
+        try:
+            clean[key] = max(0, int(metrics.get(key) or 0))
+        except Exception:
+            pass
+
+    if cache_success and state is not None:
+        try:
+            state["last_metrics"] = clean
+            state["last_metrics_at"] = datetime.now(MOSCOW).replace(microsecond=0).isoformat()
+            await asyncio.wait_for(
+                save_radar_daily_digest_state(state),
+                timeout=RADAR_DAILY_DIGEST_STATE_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            # Metric caching is best-effort and must never break the admin UI.
+            log.warning("Daily Radar metric cache save failed", exc_info=True)
+    return clean, True
 
 
 async def radar_daily_digest_metrics() -> dict[str, int]:
@@ -11287,32 +11373,43 @@ async def radar_daily_digest_scheduler(bot: Bot) -> None:
                 state = await load_radar_daily_digest_state()
                 now = datetime.now(MOSCOW)
                 if _daily_digest_due(state, now) and current_access_mode() == "subscription":
-                    state["last_sent_date"] = now.date().isoformat()
-                    state["last_sent_at"] = now.replace(microsecond=0).isoformat()
-                    await save_radar_daily_digest_state(state)
-                    metrics = await radar_daily_digest_metrics()
-                    result = await _send_radar_daily_digest(bot, metrics)
-                    state = await load_radar_daily_digest_state()
-                    state["last_delivered"] = int(result["sent"])
-                    state["last_blocked"] = int(result["blocked"])
-                    state["last_failed"] = int(result["failed"])
-                    await save_radar_daily_digest_state(state)
-                    log.info(
-                        "Daily Radar digest sent date=%s recipients=%s delivered=%s blocked=%s failed=%s listings=%s signals=%s",
-                        now.date().isoformat(), result["recipients"], result["sent"], result["blocked"], result["failed"],
-                        metrics.get("listings_seen", 0), metrics.get("signals_today", 0),
+                    # v4.12.2: do not mark the day as sent until fresh metrics were
+                    # obtained and the delivery loop actually completed. v4.12.1
+                    # marked last_sent_date before aggregates, so a metric failure
+                    # could silently suppress the whole day's digest.
+                    metrics, metrics_fresh = await _radar_daily_digest_metrics_bounded(
+                        state,
+                        timeout_seconds=RADAR_DAILY_DIGEST_SEND_METRICS_TIMEOUT_SECONDS,
                     )
-                    for admin_id in sorted(ADMIN_IDS):
-                        try:
-                            await bot.send_message(
-                                int(admin_id),
-                                "✅ <b>Daily Radar отправлен</b>\n\n"
-                                f"Доставлено: <b>{result['sent']}</b> / {result['recipients']}\n"
-                                f"Недоступны: <b>{result['blocked']}</b> · ошибки: <b>{result['failed']}</b>",
-                                parse_mode=ParseMode.HTML,
-                            )
-                        except Exception:
-                            pass
+                    if not metrics_fresh:
+                        log.warning("Daily Radar scheduler skipped: fresh metrics unavailable")
+                    else:
+                        result = await _send_radar_daily_digest(bot, metrics)
+                        state = await load_radar_daily_digest_state()
+                        state["last_sent_date"] = now.date().isoformat()
+                        state["last_sent_at"] = now.replace(microsecond=0).isoformat()
+                        state["last_delivered"] = int(result["sent"])
+                        state["last_blocked"] = int(result["blocked"])
+                        state["last_failed"] = int(result["failed"])
+                        state["last_metrics"] = metrics
+                        state["last_metrics_at"] = datetime.now(MOSCOW).replace(microsecond=0).isoformat()
+                        await save_radar_daily_digest_state(state)
+                        log.info(
+                            "Daily Radar digest sent date=%s recipients=%s delivered=%s blocked=%s failed=%s listings=%s signals=%s",
+                            now.date().isoformat(), result["recipients"], result["sent"], result["blocked"], result["failed"],
+                            metrics.get("listings_seen", 0), metrics.get("signals_today", 0),
+                        )
+                        for admin_id in sorted(ADMIN_IDS):
+                            try:
+                                await bot.send_message(
+                                    int(admin_id),
+                                    "✅ <b>Daily Radar отправлен</b>\n\n"
+                                    f"Доставлено: <b>{result['sent']}</b> / {result['recipients']}\n"
+                                    f"Недоступны: <b>{result['blocked']}</b> · ошибки: <b>{result['failed']}</b>",
+                                    parse_mode=ParseMode.HTML,
+                                )
+                            except Exception:
+                                pass
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -11337,9 +11434,19 @@ async def admin_daily_radar_handler(callback: CallbackQuery, fsm: FSMContext) ->
         await callback.answer("Нет доступа", show_alert=True)
         return
     await fsm.clear()
-    state = await load_radar_daily_digest_state()
-    metrics = await radar_daily_digest_metrics()
-    await callback.answer()
+    # v4.12.2: acknowledge before any database aggregates. In v4.12.1 slow/busy
+    # Radar queries ran first, so Telegram looked as if the button did nothing.
+    await callback.answer("Открываю Daily Radar…")
+    await _edit_or_answer(
+        callback.message,
+        "<b>📨 Daily Radar</b>\n\n⏳ Загружаю живые цифры…",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")
+        ]]),
+    )
+    log.info("Daily Radar admin panel open requested admin=%s", callback.from_user.id)
+    state, state_fresh = await _load_radar_daily_digest_state_bounded()
+    metrics, metrics_fresh = await _radar_daily_digest_metrics_bounded(state)
     status = "✅ ВКЛ" if state.get("enabled", True) else "⏸ ВЫКЛ"
     last = str(state.get("last_sent_at") or "—")
     if last != "—":
@@ -11350,6 +11457,11 @@ async def admin_daily_radar_handler(callback: CallbackQuery, fsm: FSMContext) ->
             last = last_dt.astimezone(MOSCOW).strftime("%d.%m.%Y %H:%M МСК")
         except Exception:
             pass
+    freshness = ""
+    if not state_fresh or not metrics_fresh:
+        cached_at = str(state.get("last_metrics_at") or "")
+        suffix = f" · кэш {html.escape(cached_at)}" if cached_at else ""
+        freshness = f"\n\n⚠️ <b>Живые цифры временно недоступны</b>{suffix}. Управление рассылкой работает; нажми «Обновить цифры» позже."
     text = (
         "<b>📨 Daily Radar</b>\n\n"
         "Ежедневная продающая сводка с живыми цифрами DT Radar. Отправляется всем зарегистрированным пользователям, кроме заблокированных.\n\n"
@@ -11363,6 +11475,7 @@ async def admin_daily_radar_handler(callback: CallbackQuery, fsm: FSMContext) ->
         f"📡 Сигналов сегодня: <b>+{_digest_n(metrics.get('signals_today', 0))}</b>\n"
         f"🔥 Горячих: <b>{_digest_n(metrics.get('hot', 0))}</b> · 🚀 Набирают: <b>{_digest_n(metrics.get('rising', 0))}</b>\n"
         f"🧠 AI Picks: <b>{_digest_n(metrics.get('ai_picks', 0))}</b> · 📦 база: <b>{_digest_n(metrics.get('radar_total', 0))}</b>"
+        + freshness
     )
     await _edit_or_answer(callback.message, text, reply_markup=admin_daily_radar_keyboard(state))
 
@@ -11372,11 +11485,20 @@ async def admin_daily_radar_toggle(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    state = await load_radar_daily_digest_state()
+    await callback.answer("Меняю режим…")
+    state, _ = await _load_radar_daily_digest_state_bounded()
     state["enabled"] = not bool(state.get("enabled", True))
-    state = await save_radar_daily_digest_state(state)
-    await callback.answer("Daily Radar включён" if state["enabled"] else "Daily Radar выключен")
-    metrics = await radar_daily_digest_metrics()
+    try:
+        state = await asyncio.wait_for(save_radar_daily_digest_state(state), timeout=RADAR_DAILY_DIGEST_STATE_TIMEOUT_SECONDS)
+    except Exception:
+        log.exception("Daily Radar toggle save failed")
+        await _edit_or_answer(
+            callback.message,
+            "❌ <b>Не удалось сохранить настройку Daily Radar.</b>\n\nПопробуй ещё раз.",
+            reply_markup=admin_daily_radar_keyboard(state),
+        )
+        return
+    metrics, _ = await _radar_daily_digest_metrics_bounded(state)
     status = "✅ ВКЛ" if state["enabled"] else "⏸ ВЫКЛ"
     await _edit_or_answer(
         callback.message,
@@ -11395,8 +11517,8 @@ async def admin_daily_radar_time(callback: CallbackQuery, state: FSMContext) -> 
         await callback.answer("Нет доступа", show_alert=True)
         return
     await state.clear()
-    digest_state = await load_radar_daily_digest_state()
-    await callback.answer()
+    await callback.answer("Открываю выбор времени…")
+    digest_state, _ = await _load_radar_daily_digest_state_bounded()
     await _edit_or_answer(
         callback.message,
         "<b>🕐 Время Daily Radar</b>\n\n"
@@ -11419,10 +11541,19 @@ async def admin_daily_radar_set_time(callback: CallbackQuery, state: FSMContext)
         await callback.answer("Некорректное время", show_alert=True)
         return
     await state.clear()
-    digest_state = await load_radar_daily_digest_state()
+    await callback.answer(f"Сохраняю {value} МСК…")
+    digest_state, _ = await _load_radar_daily_digest_state_bounded()
     digest_state["time"] = value
-    digest_state = await save_radar_daily_digest_state(digest_state)
-    await callback.answer(f"Время: {value} МСК")
+    try:
+        digest_state = await asyncio.wait_for(save_radar_daily_digest_state(digest_state), timeout=RADAR_DAILY_DIGEST_STATE_TIMEOUT_SECONDS)
+    except Exception:
+        log.exception("Daily Radar set-time save failed value=%s", value)
+        await _edit_or_answer(
+            callback.message,
+            "❌ <b>Не удалось сохранить время.</b>\n\nПопробуй ещё раз.",
+            reply_markup=admin_daily_radar_time_keyboard(str(digest_state.get("time") or "")),
+        )
+        return
     await _edit_or_answer(
         callback.message,
         "<b>📨 Daily Radar</b>\n\n"
@@ -11465,9 +11596,14 @@ async def admin_daily_radar_custom_time_message(message: Message, state: FSMCont
             parse_mode=ParseMode.HTML,
         )
         return
-    digest_state = await load_radar_daily_digest_state()
+    digest_state, _ = await _load_radar_daily_digest_state_bounded()
     digest_state["time"] = value
-    digest_state = await save_radar_daily_digest_state(digest_state)
+    try:
+        digest_state = await asyncio.wait_for(save_radar_daily_digest_state(digest_state), timeout=RADAR_DAILY_DIGEST_STATE_TIMEOUT_SECONDS)
+    except Exception:
+        log.exception("Daily Radar custom-time save failed value=%s", value)
+        await message.answer("❌ Не удалось сохранить время. Попробуй ещё раз.")
+        return
     await state.clear()
     await message.answer(
         "✅ <b>Время Daily Radar сохранено</b>\n\n"
@@ -11483,9 +11619,33 @@ async def admin_daily_radar_send_now_preview(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    metrics = await radar_daily_digest_metrics()
-    recipients = await _broadcast_recipient_ids()
-    await callback.answer()
+    await callback.answer("Готовлю предпросмотр…")
+    await _edit_or_answer(
+        callback.message,
+        "<b>📣 Daily Radar</b>\n\n⏳ Считаю живые цифры и получателей…",
+    )
+    state, _ = await _load_radar_daily_digest_state_bounded()
+    metrics, metrics_fresh = await _radar_daily_digest_metrics_bounded(state)
+    try:
+        recipients = await asyncio.wait_for(
+            _broadcast_recipient_ids(),
+            timeout=RADAR_DAILY_DIGEST_RECIPIENTS_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        log.exception("Daily Radar recipient count failed/timeout")
+        await _edit_or_answer(
+            callback.message,
+            "❌ <b>Не удалось получить список получателей.</b>\n\nНичего не отправлено. Попробуй ещё раз.",
+            reply_markup=admin_daily_radar_keyboard(state),
+        )
+        return
+    if not metrics_fresh:
+        await _edit_or_answer(
+            callback.message,
+            "⚠️ <b>Не удалось обновить живые цифры.</b>\n\nРассылка не запущена, чтобы не отправить устаревшую статистику. Нажми «Обновить цифры» и повтори.",
+            reply_markup=admin_daily_radar_keyboard(state),
+        )
+        return
     await _edit_or_answer(
         callback.message,
         "<b>📣 Отправить Daily Radar сейчас?</b>\n\n"
@@ -11513,9 +11673,19 @@ async def admin_daily_radar_send_now_confirm(callback: CallbackQuery) -> None:
         "<b>📣 Daily Radar отправляется…</b>\n\nСобираю живые цифры и отправляю пост пользователям.",
     )
     async with _RADAR_DAILY_DIGEST_SEND_LOCK:
-        metrics = await radar_daily_digest_metrics()
+        digest_state, _ = await _load_radar_daily_digest_state_bounded()
+        metrics, metrics_fresh = await _radar_daily_digest_metrics_bounded(
+            digest_state,
+            timeout_seconds=RADAR_DAILY_DIGEST_SEND_METRICS_TIMEOUT_SECONDS,
+        )
+        if not metrics_fresh:
+            await _edit_or_answer(
+                callback.message,
+                "❌ <b>Daily Radar не отправлен.</b>\n\nНе удалось получить свежие цифры. Попробуй ещё раз через минуту.",
+                reply_markup=admin_daily_radar_keyboard(digest_state),
+            )
+            return
         result = await _send_radar_daily_digest(callback.bot, metrics)
-        digest_state = await load_radar_daily_digest_state()
         now = datetime.now(MOSCOW)
         # A manual send counts as today's digest so the scheduler does not duplicate it later.
         # The admin may still press "Send now" again explicitly if another blast is desired.
@@ -11524,7 +11694,13 @@ async def admin_daily_radar_send_now_confirm(callback: CallbackQuery) -> None:
         digest_state["last_delivered"] = int(result["sent"])
         digest_state["last_blocked"] = int(result["blocked"])
         digest_state["last_failed"] = int(result["failed"])
-        digest_state = await save_radar_daily_digest_state(digest_state)
+        try:
+            digest_state = await asyncio.wait_for(
+                save_radar_daily_digest_state(digest_state),
+                timeout=RADAR_DAILY_DIGEST_STATE_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            log.warning("Daily Radar manual-send state save failed", exc_info=True)
     log.info(
         "Daily Radar digest manual send admin=%s recipients=%s delivered=%s blocked=%s failed=%s listings=%s signals=%s",
         callback.from_user.id, result["recipients"], result["sent"], result["blocked"], result["failed"],
@@ -11547,9 +11723,13 @@ async def admin_daily_radar_test(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    metrics = await radar_daily_digest_metrics()
+    await callback.answer("Готовлю тест…")
+    state, _ = await _load_radar_daily_digest_state_bounded()
+    metrics, fresh = await _radar_daily_digest_metrics_bounded(state)
+    if not fresh:
+        await callback.message.answer("⚠️ Не удалось получить свежие цифры Daily Radar. Тест не отправлен.")
+        return
     paid = allowed(callback.from_user.id)
-    await callback.answer("Тест отправлен только тебе")
     await callback.bot.send_message(
         int(callback.from_user.id),
         radar_daily_digest_text(metrics, paid=paid),
@@ -15360,7 +15540,7 @@ async def main() -> None:
             f"v4.9.1 expected {GUARANTEED_LOCAL_PARSER_LANES} scan workers, got {len(worker_tasks)}"
         )
     log.warning(
-        "v4.12.1 Daily Radar Manual Control + Daily Radar Growth Loop + AutoScan View Deadlock Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
+        "v4.12.2 Daily Radar Instant UI + Manual Control + Growth Loop + AutoScan View Deadlock Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
         "trial_and_paid_same_queue=True | railway_lane_overrides_ignored=True",
         GUARANTEED_LOCAL_PARSER_LANES,
     )

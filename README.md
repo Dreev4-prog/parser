@@ -1,3 +1,9 @@
+# DT PARSER 4.12.2 — Daily Radar Instant UI
+
+**Base:** 4.12.1 Daily Radar Manual Control.
+
+This hotfix makes the admin Daily Radar controls fail-fast and visibly responsive. Telegram callbacks are acknowledged before live PostgreSQL/Radar aggregates run, a loading state is shown immediately, live metric/state reads are bounded by timeouts, and the last successful metrics are cached for panel fallback. Manual send still requires fresh metrics and will refuse to broadcast stale data. Time selection/manual time and the v4.11.9 AutoScan view-deadlock fix are preserved.
+
 # DT PARSER 4.12.1 — Daily Radar Manual Control
 
 - Daily Radar: любое время `HH:MM` по Москве.
