@@ -1,3 +1,13 @@
+# DT PARSER 4.14.1 — Radar Price & Return UX
+
+**Base:** 4.14.0 Fast Sold Lifecycle.
+
+Adds a persistent Radar price filter to category/search feeds and preserves exact list context when a product card is opened. Category cards now return to the same category/page/sort/filter with `⬅️ Назад к категории`; search and other feeds keep their own return context. Price matching uses actually observed listing prices from `radar_product_listings`, not only a product-family min/max range. No AI/DT Score, parser, AutoScan, Date/Page/View/Lifecycle algorithm or DB schema change.
+
+See `DEPLOY_V4_14_1_RADAR_PRICE_AND_RETURN_UX.md`.
+
+---
+
 # DT PARSER 4.14.0 — Fast Sold Lifecycle
 
 **Base:** 4.13.0 Simple Referral Promo.

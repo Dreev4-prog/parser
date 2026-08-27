@@ -642,6 +642,7 @@ class ScanInput(StatesGroup):
 
 class RadarInput(StatesGroup):
     search = State()
+    price = State()
 
 
 class AdminInput(StatesGroup):
@@ -1147,6 +1148,55 @@ RADAR_TYPE_LABEL = {
 }
 
 
+def _radar_price_filter(data: dict | None) -> str:
+    value = str((data or {}).get("radar_price_filter") or "any").strip()
+    return value or "any"
+
+
+def _radar_product_price_text(product) -> str:
+    lo = getattr(product, "min_price_eur", None)
+    hi = getattr(product, "max_price_eur", None)
+    if lo is None and hi is None:
+        return "—"
+    if lo is None:
+        return f"до {int(hi)} €"
+    if hi is None or int(lo) == int(hi):
+        return f"{int(lo)} €"
+    return f"{int(lo)}–{int(hi)} €"
+
+
+def _radar_context_back(data: dict | None) -> tuple[str, str]:
+    data = data or {}
+    kind = str(data.get("radar_context_kind") or "")
+    page = max(0, int(data.get("radar_context_page") or 0))
+    if kind == "category":
+        category_key = str(data.get("radar_context_category") or "")
+        mode = str(data.get("radar_context_mode") or "category_new")
+        prefix = "radarcatbest" if mode == "category_best" else "radarcat"
+        if category_key:
+            return f"{prefix}:{category_key}:{page}", "⬅️ Назад к категории"
+    if kind == "search":
+        return f"radarsearchpage:{page}", "⬅️ К результатам"
+    if kind == "list":
+        mode = str(data.get("radar_context_mode") or "hot")
+        return f"radarlist:{mode}:{page}", "⬅️ К списку"
+    return "radar_home", "⬅️ DT Radar"
+
+
+def radar_price_keyboard(current_filter: str = "any") -> InlineKeyboardMarkup:
+    current = (current_filter or "any").strip()
+    def b(label: str, value: str) -> InlineKeyboardButton:
+        mark = "✅ " if current == value else ""
+        return InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"radarprice:set:{value}")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [b("Любая", "any"), b("до 50 €", "0_50")],
+        [b("50–100 €", "50_100"), b("100–200 €", "100_200")],
+        [b("200–500 €", "200_500"), b("500+ €", "500_plus")],
+        [InlineKeyboardButton(text="✍️ Свой диапазон", callback_data="radarprice:custom")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="radarprice:back")],
+    ])
+
+
 def radar_home_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     # Paid users see all four destinations.  Free preview keeps the same shape so
     # the value of the full product is visible without granting the locked data.
@@ -1181,7 +1231,7 @@ def radar_best_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def radar_search_keyboard(items, *, page: int, total: int) -> InlineKeyboardMarkup:
+def radar_search_keyboard(items, *, page: int, total: int, price_filter: str = "any") -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for product in items:
         icon = RADAR_STATUS_ICON.get(str(product.status or ""), "📡")
@@ -1199,6 +1249,9 @@ def radar_search_keyboard(items, *, page: int, total: int) -> InlineKeyboardMark
         nav.append(InlineKeyboardButton(text="➡️", callback_data=f"radarsearchpage:{page+1}"))
     if nav:
         rows.append(nav)
+    rows.append([InlineKeyboardButton(
+        text=f"💶 Цена: {price_filter_label(price_filter)}", callback_data="radarprice:open"
+    )])
     rows.append([InlineKeyboardButton(text="🔎 Новый поиск", callback_data="radarsearch")])
     rows.append([InlineKeyboardButton(text="⬅️ DT Radar", callback_data="radar_home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1241,7 +1294,10 @@ def radar_preview_list_keyboard(
 
 
 
-def radar_list_keyboard(items, *, mode: str, page: int, total: int, category_key: str | None = None) -> InlineKeyboardMarkup:
+def radar_list_keyboard(
+    items, *, mode: str, page: int, total: int, category_key: str | None = None,
+    price_filter: str = "any",
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for product in items:
         icon = "⚡" if mode == "fastsold" else RADAR_STATUS_ICON.get(str(product.status or ""), "📡")
@@ -1271,6 +1327,9 @@ def radar_list_keyboard(items, *, mode: str, page: int, total: int, category_key
             rows.append([InlineKeyboardButton(text="🆕 Сначала новые", callback_data=f"radarcat:{category_key}:0")])
         else:
             rows.append([InlineKeyboardButton(text="🔥 Сначала лучшие", callback_data=f"radarcatbest:{category_key}:0")])
+        rows.append([InlineKeyboardButton(
+            text=f"💶 Цена: {price_filter_label(price_filter)}", callback_data="radarprice:open"
+        )])
         cat = CATEGORIES.get(category_key)
         group = GROUPS.get(cat.group) if cat is not None else None
         rows.append([InlineKeyboardButton(
@@ -1337,7 +1396,8 @@ def radar_group_keyboard(group_key: str, items: list[tuple[str, int, int, int]])
 
 def radar_product_keyboard(
     product_id: int, *, favorite: bool = False, listing_url: str | None = None,
-    preview_mode: str | None = None,
+    preview_mode: str | None = None, return_callback: str | None = None,
+    return_text: str | None = None,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if preview_mode is None:
@@ -1351,7 +1411,9 @@ def radar_product_keyboard(
         rows.append([InlineKeyboardButton(text="💎 Открыть полный DT Radar", callback_data="radar_upgrade:item")])
         rows.append([InlineKeyboardButton(text="⬅️ К бесплатным находкам", callback_data=f"radarlist:{preview_mode}:0")])
     else:
-        rows.append([InlineKeyboardButton(text="⬅️ DT Radar", callback_data="radar_home")])
+        rows.append([InlineKeyboardButton(
+            text=return_text or "⬅️ DT Radar", callback_data=return_callback or "radar_home"
+        )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -13533,6 +13595,7 @@ async def _radar_home_text(user_id: int | None = None) -> str:
 
 async def _radar_list_payload(
     user_id: int, mode: str, page: int, category_key: str | None = None, *, preview: bool = False,
+    price_filter: str = "any",
 ):
     if preview:
         page = 0
@@ -13541,7 +13604,8 @@ async def _radar_list_payload(
         )
     else:
         rows, total = await list_radar_products(
-            mode=mode, category_key=category_key, page=page, user_id=user_id
+            mode=mode, category_key=category_key, page=page, user_id=user_id,
+            price_filter=price_filter if category_key else "any",
         )
     titles = {
         "hot": "🔥 Горячие сейчас",
@@ -13581,13 +13645,15 @@ async def _radar_list_payload(
         if mode == "category_best":
             lines += [
                 "🔥 Сортировка: <b>сначала лучшие по DT Score</b>.",
-                "В списке остаются <b>все товары, прошедшие отбор Radar</b>.",
+                f"💶 Цена: <b>{html.escape(price_filter_label(price_filter))}</b>.",
+                "В списке остаются <b>все товары, прошедшие отбор Radar</b> и подходящие под фильтр цены.",
                 "",
             ]
         else:
             lines += [
                 "🆕 Сортировка: <b>сначала новые</b>.",
-                "В списке — <b>все товары, прошедшие отбор Radar</b>.",
+                f"💶 Цена: <b>{html.escape(price_filter_label(price_filter))}</b>.",
+                "В списке — <b>все товары, прошедшие отбор Radar</b> и подходящие под фильтр цены.",
                 "",
             ]
     if not rows:
@@ -13621,7 +13687,7 @@ async def _radar_list_payload(
                 f"{icon} <b>{index}. {html.escape(str(product.title or 'Товар')[:70])}</b>\n"
                 f"⭐ <b>{int(product.current_score or 0)}</b>/100 · Peak <b>{int(product.peak_score or 0)}</b> · "
                 f"📂 {html.escape(cat_name)}\n"
-                f"🕐 <b>{html.escape(freshness)}</b> · "
+                f"💶 <b>{html.escape(_radar_product_price_text(product))}</b> · 🕐 <b>{html.escape(freshness)}</b> · "
                 f"🔁 сигналов: <b>{int(product.signal_count or 0)}</b> · объявлений: <b>{int(product.listing_count or 0)}</b>"
             )
     if preview:
@@ -13640,11 +13706,15 @@ async def _radar_list_payload(
         pages = max(1, (total + RADAR_PAGE_SIZE - 1) // RADAR_PAGE_SIZE)
         lines += ["", f"Страница <b>{page + 1}/{pages}</b> · всего <b>{total}</b>"]
     return "\n\n".join(lines), radar_list_keyboard(
-        rows, mode=mode, page=page, total=total, category_key=category_key
+        rows, mode=mode, page=page, total=total, category_key=category_key,
+        price_filter=price_filter,
     )
 
 
-async def _radar_product_payload(user_id: int, product_id: int, *, preview_mode: str | None = None):
+async def _radar_product_payload(
+    user_id: int, product_id: int, *, preview_mode: str | None = None,
+    return_callback: str | None = None, return_text: str | None = None,
+):
     product, listing, snapshots = await get_radar_product(product_id)
     if product is None:
         return None, None
@@ -13704,7 +13774,8 @@ async def _radar_product_payload(user_id: int, product_id: int, *, preview_mode:
     if preview_mode is not None:
         lines += ["", "🎁 <b>Бесплатная находка DT Radar</b> · полный доступ открывает всю базу, поиск и категории."]
     return "\n".join(lines), radar_product_keyboard(
-        product_id, favorite=favorite, listing_url=listing_url, preview_mode=preview_mode
+        product_id, favorite=favorite, listing_url=listing_url, preview_mode=preview_mode,
+        return_callback=return_callback, return_text=return_text,
     )
 
 
@@ -13715,10 +13786,15 @@ async def _radar_preview_product_allowed(product_id: int, mode: str) -> bool:
     return any(int(product.id) == int(product_id) for product in rows)
 
 
-async def _radar_search_payload(query: str, page: int = 0):
+async def _radar_search_payload(query: str, page: int = 0, *, price_filter: str = "any"):
     clean = " ".join(str(query or "").split())[:80]
-    rows, total = await search_radar_products(clean, page=page)
-    lines = [f"🔎 <b>Поиск DT Radar</b>", f"Запрос: <b>{html.escape(clean)}</b>", ""]
+    rows, total = await search_radar_products(clean, page=page, price_filter=price_filter)
+    lines = [
+        f"🔎 <b>Поиск DT Radar</b>",
+        f"Запрос: <b>{html.escape(clean)}</b>",
+        f"💶 Цена: <b>{html.escape(price_filter_label(price_filter))}</b>",
+        "",
+    ]
     if not rows:
         lines.append("Ничего не нашёл. Попробуй более короткое название или модель.")
     else:
@@ -13729,13 +13805,47 @@ async def _radar_search_payload(query: str, page: int = 0):
             cat_name = cat.name if cat is not None else str(product.category_key or "—")
             lines.append(
                 f"{icon} <b>{index}. {html.escape(str(product.title or 'Товар')[:70])}</b>\n"
-                f"⭐ <b>{int(product.current_score or 0)}</b>/100 · 📂 {html.escape(cat_name)}\n"
+                f"⭐ <b>{int(product.current_score or 0)}</b>/100 · 💶 <b>{html.escape(_radar_product_price_text(product))}</b> · "
+                f"📂 {html.escape(cat_name)}\n"
                 f"🕐 <b>{html.escape(_radar_freshness(product.last_signal_at))}</b>"
             )
     if total:
         pages = max(1, (total + RADAR_PAGE_SIZE - 1) // RADAR_PAGE_SIZE)
         lines += ["", f"Страница <b>{page + 1}/{pages}</b> · найдено <b>{total}</b>"]
-    return "\n\n".join(lines), radar_search_keyboard(rows, page=page, total=total)
+    return "\n\n".join(lines), radar_search_keyboard(
+        rows, page=page, total=total, price_filter=price_filter
+    )
+
+
+async def _render_radar_context(message: Message, user_id: int, state: FSMContext) -> None:
+    data = await state.get_data()
+    kind = str(data.get("radar_context_kind") or "")
+    page = max(0, int(data.get("radar_context_page") or 0))
+    price_filter = _radar_price_filter(data)
+    if kind == "category":
+        category_key = str(data.get("radar_context_category") or "")
+        mode = str(data.get("radar_context_mode") or "category_new")
+        if category_key in CATEGORIES:
+            text, markup = await _radar_list_payload(
+                user_id, mode, page, category_key=category_key, price_filter=price_filter
+            )
+            await _edit_or_answer(message, text, reply_markup=markup)
+            return
+    if kind == "search":
+        query = str(data.get("radar_search_query") or "").strip()
+        if query:
+            text, markup = await _radar_search_payload(query, page, price_filter=price_filter)
+            await _edit_or_answer(message, text, reply_markup=markup)
+            return
+    if kind == "list":
+        mode = str(data.get("radar_context_mode") or "hot")
+        if mode in {"hot", "rising", "ai", "fastsold", "alltime", "favorites"}:
+            text, markup = await _radar_list_payload(user_id, mode, page)
+            await _edit_or_answer(message, text, reply_markup=markup)
+            return
+    await _edit_or_answer(
+        message, await _radar_home_text(user_id), reply_markup=radar_home_keyboard(user_id)
+    )
 
 
 @dp.callback_query(F.data.startswith("radar_locked"))
@@ -13790,6 +13900,7 @@ async def radar_daily_open(callback: CallbackQuery, state: FSMContext) -> None:
 @dp.callback_query(F.data == "radar_home")
 async def radar_home(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(None)
+    await state.update_data(radar_context_kind="", radar_context_page=0)
     if free_radar_preview_allowed(callback.from_user.id):
         await record_free_radar_event(callback.from_user.id, "radar_open", feature="home")
     await callback.answer()
@@ -13846,7 +13957,7 @@ async def radar_best_handler(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data == "radarsearch")
 async def radar_search_begin(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(RadarInput.search)
-    await state.update_data(radar_search_query="")
+    await state.update_data(radar_search_query="", radar_context_kind="search", radar_context_page=0)
     await callback.answer()
     await _edit_or_answer(
         callback.message,
@@ -13862,9 +13973,12 @@ async def radar_search_message(message: Message, state: FSMContext) -> None:
         await message.answer("Напиши хотя бы 2 символа для поиска.")
         return
     query = query[:80]
-    await state.update_data(radar_search_query=query)
+    await state.update_data(
+        radar_search_query=query, radar_context_kind="search", radar_context_page=0
+    )
     await state.set_state(None)
-    text, markup = await _radar_search_payload(query, 0)
+    data = await state.get_data()
+    text, markup = await _radar_search_payload(query, 0, price_filter=_radar_price_filter(data))
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
@@ -13879,13 +13993,108 @@ async def radar_search_page(callback: CallbackQuery, state: FSMContext) -> None:
         page = max(0, int(callback.data.split(":", 1)[1]))
     except Exception:
         page = 0
+    await state.update_data(radar_context_kind="search", radar_context_page=page)
+    data = await state.get_data()
     await callback.answer()
-    text, markup = await _radar_search_payload(query, page)
+    text, markup = await _radar_search_payload(query, page, price_filter=_radar_price_filter(data))
     await _edit_or_answer(callback.message, text, reply_markup=markup)
 
 
+@dp.callback_query(F.data == "radarprice:open")
+async def radar_price_open(callback: CallbackQuery, state: FSMContext) -> None:
+    if not allowed(callback.from_user.id):
+        await callback.answer("Доступно в полном DT Radar", show_alert=True)
+        return
+    data = await state.get_data()
+    if str(data.get("radar_context_kind") or "") not in {"category", "search"}:
+        await callback.answer("Открой категорию или результаты поиска", show_alert=True)
+        return
+    current = _radar_price_filter(data)
+    await state.set_state(None)
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message,
+        "💶 <b>Фильтр цены DT Radar</b>\n\n"
+        f"Сейчас: <b>{html.escape(price_filter_label(current))}</b>.\n"
+        "Выбери диапазон. Radar оставит товары, у которых есть реально замеченное объявление в этой цене.",
+        reply_markup=radar_price_keyboard(current),
+    )
+
+
+@dp.callback_query(F.data.startswith("radarprice:set:"))
+async def radar_price_set(callback: CallbackQuery, state: FSMContext) -> None:
+    if not allowed(callback.from_user.id):
+        await callback.answer("Доступно в полном DT Radar", show_alert=True)
+        return
+    value = str(callback.data or "").removeprefix("radarprice:set:").strip()
+    allowed_values = {"any", "0_50", "50_100", "100_200", "200_500", "500_plus"}
+    if value not in allowed_values:
+        await callback.answer("Неизвестный диапазон", show_alert=True)
+        return
+    await state.set_state(None)
+    await state.update_data(radar_price_filter=value, radar_context_page=0)
+    await callback.answer(f"Цена: {price_filter_label(value)}")
+    await _render_radar_context(callback.message, callback.from_user.id, state)
+
+
+@dp.callback_query(F.data == "radarprice:custom")
+async def radar_price_custom(callback: CallbackQuery, state: FSMContext) -> None:
+    if not allowed(callback.from_user.id):
+        await callback.answer("Доступно в полном DT Radar", show_alert=True)
+        return
+    await state.set_state(RadarInput.price)
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message,
+        "✍️ <b>Свой диапазон цены</b>\n\n"
+        "Напиши, например:\n"
+        "<code>120-250</code>\n"
+        "<code>до 100</code>\n"
+        "<code>500+</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="radarprice:open")
+        ]]),
+    )
+
+
+@dp.message(RadarInput.price)
+async def radar_price_custom_message(message: Message, state: FSMContext) -> None:
+    value = parse_scan_price_input(message.text)
+    if value is None:
+        await message.answer(
+            "Не понял диапазон. Напиши, например: <code>120-250</code>, <code>до 100</code> или <code>500+</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await state.update_data(radar_price_filter=value, radar_context_page=0)
+    await state.set_state(None)
+    data = await state.get_data()
+    kind = str(data.get("radar_context_kind") or "")
+    price_filter = _radar_price_filter(data)
+    if kind == "category":
+        category_key = str(data.get("radar_context_category") or "")
+        mode = str(data.get("radar_context_mode") or "category_new")
+        text, markup = await _radar_list_payload(
+            message.from_user.id, mode, 0, category_key=category_key, price_filter=price_filter
+        )
+    elif kind == "search" and str(data.get("radar_search_query") or "").strip():
+        text, markup = await _radar_search_payload(
+            str(data.get("radar_search_query") or ""), 0, price_filter=price_filter
+        )
+    else:
+        text, markup = await _radar_home_text(message.from_user.id), radar_home_keyboard(message.from_user.id)
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+@dp.callback_query(F.data == "radarprice:back")
+async def radar_price_back(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(None)
+    await callback.answer()
+    await _render_radar_context(callback.message, callback.from_user.id, state)
+
+
 @dp.callback_query(F.data.startswith("radarlist:"))
-async def radar_list_handler(callback: CallbackQuery) -> None:
+async def radar_list_handler(callback: CallbackQuery, state: FSMContext) -> None:
     parts = callback.data.split(":")
     mode = parts[1] if len(parts) > 1 else "hot"
     try:
@@ -13913,6 +14122,10 @@ async def radar_list_handler(callback: CallbackQuery) -> None:
         await record_free_radar_event(callback.from_user.id, "mode_open", mode=mode, item_count=FREE_RADAR_PREVIEW_LIMIT)
         await _edit_or_answer(callback.message, text, reply_markup=markup)
         return
+    await state.update_data(
+        radar_context_kind="list", radar_context_mode=mode, radar_context_page=page,
+        radar_context_category="",
+    )
     await callback.answer()
     text, markup = await _radar_list_payload(callback.from_user.id, mode, page)
     await _edit_or_answer(callback.message, text, reply_markup=markup)
@@ -13990,7 +14203,7 @@ async def radar_group_handler(callback: CallbackQuery) -> None:
 
 
 @dp.callback_query(F.data.startswith("radarcat:"))
-async def radar_category_handler(callback: CallbackQuery) -> None:
+async def radar_category_handler(callback: CallbackQuery, state: FSMContext) -> None:
     parts = callback.data.split(":")
     if len(parts) < 2:
         await callback.answer("Категория не найдена", show_alert=True); return
@@ -13999,13 +14212,21 @@ async def radar_category_handler(callback: CallbackQuery) -> None:
         page = max(0, int(parts[2])) if len(parts) > 2 else 0
     except Exception:
         page = 0
+    await state.update_data(
+        radar_context_kind="category", radar_context_mode="category_new",
+        radar_context_category=category_key, radar_context_page=page,
+    )
+    data = await state.get_data()
     await callback.answer()
-    text, markup = await _radar_list_payload(callback.from_user.id, "category_new", page, category_key=category_key)
+    text, markup = await _radar_list_payload(
+        callback.from_user.id, "category_new", page, category_key=category_key,
+        price_filter=_radar_price_filter(data),
+    )
     await _edit_or_answer(callback.message, text, reply_markup=markup)
 
 
 @dp.callback_query(F.data.startswith("radarcatbest:"))
-async def radar_category_best_handler(callback: CallbackQuery) -> None:
+async def radar_category_best_handler(callback: CallbackQuery, state: FSMContext) -> None:
     parts = callback.data.split(":")
     if len(parts) < 2:
         await callback.answer("Категория не найдена", show_alert=True); return
@@ -14014,18 +14235,30 @@ async def radar_category_best_handler(callback: CallbackQuery) -> None:
         page = max(0, int(parts[2])) if len(parts) > 2 else 0
     except Exception:
         page = 0
+    await state.update_data(
+        radar_context_kind="category", radar_context_mode="category_best",
+        radar_context_category=category_key, radar_context_page=page,
+    )
+    data = await state.get_data()
     await callback.answer()
-    text, markup = await _radar_list_payload(callback.from_user.id, "category_best", page, category_key=category_key)
+    text, markup = await _radar_list_payload(
+        callback.from_user.id, "category_best", page, category_key=category_key,
+        price_filter=_radar_price_filter(data),
+    )
     await _edit_or_answer(callback.message, text, reply_markup=markup)
 
 
 @dp.callback_query(F.data.startswith("radaritem:"))
-async def radar_item_handler(callback: CallbackQuery) -> None:
+async def radar_item_handler(callback: CallbackQuery, state: FSMContext) -> None:
     try:
         product_id = int(callback.data.split(":", 1)[1])
     except Exception:
         await callback.answer("Товар не найден", show_alert=True); return
-    text, markup = await _radar_product_payload(callback.from_user.id, product_id)
+    data = await state.get_data()
+    return_callback, return_text = _radar_context_back(data)
+    text, markup = await _radar_product_payload(
+        callback.from_user.id, product_id, return_callback=return_callback, return_text=return_text
+    )
     if text is None:
         await callback.answer("Товар не найден", show_alert=True); return
     await callback.answer()
@@ -14033,14 +14266,18 @@ async def radar_item_handler(callback: CallbackQuery) -> None:
 
 
 @dp.callback_query(F.data.startswith("radarfav:"))
-async def radar_favorite_handler(callback: CallbackQuery) -> None:
+async def radar_favorite_handler(callback: CallbackQuery, state: FSMContext) -> None:
     try:
         product_id = int(callback.data.split(":", 1)[1])
     except Exception:
         await callback.answer("Товар не найден", show_alert=True); return
     favorite = await toggle_radar_favorite(callback.from_user.id, product_id)
     await callback.answer("Добавлено в Мой Radar ⭐" if favorite else "Убрано из Моего Radar")
-    text, markup = await _radar_product_payload(callback.from_user.id, product_id)
+    data = await state.get_data()
+    return_callback, return_text = _radar_context_back(data)
+    text, markup = await _radar_product_payload(
+        callback.from_user.id, product_id, return_callback=return_callback, return_text=return_text
+    )
     if text is not None:
         await _edit_or_answer(callback.message, text, reply_markup=markup)
 

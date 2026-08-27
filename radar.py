@@ -12,6 +12,7 @@ from sqlalchemy import case, func, select, text
 
 from db import SessionLocal
 from early_winner import opportunity_family_key
+from filters import price_bounds
 from models import (
     AIEarlyWinnerCandidate,
     AppSetting,
@@ -810,6 +811,7 @@ async def radar_stats() -> RadarStats:
 async def list_radar_products(
     *, mode: str = "hot", category_key: str | None = None, page: int = 0,
     page_size: int = RADAR_PAGE_SIZE, user_id: int | None = None,
+    price_filter: str = "any",
 ) -> tuple[list[RadarProduct], int]:
     """Return Radar products for the requested user-facing feed.
 
@@ -826,6 +828,21 @@ async def list_radar_products(
         conditions = []
         if category_key:
             conditions.append(RadarProduct.category_key == category_key)
+        price_lo, price_hi = price_bounds(price_filter)
+        if price_lo is not None or price_hi is not None:
+            # A Radar row can represent a product family with several listings.
+            # Filter by an actually observed listing price rather than by the
+            # family's broad min/max envelope, otherwise a 50–500 € family could
+            # incorrectly match every intermediate preset.
+            price_conditions = [
+                RadarProductListing.product_id == RadarProduct.id,
+                RadarProductListing.last_price_eur.is_not(None),
+            ]
+            if price_lo is not None:
+                price_conditions.append(RadarProductListing.last_price_eur >= int(price_lo))
+            if price_hi is not None:
+                price_conditions.append(RadarProductListing.last_price_eur <= int(price_hi))
+            conditions.append(select(RadarProductListing.id).where(*price_conditions).exists())
         if mode == "hot":
             conditions.append(RadarProduct.status == "hot")
             order = (RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
@@ -890,6 +907,7 @@ async def list_radar_products(
 
 async def search_radar_products(
     query_text: str, *, page: int = 0, page_size: int = RADAR_PAGE_SIZE,
+    price_filter: str = "any",
 ) -> tuple[list[RadarProduct], int]:
     """Simple mass-market Radar search by product title/model."""
     clean = " ".join(str(query_text or "").split()).strip()[:80]
@@ -899,13 +917,24 @@ async def search_radar_products(
     page_size = max(1, min(20, int(page_size)))
     pattern = f"%{clean}%"
     async with SessionLocal() as session:
-        condition = RadarProduct.title.ilike(pattern)
+        conditions = [RadarProduct.title.ilike(pattern)]
+        price_lo, price_hi = price_bounds(price_filter)
+        if price_lo is not None or price_hi is not None:
+            price_conditions = [
+                RadarProductListing.product_id == RadarProduct.id,
+                RadarProductListing.last_price_eur.is_not(None),
+            ]
+            if price_lo is not None:
+                price_conditions.append(RadarProductListing.last_price_eur >= int(price_lo))
+            if price_hi is not None:
+                price_conditions.append(RadarProductListing.last_price_eur <= int(price_hi))
+            conditions.append(select(RadarProductListing.id).where(*price_conditions).exists())
         total = int((await session.execute(
-            select(func.count(RadarProduct.id)).where(condition)
+            select(func.count(RadarProduct.id)).where(*conditions)
         )).scalar_one() or 0)
         rows = list((await session.execute(
             select(RadarProduct)
-            .where(condition)
+            .where(*conditions)
             .order_by(RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
             .offset(page * page_size).limit(page_size)
         )).scalars().all())
