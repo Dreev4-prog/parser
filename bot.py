@@ -196,7 +196,9 @@ RADAR_AUTOSCAN_LAUNCH_WATCHDOG_SECONDS = 20
 RADAR_DAILY_DIGEST_SETTING_KEY = "dt_radar_daily_digest_v1"
 RADAR_DAILY_DIGEST_DEFAULT_TIME = "20:00"
 RADAR_DAILY_DIGEST_TIME_CHOICES = ("12:00", "18:00", "20:00", "22:00")
+RADAR_DAILY_DIGEST_TIME_RE = re.compile(r"^(?:[01]?\d|2[0-3]):[0-5]\d$")
 RADAR_DAILY_DIGEST_POLL_SECONDS = 30
+_RADAR_DAILY_DIGEST_SEND_LOCK = asyncio.Lock()
 
 _radar_autoscan_guard = asyncio.Lock()
 # Serializes the actual round runner. The scheduler and a manual admin kick may race,
@@ -637,6 +639,7 @@ class AdminInput(StatesGroup):
     plan_price = State()
     custom_days = State()
     broadcast_content = State()
+    daily_radar_time = State()
 
 
 def allowed(user_id: int) -> bool:
@@ -9137,19 +9140,35 @@ def admin_daily_radar_keyboard(state: dict) -> InlineKeyboardMarkup:
             callback_data="admindailyradar:toggle",
         )],
         [InlineKeyboardButton(text=f"🕐 Время: {state.get('time') or RADAR_DAILY_DIGEST_DEFAULT_TIME}", callback_data="admindailyradar:time")],
+        [InlineKeyboardButton(text="📣 Отправить сейчас", callback_data="admindailyradar:sendnow")],
         [InlineKeyboardButton(text="🧪 Тест только мне", callback_data="admindailyradar:test")],
         [InlineKeyboardButton(text="🔄 Обновить цифры", callback_data="admindailyradar")],
         [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
     ])
 
 
-def admin_daily_radar_time_keyboard() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=value, callback_data=f"admindailyradar:settime:{value}")]
-        for value in RADAR_DAILY_DIGEST_TIME_CHOICES
-    ]
+def admin_daily_radar_time_keyboard(current: str = "") -> InlineKeyboardMarkup:
+    rows = []
+    row: list[InlineKeyboardButton] = []
+    for value in RADAR_DAILY_DIGEST_TIME_CHOICES:
+        label = ("✅ " if value == current else "") + value
+        # Encode HHMM so callback parsing cannot lose the hour/minute separator.
+        row.append(InlineKeyboardButton(text=label, callback_data=f"admindailyradar:settime:{value.replace(':', '')}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="✍️ Ввести своё время", callback_data="admindailyradar:customtime")])
     rows.append([InlineKeyboardButton(text="⬅️ Daily Radar", callback_data="admindailyradar")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_daily_radar_send_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 Да, отправить всем", callback_data="admindailyradar:sendconfirm")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admindailyradar")],
+    ])
 
 
 def admin_broadcast_back_keyboard() -> InlineKeyboardMarkup:
@@ -11009,6 +11028,21 @@ async def admin_pages_handler(callback: CallbackQuery) -> None:
     )
 
 
+def _normalize_daily_digest_time(value: object) -> str | None:
+    raw = str(value or "").strip().replace(".", ":")
+    if not RADAR_DAILY_DIGEST_TIME_RE.fullmatch(raw):
+        return None
+    hour_text, minute_text = raw.split(":", 1)
+    try:
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
 def _daily_digest_default_state(*, initialize: bool = False) -> dict:
     now = datetime.now(MOSCOW)
     hh, mm = [int(x) for x in RADAR_DAILY_DIGEST_DEFAULT_TIME.split(":", 1)]
@@ -11044,8 +11078,8 @@ async def load_radar_daily_digest_state() -> dict:
     default = _daily_digest_default_state()
     default.update(state)
     default["enabled"] = bool(default.get("enabled", True))
-    if str(default.get("time") or "") not in RADAR_DAILY_DIGEST_TIME_CHOICES:
-        default["time"] = RADAR_DAILY_DIGEST_DEFAULT_TIME
+    normalized_time = _normalize_daily_digest_time(default.get("time"))
+    default["time"] = normalized_time or RADAR_DAILY_DIGEST_DEFAULT_TIME
     return default
 
 
@@ -11053,8 +11087,8 @@ async def save_radar_daily_digest_state(state: dict) -> dict:
     clean = _daily_digest_default_state()
     clean.update(dict(state or {}))
     clean["enabled"] = bool(clean.get("enabled", True))
-    if str(clean.get("time") or "") not in RADAR_DAILY_DIGEST_TIME_CHOICES:
-        clean["time"] = RADAR_DAILY_DIGEST_DEFAULT_TIME
+    normalized_time = _normalize_daily_digest_time(clean.get("time"))
+    clean["time"] = normalized_time or RADAR_DAILY_DIGEST_DEFAULT_TIME
     payload = json.dumps(clean, ensure_ascii=False, separators=(",", ":"))
     async with SessionLocal() as session:
         row = await session.get(AppSetting, RADAR_DAILY_DIGEST_SETTING_KEY)
@@ -11247,35 +11281,38 @@ async def radar_daily_digest_scheduler(bot: Bot) -> None:
     await asyncio.sleep(5)
     while True:
         try:
-            state = await load_radar_daily_digest_state()
-            now = datetime.now(MOSCOW)
-            if _daily_digest_due(state, now) and current_access_mode() == "subscription":
-                state["last_sent_date"] = now.date().isoformat()
-                state["last_sent_at"] = now.replace(microsecond=0).isoformat()
-                await save_radar_daily_digest_state(state)
-                metrics = await radar_daily_digest_metrics()
-                result = await _send_radar_daily_digest(bot, metrics)
+            # Re-check due state only after acquiring the shared send lock so a manual
+            # send and the scheduler cannot race into two deliveries.
+            async with _RADAR_DAILY_DIGEST_SEND_LOCK:
                 state = await load_radar_daily_digest_state()
-                state["last_delivered"] = int(result["sent"])
-                state["last_blocked"] = int(result["blocked"])
-                state["last_failed"] = int(result["failed"])
-                await save_radar_daily_digest_state(state)
-                log.info(
-                    "Daily Radar digest sent date=%s recipients=%s delivered=%s blocked=%s failed=%s listings=%s signals=%s",
-                    now.date().isoformat(), result["recipients"], result["sent"], result["blocked"], result["failed"],
-                    metrics.get("listings_seen", 0), metrics.get("signals_today", 0),
-                )
-                for admin_id in sorted(ADMIN_IDS):
-                    try:
-                        await bot.send_message(
-                            int(admin_id),
-                            "✅ <b>Daily Radar отправлен</b>\n\n"
-                            f"Доставлено: <b>{result['sent']}</b> / {result['recipients']}\n"
-                            f"Недоступны: <b>{result['blocked']}</b> · ошибки: <b>{result['failed']}</b>",
-                            parse_mode=ParseMode.HTML,
-                        )
-                    except Exception:
-                        pass
+                now = datetime.now(MOSCOW)
+                if _daily_digest_due(state, now) and current_access_mode() == "subscription":
+                    state["last_sent_date"] = now.date().isoformat()
+                    state["last_sent_at"] = now.replace(microsecond=0).isoformat()
+                    await save_radar_daily_digest_state(state)
+                    metrics = await radar_daily_digest_metrics()
+                    result = await _send_radar_daily_digest(bot, metrics)
+                    state = await load_radar_daily_digest_state()
+                    state["last_delivered"] = int(result["sent"])
+                    state["last_blocked"] = int(result["blocked"])
+                    state["last_failed"] = int(result["failed"])
+                    await save_radar_daily_digest_state(state)
+                    log.info(
+                        "Daily Radar digest sent date=%s recipients=%s delivered=%s blocked=%s failed=%s listings=%s signals=%s",
+                        now.date().isoformat(), result["recipients"], result["sent"], result["blocked"], result["failed"],
+                        metrics.get("listings_seen", 0), metrics.get("signals_today", 0),
+                    )
+                    for admin_id in sorted(ADMIN_IDS):
+                        try:
+                            await bot.send_message(
+                                int(admin_id),
+                                "✅ <b>Daily Radar отправлен</b>\n\n"
+                                f"Доставлено: <b>{result['sent']}</b> / {result['recipients']}\n"
+                                f"Недоступны: <b>{result['blocked']}</b> · ошибки: <b>{result['failed']}</b>",
+                                parse_mode=ParseMode.HTML,
+                            )
+                        except Exception:
+                            pass
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -11295,10 +11332,11 @@ async def _broadcast_recipient_ids() -> list[int]:
 
 
 @dp.callback_query(F.data == "admindailyradar")
-async def admin_daily_radar_handler(callback: CallbackQuery) -> None:
+async def admin_daily_radar_handler(callback: CallbackQuery, fsm: FSMContext) -> None:
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
+    await fsm.clear()
     state = await load_radar_daily_digest_state()
     metrics = await radar_daily_digest_metrics()
     await callback.answer()
@@ -11352,37 +11390,155 @@ async def admin_daily_radar_toggle(callback: CallbackQuery) -> None:
 
 
 @dp.callback_query(F.data == "admindailyradar:time")
-async def admin_daily_radar_time(callback: CallbackQuery) -> None:
+async def admin_daily_radar_time(callback: CallbackQuery, state: FSMContext) -> None:
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
+    await state.clear()
+    digest_state = await load_radar_daily_digest_state()
     await callback.answer()
     await _edit_or_answer(
         callback.message,
-        "<b>🕐 Время Daily Radar</b>\n\nВыбери время ежедневной рассылки по Москве.",
-        reply_markup=admin_daily_radar_time_keyboard(),
+        "<b>🕐 Время Daily Radar</b>\n\n"
+        f"Сейчас: <b>{html.escape(str(digest_state.get('time') or RADAR_DAILY_DIGEST_DEFAULT_TIME))} МСК</b>\n\n"
+        "Выбери готовое время или нажми <b>«Ввести своё время»</b>.\n"
+        "Можно установить любое время от <b>00:00</b> до <b>23:59</b> по Москве.",
+        reply_markup=admin_daily_radar_time_keyboard(str(digest_state.get("time") or "")),
     )
 
 
 @dp.callback_query(F.data.startswith("admindailyradar:settime:"))
-async def admin_daily_radar_set_time(callback: CallbackQuery) -> None:
+async def admin_daily_radar_set_time(callback: CallbackQuery, state: FSMContext) -> None:
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    value = str(callback.data or "").rsplit(":", 1)[-1]
-    if value not in RADAR_DAILY_DIGEST_TIME_CHOICES:
+    token = str(callback.data or "").removeprefix("admindailyradar:settime:")
+    value = f"{token[:2]}:{token[2:]}" if len(token) == 4 and token.isdigit() else token
+    value = _normalize_daily_digest_time(value)
+    if value is None:
         await callback.answer("Некорректное время", show_alert=True)
         return
-    state = await load_radar_daily_digest_state()
-    state["time"] = value
-    state = await save_radar_daily_digest_state(state)
+    await state.clear()
+    digest_state = await load_radar_daily_digest_state()
+    digest_state["time"] = value
+    digest_state = await save_radar_daily_digest_state(digest_state)
     await callback.answer(f"Время: {value} МСК")
     await _edit_or_answer(
         callback.message,
         "<b>📨 Daily Radar</b>\n\n"
         f"Время изменено: <b>{value} МСК</b>\n"
-        f"Следующая рассылка: <b>{html.escape(_daily_digest_next_run_text(state))}</b>",
-        reply_markup=admin_daily_radar_keyboard(state),
+        f"Следующая рассылка: <b>{html.escape(_daily_digest_next_run_text(digest_state))}</b>",
+        reply_markup=admin_daily_radar_keyboard(digest_state),
+    )
+
+
+@dp.callback_query(F.data == "admindailyradar:customtime")
+async def admin_daily_radar_custom_time(callback: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdminInput.daily_radar_time)
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message,
+        "<b>✍️ Своё время Daily Radar</b>\n\n"
+        "Отправь время одним сообщением в формате <b>ЧЧ:ММ</b>.\n\n"
+        "Например: <code>09:35</code>, <code>16:10</code> или <code>23:45</code>.\n"
+        "Часовой пояс: <b>Москва</b>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отмена", callback_data="admindailyradar")
+        ]]),
+    )
+
+
+@dp.message(AdminInput.daily_radar_time)
+async def admin_daily_radar_custom_time_message(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message.from_user.id):
+        await state.clear()
+        return
+    value = _normalize_daily_digest_time(message.text)
+    if value is None:
+        await message.answer(
+            "❌ <b>Некорректное время.</b>\n\n"
+            "Отправь время в формате <b>ЧЧ:ММ</b>, например <code>09:35</code> или <code>21:10</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    digest_state = await load_radar_daily_digest_state()
+    digest_state["time"] = value
+    digest_state = await save_radar_daily_digest_state(digest_state)
+    await state.clear()
+    await message.answer(
+        "✅ <b>Время Daily Radar сохранено</b>\n\n"
+        f"Каждый день: <b>{value} МСК</b>\n"
+        f"Следующая рассылка: <b>{html.escape(_daily_digest_next_run_text(digest_state))}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_daily_radar_keyboard(digest_state),
+    )
+
+
+@dp.callback_query(F.data == "admindailyradar:sendnow")
+async def admin_daily_radar_send_now_preview(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    metrics = await radar_daily_digest_metrics()
+    recipients = await _broadcast_recipient_ids()
+    await callback.answer()
+    await _edit_or_answer(
+        callback.message,
+        "<b>📣 Отправить Daily Radar сейчас?</b>\n\n"
+        f"Получателей: <b>{len(recipients)}</b>\n"
+        f"🔎 Проверено сегодня: <b>{_digest_n(metrics.get('listings_seen', 0))}</b>\n"
+        f"📡 Сигналов сегодня: <b>+{_digest_n(metrics.get('signals_today', 0))}</b>\n"
+        f"🔥 Горячих: <b>{_digest_n(metrics.get('hot', 0))}</b> · 🚀 Набирают: <b>{_digest_n(metrics.get('rising', 0))}</b>\n\n"
+        "После подтверждения пост уйдёт всем незаблокированным пользователям. "
+        "Ручную рассылку можно запускать в любое время.",
+        reply_markup=admin_daily_radar_send_confirm_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "admindailyradar:sendconfirm")
+async def admin_daily_radar_send_now_confirm(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    if _RADAR_DAILY_DIGEST_SEND_LOCK.locked():
+        await callback.answer("Daily Radar уже отправляется", show_alert=True)
+        return
+    await callback.answer("Запускаю рассылку")
+    await _edit_or_answer(
+        callback.message,
+        "<b>📣 Daily Radar отправляется…</b>\n\nСобираю живые цифры и отправляю пост пользователям.",
+    )
+    async with _RADAR_DAILY_DIGEST_SEND_LOCK:
+        metrics = await radar_daily_digest_metrics()
+        result = await _send_radar_daily_digest(callback.bot, metrics)
+        digest_state = await load_radar_daily_digest_state()
+        now = datetime.now(MOSCOW)
+        # A manual send counts as today's digest so the scheduler does not duplicate it later.
+        # The admin may still press "Send now" again explicitly if another blast is desired.
+        digest_state["last_sent_date"] = now.date().isoformat()
+        digest_state["last_sent_at"] = now.replace(microsecond=0).isoformat()
+        digest_state["last_delivered"] = int(result["sent"])
+        digest_state["last_blocked"] = int(result["blocked"])
+        digest_state["last_failed"] = int(result["failed"])
+        digest_state = await save_radar_daily_digest_state(digest_state)
+    log.info(
+        "Daily Radar digest manual send admin=%s recipients=%s delivered=%s blocked=%s failed=%s listings=%s signals=%s",
+        callback.from_user.id, result["recipients"], result["sent"], result["blocked"], result["failed"],
+        metrics.get("listings_seen", 0), metrics.get("signals_today", 0),
+    )
+    await _edit_or_answer(
+        callback.message,
+        "✅ <b>Daily Radar отправлен вручную</b>\n\n"
+        f"Получателей: <b>{result['recipients']}</b>\n"
+        f"Доставлено: <b>{result['sent']}</b>\n"
+        f"Недоступны: <b>{result['blocked']}</b> · ошибки: <b>{result['failed']}</b>\n\n"
+        "Автоматическая рассылка сегодня повторно не сработает. "
+        "При необходимости ты можешь снова нажать «Отправить сейчас» вручную.",
+        reply_markup=admin_daily_radar_keyboard(digest_state),
     )
 
 
@@ -15204,7 +15360,7 @@ async def main() -> None:
             f"v4.9.1 expected {GUARANTEED_LOCAL_PARSER_LANES} scan workers, got {len(worker_tasks)}"
         )
     log.warning(
-        "v4.12.0 Daily Radar Growth Loop + AutoScan View Deadlock Recovery + Free Funnel Analytics online | parser_lanes=%s | fifth_plus=FIFO | "
+        "v4.12.1 Daily Radar Manual Control + Daily Radar Growth Loop + AutoScan View Deadlock Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
         "trial_and_paid_same_queue=True | railway_lane_overrides_ignored=True",
         GUARANTEED_LOCAL_PARSER_LANES,
     )

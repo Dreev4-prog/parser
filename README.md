@@ -1,3 +1,11 @@
+# DT PARSER 4.12.1 — Daily Radar Manual Control
+
+- Daily Radar: любое время `HH:MM` по Москве.
+- Исправлена ошибка «Некорректное время» на кнопках времени.
+- `📣 Отправить сейчас` с подтверждением и живыми цифрами.
+- Ручная отправка не создаёт автоматический дубль в тот же день.
+- База: 4.12.0; Radar/AutoScan/Page/Date/View/AI core сохранён.
+
 ## v4.12.0 — Daily Radar Growth Loop
 
 v4.12.0 keeps the full **v4.11.9 AutoScan View Deadlock Recovery + v4.11.8 Launch Recovery + Free Radar funnel** and adds a permanent daily growth loop around DT Radar.
