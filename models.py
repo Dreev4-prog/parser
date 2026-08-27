@@ -592,6 +592,28 @@ class SubscriptionPayment(Base):
     raw_status: Mapped[str] = mapped_column(String(100), default="")
 
 
+class ReferralInvite(Base):
+    """One unique first-time bot entry attributed to a referrer.
+
+    Referral links keep attribution even while the promo is paused. Only rows
+    created while the promo is enabled are eligible for the 2 users -> 1 day
+    reward. Two eligible rows are marked together with the same reward time in
+    the same DB transaction that extends the referrer's access.
+    """
+
+    __tablename__ = "referral_invites"
+    __table_args__ = (
+        UniqueConstraint("referred_user_id", name="uq_referral_invites_referred_user"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    referrer_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    referred_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    promo_eligible: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    rewarded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+
 class AppSetting(Base):
     """Small persistent runtime settings controlled from the admin panel."""
 

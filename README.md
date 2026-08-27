@@ -1,3 +1,25 @@
+# DT PARSER 4.13.0 — Simple Referral Promo
+
+**Base:** 4.12.3 Daily Radar FSM Hotfix.
+
+Adds the first compact referral growth loop without changing parser/Radar worker algorithms:
+
+- every user has a personal deep link `?start=ref_<telegram_id>`;
+- only the **first bot entry of a new Telegram user** can be attributed;
+- one referred user can belong to only one referrer;
+- promo rule: **2 eligible new users = +1 day of full subscription**;
+- reward repeats automatically: 4 users = +2 days, 6 users = +3 days, etc.;
+- active subscribers get the day appended to their current expiry; users without an active subscription start from now;
+- admin can enable/disable the promo from `Админ-панель -> 👥 Рефералы`;
+- referral-link attribution is still counted while the promo is paused, but those paused-period entries do not earn bonus days;
+- the user home gets `🎁 Получить день бесплатно` only while the promo is enabled;
+- user referral screen shows personal link, total unique entries, promo progress and earned days;
+- new `referral_invites` table is created automatically; no manual SQL migration and no new Railway variables.
+
+Redeploy the **parser** service. Other worker code and concurrency remain unchanged.
+
+---
+
 # DT PARSER 4.12.3 — Daily Radar FSM Hotfix
 
 **Base:** 4.12.2 Daily Radar Instant UI.

@@ -12,7 +12,7 @@ import httpx
 from sqlalchemy import func, or_, select
 
 from db import SessionLocal
-from models import AppSetting, BotUser, SubscriptionPayment, SubscriptionPlan, UserScan
+from models import AppSetting, BotUser, ReferralInvite, SubscriptionPayment, SubscriptionPlan, UserScan
 
 log = logging.getLogger("kleinanzeigen-commerce")
 
@@ -39,6 +39,11 @@ _activity_write_cache: dict[int, float] = {}
 _activity_guard = asyncio.Lock()
 _payment_locks: dict[int, asyncio.Lock] = {}
 _payment_locks_guard = asyncio.Lock()
+
+REFERRAL_PROMO_SETTING_KEY = "referral_promo_enabled"
+REFERRAL_PROMO_DEFAULT_ENABLED = True
+REFERRAL_USERS_PER_REWARD = 2
+REFERRAL_REWARD_DAYS = 1
 
 
 class PaymentProviderError(RuntimeError):
@@ -100,6 +105,14 @@ async def initialize_commerce() -> None:
         elif setting.value in {"admin_only", "subscription", "open"}:
             _access_mode = setting.value
 
+        referral_setting = await session.get(AppSetting, REFERRAL_PROMO_SETTING_KEY)
+        if referral_setting is None:
+            session.add(AppSetting(
+                key=REFERRAL_PROMO_SETTING_KEY,
+                value="1" if REFERRAL_PROMO_DEFAULT_ENABLED else "0",
+                updated_at=datetime.utcnow(),
+            ))
+
         for key, title, days, price, order in DEFAULT_PLAN_SPECS:
             existing = await session.get(SubscriptionPlan, key)
             if existing is None:
@@ -150,7 +163,9 @@ async def set_access_mode(mode: str) -> str:
     return mode
 
 
-async def touch_user(tg_user: Any, *, force: bool = False) -> BotUser | None:
+async def touch_user(
+    tg_user: Any, *, force: bool = False, referral_referrer_id: int | None = None,
+) -> BotUser | None:
     if tg_user is None:
         return None
     uid = int(tg_user.id)
@@ -161,10 +176,12 @@ async def touch_user(tg_user: Any, *, force: bool = False) -> BotUser | None:
             return None
         _activity_write_cache[uid] = loop_time
 
+    reward_until: datetime | None = None
     async with SessionLocal() as session:
         row = await session.get(BotUser, uid)
         now = datetime.utcnow()
-        if row is None:
+        is_new_user = row is None
+        if is_new_user:
             row = BotUser(
                 user_id=uid,
                 username=getattr(tg_user, "username", None),
@@ -177,8 +194,142 @@ async def touch_user(tg_user: Any, *, force: bool = False) -> BotUser | None:
             row.username = getattr(tg_user, "username", None)
             row.first_name = getattr(tg_user, "first_name", None)
             row.last_seen_at = now
+
+        # v4.13.0: referral attribution is accepted only on the very first
+        # persisted bot entry. Existing users cannot later attach themselves to
+        # somebody else's link. Attribution itself is stored even when the promo
+        # is paused; bonus eligibility is frozen at the time of first entry.
+        if is_new_user and referral_referrer_id is not None:
+            referrer_id = int(referral_referrer_id)
+            if referrer_id > 0 and referrer_id != uid:
+                # Serialize referrals per referrer. Without this lock two brand-new
+                # users arriving at the same instant could each see only its own
+                # uncommitted row and leave a 2-user pair unrewarded.
+                referrer = (await session.execute(
+                    select(BotUser)
+                    .where(BotUser.user_id == referrer_id)
+                    .with_for_update()
+                )).scalar_one_or_none()
+                if referrer is not None:
+                    existing_invite = (await session.execute(
+                        select(ReferralInvite).where(ReferralInvite.referred_user_id == uid).limit(1)
+                    )).scalar_one_or_none()
+                    if existing_invite is None:
+                        promo_setting = await session.get(AppSetting, REFERRAL_PROMO_SETTING_KEY)
+                        promo_enabled = (
+                            REFERRAL_PROMO_DEFAULT_ENABLED
+                            if promo_setting is None
+                            else str(promo_setting.value or "").strip().lower() in {"1", "true", "yes", "on"}
+                        )
+                        session.add(ReferralInvite(
+                            referrer_user_id=referrer_id,
+                            referred_user_id=uid,
+                            promo_eligible=promo_enabled,
+                            created_at=now,
+                        ))
+                        await session.flush()
+
+                        if promo_enabled:
+                            pending = list((await session.execute(
+                                select(ReferralInvite)
+                                .where(
+                                    ReferralInvite.referrer_user_id == referrer_id,
+                                    ReferralInvite.promo_eligible.is_(True),
+                                    ReferralInvite.rewarded_at.is_(None),
+                                )
+                                .order_by(ReferralInvite.created_at.asc(), ReferralInvite.id.asc())
+                                .with_for_update()
+                            )).scalars().all())
+                            rewards_to_grant = len(pending) // REFERRAL_USERS_PER_REWARD
+                            if rewards_to_grant > 0:
+                                reward_rows = pending[:rewards_to_grant * REFERRAL_USERS_PER_REWARD]
+                                for invite in reward_rows:
+                                    invite.rewarded_at = now
+                                base = (
+                                    referrer.access_until
+                                    if referrer.access_until and referrer.access_until > now
+                                    else now
+                                )
+                                referrer.access_until = base + timedelta(
+                                    days=rewards_to_grant * REFERRAL_REWARD_DAYS
+                                )
+                                referrer.is_banned = False
+                                referrer.expiry_warning_sent_for = None
+                                referrer.expiry_expired_sent_for = None
+                                reward_until = referrer.access_until
         await session.commit()
-        return row
+    if reward_until is not None and referral_referrer_id is not None:
+        referrer_id = int(referral_referrer_id)
+        _banned_users.discard(referrer_id)
+        _access_cache[referrer_id] = reward_until
+    return row
+
+
+async def referral_promo_enabled() -> bool:
+    async with SessionLocal() as session:
+        row = await session.get(AppSetting, REFERRAL_PROMO_SETTING_KEY)
+        if row is None:
+            return REFERRAL_PROMO_DEFAULT_ENABLED
+        return str(row.value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def set_referral_promo_enabled(enabled: bool) -> bool:
+    enabled = bool(enabled)
+    async with SessionLocal() as session:
+        row = await session.get(AppSetting, REFERRAL_PROMO_SETTING_KEY)
+        if row is None:
+            row = AppSetting(
+                key=REFERRAL_PROMO_SETTING_KEY,
+                value="1" if enabled else "0",
+                updated_at=datetime.utcnow(),
+            )
+            session.add(row)
+        else:
+            row.value = "1" if enabled else "0"
+            row.updated_at = datetime.utcnow()
+        await session.commit()
+    return enabled
+
+
+async def referral_user_stats(user_id: int) -> dict[str, int]:
+    uid = int(user_id)
+    async with SessionLocal() as session:
+        rows = list((await session.execute(
+            select(ReferralInvite).where(ReferralInvite.referrer_user_id == uid)
+        )).scalars().all())
+    total = len(rows)
+    eligible = sum(1 for row in rows if bool(row.promo_eligible))
+    rewarded = sum(1 for row in rows if row.rewarded_at is not None)
+    pending = sum(1 for row in rows if bool(row.promo_eligible) and row.rewarded_at is None)
+    return {
+        "total": total,
+        "eligible": eligible,
+        "rewarded_referrals": rewarded,
+        "pending": pending,
+        "progress": pending % REFERRAL_USERS_PER_REWARD,
+        "days_earned": rewarded // REFERRAL_USERS_PER_REWARD * REFERRAL_REWARD_DAYS,
+    }
+
+
+async def referral_admin_stats() -> dict[str, int]:
+    async with SessionLocal() as session:
+        total = int((await session.execute(select(func.count(ReferralInvite.id)))).scalar_one() or 0)
+        eligible = int((await session.execute(
+            select(func.count(ReferralInvite.id)).where(ReferralInvite.promo_eligible.is_(True))
+        )).scalar_one() or 0)
+        rewarded = int((await session.execute(
+            select(func.count(ReferralInvite.id)).where(ReferralInvite.rewarded_at.is_not(None))
+        )).scalar_one() or 0)
+        referrers = int((await session.execute(
+            select(func.count(func.distinct(ReferralInvite.referrer_user_id)))
+        )).scalar_one() or 0)
+    return {
+        "total": total,
+        "eligible": eligible,
+        "rewarded_referrals": rewarded,
+        "days_earned": rewarded // REFERRAL_USERS_PER_REWARD * REFERRAL_REWARD_DAYS,
+        "referrers": referrers,
+    }
 
 
 async def get_user(user_id: int) -> BotUser | None:

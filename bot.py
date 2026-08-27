@@ -18,6 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 # v4.8.3 Reliable Core: the main Telegram parser must not keep the historical
@@ -94,7 +95,9 @@ from commerce import (
     get_plan, get_plans, get_user as get_commerce_user, grant_access_days,
     has_access, initialize_commerce, is_banned_cached, pending_payments,
     provider_enabled, providers_status, recent_payments, recent_users,
+    referral_admin_stats, referral_promo_enabled, referral_user_stats,
     refresh_payment, revoke_access, set_access_mode, set_banned, toggle_plan,
+    set_referral_promo_enabled,
     touch_user, update_plan_price, set_onboarding_completed, user_payments,
     subscription_notice_candidates, mark_subscription_notice,
 )
@@ -981,7 +984,7 @@ def read_only_history_allowed(user_id: int) -> bool:
 
 def main_keyboard(
     selected_count: int = 0, *, admin: bool = False, auto_observations: bool | None = None,
-    access_active: bool = True, trial_remaining: int = 0,
+    access_active: bool = True, trial_remaining: int = 0, referral_enabled: bool = False,
 ) -> InlineKeyboardMarkup:
     """Product-style home screen with one clear primary action."""
     if auto_observations is True:
@@ -1019,6 +1022,8 @@ def main_keyboard(
              InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
             [InlineKeyboardButton(text="💎 Продлить подписку", callback_data="subscription")],
         ]
+    if referral_enabled:
+        rows.append([InlineKeyboardButton(text="🎁 Получить день бесплатно", callback_data="referral")])
     if admin:
         rows.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="adminhome")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -9016,7 +9021,8 @@ def admin_keyboard(ai_unread: int = 0, active_scans: int = 0) -> InlineKeyboardM
          InlineKeyboardButton(text="💳 Платежи", callback_data="adminpayments")],
         [InlineKeyboardButton(text="🎟 Тарифы", callback_data="adminplans"),
          InlineKeyboardButton(text="🔐 Режим доступа", callback_data="adminmode")],
-        [InlineKeyboardButton(text="🎁 Бесплатные сканы", callback_data="admintrial")],
+        [InlineKeyboardButton(text="🎁 Бесплатные сканы", callback_data="admintrial"),
+         InlineKeyboardButton(text="👥 Рефералы", callback_data="adminreferral")],
         [InlineKeyboardButton(text="📡 Radar AutoScan", callback_data="adminradarauto")],
         [InlineKeyboardButton(text="🔎 Найти пользователя", callback_data="adminusersearch")],
         [InlineKeyboardButton(text="📨 Daily Radar", callback_data="admindailyradar"),
@@ -9037,6 +9043,17 @@ def admin_trial_keyboard(enabled: bool) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=toggle, callback_data="admintrial:toggle")],
         [InlineKeyboardButton(text="📡 Воронка бесплатного Radar", callback_data="adminradarfunnel:0")],
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="admintrial")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
+    ])
+
+
+def admin_referral_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="⏸ Выключить акцию" if enabled else "▶️ Включить акцию",
+            callback_data="adminreferral:toggle",
+        )],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminreferral")],
         [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
     ])
 
@@ -9459,8 +9476,17 @@ class ActivityAccessMiddleware(BaseMiddleware):
         tg_user = getattr(event, "from_user", None)
         if tg_user is None:
             return await handler(event, data)
+        referral_referrer_id: int | None = None
+        if isinstance(event, Message):
+            raw_text = (event.text or "").strip()
+            match = re.match(r"^/start(?:@[A-Za-z0-9_]+)?\s+ref_(\d+)\s*$", raw_text, flags=re.IGNORECASE)
+            if match:
+                try:
+                    referral_referrer_id = int(match.group(1))
+                except Exception:
+                    referral_referrer_id = None
         try:
-            await touch_user(tg_user)
+            await touch_user(tg_user, referral_referrer_id=referral_referrer_id)
         except Exception:
             log.exception("Could not update user activity user=%s", tg_user.id)
 
@@ -9507,7 +9533,7 @@ class ActivityAccessMiddleware(BaseMiddleware):
         if isinstance(event, CallbackQuery):
             callback_data = event.data or ""
             public_prefixes = ("buyplan:", "payprovider:", "paycheck:", "mypayments", "language:")
-            if callback_data in {"subscription", "language_settings"} or callback_data.startswith(public_prefixes):
+            if callback_data in {"subscription", "language_settings", "referral"} or callback_data.startswith(public_prefixes):
                 return await handler(event, data)
             if is_banned_cached(uid):
                 await event.answer("Доступ заблокирован", show_alert=True)
@@ -10283,6 +10309,73 @@ async def radar_upgrade_handler(callback: CallbackQuery, state: FSMContext) -> N
     await _edit_or_answer(callback.message, text, reply_markup=markup)
 
 
+async def _referral_screen(user_id: int, bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
+    enabled, stats = await asyncio.gather(
+        referral_promo_enabled(), referral_user_stats(user_id)
+    )
+    me = await bot.get_me()
+    username = (me.username or "").strip()
+    referral_link = f"https://t.me/{username}?start=ref_{int(user_id)}" if username else f"ref_{int(user_id)}"
+    total = int(stats.get("total", 0) or 0)
+    eligible = int(stats.get("eligible", 0) or 0)
+    progress = int(stats.get("progress", 0) or 0)
+    days_earned = int(stats.get("days_earned", 0) or 0)
+    left = 2 - progress if progress else 2
+
+    if enabled:
+        status = (
+            "🟢 <b>Акция активна</b>\n\n"
+            "Приведи <b>2 новых пользователей</b> в DT Parser и получи "
+            "<b>+1 день полной подписки</b>.\n"
+            "Каждые следующие 2 новых пользователя дают ещё +1 день."
+        )
+        progress_text = (
+            f"🎯 Прогресс: <b>{progress}/2</b>\n"
+            f"До следующего дня: <b>{left} чел.</b>"
+        )
+        share_text = (
+            "Попробуй DT Parser для Kleinanzeigen по моей ссылке 👇"
+        )
+    else:
+        status = (
+            "⏸ <b>Реферальная акция сейчас на паузе.</b>\n\n"
+            "Твоя персональная ссылка продолжает учитывать новых пользователей, "
+            "но входы во время паузы не дают бонусные дни."
+        )
+        progress_text = "🎯 Бонусный зачёт временно остановлен."
+        share_text = "DT Parser для Kleinanzeigen 👇"
+
+    text = (
+        "<b>🎁 Получить день бесплатно</b>\n\n"
+        f"{status}\n\n"
+        f"👥 Всего новых по твоей ссылке: <b>{total}</b>\n"
+        f"✅ В зачёте акции: <b>{eligible}</b>\n"
+        f"💎 Получено: <b>+{days_earned} дн.</b>\n"
+        f"{progress_text}\n\n"
+        "<b>Твоя персональная ссылка:</b>\n"
+        f"<code>{html.escape(referral_link)}</code>"
+    )
+
+    share_url = (
+        "https://t.me/share/url?url=" + quote(referral_link, safe="") +
+        "&text=" + quote(share_text, safe="")
+    )
+    rows = [
+        [InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share_url)],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="referral")],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
+    ]
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "referral")
+async def referral_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.answer()
+    text, markup = await _referral_screen(callback.from_user.id, callback.bot)
+    await _edit_or_answer(callback.message, text, reply_markup=markup)
+
+
 @dp.callback_query(F.data == "subscription")
 async def subscription_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
@@ -10704,6 +10797,48 @@ async def admin_trial_toggle_handler(callback: CallbackQuery) -> None:
     text, current = await _admin_trial_text()
     await callback.answer("Акция включена" if current else "Акция выключена")
     await _edit_or_answer(callback.message, text, reply_markup=admin_trial_keyboard(current))
+
+
+async def _admin_referral_text() -> tuple[str, bool]:
+    enabled, stats = await asyncio.gather(
+        referral_promo_enabled(), referral_admin_stats()
+    )
+    text = (
+        "<b>👥 Реферальная акция</b>\n\n"
+        f"Статус: <b>{'🟢 ВКЛ' if enabled else '⏸ ВЫКЛ'}</b>\n"
+        "Условие: <b>2 новых пользователя → +1 день</b>\n"
+        "Механика повторяется: 4 → +2 дня, 6 → +3 дня и т.д.\n\n"
+        f"🔗 Уникальных входов по реферальным ссылкам: <b>{int(stats.get('total', 0) or 0)}</b>\n"
+        f"✅ Входов во время активной акции: <b>{int(stats.get('eligible', 0) or 0)}</b>\n"
+        f"👤 Пользователей, которые приглашали: <b>{int(stats.get('referrers', 0) or 0)}</b>\n"
+        f"💎 Выдано бонусных дней: <b>{int(stats.get('days_earned', 0) or 0)}</b>\n\n"
+        "<i>Считается только первый вход нового Telegram-пользователя в бот. "
+        "Один человек может быть засчитан только одному пригласившему. "
+        "Когда акция выключена, новые входы сохраняются в общей статистике, но не участвуют в бонусе.</i>"
+    )
+    return text, bool(enabled)
+
+
+@dp.callback_query(F.data == "adminreferral")
+async def admin_referral_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    text, enabled = await _admin_referral_text()
+    await callback.answer()
+    await _edit_or_answer(callback.message, text, reply_markup=admin_referral_keyboard(enabled))
+
+
+@dp.callback_query(F.data == "adminreferral:toggle")
+async def admin_referral_toggle_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    current = await referral_promo_enabled()
+    await set_referral_promo_enabled(not current)
+    text, enabled = await _admin_referral_text()
+    await callback.answer("Реферальная акция включена" if enabled else "Реферальная акция выключена")
+    await _edit_or_answer(callback.message, text, reply_markup=admin_referral_keyboard(enabled))
 
 
 @dp.callback_query(F.data.startswith("adminradarfunnel:"))
@@ -12622,10 +12757,11 @@ def home_text(
 async def _send_home_message(message: Message, user_id: int, *, intro: bool = False) -> None:
     """Send the branded DT PARSER home card with low-latency navigation."""
     global _MENU_IMAGE_FILE_ID
-    selected, user_settings, trial = await asyncio.gather(
+    selected, user_settings, trial, referral_enabled = await asyncio.gather(
         get_selected(user_id),
         get_settings(user_id),
         get_trial_status(user_id),
+        referral_promo_enabled(),
     )
     auto_enabled = bool(getattr(user_settings, "auto_observations", False))
     access_active = allowed(user_id)
@@ -12633,6 +12769,7 @@ async def _send_home_message(message: Message, user_id: int, *, intro: bool = Fa
     markup = main_keyboard(
         len(selected), admin=_is_admin(user_id), auto_observations=auto_enabled,
         access_active=access_active, trial_remaining=trial_remaining,
+        referral_enabled=bool(referral_enabled),
     )
     caption = home_text(
         len(selected), auto_enabled, access_active=access_active, trial_remaining=trial_remaining
@@ -15540,7 +15677,7 @@ async def main() -> None:
             f"v4.9.1 expected {GUARANTEED_LOCAL_PARSER_LANES} scan workers, got {len(worker_tasks)}"
         )
     log.warning(
-        "v4.12.3 Daily Radar FSM Hotfix + Instant UI + Manual Control + Growth Loop + AutoScan View Deadlock Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
+        "v4.13.0 Referral Promo + Daily Radar FSM Hotfix + AutoScan View Deadlock Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
         "trial_and_paid_same_queue=True | railway_lane_overrides_ignored=True",
         GUARANTEED_LOCAL_PARSER_LANES,
     )

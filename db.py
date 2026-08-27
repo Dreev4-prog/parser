@@ -149,6 +149,26 @@ async def init_db() -> None:
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_free_radar_events_feature ON free_radar_events (feature)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_free_radar_events_product_id ON free_radar_events (product_id)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_free_radar_events_created_at ON free_radar_events (created_at)"))
+            # v4.13.0: referral attribution is a small standalone table. Create it
+            # explicitly before metadata.create_all so multiple Railway services
+            # starting together cannot race on first deployment.
+            await conn.execute(text(
+                """
+                CREATE TABLE IF NOT EXISTS referral_invites (
+                    id SERIAL PRIMARY KEY,
+                    referrer_user_id BIGINT NOT NULL,
+                    referred_user_id BIGINT NOT NULL UNIQUE,
+                    promo_eligible BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    rewarded_at TIMESTAMP
+                )
+                """
+            ))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_invites_referrer_user_id ON referral_invites (referrer_user_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_invites_referred_user_id ON referral_invites (referred_user_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_invites_promo_eligible ON referral_invites (promo_eligible)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_invites_created_at ON referral_invites (created_at)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_invites_rewarded_at ON referral_invites (rewarded_at)"))
         await conn.run_sync(Base.metadata.create_all)
 
         # Lightweight additive migrations so existing PostgreSQL databases can be
