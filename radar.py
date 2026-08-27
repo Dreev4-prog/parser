@@ -17,6 +17,7 @@ from models import (
     AppSetting,
     Listing,
     RadarFavorite,
+    RadarLifecycleWatch,
     RadarProduct,
     RadarProductListing,
     RadarSnapshot,
@@ -29,6 +30,17 @@ log = logging.getLogger("dtparser-radar")
 RADAR_BACKFILL_SETTING = "dt_radar_v1_backfill_complete"
 RADAR_SCAN_TOP_LIMIT = 12
 RADAR_PAGE_SIZE = 8
+
+# v4.14.0 Fast Sold / Lifecycle. Strong fresh Radar listings are watched at
+# absolute checkpoints after first discovery. A disappearance is never accepted
+# from one miss: a second direct detail-page check confirms it a few minutes later.
+RADAR_LIFECYCLE_MIN_SCORE = 72
+RADAR_LIFECYCLE_CHECK_MINUTES = (15, 30, 60, 120, 180)
+RADAR_LIFECYCLE_CONFIRM_MINUTES = 3
+RADAR_LIFECYCLE_UNKNOWN_RETRY_MINUTES = 5
+RADAR_LIFECYCLE_MAX_MINUTES = max(RADAR_LIFECYCLE_CHECK_MINUTES)
+RADAR_FAST_SOLD_MAX_SECONDS = RADAR_LIFECYCLE_MAX_MINUTES * 60
+
 _radar_lock = asyncio.Lock()
 
 
@@ -40,6 +52,38 @@ class RadarStats:
     ai_picks: int
     categories: int
     signals: int
+    fast_sold: int = 0
+
+
+@dataclass(frozen=True)
+class LifecycleJob:
+    id: int
+    product_id: int
+    external_id: str
+    url: str
+    first_seen_at: datetime
+    last_seen_at: datetime
+    status: str
+    score: int
+    check_step: int
+    checks: int
+    consecutive_missing: int
+
+
+@dataclass(frozen=True)
+class FastSoldInfo:
+    product_id: int
+    external_id: str
+    title: str
+    category_key: str
+    disappeared_at: datetime
+    confirmed_at: datetime | None
+    first_seen_at: datetime
+    last_seen_at: datetime
+    lifetime_seconds: int
+    last_views: int | None
+    last_price_eur: int | None
+    peak_score: int
 
 
 def _clamp_score(value: int | float) -> int:
@@ -85,6 +129,84 @@ def _effective_score(product: RadarProduct, now: datetime) -> int:
     repeat_bonus = min(6.0, math.log2(max(1, int(product.signal_count or 0)) + 1) * 1.5)
     confirmed_bonus = min(6.0, float(int(product.confirmed_count or 0)) * 2.0)
     return _clamp_score(raw + repeat_bonus + confirmed_bonus - decay)
+
+
+def _next_lifecycle_checkpoint(first_seen_at: datetime, now: datetime) -> tuple[int, datetime] | None:
+    elapsed = max(0.0, (now - first_seen_at).total_seconds() / 60.0)
+    for step, minutes in enumerate(RADAR_LIFECYCLE_CHECK_MINUTES):
+        if elapsed < float(minutes):
+            return step, first_seen_at + timedelta(minutes=int(minutes))
+    return None
+
+
+async def _maybe_queue_lifecycle_watch(
+    session, *, product: RadarProduct, listing: Listing, score: int, now: datetime
+) -> None:
+    """Enroll a fresh strong listing in the durable Lifecycle queue.
+
+    The helper runs inside the same transaction as the Radar signal. Existing
+    watches are only refreshed; disappeared/expired history is never resurrected.
+    """
+    if int(score or 0) < RADAR_LIFECYCLE_MIN_SCORE:
+        return
+    if not bool(listing.is_active) or not str(listing.url or "").strip():
+        return
+    first_seen = listing.first_seen_at or now
+    checkpoint = _next_lifecycle_checkpoint(first_seen, now)
+    if checkpoint is None:
+        return
+    bind = session.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(CAST(hashtext(:lifecycle_key) AS bigint))"),
+            {"lifecycle_key": f"lifecycle:{listing.external_id}"},
+        )
+    existing = (await session.execute(
+        select(RadarLifecycleWatch).where(
+            RadarLifecycleWatch.external_id == str(listing.external_id)
+        ).limit(1)
+    )).scalar_one_or_none()
+    tier = "A" if int(score or 0) >= 85 else "B"
+    if existing is None:
+        step, next_check = checkpoint
+        session.add(RadarLifecycleWatch(
+            product_id=int(product.id),
+            external_id=str(listing.external_id),
+            category_key=str(listing.category_key or ""),
+            title=str(listing.identity_label or listing.title or "")[:500],
+            url=str(listing.url or "")[:1200],
+            first_seen_at=first_seen,
+            radar_started_at=now,
+            last_seen_at=listing.last_seen_at or now,
+            status="watching",
+            tier=tier,
+            score=int(score or 0),
+            peak_score=int(score or 0),
+            last_views=(int(listing.view_count) if listing.view_count is not None else None),
+            last_price_eur=listing.price_eur,
+            check_step=int(step),
+            next_check_at=next_check,
+            created_at=now,
+            updated_at=now,
+        ))
+        log.info(
+            "DT Radar Lifecycle queued external_id=%s product=%s score=%s next=%s",
+            listing.external_id, product.id, score, next_check.isoformat(timespec="seconds"),
+        )
+        return
+    if str(existing.status or "") in {"disappeared", "expired"}:
+        return
+    existing.product_id = int(product.id)
+    existing.category_key = str(listing.category_key or existing.category_key or "")
+    existing.title = str(listing.identity_label or listing.title or existing.title or "")[:500]
+    existing.url = str(listing.url or existing.url or "")[:1200]
+    existing.score = max(int(existing.score or 0), int(score or 0))
+    existing.peak_score = max(int(existing.peak_score or 0), int(score or 0))
+    existing.tier = "A" if int(existing.peak_score or 0) >= 85 else "B"
+    existing.last_views = max(int(existing.last_views or 0), int(listing.view_count or 0)) if listing.view_count is not None else existing.last_views
+    existing.last_price_eur = listing.price_eur if listing.price_eur is not None else existing.last_price_eur
+    existing.last_seen_at = max(existing.last_seen_at or now, listing.last_seen_at or now)
+    existing.updated_at = now
 
 
 async def _upsert_signal(
@@ -264,6 +386,9 @@ async def _upsert_signal(
             product.current_score = _effective_score(product, now)
             product.status = _status_for_score(int(product.current_score or 0))
             product.updated_at = now
+            await _maybe_queue_lifecycle_watch(
+                session, product=product, listing=listing, score=score, now=now
+            )
             await session.commit()
             return int(product.id)
 
@@ -422,6 +547,221 @@ async def record_ai_candidate(candidate_id: int, *, source_key: str | None = Non
         )
 
 
+async def claim_due_lifecycle_watches(
+    worker_id: str, *, limit: int = 20, lease_seconds: int = 180
+) -> list[LifecycleJob]:
+    """Atomically lease due Lifecycle checks from PostgreSQL/SQLite."""
+    now = datetime.utcnow()
+    async with SessionLocal() as session:
+        query = (
+            select(RadarLifecycleWatch)
+            .where(
+                RadarLifecycleWatch.status.in_(["watching", "confirming"]),
+                RadarLifecycleWatch.next_check_at.is_not(None),
+                RadarLifecycleWatch.next_check_at <= now,
+                (RadarLifecycleWatch.lease_until.is_(None)) | (RadarLifecycleWatch.lease_until < now),
+            )
+            .order_by(RadarLifecycleWatch.next_check_at.asc(), RadarLifecycleWatch.id.asc())
+            .limit(max(1, min(100, int(limit))))
+        )
+        bind = session.get_bind()
+        if bind is not None and bind.dialect.name == "postgresql":
+            query = query.with_for_update(skip_locked=True)
+        rows = list((await session.execute(query)).scalars().all())
+        lease_until = now + timedelta(seconds=max(30, int(lease_seconds)))
+        jobs: list[LifecycleJob] = []
+        for row in rows:
+            row.lease_owner = str(worker_id or "lifecycle")[:120]
+            row.lease_until = lease_until
+            row.updated_at = now
+            jobs.append(LifecycleJob(
+                id=int(row.id), product_id=int(row.product_id),
+                external_id=str(row.external_id), url=str(row.url or ""),
+                first_seen_at=row.first_seen_at, last_seen_at=row.last_seen_at,
+                status=str(row.status or "watching"), score=int(row.score or 0),
+                check_step=int(row.check_step or 0), checks=int(row.checks or 0),
+                consecutive_missing=int(row.consecutive_missing or 0),
+            ))
+        if rows:
+            await session.commit()
+        return jobs
+
+
+def _lifecycle_reason(lifetime_seconds: int) -> str:
+    minutes = max(1, int(round(max(0, lifetime_seconds) / 60.0)))
+    return f"Объявление исчезло примерно через {minutes} мин после первого обнаружения DT Radar"
+
+
+async def complete_lifecycle_check(
+    watch_id: int, active: bool | None, *, error_text: str | None = None, checked_at: datetime | None = None
+) -> str:
+    """Persist one direct availability result. Returns the new watch status."""
+    now = checked_at or datetime.utcnow()
+    async with SessionLocal() as session:
+        query = select(RadarLifecycleWatch).where(RadarLifecycleWatch.id == int(watch_id)).limit(1)
+        bind = session.get_bind()
+        if bind is not None and bind.dialect.name == "postgresql":
+            query = query.with_for_update()
+        watch = (await session.execute(query)).scalar_one_or_none()
+        if watch is None:
+            return "missing"
+        if str(watch.status or "") not in {"watching", "confirming"}:
+            watch.lease_owner = ""
+            watch.lease_until = None
+            await session.commit()
+            return str(watch.status or "unknown")
+
+        watch.checks = int(watch.checks or 0) + 1
+        watch.last_checked_at = now
+        watch.last_error = (str(error_text)[:1000] if error_text else None)
+        watch.lease_owner = ""
+        watch.lease_until = None
+        watch.updated_at = now
+
+        listing = (await session.execute(
+            select(Listing).where(Listing.external_id == str(watch.external_id)).limit(1)
+        )).scalar_one_or_none()
+
+        if active is True:
+            watch.status = "watching"
+            watch.last_result = "active"
+            watch.consecutive_missing = 0
+            watch.first_missing_at = None
+            watch.last_seen_at = now
+            if listing is not None:
+                listing.is_active = True
+                listing.disappeared_at = None
+                listing.last_seen_at = max(listing.last_seen_at or now, now)
+                if listing.view_count is not None:
+                    watch.last_views = max(int(watch.last_views or 0), int(listing.view_count or 0))
+                if listing.price_eur is not None:
+                    watch.last_price_eur = int(listing.price_eur)
+            checkpoint = _next_lifecycle_checkpoint(watch.first_seen_at, now)
+            if checkpoint is None:
+                watch.status = "expired"
+                watch.next_check_at = None
+                watch.last_result = "active_at_3h"
+            else:
+                step, next_check = checkpoint
+                watch.check_step = int(step)
+                watch.next_check_at = next_check
+
+        elif active is False:
+            watch.last_result = "unavailable"
+            if int(watch.consecutive_missing or 0) <= 0:
+                # One miss is only a candidate. A second direct detail-page miss
+                # after a short delay is required before Fast Sold is recorded.
+                watch.consecutive_missing = 1
+                watch.first_missing_at = now
+                watch.status = "confirming"
+                watch.next_check_at = now + timedelta(minutes=RADAR_LIFECYCLE_CONFIRM_MINUTES)
+            else:
+                disappeared_at = watch.first_missing_at or now
+                lifetime_seconds = max(0, int((disappeared_at - watch.first_seen_at).total_seconds()))
+                watch.status = "disappeared"
+                watch.consecutive_missing = 2
+                watch.disappeared_at = disappeared_at
+                watch.confirmed_at = now
+                watch.lifetime_seconds = lifetime_seconds
+                watch.next_check_at = None
+                watch.last_result = "confirmed_disappeared"
+                if listing is not None:
+                    listing.is_active = False
+                    listing.disappeared_at = disappeared_at
+                product = await session.get(RadarProduct, int(watch.product_id))
+                if product is not None:
+                    reason = _lifecycle_reason(lifetime_seconds)
+                    duplicate = (await session.execute(
+                        select(RadarSnapshot.id).where(
+                            RadarSnapshot.source_key == f"lifecycle-fast:{int(watch.id)}"
+                        ).limit(1)
+                    )).scalar_one_or_none()
+                    if duplicate is None:
+                        score = max(int(product.current_score or 0), int(watch.peak_score or watch.score or 0))
+                        session.add(RadarSnapshot(
+                            source_key=f"lifecycle-fast:{int(watch.id)}",
+                            product_id=int(product.id),
+                            external_id=str(watch.external_id),
+                            source="lifecycle",
+                            score=_clamp_score(score),
+                            confidence=max(55, int(product.confidence or 0)),
+                            stage="fast_sold", outcome="disappeared",
+                            opportunity_type="fast_sold",
+                            view_count=watch.last_views,
+                            price_eur=watch.last_price_eur,
+                            reasons_json=json.dumps([reason], ensure_ascii=False),
+                            recorded_at=now,
+                        ))
+                        product.signal_count = int(product.signal_count or 0) + 1
+                    product.latest_reason = reason[:800]
+                    product.latest_source = "lifecycle"
+                    product.last_signal_at = max(product.last_signal_at or now, now)
+                    product.updated_at = now
+                log.info(
+                    "DT Radar Fast Sold confirmed external_id=%s product=%s lifetime=%ss checks=%s",
+                    watch.external_id, watch.product_id, lifetime_seconds, watch.checks,
+                )
+
+        else:
+            watch.last_result = "unknown"
+            # Refusals/timeouts never count as disappearance. Retry gently. If the
+            # 3-hour horizon has already passed, one small grace period is enough.
+            elapsed_minutes = max(0.0, (now - watch.first_seen_at).total_seconds() / 60.0)
+            if elapsed_minutes > RADAR_LIFECYCLE_MAX_MINUTES + 15:
+                watch.status = "expired"
+                watch.next_check_at = None
+            else:
+                watch.next_check_at = now + timedelta(minutes=RADAR_LIFECYCLE_UNKNOWN_RETRY_MINUTES)
+
+        await session.commit()
+        return str(watch.status or "unknown")
+
+
+async def get_fast_sold_infos(product_ids: list[int] | tuple[int, ...]) -> dict[int, FastSoldInfo]:
+    ids = list(dict.fromkeys(int(x) for x in product_ids if int(x) > 0))
+    if not ids:
+        return {}
+    async with SessionLocal() as session:
+        rows = list((await session.execute(
+            select(RadarLifecycleWatch).where(
+                RadarLifecycleWatch.product_id.in_(ids),
+                RadarLifecycleWatch.status == "disappeared",
+                RadarLifecycleWatch.lifetime_seconds.is_not(None),
+                RadarLifecycleWatch.lifetime_seconds <= RADAR_FAST_SOLD_MAX_SECONDS,
+            ).order_by(
+                RadarLifecycleWatch.disappeared_at.desc(), RadarLifecycleWatch.lifetime_seconds.asc()
+            )
+        )).scalars().all())
+    result: dict[int, FastSoldInfo] = {}
+    for row in rows:
+        product_id = int(row.product_id)
+        if product_id in result or row.disappeared_at is None or row.lifetime_seconds is None:
+            continue
+        result[product_id] = FastSoldInfo(
+            product_id=product_id, external_id=str(row.external_id),
+            title=str(row.title or ""), category_key=str(row.category_key or ""),
+            disappeared_at=row.disappeared_at, confirmed_at=row.confirmed_at,
+            first_seen_at=row.first_seen_at, last_seen_at=row.last_seen_at,
+            lifetime_seconds=int(row.lifetime_seconds), last_views=row.last_views,
+            last_price_eur=row.last_price_eur, peak_score=int(row.peak_score or row.score or 0),
+        )
+    return result
+
+
+async def get_fast_sold_info(product_id: int) -> FastSoldInfo | None:
+    return (await get_fast_sold_infos([int(product_id)])).get(int(product_id))
+
+
+async def lifecycle_queue_stats() -> dict[str, int]:
+    async with SessionLocal() as session:
+        rows = (await session.execute(
+            select(RadarLifecycleWatch.status, func.count(RadarLifecycleWatch.id)).group_by(RadarLifecycleWatch.status)
+        )).all()
+    stats = {str(status): int(count or 0) for status, count in rows}
+    stats["total"] = sum(stats.values())
+    return stats
+
+
 async def refresh_radar_scores() -> int:
     """Apply age cooling to current score without deleting historical products."""
     now = datetime.utcnow()
@@ -457,7 +797,14 @@ async def radar_stats() -> RadarStats:
         ))).scalar_one() or 0)
         categories = int((await session.execute(select(func.count(func.distinct(RadarProduct.category_key))))).scalar_one() or 0)
         signals = int((await session.execute(select(func.count(RadarSnapshot.id)))).scalar_one() or 0)
-    return RadarStats(total, hot, rising, ai_picks, categories, signals)
+        fast_sold = int((await session.execute(
+            select(func.count(func.distinct(RadarLifecycleWatch.product_id))).where(
+                RadarLifecycleWatch.status == "disappeared",
+                RadarLifecycleWatch.lifetime_seconds.is_not(None),
+                RadarLifecycleWatch.lifetime_seconds <= RADAR_FAST_SOLD_MAX_SECONDS,
+            )
+        )).scalar_one() or 0)
+    return RadarStats(total, hot, rising, ai_picks, categories, signals, fast_sold)
 
 
 async def list_radar_products(
@@ -491,6 +838,34 @@ async def list_radar_products(
                 RadarProduct.confidence >= 55,
             ])
             order = (RadarProduct.current_score.desc(), RadarProduct.confidence.desc(), RadarProduct.last_signal_at.desc())
+        elif mode == "fastsold":
+            fast_product_ids = select(RadarLifecycleWatch.product_id).where(
+                RadarLifecycleWatch.status == "disappeared",
+                RadarLifecycleWatch.lifetime_seconds.is_not(None),
+                RadarLifecycleWatch.lifetime_seconds <= RADAR_FAST_SOLD_MAX_SECONDS,
+            )
+            conditions.append(RadarProduct.id.in_(fast_product_ids))
+            latest_disappearance = (
+                select(func.max(RadarLifecycleWatch.disappeared_at))
+                .where(
+                    RadarLifecycleWatch.product_id == RadarProduct.id,
+                    RadarLifecycleWatch.status == "disappeared",
+                    RadarLifecycleWatch.lifetime_seconds.is_not(None),
+                    RadarLifecycleWatch.lifetime_seconds <= RADAR_FAST_SOLD_MAX_SECONDS,
+                )
+                .correlate(RadarProduct).scalar_subquery()
+            )
+            fastest_lifetime = (
+                select(func.min(RadarLifecycleWatch.lifetime_seconds))
+                .where(
+                    RadarLifecycleWatch.product_id == RadarProduct.id,
+                    RadarLifecycleWatch.status == "disappeared",
+                    RadarLifecycleWatch.lifetime_seconds.is_not(None),
+                    RadarLifecycleWatch.lifetime_seconds <= RADAR_FAST_SOLD_MAX_SECONDS,
+                )
+                .correlate(RadarProduct).scalar_subquery()
+            )
+            order = (latest_disappearance.desc(), fastest_lifetime.asc(), RadarProduct.peak_score.desc())
         elif mode == "alltime":
             order = (RadarProduct.peak_score.desc(), RadarProduct.signal_count.desc(), RadarProduct.last_signal_at.desc())
         elif mode == "favorites" and user_id is not None:

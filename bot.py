@@ -119,9 +119,10 @@ from parser import (
 from view_manager import REMOTE_VIEW_MANAGER, REMOTE_VIEW_WORKER_ENABLED
 from ai_manager import AI_MANAGER
 from radar import (
-    RADAR_PAGE_SIZE, backfill_radar_once, get_radar_product, is_radar_favorite,
-    list_radar_products, radar_categories, radar_stats, record_autoscan_hot, record_scan_hot,
-    refresh_radar_scores, search_radar_products, toggle_radar_favorite,
+    RADAR_PAGE_SIZE, backfill_radar_once, get_fast_sold_info, get_fast_sold_infos,
+    get_radar_product, is_radar_favorite, list_radar_products, radar_categories, radar_stats,
+    record_autoscan_hot, record_scan_hot, refresh_radar_scores, search_radar_products,
+    toggle_radar_favorite,
 )
 from page_manager import (
     PAGE_PREFETCH_EXTRA_PAGES, PAGE_PREFETCH_LOW_WATER_PAGES, PAGE_PREFETCH_WINDOW_PAGES,
@@ -1142,6 +1143,7 @@ RADAR_TYPE_LABEL = {
     "emerging": "🚀 Emerging",
     "saturated": "⚫ Saturated",
     "spark": "⚡ Signal",
+    "fast_sold": "⚡ Fast Sold",
 }
 
 
@@ -1163,10 +1165,12 @@ def radar_home_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
 
 def radar_best_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     full = bool(user_id is not None and allowed(int(user_id)))
+    fast_cb = "radarlist:fastsold:0" if full else "radar_locked:fastsold"
     rows = [
         [InlineKeyboardButton(text="🔥 Горячие", callback_data="radarlist:hot:0"),
          InlineKeyboardButton(text="🚀 Набирают", callback_data="radarlist:rising:0")],
-        [InlineKeyboardButton(text="🧠 AI Picks", callback_data="radarlist:ai:0")],
+        [InlineKeyboardButton(text="🧠 AI Picks", callback_data="radarlist:ai:0"),
+         InlineKeyboardButton(text="⚡ Быстро исчезли" + ("" if full else " · 🔒"), callback_data=fast_cb)],
     ]
     if full:
         rows.append([InlineKeyboardButton(text="🏆 Рекорды Radar", callback_data="radarlist:alltime:0")])
@@ -1240,7 +1244,7 @@ def radar_preview_list_keyboard(
 def radar_list_keyboard(items, *, mode: str, page: int, total: int, category_key: str | None = None) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for product in items:
-        icon = RADAR_STATUS_ICON.get(str(product.status or ""), "📡")
+        icon = "⚡" if mode == "fastsold" else RADAR_STATUS_ICON.get(str(product.status or ""), "📡")
         title = " ".join(str(product.title or "Товар").split())
         if len(title) > 32:
             title = title[:31].rstrip() + "…"
@@ -1274,7 +1278,7 @@ def radar_list_keyboard(items, *, mode: str, page: int, total: int, category_key
             callback_data=f"radargroup:{cat.group}" if cat is not None and cat.group in GROUPS else "radarcats:0",
         )])
     else:
-        back_callback = "radarbest" if mode in {"hot", "rising", "ai", "alltime"} else "radar_home"
+        back_callback = "radarbest" if mode in {"hot", "rising", "ai", "fastsold", "alltime"} else "radar_home"
         back_text = "⬅️ Лучшие сейчас" if back_callback == "radarbest" else "⬅️ DT Radar"
         rows.append([InlineKeyboardButton(text=back_text, callback_data=back_callback)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -13462,6 +13466,19 @@ def _radar_freshness(value: datetime | None) -> str:
     return _moscow_text(value)
 
 
+def _fast_sold_lifetime_text(seconds: int | None) -> str:
+    if seconds is None:
+        return "—"
+    total = max(0, int(seconds))
+    minutes = max(1, int(round(total / 60.0)))
+    if minutes < 60:
+        return f"~{minutes} мин"
+    hours, rest = divmod(minutes, 60)
+    if rest == 0:
+        return f"~{hours} ч"
+    return f"~{hours} ч {rest} мин"
+
+
 def _radar_added_label(value: datetime | None) -> str:
     """Compact category-feed label based on when the product first entered Radar.
 
@@ -13499,17 +13516,17 @@ async def _radar_home_text(user_id: int | None = None) -> str:
             "Посмотри, как Radar отбирает сильные товары из тысяч объявлений.\n\n"
             f"🎁 <b>Бесплатно:</b> первые {FREE_RADAR_PREVIEW_LIMIT} находок в каждом режиме «Лучшие сейчас».\n"
             "🔒 Поиск, Категории, Мой Radar и полные ленты открываются с подпиской.\n\n"
-            f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих · 🚀 <b>{stats.rising}</b> набирают.\n\n"
+            f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих · 🚀 <b>{stats.rising}</b> набирают · ⚡ <b>{stats.fast_sold}</b> Fast Sold.\n\n"
             "⭐ <b>DT Score</b> показывает силу каждого товара."
         )
     return (
         "📡 <b>DT Radar</b>\n\n"
         "Найди сильные товары без лишней сложности. Выбери, что хочешь сделать:\n\n"
-        "🔥 <b>Лучшие сейчас</b> — горячие, набирающие и AI Picks\n"
+        "🔥 <b>Лучшие сейчас</b> — горячие, набирающие, AI Picks и быстро исчезнувшие\n"
         "🔎 <b>Поиск</b> — если уже знаешь название товара\n"
         "🗂 <b>Категории</b> — если хочешь посмотреть по разделам\n"
         "⭐ <b>Мой Radar</b> — сохранённые товары\n\n"
-        f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих · 🚀 <b>{stats.rising}</b> набирают.\n\n"
+        f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих · 🚀 <b>{stats.rising}</b> набирают · ⚡ <b>{stats.fast_sold}</b> Fast Sold.\n\n"
         "⭐ <b>DT Score</b> оставляем главным рейтингом товара."
     )
 
@@ -13530,6 +13547,7 @@ async def _radar_list_payload(
         "hot": "🔥 Горячие сейчас",
         "rising": "🚀 Набирают обороты",
         "ai": "🧠 AI Picks",
+        "fastsold": "⚡ Быстро исчезли",
         "alltime": "🏆 Рекорды Radar",
         "favorites": "⭐ Мой Radar",
     }
@@ -13543,6 +13561,15 @@ async def _radar_list_payload(
     else:
         heading = titles.get(mode, "📡 DT Radar")
     lines = [f"<b>{html.escape(heading)}</b>", ""]
+    fast_infos = {}
+    if mode == "fastsold" and rows and not preview:
+        fast_infos = await get_fast_sold_infos([int(product.id) for product in rows])
+        lines += [
+            "Radar автоматически проверяет сильные свежие объявления через 15 / 30 / 60 / 120 / 180 минут.",
+            "В список попадает только исчезновение, подтверждённое двумя прямыми проверками.",
+            "ℹ️ Исчезновение обычно означает продажу или снятие объявления; Kleinanzeigen не всегда раскрывает причину.",
+            "",
+        ]
     if preview:
         shown = min(len(rows), FREE_RADAR_PREVIEW_LIMIT)
         lines += [
@@ -13576,6 +13603,20 @@ async def _radar_list_payload(
                 if category_key and not preview
                 else _radar_freshness(product.last_signal_at)
             )
+            if mode == "fastsold" and not preview:
+                info = fast_infos.get(int(product.id))
+                if info is not None:
+                    price = f"{int(info.last_price_eur)} €" if info.last_price_eur is not None else "—"
+                    views = str(int(info.last_views)) if info.last_views is not None else "—"
+                    lines.append(
+                        f"⚡ <b>{index}. {html.escape(str(product.title or info.title or 'Товар')[:70])}</b>\n"
+                        f"⏱ Исчезло за <b>{html.escape(_fast_sold_lifetime_text(info.lifetime_seconds))}</b> · "
+                        f"🕐 {html.escape(_moscow_text(info.disappeared_at))}\n"
+                        f"💶 <b>{html.escape(price)}</b> · 👀 последний замер <b>{views}</b> · "
+                        f"🏆 Peak <b>{max(int(product.peak_score or 0), int(info.peak_score or 0))}</b>\n"
+                        f"📂 {html.escape(cat_name)}"
+                    )
+                    continue
             lines.append(
                 f"{icon} <b>{index}. {html.escape(str(product.title or 'Товар')[:70])}</b>\n"
                 f"⭐ <b>{int(product.current_score or 0)}</b>/100 · Peak <b>{int(product.peak_score or 0)}</b> · "
@@ -13607,6 +13648,7 @@ async def _radar_product_payload(user_id: int, product_id: int, *, preview_mode:
     product, listing, snapshots = await get_radar_product(product_id)
     if product is None:
         return None, None
+    fast_info = await get_fast_sold_info(product_id)
     favorite = False if preview_mode is not None else await is_radar_favorite(user_id, product_id)
     status = RADAR_STATUS_LABEL.get(str(product.status or ""), str(product.status or "—"))
     status_icon = RADAR_STATUS_ICON.get(str(product.status or ""), "📡")
@@ -13637,6 +13679,17 @@ async def _radar_product_payload(user_id: int, product_id: int, *, preview_mode:
         f"📡 Последний сигнал: <b>{html.escape(_moscow_text(product.last_signal_at))}</b>",
         f"🕐 Свежесть: <b>{html.escape(_radar_freshness(product.last_signal_at))}</b>",
     ]
+    if fast_info is not None:
+        lines += [
+            "",
+            "⚡ <b>Fast Sold / быстро исчезло</b>",
+            f"⏱ Было доступно примерно: <b>{html.escape(_fast_sold_lifetime_text(fast_info.lifetime_seconds))}</b>",
+            f"❌ Исчезновение замечено: <b>{html.escape(_moscow_text(fast_info.disappeared_at))}</b>",
+            f"✅ Повторно подтверждено: <b>{html.escape(_moscow_text(fast_info.confirmed_at))}</b>",
+        ]
+        if fast_info.last_views is not None:
+            lines.append(f"👀 Последний известный замер: <b>{int(fast_info.last_views)}</b>")
+        lines.append("ℹ️ Kleinanzeigen не всегда сообщает, было ли объявление продано или снято продавцом.")
     if product.latest_reason:
         lines += ["", f"💡 <b>Почему в Radar:</b> {html.escape(str(product.latest_reason)[:500])}"]
     if snapshots:
@@ -13704,6 +13757,7 @@ async def radar_locked(callback: CallbackQuery) -> None:
         "categories": "🗂 Категории",
         "favorites": "⭐ Мой Radar",
         "records": "🏆 Рекорды Radar",
+        "fastsold": "⚡ Быстро исчезли",
     }
     if free_radar_preview_allowed(callback.from_user.id):
         await record_free_radar_event(callback.from_user.id, "locked_feature", feature=feature)
@@ -13713,7 +13767,8 @@ async def radar_locked(callback: CallbackQuery) -> None:
         f"Эта функция доступна в полном DT Radar. Бесплатно можно посмотреть первые <b>{FREE_RADAR_PREVIEW_LIMIT}</b> "
         "реальных находок в каждом режиме «Лучшие сейчас».\n\n"
         f"📦 В Radar уже: <b>{stats.total}</b> товаров\n"
-        f"🔥 Горячих: <b>{stats.hot}</b> · 🚀 Набирают: <b>{stats.rising}</b> · 🧠 AI Picks: <b>{stats.ai_picks}</b>\n\n"
+        f"🔥 Горячих: <b>{stats.hot}</b> · 🚀 Набирают: <b>{stats.rising}</b> · 🧠 AI Picks: <b>{stats.ai_picks}</b>\n"
+        f"⚡ Быстро исчезли: <b>{stats.fast_sold}</b>\n\n"
         "💎 Полный доступ открывает все результаты, поиск, категории, сохранения и историю Radar."
     )
     await _edit_or_answer(callback.message, text, reply_markup=radar_locked_keyboard())
@@ -13769,7 +13824,9 @@ async def radar_best_handler(callback: CallbackQuery) -> None:
             "Выбери, какие сильные товары хочешь посмотреть:\n\n"
             f"🔥 Горячие: <b>{stats.hot}</b>\n"
             f"🚀 Набирают: <b>{stats.rising}</b>\n"
-            f"🧠 AI Picks: <b>{stats.ai_picks}</b>\n\n"
+            f"🧠 AI Picks: <b>{stats.ai_picks}</b>\n"
+            f"⚡ Быстро исчезли: <b>{stats.fast_sold}</b>\n\n"
+            "⚡ «Быстро исчезли» — объявления, которые Radar видел активными и затем подтвердил недоступными в первые 3 часа.\n\n"
             "🏆 Рекорды Radar оставлены ниже как дополнительная история."
         )
     else:
@@ -13779,7 +13836,8 @@ async def radar_best_handler(callback: CallbackQuery) -> None:
             f"🎁 <b>Бесплатно покажем первые {FREE_RADAR_PREVIEW_LIMIT} находок</b> в выбранном режиме.\n\n"
             f"🔥 Горячие: <b>{stats.hot}</b>\n"
             f"🚀 Набирают: <b>{stats.rising}</b>\n"
-            f"🧠 AI Picks: <b>{stats.ai_picks}</b>\n\n"
+            f"🧠 AI Picks: <b>{stats.ai_picks}</b>\n"
+            f"⚡ Быстро исчезли: <b>{stats.fast_sold}</b> · 🔒\n\n"
             "Выбери режим и посмотри реальные результаты Radar."
         )
     await _edit_or_answer(callback.message, text, reply_markup=radar_best_keyboard(callback.from_user.id))
@@ -13834,7 +13892,7 @@ async def radar_list_handler(callback: CallbackQuery) -> None:
         page = max(0, int(parts[2])) if len(parts) > 2 else 0
     except Exception:
         page = 0
-    if mode not in {"hot", "rising", "ai", "alltime", "favorites"}:
+    if mode not in {"hot", "rising", "ai", "fastsold", "alltime", "favorites"}:
         mode = "hot"
     full = allowed(callback.from_user.id)
     if not full:
@@ -15677,7 +15735,7 @@ async def main() -> None:
             f"v4.9.1 expected {GUARANTEED_LOCAL_PARSER_LANES} scan workers, got {len(worker_tasks)}"
         )
     log.warning(
-        "v4.13.0 Referral Promo + Daily Radar FSM Hotfix + AutoScan View Deadlock Recovery online | parser_lanes=%s | fifth_plus=FIFO | "
+        "v4.14.0 Fast Sold Lifecycle + Referral Promo + Daily Radar FSM Hotfix online | parser_lanes=%s | fifth_plus=FIFO | "
         "trial_and_paid_same_queue=True | railway_lane_overrides_ignored=True",
         GUARANTEED_LOCAL_PARSER_LANES,
     )

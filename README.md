@@ -1,3 +1,28 @@
+# DT PARSER 4.14.0 — Fast Sold Lifecycle
+
+**Base:** 4.13.0 Simple Referral Promo.
+
+Adds a new DT Radar market-memory signal without changing the proven four user scan lanes, AutoScan page/date/view logic, referrals or Daily Radar:
+
+- new paid Radar mode: **⚡ Fast Sold / Быстро исчезли**;
+- fresh strong Radar listings (`DT Score >= 72`) are automatically enrolled in a durable PostgreSQL Lifecycle queue;
+- availability checkpoints run at **15 / 30 / 60 / 120 / 180 minutes** after DT first sees the listing;
+- one missing response never counts as a sale/disappearance — a second direct detail-page check about **3 minutes later** is required;
+- `403`, `429`, timeouts and uncertain pages are treated as **unknown**, never as sold;
+- confirmed disappearances keep first-seen, last-seen, disappearance time, lifetime, last views, price and Peak DT Score;
+- Fast Sold cards clearly state that Kleinanzeigen does not always disclose whether the ad was sold or manually removed;
+- strong signals from AutoScan, normal completed scans and DT AI can all enter Lifecycle;
+- a new **Lifecycle Worker** performs only lightweight direct availability checks, isolated from the main parser lanes;
+- PostgreSQL is the durable queue, so the worker does **not require Redis**;
+- `radar_lifecycle_watches` is created automatically; no manual SQL migration is required.
+
+### Railway
+Deploy the new code, then add **one** service named `Lifecycle Worker` from the same repo and give it the same `DATABASE_URL`. The existing `service_launcher.py` detects that name and starts `lifecycle_worker.py`. No `BOT_TOKEN` is needed on that worker and Redis is optional/not used. If a different service name is preferred, set `DT_SERVICE_ROLE=lifecycleworker`.
+
+See `DEPLOY_V4_14_0_FAST_SOLD_LIFECYCLE.md` for rollout and smoke tests.
+
+---
+
 # DT PARSER 4.13.0 — Simple Referral Promo
 
 **Base:** 4.12.3 Daily Radar FSM Hotfix.

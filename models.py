@@ -406,6 +406,47 @@ class RadarProductListing(Base):
     last_price_eur: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
+class RadarLifecycleWatch(Base):
+    """Adaptive availability watch for fresh, strong DT Radar listings.
+
+    The table is intentionally listing-level rather than product-level: one product
+    family may have several independent Kleinanzeigen ads with different lifetimes.
+    """
+
+    __tablename__ = "radar_lifecycle_watches"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int] = mapped_column(index=True)
+    external_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    category_key: Mapped[str] = mapped_column(String(80), default="", index=True)
+    title: Mapped[str] = mapped_column(String(500), default="")
+    url: Mapped[str] = mapped_column(String(1200), default="")
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    radar_started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    status: Mapped[str] = mapped_column(String(24), default="watching", index=True)
+    tier: Mapped[str] = mapped_column(String(8), default="B", index=True)
+    score: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    peak_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    last_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_price_eur: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    check_step: Mapped[int] = mapped_column(Integer, default=0)
+    checks: Mapped[int] = mapped_column(Integer, default=0)
+    consecutive_missing: Mapped[int] = mapped_column(Integer, default=0)
+    next_check_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    first_missing_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    disappeared_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    lifetime_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    last_result: Mapped[str] = mapped_column(String(32), default="")
+    last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    lease_owner: Mapped[str] = mapped_column(String(120), default="", index=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
 class RadarSnapshot(Base):
     """Append-only score/signal history for DT Radar."""
 

@@ -21,6 +21,8 @@ def _role() -> str:
         return "view-worker"
     if explicit in {"aiworker", "earlywinnerworker", "dtaiworker"}:
         return "ai-worker"
+    if explicit in {"lifecycleworker", "radarlifecycleworker", "fastsoldworker"}:
+        return "lifecycle-worker"
     if explicit in {"bot", "main", "parserbot", "telegrambot"}:
         return "bot"
 
@@ -44,6 +46,10 @@ def _role() -> str:
         ("ai" in normalized or "earlywinner" in normalized) and "worker" in normalized
     ):
         return "ai-worker"
+    if normalized in {"lifecycleworker", "radarlifecycleworker", "fastsoldworker"} or (
+        ("lifecycle" in normalized or "fastsold" in normalized) and "worker" in normalized
+    ):
+        return "lifecycle-worker"
 
     # v4.3.17 safety net for Railway services created from the same repo:
     # the dedicated View Worker intentionally needs Redis only, while the main
@@ -67,11 +73,16 @@ def main() -> None:
         # exact View Worker fleet; it never opens its own browser.
         os.environ.setdefault("REMOTE_VIEW_WORKER_ENABLED", "1")
         os.environ.setdefault("DISTRIBUTED_WORKERS", "1")
+    if role == "lifecycle-worker":
+        # Fast Sold uses PostgreSQL as its durable queue and direct lightweight
+        # detail-page checks. Keep the worker on a small independent DB/traffic pool.
+        os.environ.setdefault("DISTRIBUTED_WORKERS", "1")
     target = {
         "view-worker": "view_counter_worker.py",
         "page-worker": "page_worker.py",
         "date-worker": "date_worker.py",
         "ai-worker": "ai_worker.py",
+        "lifecycle-worker": "lifecycle_worker.py",
     }.get(role, "bot.py")
 
     print(

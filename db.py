@@ -169,6 +169,58 @@ async def init_db() -> None:
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_invites_promo_eligible ON referral_invites (promo_eligible)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_invites_created_at ON referral_invites (created_at)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_invites_rewarded_at ON referral_invites (rewarded_at)"))
+            # v4.14.0: DT Radar Lifecycle / Fast Sold. PostgreSQL itself is the
+            # durable queue so a dedicated Lifecycle Worker needs no Redis and a
+            # parser restart cannot lose pending availability checks.
+            await conn.execute(text(
+                """
+                CREATE TABLE IF NOT EXISTS radar_lifecycle_watches (
+                    id SERIAL PRIMARY KEY,
+                    product_id INTEGER NOT NULL,
+                    external_id VARCHAR(64) NOT NULL UNIQUE,
+                    category_key VARCHAR(80) NOT NULL DEFAULT '',
+                    title VARCHAR(500) NOT NULL DEFAULT '',
+                    url VARCHAR(1200) NOT NULL DEFAULT '',
+                    first_seen_at TIMESTAMP NOT NULL,
+                    radar_started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_seen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    status VARCHAR(24) NOT NULL DEFAULT 'watching',
+                    tier VARCHAR(8) NOT NULL DEFAULT 'B',
+                    score INTEGER NOT NULL DEFAULT 0,
+                    peak_score INTEGER NOT NULL DEFAULT 0,
+                    last_views INTEGER,
+                    last_price_eur INTEGER,
+                    check_step INTEGER NOT NULL DEFAULT 0,
+                    checks INTEGER NOT NULL DEFAULT 0,
+                    consecutive_missing INTEGER NOT NULL DEFAULT 0,
+                    next_check_at TIMESTAMP,
+                    last_checked_at TIMESTAMP,
+                    first_missing_at TIMESTAMP,
+                    disappeared_at TIMESTAMP,
+                    confirmed_at TIMESTAMP,
+                    lifetime_seconds INTEGER,
+                    last_result VARCHAR(32) NOT NULL DEFAULT '',
+                    last_error VARCHAR(1000),
+                    lease_owner VARCHAR(120) NOT NULL DEFAULT '',
+                    lease_until TIMESTAMP,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            ))
+            for index_sql in (
+                "CREATE INDEX IF NOT EXISTS ix_radar_lifecycle_watches_product_id ON radar_lifecycle_watches (product_id)",
+                "CREATE INDEX IF NOT EXISTS ix_radar_lifecycle_watches_external_id ON radar_lifecycle_watches (external_id)",
+                "CREATE INDEX IF NOT EXISTS ix_radar_lifecycle_watches_category_key ON radar_lifecycle_watches (category_key)",
+                "CREATE INDEX IF NOT EXISTS ix_radar_lifecycle_watches_first_seen_at ON radar_lifecycle_watches (first_seen_at)",
+                "CREATE INDEX IF NOT EXISTS ix_radar_lifecycle_watches_status ON radar_lifecycle_watches (status)",
+                "CREATE INDEX IF NOT EXISTS ix_radar_lifecycle_watches_score ON radar_lifecycle_watches (score)",
+                "CREATE INDEX IF NOT EXISTS ix_radar_lifecycle_watches_next_check_at ON radar_lifecycle_watches (next_check_at)",
+                "CREATE INDEX IF NOT EXISTS ix_radar_lifecycle_watches_disappeared_at ON radar_lifecycle_watches (disappeared_at)",
+                "CREATE INDEX IF NOT EXISTS ix_radar_lifecycle_watches_lifetime_seconds ON radar_lifecycle_watches (lifetime_seconds)",
+                "CREATE INDEX IF NOT EXISTS ix_radar_lifecycle_watches_lease_until ON radar_lifecycle_watches (lease_until)",
+            ):
+                await conn.execute(text(index_sql))
         await conn.run_sync(Base.metadata.create_all)
 
         # Lightweight additive migrations so existing PostgreSQL databases can be
