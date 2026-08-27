@@ -10,9 +10,19 @@ from typing import Iterable
 from product_identity import canonical_text
 from zoneinfo import ZoneInfo
 
-MODEL_VERSION = "product-opportunity-v3"
+MODEL_VERSION = "dt-demand-score-v2"
 BERLIN = ZoneInfo("Europe/Berlin")
 UTC = timezone.utc
+
+# DT Demand Score 2.0.  Keep one user-facing score, but make its internals explicit
+# and testable.  Lifecycle/disappearance data is intentionally NOT part of this
+# score because disappearance can also mean moderation, fraud removal, or a seller
+# withdrawing an ad.
+WEIGHT_VELOCITY = 40.0
+WEIGHT_ACCELERATION = 20.0
+WEIGHT_PERSISTENCE = 15.0
+WEIGHT_REPEATABILITY = 15.0
+WEIGHT_PRICE_FIT = 10.0
 
 
 def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
@@ -160,6 +170,12 @@ class InitialScore:
     anomaly_ratio: float = 1.0
     current_vs_history_ratio: float = 1.0
     opportunity_type: str = "spark"
+    # DT Demand Score 2.0 internals.  They are deliberately not separate public
+    # scores; keeping them here makes diagnostics and future calibration possible.
+    velocity_factor: float = 0.5
+    acceleration_factor: float = 0.5
+    persistence_factor: float = 0.5
+    price_fit_factor: float = 0.5
     # Kept as compatibility aliases for older tests/callers. v4.6 never subtracts them.
     supply_fit: float = 0.0
     mass_penalty: float = 0.0
@@ -191,8 +207,25 @@ def _price_factor(price: int | None, median: float | None) -> tuple[float, float
         # unknown products, while well-recognised mass electronics got a free edge.
         return 0.5, None
     delta = (float(median) - float(price)) / float(median)
-    # Price is a supporting signal only: 20% under market -> 1.0; median -> 0.5.
-    return clamp(0.5 + delta * 2.5), delta * 100.0
+
+    # Best fit is a believable discount, not "the cheaper the better".  An ad at
+    # 70-80% below a stable market median can be a typo, damaged item, scam bait, or
+    # otherwise non-comparable.  It therefore must not receive the maximum price
+    # bonus merely for being implausibly cheap.
+    if delta < -0.40:
+        factor = 0.08
+    elif delta < 0.0:
+        # 40% above median -> 0.08, median -> 0.60.
+        factor = 0.60 + delta * 1.30
+    elif delta <= 0.25:
+        # Median -> 0.60, 25% below -> 1.00.
+        factor = 0.60 + (delta / 0.25) * 0.40
+    elif delta <= 0.55:
+        # Preserve a good score for a strong discount, but taper extreme values.
+        factor = 1.00 - ((delta - 0.25) / 0.30) * 0.35
+    else:
+        factor = 0.55
+    return clamp(factor), delta * 100.0
 
 
 _FAMILY_STOPWORDS = {
@@ -269,6 +302,8 @@ def _market_profile(value) -> dict[str, float | int | None]:
         "demand_growth_ratio": 1.0,
         "demand_recent_samples": 0,
         "demand_previous_samples": 0,
+        "persistence": 0.5,
+        "historical_repeatability": 0.5,
         "prior_signals": 0,
         "prior_confirmed": 0,
     }
@@ -285,8 +320,12 @@ def _market_profile(value) -> dict[str, float | int | None]:
         profile["median"] = float(profile["median"]) if profile["median"] is not None else None
         for key in ("count", "recent_count", "previous_count", "demand_recent_samples", "demand_previous_samples", "prior_signals", "prior_confirmed"):
             profile[key] = int(profile[key] or 0)
-        for key in ("supply_percentile", "supply_growth_ratio", "demand_growth_ratio"):
-            profile[key] = float(profile[key] or (1.0 if "growth" in key else 0.0))
+        for key in (
+            "supply_percentile", "supply_growth_ratio", "demand_growth_ratio",
+            "persistence", "historical_repeatability",
+        ):
+            neutral = 1.0 if "growth" in key else (0.5 if key in {"persistence", "historical_repeatability"} else 0.0)
+            profile[key] = float(profile[key] if profile[key] is not None else neutral)
         for key in ("demand_recent_median", "demand_previous_median"):
             if profile[key] is not None:
                 profile[key] = float(profile[key])
@@ -335,6 +374,60 @@ def _combine_growth(current_vs_history: float | None, historical_growth: float |
     return max(0.20, min(5.0, math.exp(log_mean))), True
 
 
+def _age_matched_rows(row: FeatureRow, category_rows: list[FeatureRow]) -> list[FeatureRow]:
+    """Return a robust same-age comparison cohort.
+
+    Views/hour is already age-normalised, but very young listings are noisier than
+    listings that have had several hours to accumulate traffic.  Demand Score 2.0
+    therefore prefers listings from a similar age band and falls back to the whole
+    category only when the band is too small.
+    """
+    age = max(5.0, float(row.age_minutes))
+    if age <= 30:
+        low, high = 5.0, 45.0
+    elif age <= 90:
+        low, high = 20.0, 150.0
+    elif age <= 240:
+        low, high = 60.0, 360.0
+    elif age <= 720:
+        low, high = 180.0, 960.0
+    else:
+        low, high = 480.0, 24.0 * 60.0
+    matched = [x for x in category_rows if low <= float(x.age_minutes) <= high]
+    return matched if len(matched) >= 5 else category_rows
+
+
+def _relative_rate_factor(rate: float, median: float, p85: float) -> float:
+    """Map an observed rate onto a smooth 0..1 category-relative demand scale."""
+    rate = max(0.0, float(rate))
+    median = max(0.25, float(median))
+    p85 = max(median + 0.25, float(p85))
+    if rate <= median:
+        return clamp(0.50 * (rate / median))
+    if rate <= p85:
+        return clamp(0.50 + 0.35 * ((rate - median) / (p85 - median)))
+    spread = max(0.50, p85 - median)
+    return clamp(0.85 + 0.15 * (1.0 - math.exp(-(rate - p85) / spread)))
+
+
+def _demand_score(
+    *,
+    velocity: float,
+    acceleration: float,
+    persistence: float,
+    repeatability: float,
+    price_fit: float,
+) -> int:
+    raw = (
+        WEIGHT_VELOCITY * clamp(velocity)
+        + WEIGHT_ACCELERATION * clamp(acceleration)
+        + WEIGHT_PERSISTENCE * clamp(persistence)
+        + WEIGHT_REPEATABILITY * clamp(repeatability)
+        + WEIGHT_PRICE_FIT * clamp(price_fit)
+    )
+    return int(round(max(0.0, min(100.0, raw))))
+
+
 def _opportunity_type(
     *,
     score: int,
@@ -362,11 +455,12 @@ def score_initial_rows(
     rows: list[FeatureRow],
     market_stats: dict[str, tuple[float, int] | dict] | None = None,
 ) -> list[InitialScore]:
-    """DT Product Opportunity Engine v3.
+    """DT Demand Score 2.0.
 
-    Opportunity Score answers: "is something unusually strong happening with this
-    product now?" Saturation is a separate axis. A popular family can therefore become
-    a Hot Product when demand accelerates; it is not pushed down merely for being large.
+    One 0..100 score answers whether a product is showing strong, sustained buyer
+    interest now.  The fixed weights are 40/20/15/15/10 for relative view velocity,
+    acceleration, persistence, repeatability, and price fit.  Saturation and Lifecycle
+    remain descriptive axes and do not change this score.
     """
     market_stats = market_stats or {}
     by_category: dict[str, list[FeatureRow]] = {}
@@ -408,10 +502,28 @@ def score_initial_rows(
             peer_p85 = percentile_value(peer_rates, 0.85)
             peer_p90 = percentile_value(peer_rates, 0.90)
 
-            category_velocity_pct = percentile_rank(row.views_per_hour, balanced_category_rates)
+            # 40% Relative View Velocity: compare primarily with listings of similar
+            # age, while still family-balancing the baseline so duplicate-heavy
+            # products cannot redefine what "normal" means for the category.
+            age_rows = _age_matched_rows(row, category_rows)
+            age_groups: dict[str, list[float]] = {}
+            age_ungrouped: list[float] = []
+            for age_item in age_rows:
+                age_key = cohort_key_by_id.get(age_item.external_id, "")
+                if age_key:
+                    age_groups.setdefault(age_key, []).append(age_item.views_per_hour)
+                else:
+                    age_ungrouped.append(age_item.views_per_hour)
+            age_balanced_rates = list(age_ungrouped)
+            for rates in age_groups.values():
+                age_balanced_rates.append(percentile_value(rates, 0.50))
+            if len(age_balanced_rates) < 2:
+                age_balanced_rates = list(balanced_category_rates)
+
+            category_velocity_pct = percentile_rank(row.views_per_hour, age_balanced_rates)
             views_pct = percentile_rank(float(row.views), view_values)
             absolute_demand = _absolute_demand_factor(row.views, row.views_per_hour)
-            demand_factor = 0.68 * category_velocity_pct + 0.32 * absolute_demand
+            velocity_factor = clamp(0.85 * category_velocity_pct + 0.15 * absolute_demand)
 
             category_ratio = row.views_per_hour / category_median
             peer_ratio = row.views_per_hour / max(0.25, peer_median) if use_peers else category_ratio
@@ -430,20 +542,20 @@ def score_initial_rows(
             saturation = _saturation_score(float(profile["supply_percentile"] or 0.0), scan_share, market_count)
 
             # Repeatability: multiple independent strong listings beat a single viral ad.
-            if peers:
+            if len(peers) >= 2:
                 strong_peers = sum(1 for x in peers if x.views_per_hour >= category_p75)
                 peer_share = strong_peers / max(1, len(peers))
                 peer_depth = clamp((len(peers) - 1) / 4.0)
                 current_repeatability = 0.65 * peer_share + 0.35 * peer_depth
             else:
-                current_repeatability = 0.28
+                # Lack of comparable listings is uncertainty, not evidence of weak
+                # demand.  Keep it neutral and let confidence express thin data.
+                current_repeatability = 0.50
             prior_signals = int(profile["prior_signals"] or 0)
-            prior_confirmed = int(profile["prior_confirmed"] or 0)
-            if prior_signals > 0:
-                historical_repeatability = prior_confirmed / max(1, prior_signals)
-                repeatability = clamp(0.65 * current_repeatability + 0.35 * historical_repeatability)
-            else:
-                repeatability = clamp(current_repeatability)
+            historical_repeatability_raw = profile.get("historical_repeatability")
+            historical_repeatability = clamp(float(
+                0.5 if historical_repeatability_raw is None else historical_repeatability_raw
+            ))
 
             demand_recent = profile["demand_recent_median"]
             demand_previous = profile["demand_previous_median"]
@@ -456,6 +568,36 @@ def score_initial_rows(
             if demand_recent is not None and demand_previous is not None and float(demand_previous) > 0 and history_samples >= 4:
                 historical_growth = float(demand_recent) / max(0.25, float(demand_previous))
             demand_growth_ratio, trend_evidence = _combine_growth(current_vs_history, historical_growth)
+
+            # 20% Acceleration: how much the product family's current demand is
+            # speeding up versus its own recent history, with recent-vs-previous
+            # market history as independent confirmation.  Missing history is 0.5.
+            acceleration_parts: list[tuple[float, float]] = []
+            if current_vs_history is not None:
+                acceleration_parts.append((_growth_factor(current_vs_history), 0.65))
+            if historical_growth is not None:
+                acceleration_parts.append((_growth_factor(historical_growth), 0.35))
+            if acceleration_parts:
+                total_w = sum(weight for _factor, weight in acceleration_parts)
+                acceleration_factor = clamp(sum(factor * weight for factor, weight in acceleration_parts) / total_w)
+            else:
+                acceleration_factor = 0.50
+
+            # 15% Persistence comes only from raw historical view curves.  It is
+            # deliberately neutral when the database has not accumulated enough
+            # checkpoints for this family yet.
+            persistence_raw = profile.get("persistence")
+            persistence_factor = clamp(float(0.5 if persistence_raw is None else persistence_raw))
+
+            # 15% Repeatability blends the current scan with raw historical demand
+            # evidence.  It no longer depends on prior AI "confirmed" labels, which
+            # avoids a circular model-rewarding-itself feedback loop.
+            if history_samples >= 3:
+                repeatability = clamp(0.55 * current_repeatability + 0.45 * historical_repeatability)
+            elif history_samples > 0:
+                repeatability = clamp(0.75 * current_repeatability + 0.25 * historical_repeatability)
+            else:
+                repeatability = clamp(current_repeatability)
 
             supply_growth_ratio = max(0.25, min(4.0, float(profile["supply_growth_ratio"] or 1.0)))
             demand_supply_ratio = (
@@ -476,21 +618,16 @@ def score_initial_rows(
                 anomaly_factor = 0.72 * _ratio_factor(category_ratio) + 0.28 * _ratio_factor(peer_ratio)
                 anomaly_ratio = category_ratio
 
-            trend_factor = _growth_factor(demand_growth_ratio) if trend_evidence else 0.50
-            imbalance_factor = _growth_factor(demand_supply_ratio) if trend_evidence else 0.50
-            freshness = clamp(1.0 - (row.age_minutes / (24.0 * 60.0)))
-
-            # No mass penalty. Saturation is intentionally absent from this formula.
-            raw = (
-                34.0 * demand_factor
-                + 26.0 * anomaly_factor
-                + 16.0 * trend_factor
-                + 12.0 * imbalance_factor
-                + 8.0 * repeatability
-                + 3.0 * freshness
-                + 1.0 * price_factor
+            # DT Demand Score 2.0: one score, five demand-relevant inputs.  Supply
+            # saturation and Lifecycle/disappearance are descriptive only and never
+            # add/subtract points here.
+            score = _demand_score(
+                velocity=velocity_factor,
+                acceleration=acceleration_factor,
+                persistence=persistence_factor,
+                repeatability=repeatability,
+                price_fit=price_factor,
             )
-            score = int(round(max(0.0, min(100.0, raw))))
 
             identity_conf = int(row.identity_confidence or 0)
             evidence_count = market_count if market_count > 0 else len(peers)
@@ -550,6 +687,11 @@ def score_initial_rows(
                 reasons.append("товарная семья новая для базы: насыщение неизвестно, а не автоматически «редко = хорошо»")
             if len(peers) >= 2:
                 reasons.append(f"повторяемость текущего сигнала: {repeatability*100:.0f}% на {len(peers)} сопоставимых")
+            reasons.append(
+                "DT Demand 2.0: "
+                f"скорость {velocity_factor*100:.0f}% · ускорение {acceleration_factor*100:.0f}% · "
+                f"устойчивость {persistence_factor*100:.0f}% · повторяемость {repeatability*100:.0f}%"
+            )
             if supply_growth_ratio >= 1.15:
                 reasons.append(f"предложение тоже растёт: {supply_growth_ratio:.2f}× к норме категории")
             elif supply_growth_ratio <= 0.85 and market_count:
@@ -590,6 +732,10 @@ def score_initial_rows(
                 anomaly_ratio=anomaly_ratio,
                 current_vs_history_ratio=float(current_vs_history or 1.0),
                 opportunity_type=opp_type,
+                velocity_factor=velocity_factor,
+                acceleration_factor=acceleration_factor,
+                persistence_factor=persistence_factor,
+                price_fit_factor=price_factor,
                 supply_fit=0.0,
                 mass_penalty=0.0,
             ))
@@ -659,6 +805,9 @@ def update_dynamic_score(
     target_hours: int,
     previous_views: int | None = None,
     previous_elapsed_hours: float | None = None,
+    repeatability: float = 0.5,
+    price_eur: int | None = None,
+    market_median_eur: float | None = None,
 ) -> DynamicScore:
     elapsed = max(0.25, float(elapsed_hours))
     delta = max(0, int(current_views) - int(baseline_views))
@@ -679,11 +828,31 @@ def update_dynamic_score(
         # only the lifetime average. This is what lets the engine detect genuine
         # acceleration instead of merely rewarding an already-large baseline.
         momentum = recent_rate / max(0.5, float(initial_views_per_hour))
-    momentum_factor = clamp((momentum - 0.50) / 1.00)
+    # Recompute the same five-factor DT Demand Score 2.0 after every real
+    # checkpoint rather than blending an old model score with new evidence.
+    velocity_factor = _relative_rate_factor(observed_rate, peer_vph_median, peer_vph_p85)
+    acceleration_factor = _growth_factor(momentum)
 
-    score = int(round(max(0.0, min(100.0,
-        float(initial_score) * 0.45 + strength * 37.0 + momentum_factor * 18.0
-    ))))
+    initial_velocity_factor = _relative_rate_factor(
+        float(initial_views_per_hour), peer_vph_median, peer_vph_p85
+    )
+    recent_velocity_factor = _relative_rate_factor(recent_rate, peer_vph_median, peer_vph_p85)
+    # Persistence rewards demand that remains strong across the starting point,
+    # lifetime growth, and the latest interval. A single spike cannot dominate it.
+    persistence_floor = min(initial_velocity_factor, velocity_factor, recent_velocity_factor)
+    persistence_mean = statistics.fmean(
+        [initial_velocity_factor, velocity_factor, recent_velocity_factor]
+    )
+    persistence_factor = clamp(0.55 * persistence_floor + 0.45 * persistence_mean)
+    price_fit, _price_delta = _price_factor(price_eur, market_median_eur)
+
+    score = _demand_score(
+        velocity=velocity_factor,
+        acceleration=acceleration_factor,
+        persistence=persistence_factor,
+        repeatability=repeatability,
+        price_fit=price_fit,
+    )
     stage = stage_for_score(score)
 
     # Objective shadow-mode label. It is intentionally based on observed future
@@ -710,6 +879,11 @@ def update_dynamic_score(
         reasons.append("темп ускоряется относительно стартовой скорости")
     elif momentum < 0.75:
         reasons.append("темп замедляется относительно стартовой скорости")
+    reasons.append(
+        "DT Demand 2.0: "
+        f"скорость {velocity_factor*100:.0f}% · ускорение {acceleration_factor*100:.0f}% · "
+        f"устойчивость {persistence_factor*100:.0f}%"
+    )
 
     return DynamicScore(
         score=score,

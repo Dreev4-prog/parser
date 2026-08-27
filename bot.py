@@ -9980,6 +9980,15 @@ def _ai_opportunity_label(value: str | None) -> str:
     }.get(str(value or ""), "⚡ Первичный сигнал")
 
 
+def _ai_saturation_label(value: int | float | None) -> str:
+    score = int(value or 0)
+    if score >= 70:
+        return "высокая"
+    if score >= 45:
+        return "средняя"
+    return "низкая"
+
+
 def _ai_json_list(raw: str | None) -> list[str]:
     try:
         data = json.loads(raw or "[]")
@@ -10171,8 +10180,7 @@ async def _admin_ai_list_text(kind: str, rows: list[tuple[AIEarlyWinnerCandidate
         price = f"{listing.price_eur} €" if listing.price_eur is not None else (listing.price_text or "—")
         lines.append(
             f"{idx}. {_ai_opportunity_label(candidate.opportunity_type)} · {_ai_stage_label(candidate.stage, candidate.outcome)}\n"
-            f"   Возможность <b>{int(candidate.current_score or 0)}/100</b> · Насыщенность <b>{int(candidate.saturation_score or 0)}/100</b> "
-            f"· уверенность {int(candidate.confidence or 0)}%\n"
+            f"   DT Demand Score <b>{int(candidate.current_score or 0)}/100</b> · уверенность {int(candidate.confidence or 0)}%\n"
             f"   {html.escape((listing.title or 'Объявление')[:80])} · <b>{html.escape(str(price))}</b>\n"
             f"   👁 {int(candidate.latest_views or 0)} · скан #{scan.id} · {_utc_to_msk_text(candidate.latest_at)} МСК"
         )
@@ -10206,8 +10214,8 @@ async def _admin_ai_candidate(candidate_id: int, requested_back_kind: str | None
         f"<b>{_ai_opportunity_label(candidate.opportunity_type)}</b> · {_ai_stage_label(candidate.stage, candidate.outcome)}",
         f"<b>{html.escape((listing.title or 'Объявление')[:180])}</b>",
         "",
-        f"🚀 Оценка возможности: <b>{int(candidate.current_score or 0)}/100</b> · старт {int(candidate.initial_score or 0)}",
-        f"🌊 Насыщенность: <b>{int(candidate.saturation_score or 0)}/100</b> · процентиль предложения {float(candidate.supply_percentile or 0)*100:.0f}%",
+        f"⭐ DT Demand Score: <b>{int(candidate.current_score or 0)}/100</b> · старт {int(candidate.initial_score or 0)}",
+        f"🌊 Насыщенность рынка: <b>{_ai_saturation_label(candidate.saturation_score)}</b> · процентиль предложения {float(candidate.supply_percentile or 0)*100:.0f}%",
         f"📈 Тренд спроса: <b>{float(candidate.demand_growth_ratio or 1.0):.2f}×</b> · тренд предложения: <b>{float(candidate.supply_growth_ratio or 1.0):.2f}×</b>",
         f"⚖️ Спрос / предложение: <b>{float(candidate.demand_supply_ratio or 1.0):.2f}×</b> · повторяемость <b>{float(candidate.repeatability or 0)*100:.0f}%</b>",
         f"🎯 Уверенность данных: <b>{int(candidate.confidence or 0)}%</b>",

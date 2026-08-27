@@ -342,12 +342,16 @@ class AIWorker:
             return max(0.0, min(1.0, (below + 0.5 * equal) / len(vals)))
 
         # Demand rate from two or more actual ViewHistory checkpoints for one listing.
-        def demand_rates(rows) -> dict[str, list[float]]:
+        # Build it for the whole selected category set, not only target families: the
+        # surrounding category is required for raw persistence/repeatability baselines.
+        def demand_rates(rows) -> tuple[dict[str, list[float]], dict[str, str]]:
             points: dict[tuple[str, str], list[tuple[datetime, int]]] = defaultdict(list)
+            category_by_key: dict[str, str] = {}
             for external_id, view_count, recorded_at, category_key, identity_key, identity_confidence, title, _first_seen in rows:
                 key = family_key(category_key, identity_key, identity_confidence, title)
-                if not key or key not in target_keys or recorded_at is None:
+                if not key or recorded_at is None:
                     continue
+                category_by_key[key] = str(category_key or "unknown")
                 points[(key, str(external_id))].append((recorded_at, int(view_count or 0)))
             rates: dict[str, list[float]] = defaultdict(list)
             for (key, _external_id), series in points.items():
@@ -360,10 +364,17 @@ class AIWorker:
                 if hours < 0.50 or last_views < first_views:
                     continue
                 rates[key].append((last_views - first_views) / hours)
-            return rates
+            return rates, category_by_key
 
-        recent_demand = demand_rates(recent_view_rows)
-        previous_demand = demand_rates(previous_view_rows)
+        recent_demand, recent_key_categories = demand_rates(recent_view_rows)
+        previous_demand, previous_key_categories = demand_rates(previous_view_rows)
+
+        category_recent_demand: dict[str, list[float]] = defaultdict(list)
+        category_previous_demand: dict[str, list[float]] = defaultdict(list)
+        for key, values in recent_demand.items():
+            category_recent_demand[recent_key_categories.get(key, "unknown")].extend(values)
+        for key, values in previous_demand.items():
+            category_previous_demand[previous_key_categories.get(key, "unknown")].extend(values)
         prior_signals: dict[str, int] = defaultdict(int)
         prior_confirmed: dict[str, int] = defaultdict(int)
         for key, outcome, current_score in prior_rows:
@@ -382,6 +393,70 @@ class AIWorker:
             n = len(vals)
             mid = n // 2
             return vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+
+        def percentile_rank_float(value: float, values: list[float]) -> float:
+            vals = sorted(float(x) for x in values if x is not None)
+            if not vals:
+                return 0.5
+            if len(vals) == 1:
+                return 0.5
+            below = sum(1 for x in vals if x < float(value))
+            equal = sum(1 for x in vals if x == float(value))
+            return max(0.0, min(1.0, (below + 0.5 * equal) / len(vals)))
+
+        def historical_demand_quality(key: str, cat: str) -> tuple[float, float]:
+            """Return (persistence, repeatability) from raw ViewHistory only.
+
+            Persistence asks whether the family stays above its category across
+            independent historical windows. Repeatability asks how often individual
+            listings land in the category's upper-demand quartile. Both shrink toward
+            neutral 0.5 when evidence is thin.
+            """
+            recent_rates = list(recent_demand.get(key, []))
+            previous_rates = list(previous_demand.get(key, []))
+            recent_category = list(category_recent_demand.get(cat, []))
+            previous_category = list(category_previous_demand.get(cat, []))
+
+            period_scores: list[float] = []
+            if recent_rates and recent_category:
+                recent_period = median([percentile_rank_float(v, recent_category) for v in recent_rates])
+                period_scores.append(0.5 if recent_period is None else recent_period)
+            if previous_rates and previous_category:
+                previous_period = median([percentile_rank_float(v, previous_category) for v in previous_rates])
+                period_scores.append(0.5 if previous_period is None else previous_period)
+
+            total_samples = len(recent_rates) + len(previous_rates)
+            if not period_scores:
+                persistence = 0.5
+            elif len(period_scores) == 1:
+                # One historical window is useful but not enough to call the signal
+                # persistent; shrink it toward neutral.
+                persistence = 0.65 * period_scores[0] + 0.35 * 0.5
+            else:
+                floor = min(period_scores)
+                mean_score = sum(period_scores) / len(period_scores)
+                persistence = 0.65 * floor + 0.35 * mean_score
+            depth = min(1.0, total_samples / 8.0)
+            persistence = max(0.0, min(1.0, 0.5 + (persistence - 0.5) * (0.45 + 0.55 * depth)))
+
+            success = 0
+            trials = 0
+            if recent_category:
+                for rate in recent_rates:
+                    trials += 1
+                    if percentile_rank_float(rate, recent_category) >= 0.75:
+                        success += 1
+            if previous_category:
+                for rate in previous_rates:
+                    trials += 1
+                    if percentile_rank_float(rate, previous_category) >= 0.75:
+                        success += 1
+            # Beta(2,2) prior: raw history cannot jump to 0 or 1 from one listing.
+            repeatability = (success + 2.0) / (trials + 4.0) if trials else 0.5
+            return (
+                max(0.0, min(1.0, float(persistence))),
+                max(0.0, min(1.0, float(repeatability))),
+            )
 
         stats: dict[str, dict] = {}
         feature_cat_by_key: dict[str, str] = {}
@@ -411,6 +486,7 @@ class AIWorker:
             demand_growth_ratio = 1.0
             if recent_median is not None and previous_median is not None and previous_median > 0:
                 demand_growth_ratio = max(0.25, min(4.0, recent_median / previous_median))
+            persistence, historical_repeatability = historical_demand_quality(key, cat)
 
             stats[key] = {
                 "median": price_median,
@@ -424,6 +500,8 @@ class AIWorker:
                 "demand_growth_ratio": demand_growth_ratio,
                 "demand_recent_samples": len(recent_rates),
                 "demand_previous_samples": len(previous_rates),
+                "persistence": persistence,
+                "historical_repeatability": historical_repeatability,
                 "prior_signals": int(prior_signals.get(key, 0)),
                 "prior_confirmed": int(prior_confirmed.get(key, 0)),
             }
@@ -668,6 +746,9 @@ class AIWorker:
                 target_hours=int(obs.target_hours),
                 previous_views=previous_views,
                 previous_elapsed_hours=previous_elapsed_hours,
+                repeatability=float(0.5 if candidate.repeatability is None else candidate.repeatability),
+                price_eur=listing.price_eur,
+                market_median_eur=candidate.market_median_eur,
             )
 
             old_stage = candidate.stage

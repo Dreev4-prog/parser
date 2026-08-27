@@ -1,3 +1,15 @@
+# DT PARSER 4.15.0 — DT Demand Score 2.0
+
+**Base:** 4.14.1 Radar Price & Return UX.
+
+Replaces the DT AI Lab score with one demand-focused 0–100 model: **40% Relative View Velocity / 20% Acceleration / 15% Persistence / 15% Repeatability / 10% Price Fit**. Relative velocity is age-matched; persistence and repeatability are derived from raw view history; extreme price deviations no longer receive an automatic maximum bonus; prior AI confirmation labels are removed from the repeatability score to avoid circular feedback. The +1/+3/+6h checkpoints now recompute the same five-factor formula instead of using the old 45/37/18 dynamic blend. Lifecycle/disappearance remains completely outside DT Demand Score.
+
+AI Lab keeps one main numeric score (`DT Demand Score`) and shows saturation only as a descriptive market diagnostic. No DB migration or new Railway variable. Redeploy **AI Worker + Parser**.
+
+See `DEPLOY_V4_15_0_DT_DEMAND_SCORE_2_0.md`.
+
+---
+
 # DT PARSER 4.14.1 — Radar Price & Return UX
 
 **Base:** 4.14.0 Fast Sold Lifecycle.
