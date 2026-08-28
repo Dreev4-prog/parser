@@ -299,6 +299,18 @@ async def init_db() -> None:
         if _IS_POSTGRES:
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_listings_is_price_reduced ON listings (is_price_reduced)"))
 
+        # v4.15.3 Strict Organic Radar Gate. Existing Radar families are not
+        # trusted merely because older search-card parsing called them clean.
+        # NULL quarantines legacy families until a live detail-page check passes.
+        radar_product_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "radar_products"))
+        if radar_product_columns and "organic_verified_at" not in radar_product_columns:
+            if _IS_POSTGRES:
+                await conn.execute(text("ALTER TABLE radar_products ADD COLUMN IF NOT EXISTS organic_verified_at TIMESTAMP"))
+            else:
+                await conn.execute(text("ALTER TABLE radar_products ADD COLUMN organic_verified_at TIMESTAMP"))
+        if _IS_POSTGRES:
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_radar_products_organic_verified_at ON radar_products (organic_verified_at)"))
+
         identity_columns = {
             "identity_key": "VARCHAR(500)",
             "identity_label": "VARCHAR(500)",

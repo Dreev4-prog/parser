@@ -4,6 +4,9 @@ import asyncio
 import json
 import logging
 import math
+
+import httpx
+from bs4 import BeautifulSoup
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -12,6 +15,8 @@ from sqlalchemy import case, delete, func, select, text
 
 from db import SessionLocal
 from early_winner import opportunity_family_key
+from parser import USER_AGENT, extract_external_id, inspect_detail_organic_integrity
+from traffic import TRAFFIC
 from filters import price_bounds
 from models import (
     AIEarlyWinnerCandidate,
@@ -214,6 +219,184 @@ async def _maybe_queue_lifecycle_watch(
     existing.updated_at = now
 
 
+@dataclass(frozen=True)
+class OrganicGateResult:
+    passed: bool
+    reason: str
+    verified_at: datetime | None = None
+    is_promoted: bool = False
+    is_price_reduced: bool = False
+
+
+_GATE_UNAVAILABLE_PHRASES = (
+    "anzeige nicht mehr verfügbar", "anzeige nicht mehr verfuegbar",
+    "die gewünschte anzeige ist nicht mehr verfügbar",
+    "die gewuenschte anzeige ist nicht mehr verfuegbar",
+)
+_GATE_CHALLENGE_PHRASES = (
+    "captcha", "access denied", "sicherheitsüberprüfung", "sicherheitsueberpruefung",
+    "ungewöhnliche aktivität", "ungewoehnliche aktivitaet", "bot protection",
+)
+
+
+async def _persist_gate_dirty(
+    external_id: str, *, is_promoted: bool, is_price_reduced: bool
+) -> None:
+    """Make a detail-page dirty verdict sticky before Radar can use the listing."""
+    if not (is_promoted or is_price_reduced):
+        return
+    now = datetime.utcnow()
+    async with SessionLocal() as session:
+        bind = session.get_bind()
+        if bind is not None and bind.dialect.name == "postgresql":
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(CAST(hashtext(:gate_key) AS bigint))"),
+                {"gate_key": f"organic-gate:{external_id}"},
+            )
+        listing = (await session.execute(
+            select(Listing).where(Listing.external_id == external_id).limit(1)
+        )).scalar_one_or_none()
+        if listing is not None:
+            listing.is_promoted = bool(listing.is_promoted or is_promoted)
+            listing.is_price_reduced = bool(listing.is_price_reduced or is_price_reduced)
+        registry = await session.get(ListingIntegrity, external_id)
+        if registry is None:
+            registry = ListingIntegrity(
+                external_id=external_id,
+                is_promoted=bool(is_promoted),
+                is_price_reduced=bool(is_price_reduced),
+                first_detected_at=now,
+                last_detected_at=now,
+            )
+            session.add(registry)
+        else:
+            registry.is_promoted = bool(registry.is_promoted or is_promoted)
+            registry.is_price_reduced = bool(registry.is_price_reduced or is_price_reduced)
+            registry.last_detected_at = now
+        await session.commit()
+
+    # Remove any pre-gate analytical contribution immediately. The raw listing,
+    # price and view audit rows remain intact, exactly like v4.15.2 cleanup.
+    await purge_nonorganic_analytics({external_id})
+
+
+async def _strict_organic_radar_gate(listing: Listing) -> OrganicGateResult:
+    """Fail-closed detail-page admission gate for every new Radar signal.
+
+    Search cards remain the cheap first filter. Radar itself, however, trusts a
+    listing only after a live Kleinanzeigen detail page is fetched and inspected.
+    403/429/challenge/ambiguous documents are *not* treated as clean; that signal
+    is simply skipped and can be retried by a later scan/checkpoint.
+    """
+    external_id = str(getattr(listing, "external_id", "") or "").strip()
+    url = str(getattr(listing, "url", "") or "").strip()
+    if not external_id or not url.startswith("https://") or "/s-anzeige/" not in url:
+        return OrganicGateResult(False, "invalid-detail-url")
+
+    # DB is authoritative. Do not trust a detached/stale Listing object crossing
+    # process boundaries; v4.15.2 sticky registry can already know it is dirty.
+    async with SessionLocal() as session:
+        db_listing = (await session.execute(
+            select(Listing).where(Listing.external_id == external_id).limit(1)
+        )).scalar_one_or_none()
+        registry = await session.get(ListingIntegrity, external_id)
+        promoted = bool(getattr(db_listing, "is_promoted", False)) or bool(
+            getattr(registry, "is_promoted", False)
+        )
+        reduced = bool(getattr(db_listing, "is_price_reduced", False)) or bool(
+            getattr(registry, "is_price_reduced", False)
+        )
+    if promoted or reduced:
+        # Synchronize stale Listing flags and purge old Radar/AI evidence.
+        await _persist_gate_dirty(
+            external_id, is_promoted=promoted, is_price_reduced=reduced
+        )
+        return OrganicGateResult(False, "sticky-dirty", is_promoted=promoted, is_price_reduced=reduced)
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "de-DE,de;q=0.9,en;q=0.7",
+        "Referer": "https://www.kleinanzeigen.de/",
+    }
+    try:
+        async with TRAFFIC.lease("view", "normal"):
+            async with httpx.AsyncClient(
+                headers=headers, follow_redirects=True, timeout=12.0
+            ) as client:
+                response = await client.get(url)
+        if response.status_code in {403, 429}:
+            await TRAFFIC.report_refusal(response.status_code, "view")
+        elif response.status_code < 500:
+            await TRAFFIC.report_success("view")
+    except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+        log.info("Strict Organic Radar Gate unknown id=%s error=%s", external_id, type(exc).__name__)
+        return OrganicGateResult(False, "detail-fetch-unknown")
+
+    if response.status_code in {403, 429} or response.status_code >= 500:
+        return OrganicGateResult(False, f"detail-http-{response.status_code}")
+    if response.status_code in {404, 410}:
+        return OrganicGateResult(False, "detail-unavailable")
+
+    html_text = response.text or ""
+    final_url = str(response.url or "")
+    visible_soup = BeautifulSoup(html_text, "html.parser")
+    for noisy in visible_soup(["script", "style", "noscript"]):
+        noisy.decompose()
+    body_lower = " ".join(visible_soup.get_text(" ", strip=True).lower().split())[:120000]
+    if any(token in body_lower for token in _GATE_CHALLENGE_PHRASES):
+        return OrganicGateResult(False, "detail-challenge")
+    if any(token in body_lower for token in _GATE_UNAVAILABLE_PHRASES):
+        return OrganicGateResult(False, "detail-unavailable")
+
+    # Require evidence that this is the requested live ad, not a consent/login or
+    # unrelated redirect. Ambiguity is a fail-closed skip, never a clean verdict.
+    final_external_id = extract_external_id(final_url) if "/s-anzeige/" in final_url else ""
+    identity_ok = final_external_id == external_id or external_id in html_text
+    if not identity_ok:
+        return OrganicGateResult(False, "detail-identity-unverified")
+
+    promoted, reduced = inspect_detail_organic_integrity(html_text)
+    if promoted or reduced:
+        await _persist_gate_dirty(
+            external_id, is_promoted=bool(promoted), is_price_reduced=bool(reduced)
+        )
+        reason = "detail-promoted+reduced" if promoted and reduced else (
+            "detail-promoted" if promoted else "detail-reduced"
+        )
+        log.info(
+            "Strict Organic Radar Gate blocked id=%s promoted=%s reduced=%s",
+            external_id, int(bool(promoted)), int(bool(reduced)),
+        )
+        return OrganicGateResult(
+            False, reason, is_promoted=bool(promoted), is_price_reduced=bool(reduced)
+        )
+
+    # Close the cross-process race: after the network check, acquire the same
+    # per-listing advisory lock used by dirty writes and re-read sticky state.
+    verified_at = datetime.utcnow()
+    async with SessionLocal() as session:
+        bind = session.get_bind()
+        if bind is not None and bind.dialect.name == "postgresql":
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(CAST(hashtext(:gate_key) AS bigint))"),
+                {"gate_key": f"organic-gate:{external_id}"},
+            )
+        db_listing = (await session.execute(
+            select(Listing).where(Listing.external_id == external_id).limit(1)
+        )).scalar_one_or_none()
+        registry = await session.get(ListingIntegrity, external_id)
+        promoted = bool(getattr(db_listing, "is_promoted", False)) or bool(
+            getattr(registry, "is_promoted", False)
+        )
+        reduced = bool(getattr(db_listing, "is_price_reduced", False)) or bool(
+            getattr(registry, "is_price_reduced", False)
+        )
+        if promoted or reduced:
+            return OrganicGateResult(False, "dirty-race", is_promoted=promoted, is_price_reduced=reduced)
+    return OrganicGateResult(True, "detail-clean", verified_at=verified_at)
+
+
 async def _upsert_signal(
     *,
     source_key: str,
@@ -232,12 +415,26 @@ async def _upsert_signal(
     reasons: list[str] | tuple[str, ...] | None = None,
     recorded_at: datetime | None = None,
 ) -> int | None:
-    """Append one idempotent Radar snapshot and refresh its aggregate product."""
-    # v4.15.2: Radar is organic-demand only. Keep this defensive guard even
-    # though parser/AI sources filter earlier, so no future ingestion path can
-    # accidentally reintroduce paid TOP/bumped or price-reduced listings.
+    """Append one idempotent Radar snapshot after strict organic admission."""
+    # Cheap detached-object guard first, then an idempotency pre-check so retries
+    # do not spend another detail-page request on a signal already stored.
     if bool(getattr(listing, "is_promoted", False)) or bool(getattr(listing, "is_price_reduced", False)):
         return None
+    async with SessionLocal() as pre_session:
+        duplicate = (await pre_session.execute(
+            select(RadarSnapshot.id).where(RadarSnapshot.source_key == source_key).limit(1)
+        )).scalar_one_or_none()
+        if duplicate is not None:
+            return None
+
+    gate = await _strict_organic_radar_gate(listing)
+    if not gate.passed:
+        log.info(
+            "Strict Organic Radar Gate skipped source=%s id=%s reason=%s",
+            source, getattr(listing, "external_id", ""), gate.reason,
+        )
+        return None
+
     now = recorded_at or datetime.utcnow()
     score = _clamp_score(score)
     confidence = _clamp_score(confidence)
@@ -255,6 +452,23 @@ async def _upsert_signal(
                     text("SELECT pg_advisory_xact_lock(CAST(hashtext(:radar_key) AS bigint))"),
                     {"radar_key": product_key},
                 )
+                # Serialize the final insert against a concurrent sticky dirty
+                # verdict from Parser/AI/another Railway process.
+                await session.execute(
+                    text("SELECT pg_advisory_xact_lock(CAST(hashtext(:gate_key) AS bigint))"),
+                    {"gate_key": f"organic-gate:{listing.external_id}"},
+                )
+            db_listing = (await session.execute(
+                select(Listing).where(Listing.external_id == str(listing.external_id)).limit(1)
+            )).scalar_one_or_none()
+            registry = await session.get(ListingIntegrity, str(listing.external_id))
+            if (
+                bool(getattr(db_listing, "is_promoted", False))
+                or bool(getattr(db_listing, "is_price_reduced", False))
+                or bool(getattr(registry, "is_promoted", False))
+                or bool(getattr(registry, "is_price_reduced", False))
+            ):
+                return None
             duplicate = (await session.execute(
                 select(RadarSnapshot.id).where(RadarSnapshot.source_key == source_key).limit(1)
             )).scalar_one_or_none()
@@ -290,10 +504,39 @@ async def _upsert_signal(
                     latest_reason=latest_reason,
                     latest_source=source[:32],
                     last_ai_candidate_id=candidate_id,
+                    organic_verified_at=gate.verified_at or datetime.utcnow(),
                     updated_at=now,
                 )
                 session.add(product)
                 await session.flush()
+            elif product.organic_verified_at is None:
+                # Legacy/pre-v4.15.3 evidence was never detail-page certified.
+                # Keep the family row/key but quarantine its old analytics: when
+                # the first live clean signal arrives, rebuild this family from
+                # strict evidence only instead of mixing old unknown snapshots.
+                await session.execute(delete(RadarSnapshot).where(RadarSnapshot.product_id == int(product.id)))
+                await session.execute(delete(RadarProductListing).where(RadarProductListing.product_id == int(product.id)))
+                await session.execute(delete(RadarLifecycleWatch).where(RadarLifecycleWatch.product_id == int(product.id)))
+                product.first_radar_at = now
+                product.last_signal_at = now
+                product.last_signal_score = score
+                product.current_score = score
+                product.peak_score = score
+                product.confidence = confidence
+                product.status = _status_for_score(score)
+                product.opportunity_type = (opportunity_type or "spark")[:32]
+                product.signal_count = 0
+                product.confirmed_count = 0
+                product.listing_count = 0
+                product.best_views = max(0, int(view_count or 0))
+                product.best_views_per_hour = max(0.0, float(views_per_hour or 0.0))
+                product.min_price_eur = listing.price_eur
+                product.max_price_eur = listing.price_eur
+                product.latest_reason = latest_reason
+                product.latest_source = source[:32]
+                product.last_ai_candidate_id = candidate_id
+
+            product.organic_verified_at = gate.verified_at or datetime.utcnow()
 
             assoc = (await session.execute(
                 select(RadarProductListing).where(
@@ -420,13 +663,19 @@ async def record_scan_hot(scan_id: int, limit: int = RADAR_SCAN_TOP_LIMIT) -> in
         )).all()
     ranked = [(listing, snap) for listing, snap in pairs if snap.initial_view_count is not None]
     ranked.sort(key=lambda item: (int(item[1].initial_view_count or 0), item[0].first_seen_at), reverse=True)
-    ranked = ranked[: max(1, int(limit))]
+    target_limit = max(1, int(limit))
+    # v4.15.3: detail-page gate can reject a card that looked clean in search.
+    # Keep a bounded reserve so Radar still gets up to TOP-N *organic* products
+    # rather than silently shrinking whenever a paid/reduced candidate is blocked.
+    ranked = ranked[: max(target_limit, target_limit * 4)]
     if not ranked:
         return 0
     saved = 0
-    n = len(ranked)
     for index, (listing, snap) in enumerate(ranked):
-        percentile = 1.0 if n == 1 else 1.0 - (index / max(1, n - 1))
+        if saved >= target_limit:
+            break
+        organic_rank = saved
+        percentile = 1.0 if target_limit == 1 else 1.0 - (organic_rank / max(1, target_limit - 1))
         views = max(0, int(snap.initial_view_count or 0))
         view_bonus = min(8, int(round(math.log10(max(1, views) + 1) * 2.5)))
         score = _clamp_score(58 + percentile * 20 + view_bonus)
@@ -441,7 +690,7 @@ async def record_scan_hot(scan_id: int, limit: int = RADAR_SCAN_TOP_LIMIT) -> in
             opportunity_type="hot_product" if score >= 82 else "spark",
             scan_id=int(scan_id),
             view_count=views,
-            reasons=[f"TOP-{index + 1} по реальным просмотрам в завершённом скане"],
+            reasons=[f"TOP-{organic_rank + 1} по органическим реальным просмотрам в завершённом скане"],
             recorded_at=snap.captured_at,
         )
         if result is not None:
@@ -485,15 +734,18 @@ async def record_autoscan_hot(
         key=lambda listing: (int(listing.view_count or 0), listing.first_seen_at or datetime.min),
         reverse=True,
     )
-    ranked = rows[: max(1, int(limit))]
+    target_limit = max(1, int(limit))
+    ranked = rows[: max(target_limit, target_limit * 4)]
     if not ranked:
         return 0
 
     saved = 0
-    n = len(ranked)
     clean_round = str(round_id or "round").replace(":", "-")[:48]
     for index, listing in enumerate(ranked):
-        percentile = 1.0 if n == 1 else 1.0 - (index / max(1, n - 1))
+        if saved >= target_limit:
+            break
+        organic_rank = saved
+        percentile = 1.0 if target_limit == 1 else 1.0 - (organic_rank / max(1, target_limit - 1))
         views = max(0, int(listing.view_count or 0))
         view_bonus = min(8, int(round(math.log10(max(1, views) + 1) * 2.5)))
         score = _clamp_score(58 + percentile * 20 + view_bonus)
@@ -507,7 +759,7 @@ async def record_autoscan_hot(
             stage="rising" if score >= 72 else "watch",
             opportunity_type="hot_product" if score >= 82 else "spark",
             view_count=views,
-            reasons=[f"TOP-{index + 1} по реальным просмотрам в автокруге DT Radar"],
+            reasons=[f"TOP-{organic_rank + 1} по органическим реальным просмотрам в автокруге DT Radar"],
             recorded_at=listing.views_checked_at or listing.last_seen_at or datetime.utcnow(),
         )
         if result is not None:
@@ -803,6 +1055,7 @@ async def refresh_radar_scores() -> int:
         async with SessionLocal() as session:
             products = list((await session.execute(
                 select(RadarProduct).where(
+                    RadarProduct.organic_verified_at.is_not(None),
                     (RadarProduct.status != "historical") | (RadarProduct.current_score > 25)
                 )
             )).scalars().all())
@@ -821,17 +1074,30 @@ async def refresh_radar_scores() -> int:
 
 async def radar_stats() -> RadarStats:
     async with SessionLocal() as session:
-        total = int((await session.execute(select(func.count(RadarProduct.id)))).scalar_one() or 0)
-        hot = int((await session.execute(select(func.count(RadarProduct.id)).where(RadarProduct.status == "hot"))).scalar_one() or 0)
-        rising = int((await session.execute(select(func.count(RadarProduct.id)).where(RadarProduct.status == "rising"))).scalar_one() or 0)
+        verified_ids = select(RadarProduct.id).where(RadarProduct.organic_verified_at.is_not(None))
+        total = int((await session.execute(select(func.count(RadarProduct.id)).where(
+            RadarProduct.organic_verified_at.is_not(None)
+        ))).scalar_one() or 0)
+        hot = int((await session.execute(select(func.count(RadarProduct.id)).where(
+            RadarProduct.organic_verified_at.is_not(None), RadarProduct.status == "hot"
+        ))).scalar_one() or 0)
+        rising = int((await session.execute(select(func.count(RadarProduct.id)).where(
+            RadarProduct.organic_verified_at.is_not(None), RadarProduct.status == "rising"
+        ))).scalar_one() or 0)
         ai_picks = int((await session.execute(select(func.count(RadarProduct.id)).where(
+            RadarProduct.organic_verified_at.is_not(None),
             RadarProduct.opportunity_type.in_(["hot_product", "hidden_gem", "emerging"]),
             RadarProduct.confidence >= 55,
         ))).scalar_one() or 0)
-        categories = int((await session.execute(select(func.count(func.distinct(RadarProduct.category_key))))).scalar_one() or 0)
-        signals = int((await session.execute(select(func.count(RadarSnapshot.id)))).scalar_one() or 0)
+        categories = int((await session.execute(select(func.count(func.distinct(RadarProduct.category_key))).where(
+            RadarProduct.organic_verified_at.is_not(None)
+        ))).scalar_one() or 0)
+        signals = int((await session.execute(select(func.count(RadarSnapshot.id)).where(
+            RadarSnapshot.product_id.in_(verified_ids)
+        ))).scalar_one() or 0)
         fast_sold = int((await session.execute(
             select(func.count(func.distinct(RadarLifecycleWatch.product_id))).where(
+                RadarLifecycleWatch.product_id.in_(verified_ids),
                 RadarLifecycleWatch.status == "disappeared",
                 RadarLifecycleWatch.lifetime_seconds.is_not(None),
                 RadarLifecycleWatch.lifetime_seconds <= RADAR_FAST_SOLD_MAX_SECONDS,
@@ -857,7 +1123,7 @@ async def list_radar_products(
     async with SessionLocal() as session:
         query = select(RadarProduct)
         count_query = select(func.count(RadarProduct.id))
-        conditions = []
+        conditions = [RadarProduct.organic_verified_at.is_not(None)]
         if category_key:
             conditions.append(RadarProduct.category_key == category_key)
         price_lo, price_hi = price_bounds(price_filter)
@@ -949,7 +1215,10 @@ async def search_radar_products(
     page_size = max(1, min(20, int(page_size)))
     pattern = f"%{clean}%"
     async with SessionLocal() as session:
-        conditions = [RadarProduct.title.ilike(pattern)]
+        conditions = [
+            RadarProduct.organic_verified_at.is_not(None),
+            RadarProduct.title.ilike(pattern),
+        ]
         price_lo, price_hi = price_bounds(price_filter)
         if price_lo is not None or price_hi is not None:
             price_conditions = [
@@ -994,7 +1263,10 @@ async def radar_categories() -> list[tuple[str, int, int, int]]:
                 new_today_expr,
                 func.max(RadarProduct.current_score),
             )
-            .where(RadarProduct.category_key != "")
+            .where(
+                RadarProduct.organic_verified_at.is_not(None),
+                RadarProduct.category_key != "",
+            )
             .group_by(RadarProduct.category_key)
             .order_by(func.count(RadarProduct.id).desc(), func.max(RadarProduct.current_score).desc())
         )).all()
@@ -1007,7 +1279,7 @@ async def radar_categories() -> list[tuple[str, int, int, int]]:
 async def get_radar_product(product_id: int) -> tuple[RadarProduct | None, Listing | None, list[RadarSnapshot]]:
     async with SessionLocal() as session:
         product = await session.get(RadarProduct, int(product_id))
-        if product is None:
+        if product is None or product.organic_verified_at is None:
             return None, None, []
         listing = None
         if product.representative_external_id:

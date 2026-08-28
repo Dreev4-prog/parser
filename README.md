@@ -1,3 +1,15 @@
+# DT PARSER 4.15.3 — Strict Organic Radar Gate
+
+**Base:** 4.15.2 Organic Demand Integrity.
+
+Adds a fail-closed live detail-page gate before every new DT Radar signal. A search card that looks clean is no longer sufficient: Radar admission re-checks PostgreSQL sticky integrity, fetches the exact `/s-anzeige/...` page, verifies listing identity, detects paid `TOP`/Top-Anzeige/Hochschieben/Highlight/Galerie markers and crossed/previous-price UI, then re-checks sticky state under a per-listing PostgreSQL advisory lock. 403/429/challenge/ambiguous detail pages are skipped rather than assumed clean. Dirty detail verdicts become sticky and immediately purge their AI/Radar/Lifecycle contribution.
+
+Existing pre-v4.15.3 Radar families are quarantined with additive `radar_products.organic_verified_at`; they stay out of user Radar until a fresh signal passes the detail gate. On the first verified signal, legacy Radar evidence for that family is reset so old unknown snapshots cannot influence the newly certified score. Scan/AutoScan TOP-N uses a bounded reserve to fill up to TOP-12 with organic candidates after gate rejections. DT Demand Score remains **40/20/15/15/10**; Page/Date/View algorithms and four user lanes are unchanged. No new Railway variable; DB migration is automatic.
+
+See `DEPLOY_V4_15_3_STRICT_ORGANIC_RADAR_GATE.md`.
+
+---
+
 # DT PARSER 4.15.2 — Organic Demand Integrity
 
 **Base:** 4.15.1 DT Demand Score 2.1 Evidence Adaptive.

@@ -11657,14 +11657,24 @@ async def radar_daily_digest_metrics() -> dict[str, int]:
             categories_processed += max(0, int(autoscan.get("processed") or 0))
 
     async with SessionLocal() as session:
+        verified_product_ids = select(RadarProduct.id).where(RadarProduct.organic_verified_at.is_not(None))
         signals_today = int((await session.execute(
-            select(func.count(RadarSnapshot.id)).where(RadarSnapshot.recorded_at >= start_utc_naive)
+            select(func.count(RadarSnapshot.id)).where(
+                RadarSnapshot.recorded_at >= start_utc_naive,
+                RadarSnapshot.product_id.in_(verified_product_ids),
+            )
         )).scalar_one() or 0)
         products_today = int((await session.execute(
-            select(func.count(RadarProduct.id)).where(RadarProduct.first_radar_at >= start_utc_naive)
+            select(func.count(RadarProduct.id)).where(
+                RadarProduct.organic_verified_at.is_not(None),
+                RadarProduct.first_radar_at >= start_utc_naive,
+            )
         )).scalar_one() or 0)
         best_score_today = int((await session.execute(
-            select(func.max(RadarSnapshot.score)).where(RadarSnapshot.recorded_at >= start_utc_naive)
+            select(func.max(RadarSnapshot.score)).where(
+                RadarSnapshot.recorded_at >= start_utc_naive,
+                RadarSnapshot.product_id.in_(verified_product_ids),
+            )
         )).scalar_one() or 0)
 
     stats = await radar_stats()

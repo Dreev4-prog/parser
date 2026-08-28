@@ -680,7 +680,7 @@ def _class_set(element) -> set[str]:
     return {str(x).strip().lower() for x in value if str(x).strip()}
 
 
-def _is_promoted_listing_node(node) -> bool:
+def _is_promoted_listing_node(node, *, force: bool = False) -> bool:
     """Detect paid/promoted Kleinanzeigen result cards conservatively.
 
     Important: only explicit markers attached to the listing wrapper (or an
@@ -689,7 +689,7 @@ def _is_promoted_listing_node(node) -> bool:
     words such as ``highlight`` or ``sponsor`` because those strings can occur
     in normal layout/UI classes and would falsely exclude every listing.
     """
-    if not FILTER_PROMOTED_LISTINGS:
+    if not force and not FILTER_PROMOTED_LISTINGS:
         return False
 
     # Kleinanzeigen result cards use .ad-listitem as the outer wrapper.  The
@@ -931,6 +931,31 @@ def _parse_category_html_with_stats(html_text: str) -> tuple[list[ParsedListing]
         "missing_price_count": missing_price,
         "date_coverage": (dated / parsed) if parsed else 0.0,
     }
+
+
+def inspect_detail_organic_integrity(html_text: str) -> tuple[bool, bool]:
+    """Inspect one Kleinanzeigen detail document for non-organic demand markers.
+
+    v4.15.3 Strict Organic Radar Gate uses the *detail page* as the final
+    admission check. Search-result cards are still filtered earlier, but some
+    Kleinanzeigen templates expose TOP/paid-feature or crossed-old-price UI only
+    on the detail page. Reuse the same conservative marker rules on the detail
+    content so ordinary title/description words such as "top Zustand" do not
+    become false positives.
+    """
+    soup = BeautifulSoup(html_text or "", "html.parser")
+    # Prefer the actual ad body and avoid unrelated recommendation/footer cards.
+    root = (
+        soup.select_one("#viewad-main")
+        or soup.select_one("#viewad-main-content")
+        or soup.select_one("[data-testid='viewad-main']")
+        or soup.select_one("main")
+        or soup.body
+        or soup
+    )
+    # Radar gate must stay strict even if a stale Railway environment still
+    # carries FILTER_PROMOTED_LISTINGS=0 from an older deployment.
+    return _is_promoted_listing_node(root, force=True), _is_price_reduced_listing_node(root)
 
 
 def parse_category_html(html_text: str) -> list[ParsedListing]:
