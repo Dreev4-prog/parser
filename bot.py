@@ -56,7 +56,7 @@ from aiogram.types import (
     BotCommand, BotCommandScopeChat, BotCommandScopeDefault, CallbackQuery, FSInputFile,
     InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, Message,
 )
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select, text, update
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -119,9 +119,9 @@ from parser import (
 from view_manager import REMOTE_VIEW_MANAGER, REMOTE_VIEW_WORKER_ENABLED
 from ai_manager import AI_MANAGER
 from radar import (
-    RADAR_PAGE_SIZE, backfill_radar_once, get_fast_sold_info, get_fast_sold_infos,
+    RADAR_PAGE_SIZE, RADAR_SCAN_TOP_LIMIT, backfill_radar_once, get_fast_sold_info, get_fast_sold_infos,
     get_radar_product, is_radar_favorite, list_radar_products, radar_categories, radar_stats,
-    purge_nonorganic_analytics, record_autoscan_hot, record_scan_hot, refresh_radar_scores,
+    purge_nonorganic_analytics, record_autoscan_hot_detailed, record_scan_hot, refresh_radar_scores,
     search_radar_products, toggle_radar_favorite,
 )
 from page_manager import (
@@ -185,7 +185,6 @@ RADAR_AUTOSCAN_PARTIAL_BACKOFF_BASE_SECONDS = 3.0
 RADAR_AUTOSCAN_SYSTEM_BACKOFF_BASE_SECONDS = 8.0
 RADAR_AUTOSCAN_MAX_BACKOFF_SECONDS = 30.0
 RADAR_AUTOSCAN_SUCCESS_GAP_SECONDS = 0.25
-RADAR_AUTOSCAN_BROWSER_FALLBACK_LIMIT = 24
 # v4.11.9: in stable single-service mode TRAFFIC.background_during_scans is forced to 0
 # to protect user-facing scans. AutoScan itself is wrapped in scan_job_started(), so using
 # background priority for its own deferred views creates a self-deadlock after the last
@@ -2703,6 +2702,7 @@ async def upsert_page_items(
     nonorganic_ids: set[str] = set()
     async with db_write_lock:
         async with SessionLocal() as session:
+            await _lock_listing_integrity_ids(session, ids)
             result = await session.execute(select(Listing).where(Listing.external_id.in_(ids)))
             existing = {row.external_id: row for row in result.scalars().all()}
             integrity_rows = list((await session.execute(
@@ -2853,6 +2853,7 @@ async def _mark_nonorganic_flag(external_ids: list[str] | set[str], *, field: st
     now = datetime.utcnow()
     async with db_write_lock:
         async with SessionLocal() as session:
+            await _lock_listing_integrity_ids(session, ids)
             result = await session.execute(select(Listing).where(Listing.external_id.in_(list(ids))))
             rows = {row.external_id: row for row in result.scalars().all()}
             integrity_rows = list((await session.execute(
@@ -3580,14 +3581,13 @@ async def enrich_autoscan_view_counts(
     items: list[ParsedListing],
     live: CategoryLiveProgress | None = None,
 ) -> tuple[int, int, int]:
-    """Low-pressure exact view collection for Radar AutoScan.
+    """Exact, completeness-first view collection for Radar AutoScan.
 
-    The public official counter endpoint is queried for every matched listing. Values
-    parsed from its explicit ``numVisits`` payload are exact and can be ranked directly.
-    Only a bounded set of endpoint misses is sent to the heavier verified browser path.
-    Rows that cannot be freshly verified are cleared, so stale counters never enter the
-    AutoScan TOP-12. This keeps every Radar-promoted counter exact without opening a
-    Chromium fallback for hundreds of weak listings in each background category.
+    v4.15.4 removes the old 24-item recovery cap. The cheap official counter is
+    still tried for every clean listing first. Every unresolved URL is then sent
+    through the exact View Worker/browser path. If any URL remains unknown, the
+    category is marked Radar-incomplete and is NOT ranked, because an unknown ad
+    could otherwise be the real TOP-1.
     """
     if not items:
         return 0, 0, 0
@@ -3604,7 +3604,6 @@ async def enrich_autoscan_view_counts(
         ))
         rows = {row.external_id: row for row in result.scalars().all()}
         targets = [unique[eid] for eid in rows if eid in unique]
-        previous_views = {eid: int(row.view_count or -1) for eid, row in rows.items()}
 
     if not targets:
         return 0, 0, 0
@@ -3624,19 +3623,13 @@ async def enrich_autoscan_view_counts(
                 live.category_name, min(total, int(done)), total,
             )
 
-    # v4.11.9 AutoScan View Deadlock Recovery. In the main parser service
-    # stable mode intentionally sets TRAFFIC.background_during_scans=0. Because the
-    # whole AutoScan category is also registered as an active scan job, a background
-    # view lease can never be acquired here: page 15 finishes and the coroutine waits
-    # forever before even one counter request starts. Keep global user-scan protection
-    # intact and give only this deferred AutoScan phase a small normal-priority lane.
     autoscan_view_priority = "normal" if int(getattr(TRAFFIC, "background_during_scans", 0)) <= 0 else "background"
     autoscan_view_concurrency = max(1, min(RADAR_AUTOSCAN_SAFE_VIEW_CONCURRENCY, VIEW_COUNT_CONCURRENCY))
     log.info(
-        "Radar AutoScan views start category=%s total=%s priority=%s concurrency=%s scan_jobs_active_safe_mode=%s",
-        (live.category_name if live is not None else "autoscan"), total, autoscan_view_priority,
-        autoscan_view_concurrency, int(getattr(TRAFFIC, "background_during_scans", 0)) <= 0,
+        "Radar AutoScan views start category=%s total=%s priority=%s concurrency=%s",
+        (live.category_name if live is not None else "autoscan"), total, autoscan_view_priority, autoscan_view_concurrency,
     )
+
     direct_results = await parser.fetch_public_view_counts(
         urls,
         concurrency=autoscan_view_concurrency,
@@ -3650,47 +3643,54 @@ async def enrich_autoscan_view_counts(
     )
 
     unresolved = [url for url in urls if direct_results.get(url) is None or direct_results[url].views is None]
-    # Prefer browser recovery for listings that were historically strong, then preserve
-    # category-feed order for brand-new rows. The bounded recovery is a safety net, not a
-    # second full measurement pass.
-    original_index = {url: index for index, url in enumerate(urls)}
-    unresolved.sort(
-        key=lambda url: (
-            previous_views.get(url_to_id.get(url, ""), -1),
-            -original_index.get(url, 0),
-        ),
-        reverse=True,
-    )
-    fallback_urls = unresolved[:RADAR_AUTOSCAN_BROWSER_FALLBACK_LIMIT]
-    exact_fallback: dict[str, ViewCountResult] = {}
-    if fallback_urls:
-        async def fallback_progress(done: int, _total: int) -> None:
-            if live is None:
-                return
-            # The direct phase already completed every URL; this is recovery telemetry.
-            live.views_ready = base_ready + total
-            if done == _total:
-                log.info(
-                    "Radar AutoScan views fallback category=%s recovered_checked=%s/%s",
-                    live.category_name, int(done), len(fallback_urls),
-                )
-
-        exact_fallback = await fetch_exact_views_v438_compatible(
-            parser,
-            fallback_urls,
-            concurrency=max(1, min(2, autoscan_view_concurrency)),
-            progress_cb=fallback_progress,
-            traffic_priority=autoscan_view_priority,
+    exact_recovery: dict[str, ViewCountResult] = {}
+    if unresolved:
+        log.info(
+            "Radar AutoScan exact recovery category=%s unresolved=%s/%s remote_enabled=%s",
+            (live.category_name if live is not None else "autoscan"), len(unresolved), total, REMOTE_VIEW_WORKER_ENABLED,
         )
 
+        async def recovery_progress(done: int, _total: int) -> None:
+            if live is None:
+                return
+            # Direct phase already visited every URL; recovery progress is shown in logs.
+            live.views_ready = base_ready + total
+            if done == _total or (done > 0 and done % 25 == 0):
+                log.info(
+                    "Radar AutoScan views recovery category=%s checked=%s/%s",
+                    live.category_name, int(done), len(unresolved),
+                )
+
+        # If this deployment is configured for the dedicated View Worker fleet,
+        # an absent heartbeat is a recoverable infrastructure problem, not a reason
+        # to open hundreds of exact browser fallbacks inside the main parser. Leave
+        # the misses unknown; the AutoScan category becomes ⚠️ and can be retried.
+        remote_ready = True
+        if REMOTE_VIEW_WORKER_ENABLED:
+            remote_ready = await REMOTE_VIEW_MANAGER.worker_alive()
+            if not remote_ready:
+                log.warning(
+                    "Radar AutoScan exact worker offline category=%s unresolved=%s; category will require retry",
+                    (live.category_name if live is not None else "autoscan"), len(unresolved),
+                )
+        if remote_ready:
+            exact_recovery = await fetch_exact_views_v438_compatible(
+                parser,
+                unresolved,
+                concurrency=autoscan_view_concurrency,
+                progress_cb=recovery_progress,
+                traffic_priority=autoscan_view_priority,
+            )
+
     combined = dict(direct_results)
-    for url, result in exact_fallback.items():
+    for url, result in exact_recovery.items():
         if result.views is not None:
             combined[url] = result
 
     now = datetime.utcnow()
     updated = 0
     failed = 0
+    source_counts = Counter()
     async with db_write_lock:
         async with SessionLocal() as session:
             db_result = await session.execute(
@@ -3711,7 +3711,9 @@ async def enrich_autoscan_view_counts(
                     failed += 1
                     row.view_count = None
                     row.views_checked_at = now
+                    source_counts["unknown"] += 1
                     continue
+                source_counts[str(vr.source or "unknown")] += 1
                 old = row.view_count
                 row.view_count = int(vr.views)
                 row.views_checked_at = now
@@ -3728,9 +3730,12 @@ async def enrich_autoscan_view_counts(
         live.views_ready = base_ready + total
         live.views_failed += failed
     log.info(
-        "Radar AutoScan views complete category=%s total=%s exact=%s unresolved=%s browser_recovery=%s/%s",
+        "Radar AutoScan views complete category=%s total=%s exact=%s failed=%s coverage=%.2f%% direct_ok=%s recovered=%s sources=%s",
         (live.category_name if live is not None else "autoscan"), total, updated, failed,
-        sum(1 for value in exact_fallback.values() if value.views is not None), len(fallback_urls),
+        (updated / max(1, total)) * 100.0,
+        total - len(unresolved),
+        sum(1 for value in exact_recovery.values() if value.views is not None),
+        dict(source_counts),
     )
     return total, updated, failed
 
@@ -4119,7 +4124,20 @@ def _radar_autoscan_default_state() -> dict:
         "pages_verified": 0,
         "listings_seen": 0,
         "new_listings": 0,
+        "search_promoted_filtered": 0,
+        "search_reduced_filtered": 0,
         "radar_saved": 0,
+        "views_requested": 0,
+        "views_verified": 0,
+        "views_failed": 0,
+        "radar_candidates": 0,
+        "radar_detail_checked": 0,
+        "radar_organic_passed": 0,
+        "radar_promoted_blocked": 0,
+        "radar_reduced_blocked": 0,
+        "radar_unknown_blocked": 0,
+        "radar_db_blocked": 0,
+        "radar_already_present": 0,
         "failed_categories": [],
         "retry_parent_total": 0,
         "retry_parent_successful": 0,
@@ -4157,7 +4175,7 @@ def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
         if key not in CATEGORIES or bool(getattr(CATEGORIES[key], "is_group", False)):
             continue
         kind = str(item.get("kind") or "").strip().lower()
-        if kind not in {"partial", "system"}:
+        if kind not in {"partial", "system", "radar_views", "radar_gate_unknown"}:
             # Legacy v4.11.1-v4.11.4 entries did not carry a kind. A category with
             # parser evidence/verified pages is a partial crawl; zero-page generic
             # execution failures are treated as system errors.
@@ -4277,7 +4295,20 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
         "pages_verified": 0,
         "listings_seen": 0,
         "new_listings": 0,
+        "search_promoted_filtered": 0,
+        "search_reduced_filtered": 0,
         "radar_saved": 0,
+        "views_requested": 0,
+        "views_verified": 0,
+        "views_failed": 0,
+        "radar_candidates": 0,
+        "radar_detail_checked": 0,
+        "radar_organic_passed": 0,
+        "radar_promoted_blocked": 0,
+        "radar_reduced_blocked": 0,
+        "radar_unknown_blocked": 0,
+        "radar_db_blocked": 0,
+        "radar_already_present": 0,
         "failed_categories": [],
         "retry_parent_total": 0,
         "retry_parent_successful": 0,
@@ -4334,11 +4365,24 @@ def _radar_autoscan_retry_round(state: dict) -> dict | None:
         "pages_verified": 0,
         "listings_seen": 0,
         "new_listings": 0,
+        "search_promoted_filtered": 0,
+        "search_reduced_filtered": 0,
         "radar_saved": 0,
+        "views_requested": 0,
+        "views_verified": 0,
+        "views_failed": 0,
+        "radar_candidates": 0,
+        "radar_detail_checked": 0,
+        "radar_organic_passed": 0,
+        "radar_promoted_blocked": 0,
+        "radar_reduced_blocked": 0,
+        "radar_unknown_blocked": 0,
+        "radar_db_blocked": 0,
+        "radar_already_present": 0,
         "failed_categories": [],
         "retry_parent_total": max(coverage_total, len(keys)),
         "retry_parent_successful": max(0, coverage_success),
-        "retry_parent_round_id": str(last.get("round_id") or ""),
+        "retry_parent_round_id": str(last.get("retry_parent_round_id") or last.get("round_id") or ""),
         "started_at": now.replace(microsecond=0).isoformat(),
     })
     return new_state
@@ -4442,9 +4486,20 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         f"❌ системных: <b>{int(state.get('system_errors') or 0)}</b>\n"
         + (f"⏭ Нетоварных пропущено: <b>{int(state.get('skipped_nonproduct') or 0)}</b>\n" if int(state.get("skipped_nonproduct") or 0) else "")
         + f"📄 Подтверждено страниц: <b>{int(state.get('pages_verified') or 0)}</b>\n"
-        f"🧾 Объявлений даты: <b>{int(state.get('listings_seen') or 0)}</b> · "
+        f"🧾 Чистых объявлений даты: <b>{int(state.get('listings_seen') or 0)}</b> · "
         f"новых: <b>{int(state.get('new_listings') or 0)}</b>\n"
-        f"📡 Добавлено Radar-сигналов: <b>{int(state.get('radar_saved') or 0)}</b>\n\n"
+        f"🚫 Сразу исключено: TOP/Promo <b>{int(state.get('search_promoted_filtered') or 0)}</b> · "
+        f"снижение <b>{int(state.get('search_reduced_filtered') or 0)}</b>\n"
+        f"👁 Точные просмотры: <b>{int(state.get('views_verified') or 0)}/{int(state.get('views_requested') or 0)}</b>"
+        + (f" · ⚠️ неизвестно: <b>{int(state.get('views_failed') or 0)}</b>" if int(state.get('views_failed') or 0) else "") + "\n"
+        f"🎯 С точными views для Radar: <b>{int(state.get('radar_candidates') or 0)}</b> · "
+        f"detail-check: <b>{int(state.get('radar_detail_checked') or 0)}</b>\n"
+        f"🛡 Organic прошло: <b>{int(state.get('radar_organic_passed') or 0)}</b> · "
+        f"TOP/Promo: <b>{int(state.get('radar_promoted_blocked') or 0)}</b> · "
+        f"снижение: <b>{int(state.get('radar_reduced_blocked') or 0)}</b> · "
+        f"unknown: <b>{int(state.get('radar_unknown_blocked') or 0)}</b>\n"
+        f"📡 Новых Radar-сигналов: <b>{int(state.get('radar_saved') or 0)}</b>"
+        + (f" · ♻️ уже были: <b>{int(state.get('radar_already_present') or 0)}</b>" if int(state.get("radar_already_present") or 0) else "") + "\n\n"
         f"Ежедневный круг: <b>{'✅ ВКЛ' if state.get('daily_enabled') else '⏸ ВЫКЛ'}</b>\n"
         f"Время: <b>{html.escape(str(state.get('daily_time') or RADAR_AUTOSCAN_DEFAULT_TIME))} МСК</b>\n"
         f"Следующий запуск: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>\n"
@@ -4513,6 +4568,7 @@ async def _radar_autoscan_history_text() -> str:
             f"✅ {int(item.get('coverage_successful') or item.get('successful') or 0)}/{int(item.get('coverage_total') or item.get('total') or 0)} · ⚠️ {int(item.get('needs_review') or 0)} · ❌ {int(item.get('system_errors') or 0)}",
             f"📊 {int(item.get('category_coverage_pct') or 0)}% кат. · {int(item.get('page_coverage_pct') or 0)}% стр. от max",
             f"📄 {int(item.get('pages_verified') or 0)} стр. · 🧾 {int(item.get('listings_seen') or 0)} объявлений",
+            f"👁 {int(item.get('views_verified') or 0)}/{int(item.get('views_requested') or 0)} exact · 🛡 {int(item.get('radar_organic_passed') or 0)} organic",
             f"📡 Radar +{int(item.get('radar_saved') or 0)} · ⏱ {_human_duration(int(item.get('duration_seconds') or 0))}",
             f"🕒 {html.escape(str(item.get('finished_at_text') or '—'))}",
         ]
@@ -4568,6 +4624,19 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         "pages_verified": int(state.get("pages_verified") or 0),
         "listings_seen": int(state.get("listings_seen") or 0),
         "new_listings": int(state.get("new_listings") or 0),
+        "search_promoted_filtered": int(state.get("search_promoted_filtered") or 0),
+        "search_reduced_filtered": int(state.get("search_reduced_filtered") or 0),
+        "views_requested": int(state.get("views_requested") or 0),
+        "views_verified": int(state.get("views_verified") or 0),
+        "views_failed": int(state.get("views_failed") or 0),
+        "radar_candidates": int(state.get("radar_candidates") or 0),
+        "radar_detail_checked": int(state.get("radar_detail_checked") or 0),
+        "radar_organic_passed": int(state.get("radar_organic_passed") or 0),
+        "radar_promoted_blocked": int(state.get("radar_promoted_blocked") or 0),
+        "radar_reduced_blocked": int(state.get("radar_reduced_blocked") or 0),
+        "radar_unknown_blocked": int(state.get("radar_unknown_blocked") or 0),
+        "radar_db_blocked": int(state.get("radar_db_blocked") or 0),
+        "radar_already_present": int(state.get("radar_already_present") or 0),
         "radar_saved": int(state.get("radar_saved") or 0),
         "failed_categories": failed_categories,
         "retry_parent_round_id": str(state.get("retry_parent_round_id") or ""),
@@ -4617,8 +4686,12 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         + f"\n📊 Страниц от максимума: <b>{page_coverage_pct}%</b> · <b>{coverage_pages_verified}/{coverage_total * RADAR_AUTOSCAN_DEPTH}</b>"
         + (f"\n⏭ Нетоварных пропущено: <b>{skipped_nonproduct}</b>" if skipped_nonproduct else "")
         + f"\n📄 Подтверждено страниц в этом запуске: <b>{int(summary['pages_verified'])}</b>"
-        + f"\n🧾 Объявлений даты: <b>{int(summary['listings_seen'])}</b> · новых <b>{int(summary['new_listings'])}</b>"
-        + f"\n📡 Radar-сигналов: <b>+{int(summary['radar_saved'])}</b>"
+        + f"\n🧾 Чистых объявлений даты: <b>{int(summary['listings_seen'])}</b> · новых <b>{int(summary['new_listings'])}</b>"
+        + f"\n🚫 Сразу исключено: TOP/Promo <b>{int(summary['search_promoted_filtered'])}</b> · снижение <b>{int(summary['search_reduced_filtered'])}</b>"
+        + f"\n👁 Точные просмотры: <b>{int(summary['views_verified'])}/{int(summary['views_requested'])}</b>"
+        + f"\n🛡 Organic: <b>{int(summary['radar_organic_passed'])}</b> · TOP/Promo <b>{int(summary['radar_promoted_blocked'])}</b> · снижение <b>{int(summary['radar_reduced_blocked'])}</b> · unknown <b>{int(summary['radar_unknown_blocked'])}</b>"
+        + f"\n📡 Новых Radar-сигналов: <b>+{int(summary['radar_saved'])}</b>"
+        + (f" · уже были <b>{int(summary.get('radar_already_present') or 0)}</b>" if int(summary.get("radar_already_present") or 0) else "")
         + f"\n⏱ Время: <b>{_human_duration(duration)}</b>"
         + "\n\nAutoScan остановлен."
         + (f" Следующий ежедневный запуск: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>." if state.get("daily_enabled") else ""),
@@ -4729,6 +4802,7 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
 
             result = None
             radar_saved = 0
+            radar_stats = None
             error_text = ""
             failure_kind = ""
             recycle_parser = False
@@ -4739,10 +4813,29 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                 result = await scan_one_category(
                     parser, cat, RADAR_AUTOSCAN_USER_ID, RADAR_AUTOSCAN_DEPTH, str(state.get("target_date"))
                 )
-                if result.date_complete:
-                    radar_saved = await record_autoscan_hot(
-                        str(state.get("round_id") or "round"), cat.key, result.matched_ids or []
+                if result.date_complete and not result.radar_views_complete:
+                    failure_kind = "radar_views"
+                    error_text = (
+                        f"Radar views неполные: {int(result.views_verified or 0)}/"
+                        f"{int(result.views_requested or 0)} точных счётчиков"
                     )
+                elif result.date_complete:
+                    source_round_id = (
+                        str(state.get("retry_parent_round_id") or "").strip()
+                        if str(state.get("mode") or "") == "retry"
+                        else ""
+                    ) or str(state.get("round_id") or "round")
+                    radar_stats = await record_autoscan_hot_detailed(
+                        source_round_id, cat.key, result.matched_ids or []
+                    )
+                    radar_saved = int(radar_stats.saved or 0)
+                    expected_slots = min(RADAR_SCAN_TOP_LIMIT, int(radar_stats.eligible_with_views or 0))
+                    if int(radar_stats.unknown_blocked or 0) > 0:
+                        failure_kind = "radar_gate_unknown"
+                        error_text = (
+                            f"Organic detail gate не подтвердил {int(radar_stats.unknown_blocked or 0)} "
+                            f"вышестоящих кандидатов; подтверждено Radar {int(radar_stats.admitted or 0)}/{expected_slots}"
+                        )
                 else:
                     failure_kind = "partial"
                     error_text = result.reason or "нужно повторно подтвердить категорию"
@@ -4783,9 +4876,23 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                 )
                 state["listings_seen"] = int(state.get("listings_seen") or 0) + max(0, int(result.today_seen or 0))
                 state["new_listings"] = int(state.get("new_listings") or 0) + max(0, int(result.new_count or 0))
+                state["search_promoted_filtered"] = int(state.get("search_promoted_filtered") or 0) + max(0, int(result.promoted_filtered or 0))
+                state["search_reduced_filtered"] = int(state.get("search_reduced_filtered") or 0) + max(0, int(result.price_reduced_filtered or 0))
+                state["views_requested"] = int(state.get("views_requested") or 0) + max(0, int(result.views_requested or 0))
+                state["views_verified"] = int(state.get("views_verified") or 0) + max(0, int(result.views_verified or 0))
+                state["views_failed"] = int(state.get("views_failed") or 0) + max(0, int(result.view_failures or 0))
                 state["radar_saved"] = int(state.get("radar_saved") or 0) + max(0, int(radar_saved or 0))
+            if radar_stats is not None:
+                state["radar_candidates"] = int(state.get("radar_candidates") or 0) + int(radar_stats.eligible_with_views or 0)
+                state["radar_detail_checked"] = int(state.get("radar_detail_checked") or 0) + int(radar_stats.detail_checked or 0)
+                state["radar_organic_passed"] = int(state.get("radar_organic_passed") or 0) + int(radar_stats.organic_passed or 0)
+                state["radar_promoted_blocked"] = int(state.get("radar_promoted_blocked") or 0) + int(radar_stats.promoted_blocked or 0)
+                state["radar_reduced_blocked"] = int(state.get("radar_reduced_blocked") or 0) + int(radar_stats.reduced_blocked or 0)
+                state["radar_unknown_blocked"] = int(state.get("radar_unknown_blocked") or 0) + int(radar_stats.unknown_blocked or 0)
+                state["radar_db_blocked"] = int(state.get("radar_db_blocked") or 0) + int(radar_stats.db_blocked or 0)
+                state["radar_already_present"] = int(state.get("radar_already_present") or 0) + int(radar_stats.already_present or 0)
 
-            if result is not None and result.date_complete:
+            if result is not None and result.date_complete and not failure_kind:
                 state["successful"] = int(state.get("successful") or 0) + 1
                 issue_streak = 0
             else:
@@ -4793,7 +4900,7 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                 if failure_kind == "system":
                     state["system_errors"] = int(state.get("system_errors") or 0) + 1
                 else:
-                    failure_kind = "partial"
+                    failure_kind = failure_kind or "partial"
                     state["needs_review"] = int(state.get("needs_review") or 0) + 1
                 state.setdefault("failed_categories", []).append({
                     "key": cat.key,
@@ -5242,6 +5349,9 @@ class ScanResult:
     low_quality_pages: int = 0
     verified_pages: int = 0
     view_failures: int = 0
+    views_requested: int = 0
+    views_verified: int = 0
+    radar_views_complete: bool = True
     quality_score: int = 0
     quality_note: str = ""
 
@@ -5417,6 +5527,18 @@ category_inflight_guard = asyncio.Lock()
 # result from every listing ever seen for that date.
 category_result_cache: dict[str, tuple[float, ScanResult]] = {}
 db_write_lock = asyncio.Lock()
+
+
+async def _lock_listing_integrity_ids(session, external_ids) -> None:
+    """Share v4.15.3 integrity locks with the Radar admission transaction."""
+    bind = session.get_bind()
+    if bind is None or bind.dialect.name != "postgresql":
+        return
+    for external_id in sorted({str(x).strip() for x in external_ids if str(x).strip()}):
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(CAST(hashtext(:integrity_key) AS bigint))"),
+            {"integrity_key": f"organic-integrity:{external_id}"},
+        )
 
 # v3.1.6 manual view refreshes are true background jobs. A user can navigate
 # anywhere in the bot while the refresh continues, and duplicate refreshes of the
@@ -5673,6 +5795,8 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     low_quality_pages = 0
     verified_pages = 0
     view_failures = 0
+    views_requested = 0
+    views_verified = 0
     # v4.8.5 Quality Integrity: quality is about unique logical pages, not
     # network attempts. A page retried four times must still count as one page.
     # Snapshots also let a later successful retry remove the earlier penalty.
@@ -7283,19 +7407,22 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 live.page_limit = depth
             try:
                 if user_id == RADAR_AUTOSCAN_USER_ID:
-                    _, _, failed_views = await enrich_autoscan_view_counts(
+                    requested_views, verified_views, failed_views = await enrich_autoscan_view_counts(
                         parser, list(deferred_view_items.values()), live
                     )
                 else:
-                    _, _, failed_views = await enrich_page_view_counts(
+                    requested_views, verified_views, failed_views = await enrich_page_view_counts(
                         parser, list(deferred_view_items.values()), live
                     )
-                view_failures += failed_views
+                views_requested += int(requested_views or 0)
+                views_verified += int(verified_views or 0)
+                view_failures += int(failed_views or 0)
             except Exception:
                 # A view-threshold result will naturally exclude rows without a
                 # counter.  Do not convert a successfully crawled date into a
                 # partial category merely because the optional counter endpoint
                 # had a transient problem.
+                views_requested += len(deferred_view_items)
                 view_failures += len(deferred_view_items)
                 log.exception(
                     "Deferred view-count phase failed category=%s target=%s",
@@ -7375,6 +7502,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             low_quality_pages=low_quality_pages,
             verified_pages=verified_pages,
             view_failures=view_failures,
+            views_requested=views_requested,
+            views_verified=views_verified,
+            radar_views_complete=bool(user_id != RADAR_AUTOSCAN_USER_ID or views_requested == views_verified),
             quality_score=quality_score,
             quality_note=quality_note,
         )
@@ -7439,6 +7569,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             low_quality_pages=low_quality_pages,
             verified_pages=verified_pages,
             view_failures=view_failures,
+            views_requested=views_requested,
+            views_verified=views_verified,
+            radar_views_complete=bool(user_id != RADAR_AUTOSCAN_USER_ID or views_requested == views_verified),
             quality_score=quality_score,
             quality_note=quality_note,
         )
@@ -11657,24 +11790,14 @@ async def radar_daily_digest_metrics() -> dict[str, int]:
             categories_processed += max(0, int(autoscan.get("processed") or 0))
 
     async with SessionLocal() as session:
-        verified_product_ids = select(RadarProduct.id).where(RadarProduct.organic_verified_at.is_not(None))
         signals_today = int((await session.execute(
-            select(func.count(RadarSnapshot.id)).where(
-                RadarSnapshot.recorded_at >= start_utc_naive,
-                RadarSnapshot.product_id.in_(verified_product_ids),
-            )
+            select(func.count(RadarSnapshot.id)).where(RadarSnapshot.recorded_at >= start_utc_naive)
         )).scalar_one() or 0)
         products_today = int((await session.execute(
-            select(func.count(RadarProduct.id)).where(
-                RadarProduct.organic_verified_at.is_not(None),
-                RadarProduct.first_radar_at >= start_utc_naive,
-            )
+            select(func.count(RadarProduct.id)).where(RadarProduct.first_radar_at >= start_utc_naive)
         )).scalar_one() or 0)
         best_score_today = int((await session.execute(
-            select(func.max(RadarSnapshot.score)).where(
-                RadarSnapshot.recorded_at >= start_utc_naive,
-                RadarSnapshot.product_id.in_(verified_product_ids),
-            )
+            select(func.max(RadarSnapshot.score)).where(RadarSnapshot.recorded_at >= start_utc_naive)
         )).scalar_one() or 0)
 
     stats = await radar_stats()
@@ -16091,7 +16214,7 @@ async def main() -> None:
     )
     if organic_cleanup.get("dirty_listings", 0):
         log.warning(
-            "v4.15.2 Organic Demand Integrity cleanup: %s",
+            "v4.15.3 Strict Organic Radar Gate cleanup: %s",
             organic_cleanup,
         )
     invalidated_views = await invalidate_untrusted_view_analytics_once()

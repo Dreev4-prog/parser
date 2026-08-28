@@ -255,6 +255,16 @@ class ViewCountResult:
     error: str | None = None
 
 
+@dataclass
+class DetailIntegrityResult:
+    """Fail-closed public detail-page integrity verdict for Radar admission."""
+
+    verified: bool
+    is_promoted: bool = False
+    is_price_reduced: bool = False
+    reason: str = ""
+    final_url: str | None = None
+    status_code: int | None = None
 
 
 @dataclass
@@ -680,7 +690,7 @@ def _class_set(element) -> set[str]:
     return {str(x).strip().lower() for x in value if str(x).strip()}
 
 
-def _is_promoted_listing_node(node, *, force: bool = False) -> bool:
+def _is_promoted_listing_node(node) -> bool:
     """Detect paid/promoted Kleinanzeigen result cards conservatively.
 
     Important: only explicit markers attached to the listing wrapper (or an
@@ -689,7 +699,7 @@ def _is_promoted_listing_node(node, *, force: bool = False) -> bool:
     words such as ``highlight`` or ``sponsor`` because those strings can occur
     in normal layout/UI classes and would falsely exclude every listing.
     """
-    if not force and not FILTER_PROMOTED_LISTINGS:
+    if not FILTER_PROMOTED_LISTINGS:
         return False
 
     # Kleinanzeigen result cards use .ad-listitem as the outer wrapper.  The
@@ -931,31 +941,6 @@ def _parse_category_html_with_stats(html_text: str) -> tuple[list[ParsedListing]
         "missing_price_count": missing_price,
         "date_coverage": (dated / parsed) if parsed else 0.0,
     }
-
-
-def inspect_detail_organic_integrity(html_text: str) -> tuple[bool, bool]:
-    """Inspect one Kleinanzeigen detail document for non-organic demand markers.
-
-    v4.15.3 Strict Organic Radar Gate uses the *detail page* as the final
-    admission check. Search-result cards are still filtered earlier, but some
-    Kleinanzeigen templates expose TOP/paid-feature or crossed-old-price UI only
-    on the detail page. Reuse the same conservative marker rules on the detail
-    content so ordinary title/description words such as "top Zustand" do not
-    become false positives.
-    """
-    soup = BeautifulSoup(html_text or "", "html.parser")
-    # Prefer the actual ad body and avoid unrelated recommendation/footer cards.
-    root = (
-        soup.select_one("#viewad-main")
-        or soup.select_one("#viewad-main-content")
-        or soup.select_one("[data-testid='viewad-main']")
-        or soup.select_one("main")
-        or soup.body
-        or soup
-    )
-    # Radar gate must stay strict even if a stale Railway environment still
-    # carries FILTER_PROMOTED_LISTINGS=0 from an older deployment.
-    return _is_promoted_listing_node(root, force=True), _is_price_reduced_listing_node(root)
 
 
 def parse_category_html(html_text: str) -> list[ParsedListing]:
@@ -3013,6 +2998,120 @@ class KleinanzeigenParser:
                 await asyncio.sleep(effective_pause)
         await report_progress()
         return results
+
+    async def inspect_detail_integrity(
+        self, url: str, *, expected_external_id: str = "", traffic_priority: str = "background"
+    ) -> DetailIntegrityResult:
+        """Verify that a public detail page is the requested ad and looks organic.
+
+        This is intentionally fail-closed for Radar admission. 403/429/challenge pages,
+        transport failures and wrong redirects are UNKNOWN rather than clean. Paid
+        visibility or an explicit old/crossed price is a sticky non-organic verdict.
+        """
+        if not _allowed_url(url) or "/s-anzeige/" not in url:
+            return DetailIntegrityResult(False, reason="invalid_url", final_url=url)
+
+        expected = str(expected_external_id or extract_external_id(url) or "").strip()
+        try:
+            async with TRAFFIC.lease("view", traffic_priority):
+                response = await self.client.get(url, timeout=AVAILABILITY_TIMEOUT)
+        except httpx.HTTPError as exc:
+            return DetailIntegrityResult(False, reason=f"transport:{exc.__class__.__name__}")
+        except Exception as exc:
+            return DetailIntegrityResult(False, reason=f"transport:{exc.__class__.__name__}")
+
+        status = int(response.status_code)
+        final_url = str(response.url)
+        if status in {403, 429}:
+            await TRAFFIC.report_refusal(status, "view")
+            return DetailIntegrityResult(False, reason=f"http_{status}", final_url=final_url, status_code=status)
+        if status >= 500:
+            return DetailIntegrityResult(False, reason=f"http_{status}", final_url=final_url, status_code=status)
+        if status in {404, 410}:
+            return DetailIntegrityResult(False, reason="unavailable", final_url=final_url, status_code=status)
+        if not (200 <= status < 400):
+            return DetailIntegrityResult(False, reason=f"http_{status}", final_url=final_url, status_code=status)
+        await TRAFFIC.report_success("view")
+
+        html_text = response.text or ""
+        if not html_text or len(html_text) < 500:
+            return DetailIntegrityResult(False, reason="weak_document", final_url=final_url, status_code=status)
+        if self._hybrid_html_is_challenge(html_text):
+            return DetailIntegrityResult(False, reason="challenge", final_url=final_url, status_code=status)
+
+        final_id = extract_external_id(final_url)
+        # Fail closed on identity. A wrong detail page can contain the requested ID
+        # inside recommendations/related links, so raw HTML substring matching is
+        # not proof that the response belongs to this ad. Public /s-anzeige/ URLs
+        # carry the listing ID in the final canonical URL; require that exact match.
+        identity_ok = bool(expected and final_id == expected)
+        if expected and not identity_ok:
+            return DetailIntegrityResult(False, reason="wrong_identity", final_url=final_url, status_code=status)
+        if "/s-anzeige/" not in final_url:
+            return DetailIntegrityResult(False, reason="wrong_redirect", final_url=final_url, status_code=status)
+
+        soup = BeautifulSoup(html_text, "html.parser")
+        # Restrict integrity evidence to the current ad's detail container whenever
+        # the template exposes one. Related/recommended cards elsewhere on the page
+        # must never contaminate the current listing's organic verdict.
+        detail_root = (
+            soup.select_one("#viewad-main")
+            or soup.select_one("#viewad-content")
+            or soup.select_one("main#viewad")
+            or soup.select_one("[data-testid='ad-detail']")
+            or soup.select_one("main")
+            or soup
+        )
+        # Generic image-gallery CSS is deliberately NOT considered paid Galerie by
+        # itself; only explicit paid-feature markers/badges count.
+        promoted = False
+        if not promoted:
+            try:
+                explicit_feature_attr = re.compile(
+                    r"(?:^|[-_: ])(?:topad|top-ad|bumpup|bump-up|hochgeschoben|hochschieben|"
+                    r"paid-highlight|feature-highlight|paid-gallery|feature-gallery|galerie-ad|"
+                    r"promoted|sponsored)(?:$|[-_: ])", re.IGNORECASE
+                )
+                for element in detail_root.find_all(True):
+                    tag = str(getattr(element, "name", "") or "").lower()
+                    classes = _class_set(element)
+                    attrs = " ".join(str(element.get(name) or "") for name in ("id", "data-testid", "aria-label", "title"))
+                    class_text = " ".join(classes)
+                    if explicit_feature_attr.search(class_text) or explicit_feature_attr.search(attrs):
+                        promoted = True
+                        break
+                    if tag not in {"span", "small", "label", "button"} and not any("badge" in c for c in classes):
+                        continue
+                    label = " ".join(element.get_text(" ", strip=True).split())
+                    # "Galerie" can be a normal photo-gallery control on detail pages,
+                    # so text-only Galerie never proves paid visibility here. Paid
+                    # Galerie is accepted only through explicit feature classes/data.
+                    if label and len(label) <= 24 and re.fullmatch(
+                        r"(?:TOP|Top[- ]?Anzeige|Werbeanzeige|Gesponsert|Sponsored|Promoted|"
+                        r"Hochgeschoben|Hochschieben|Highlight)", label, flags=re.IGNORECASE
+                    ):
+                        promoted = True
+                        break
+                if not promoted:
+                    # Common JSON/data-state booleans used by A/B detail templates.
+                    sample = html_text[:1_500_000]
+                    if re.search(r'(?i)"(?:isTopAd|topAd|isBumped|bumpUp|isPromoted|sponsored)"\s*:\s*true', sample):
+                        promoted = True
+            except Exception:
+                promoted = False
+
+        reduced = False
+        try:
+            reduced = _is_price_reduced_listing_node(detail_root)
+        except Exception:
+            reduced = False
+
+        if promoted:
+            return DetailIntegrityResult(True, is_promoted=True, is_price_reduced=reduced, reason="promoted", final_url=final_url, status_code=status)
+        if reduced:
+            return DetailIntegrityResult(True, is_promoted=False, is_price_reduced=True, reason="price_reduced", final_url=final_url, status_code=status)
+        return DetailIntegrityResult(True, reason="organic", final_url=final_url, status_code=status)
+
 
     async def check_listing_active(self, url: str) -> bool | None:
         """Return True=live, False=unavailable, None=could not determine safely."""

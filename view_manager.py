@@ -35,7 +35,10 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 
 
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
-REMOTE_VIEW_WORKER_ENABLED = _env_bool("REMOTE_VIEW_WORKER_ENABLED", False)
+# v4.15.4: a configured Redis connection means the dedicated exact-view fleet is
+# expected unless explicitly disabled. Older parser deployments could silently keep
+# REMOTE_VIEW_WORKER_ENABLED unset and then perform AutoScan recovery locally.
+REMOTE_VIEW_WORKER_ENABLED = _env_bool("REMOTE_VIEW_WORKER_ENABLED", bool(REDIS_URL))
 VIEW_REDIS_PREFIX = os.getenv("VIEW_REDIS_PREFIX", "dtparser:viewcounter").strip() or "dtparser:viewcounter"
 # v4.8.3: every release gets a fresh ephemeral view runtime. Old streams/jobs
 # can expire naturally without being reclaimed by a newly deployed worker fleet.

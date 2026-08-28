@@ -392,6 +392,9 @@ class RadarProduct(Base):
     first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     first_radar_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    # v4.15.4: user-facing Radar families are visible only after at least one
+    # live detail-page organic verification in the strict admission pipeline.
+    organic_verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     last_signal_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     last_signal_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
     current_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
@@ -409,10 +412,6 @@ class RadarProduct(Base):
     latest_reason: Mapped[str] = mapped_column(String(800), default="")
     latest_source: Mapped[str] = mapped_column(String(32), default="", index=True)
     last_ai_candidate_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
-    # v4.15.3 Strict Organic Radar Gate. NULL means this family only contains
-    # legacy/pre-gate Radar evidence and must stay quarantined from user feeds.
-    # A timestamp is written only after a live detail-page organic check passes.
-    organic_verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 

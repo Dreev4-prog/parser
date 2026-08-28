@@ -1,10 +1,22 @@
+# DT PARSER 4.15.4 — Organic Pipeline Correctness
+
+**Base:** 4.15.3 Strict Organic Radar Gate.
+
+Fixes the live `clean listings → exact views → Organic Gate → Radar` pipeline without loosening Organic rules. AutoScan now exact-recovers **all** unresolved view counters instead of only a 24-item fallback; any remaining unknown view makes the category `⚠️ допроверка` rather than silently removing candidates. Radar performs a real fail-closed public detail-page integrity check, walks the ranked list until it has up to 12 proven organic positions, stops before backfilling past an UNKNOWN higher rank, and uses retry-idempotent source keys. Legacy Radar families are quarantined through the new additive `radar_products.organic_verified_at` field until fresh strict evidence certifies them. The admin AutoScan panel now exposes the complete selection funnel and separates new vs already-present retry signals. DT Demand Score remains **40/20/15/15/10**.
+
+Redeploy **Parser + all View Workers + AI Worker + Lifecycle Worker** from the same release. No manual SQL and no new Railway variable. Stop any in-progress v4.15.3 AutoScan and start a fresh full round after deploy.
+
+See `DEPLOY_V4_15_4_ORGANIC_PIPELINE_CORRECTNESS.md`.
+
+---
+
 # DT PARSER 4.15.3 — Strict Organic Radar Gate
 
 **Base:** 4.15.2 Organic Demand Integrity.
 
-Adds a fail-closed live detail-page gate before every new DT Radar signal. A search card that looks clean is no longer sufficient: Radar admission re-checks PostgreSQL sticky integrity, fetches the exact `/s-anzeige/...` page, verifies listing identity, detects paid `TOP`/Top-Anzeige/Hochschieben/Highlight/Galerie markers and crossed/previous-price UI, then re-checks sticky state under a per-listing PostgreSQL advisory lock. 403/429/challenge/ambiguous detail pages are skipped rather than assumed clean. Dirty detail verdicts become sticky and immediately purge their AI/Radar/Lifecycle contribution.
+Closes the remaining cross-process Radar admission race. Every Radar/Lifecycle signal is now re-checked against current PostgreSQL `listings` state **and** the sticky `listing_integrity` registry inside the write transaction; parser integrity writes use the same per-external-ID advisory lock. Radar feeds, search, category counts, price filters, product details, counters and Fast Sold also have a defensive organic read gate: a family is temporarily hidden if any linked association is dirty/unverified, so contaminated aggregate evidence cannot flash before cleanup finishes. Startup cleanup now unions and repairs dirty state from both `listings` and `listing_integrity`. DT Demand Score stays **40/20/15/15/10**; parser detection, worker algorithms, DB schema and Railway variables are unchanged.
 
-Existing pre-v4.15.3 Radar families are quarantined with additive `radar_products.organic_verified_at`; they stay out of user Radar until a fresh signal passes the detail gate. On the first verified signal, legacy Radar evidence for that family is reset so old unknown snapshots cannot influence the newly certified score. Scan/AutoScan TOP-N uses a bounded reserve to fill up to TOP-12 with organic candidates after gate rejections. DT Demand Score remains **40/20/15/15/10**; Page/Date/View algorithms and four user lanes are unchanged. No new Railway variable; DB migration is automatic.
+Redeploy **Parser + AI Worker + Lifecycle Worker** from the same release. Page/Date can be redeployed from the same commit for fleet consistency; View Worker behavior is unchanged.
 
 See `DEPLOY_V4_15_3_STRICT_ORGANIC_RADAR_GATE.md`.
 
