@@ -747,8 +747,13 @@ class AIWorker:
                 previous_views=previous_views,
                 previous_elapsed_hours=previous_elapsed_hours,
                 repeatability=float(0.5 if candidate.repeatability is None else candidate.repeatability),
+                repeatability_available=(
+                    candidate.repeatability is not None
+                    and abs(float(candidate.repeatability) - 0.5) >= 0.025
+                ),
                 price_eur=listing.price_eur,
                 market_median_eur=candidate.market_median_eur,
+                market_cohort_size=int(candidate.market_cohort_size or 0),
             )
 
             old_stage = candidate.stage

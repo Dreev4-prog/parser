@@ -10,14 +10,15 @@ from typing import Iterable
 from product_identity import canonical_text
 from zoneinfo import ZoneInfo
 
-MODEL_VERSION = "dt-demand-score-v2"
+MODEL_VERSION = "dt-demand-score-v2.1-evidence-adaptive"
 BERLIN = ZoneInfo("Europe/Berlin")
 UTC = timezone.utc
 
-# DT Demand Score 2.0.  Keep one user-facing score, but make its internals explicit
-# and testable.  Lifecycle/disappearance data is intentionally NOT part of this
-# score because disappearance can also mean moderation, fraud removal, or a seller
-# withdrawing an ad.
+# DT Demand Score 2.1 — Evidence Adaptive. Keep one user-facing score and the
+# agreed 40/20/15/15/10 structure, but unknown evidence no longer acts like a real
+# neutral 0.5 vote. Available weights are renormalized to 100%. Lifecycle/disappearance
+# data is intentionally NOT part of this score because disappearance can also mean
+# moderation, fraud removal, or a seller withdrawing an ad.
 WEIGHT_VELOCITY = 40.0
 WEIGHT_ACCELERATION = 20.0
 WEIGHT_PERSISTENCE = 15.0
@@ -378,7 +379,7 @@ def _age_matched_rows(row: FeatureRow, category_rows: list[FeatureRow]) -> list[
     """Return a robust same-age comparison cohort.
 
     Views/hour is already age-normalised, but very young listings are noisier than
-    listings that have had several hours to accumulate traffic.  Demand Score 2.0
+    listings that have had several hours to accumulate traffic.  Demand Score 2.1
     therefore prefers listings from a similar age band and falls back to the whole
     category only when the band is too small.
     """
@@ -417,15 +418,48 @@ def _demand_score(
     persistence: float,
     repeatability: float,
     price_fit: float,
+    available: dict[str, bool] | None = None,
 ) -> int:
-    raw = (
-        WEIGHT_VELOCITY * clamp(velocity)
-        + WEIGHT_ACCELERATION * clamp(acceleration)
-        + WEIGHT_PERSISTENCE * clamp(persistence)
-        + WEIGHT_REPEATABILITY * clamp(repeatability)
-        + WEIGHT_PRICE_FIT * clamp(price_fit)
+    """Return the single 0..100 DT Demand Score.
+
+    v2.1 keeps the agreed 40/20/15/15/10 model, but only *observed* evidence is
+    allowed to vote. A factor that is still unknown is removed from both numerator
+    and denominator rather than being inserted as an artificial 0.5. This is crucial
+    for a genuinely fresh product: exceptional early view velocity can surface it
+    immediately, while acceleration/persistence/repeatability join the score only
+    after the database has real evidence for them.
+    """
+    factors = {
+        "velocity": (WEIGHT_VELOCITY, clamp(velocity)),
+        "acceleration": (WEIGHT_ACCELERATION, clamp(acceleration)),
+        "persistence": (WEIGHT_PERSISTENCE, clamp(persistence)),
+        "repeatability": (WEIGHT_REPEATABILITY, clamp(repeatability)),
+        "price_fit": (WEIGHT_PRICE_FIT, clamp(price_fit)),
+    }
+    availability = {key: True for key in factors} if available is None else {
+        key: bool(available.get(key, False)) for key in factors
+    }
+    active_weight = sum(weight for key, (weight, _factor) in factors.items() if availability[key])
+    if active_weight <= 0:
+        return 50
+    weighted = sum(
+        weight * factor
+        for key, (weight, factor) in factors.items()
+        if availability[key]
     )
+    raw = 100.0 * weighted / active_weight
     return int(round(max(0.0, min(100.0, raw))))
+
+
+def _evidence_weight(available: dict[str, bool]) -> float:
+    weights = {
+        "velocity": WEIGHT_VELOCITY,
+        "acceleration": WEIGHT_ACCELERATION,
+        "persistence": WEIGHT_PERSISTENCE,
+        "repeatability": WEIGHT_REPEATABILITY,
+        "price_fit": WEIGHT_PRICE_FIT,
+    }
+    return sum(weight for key, weight in weights.items() if bool(available.get(key, False)))
 
 
 def _opportunity_type(
@@ -455,11 +489,13 @@ def score_initial_rows(
     rows: list[FeatureRow],
     market_stats: dict[str, tuple[float, int] | dict] | None = None,
 ) -> list[InitialScore]:
-    """DT Demand Score 2.0.
+    """DT Demand Score 2.1 — Evidence Adaptive.
 
-    One 0..100 score answers whether a product is showing strong, sustained buyer
-    interest now.  The fixed weights are 40/20/15/15/10 for relative view velocity,
-    acceleration, persistence, repeatability, and price fit.  Saturation and Lifecycle
+    One 0..100 score answers whether a product is showing strong buyer interest now.
+    The base weights stay 40/20/15/15/10 for relative view velocity, acceleration,
+    persistence, repeatability, and price fit. Unknown factors are omitted and the
+    available weights are renormalized, so lack of future/history evidence cannot
+    mechanically pin a fresh high-velocity product near 70. Saturation and Lifecycle
     remain descriptive axes and do not change this score.
     """
     market_stats = market_stats or {}
@@ -523,7 +559,13 @@ def score_initial_rows(
             category_velocity_pct = percentile_rank(row.views_per_hour, age_balanced_rates)
             views_pct = percentile_rank(float(row.views), view_values)
             absolute_demand = _absolute_demand_factor(row.views, row.views_per_hour)
-            velocity_factor = clamp(0.85 * category_velocity_pct + 0.15 * absolute_demand)
+            # Relative velocity is the main signal, but an absolute-demand gate stops
+            # tiny categories from turning e.g. 3 views vs 1 view into an 88+ score.
+            # Exceptional relative growth still dominates once the actual view volume
+            # is meaningful.
+            velocity_factor = clamp(
+                category_velocity_pct * (0.55 + 0.45 * absolute_demand)
+            )
 
             category_ratio = row.views_per_hour / category_median
             peer_ratio = row.views_per_hour / max(0.25, peer_median) if use_peers else category_ratio
@@ -571,7 +613,8 @@ def score_initial_rows(
 
             # 20% Acceleration: how much the product family's current demand is
             # speeding up versus its own recent history, with recent-vs-previous
-            # market history as independent confirmation.  Missing history is 0.5.
+            # market history as independent confirmation. Missing history still uses
+            # 0.5 for diagnostics, but v2.1 excludes that unknown factor from Score.
             acceleration_parts: list[tuple[float, float]] = []
             if current_vs_history is not None:
                 acceleration_parts.append((_growth_factor(current_vs_history), 0.65))
@@ -583,9 +626,9 @@ def score_initial_rows(
             else:
                 acceleration_factor = 0.50
 
-            # 15% Persistence comes only from raw historical view curves.  It is
-            # deliberately neutral when the database has not accumulated enough
-            # checkpoints for this family yet.
+            # 15% Persistence comes only from raw historical view curves. Diagnostic
+            # value stays neutral when history is thin; v2.1 only activates its score
+            # weight after at least two independent raw demand-rate observations.
             persistence_raw = profile.get("persistence")
             persistence_factor = clamp(float(0.5 if persistence_raw is None else persistence_raw))
 
@@ -618,16 +661,30 @@ def score_initial_rows(
                 anomaly_factor = 0.72 * _ratio_factor(category_ratio) + 0.28 * _ratio_factor(peer_ratio)
                 anomaly_ratio = category_ratio
 
-            # DT Demand Score 2.0: one score, five demand-relevant inputs.  Supply
-            # saturation and Lifecycle/disappearance are descriptive only and never
-            # add/subtract points here.
+            # DT Demand Score 2.1: the 40/20/15/15/10 weights are fixed, but a
+            # factor joins the vote only when there is real evidence for it. This
+            # prevents unknown future/history features from acting as four synthetic
+            # 50% votes against a genuinely exceptional fresh listing.
+            evidence_available = {
+                "velocity": len(age_balanced_rates) >= 2,
+                "acceleration": bool(acceleration_parts),
+                "persistence": history_samples >= 2,
+                "repeatability": (len(peers) >= 2) or history_samples >= 2,
+                "price_fit": (
+                    row.price_eur is not None
+                    and market_median is not None
+                    and market_count >= 3
+                ),
+            }
             score = _demand_score(
                 velocity=velocity_factor,
                 acceleration=acceleration_factor,
                 persistence=persistence_factor,
                 repeatability=repeatability,
                 price_fit=price_factor,
+                available=evidence_available,
             )
+            evidence_weight = _evidence_weight(evidence_available)
 
             identity_conf = int(row.identity_confidence or 0)
             evidence_count = market_count if market_count > 0 else len(peers)
@@ -655,7 +712,7 @@ def score_initial_rows(
                 anomaly_ratio=anomaly_ratio,
                 demand_growth_ratio=demand_growth_ratio,
                 demand_supply_ratio=demand_supply_ratio,
-                repeatability=repeatability,
+                repeatability=(repeatability if evidence_available["repeatability"] else 0.0),
                 trend_evidence=trend_evidence,
             )
             reasons: list[str] = []
@@ -687,10 +744,23 @@ def score_initial_rows(
                 reasons.append("товарная семья новая для базы: насыщение неизвестно, а не автоматически «редко = хорошо»")
             if len(peers) >= 2:
                 reasons.append(f"повторяемость текущего сигнала: {repeatability*100:.0f}% на {len(peers)} сопоставимых")
+            active_names = [
+                label for key, label in (
+                    ("velocity", "скорость"),
+                    ("acceleration", "ускорение"),
+                    ("persistence", "устойчивость"),
+                    ("repeatability", "повторяемость"),
+                    ("price_fit", "цена"),
+                ) if evidence_available[key]
+            ]
             reasons.append(
-                "DT Demand 2.0: "
+                "DT Demand 2.1: "
                 f"скорость {velocity_factor*100:.0f}% · ускорение {acceleration_factor*100:.0f}% · "
                 f"устойчивость {persistence_factor*100:.0f}% · повторяемость {repeatability*100:.0f}%"
+            )
+            reasons.append(
+                f"Evidence Adaptive: реально доступны {', '.join(active_names) or 'нет'} "
+                f"({evidence_weight:.0f}/100 базового веса); неизвестные факторы Score не занижают"
             )
             if supply_growth_ratio >= 1.15:
                 reasons.append(f"предложение тоже растёт: {supply_growth_ratio:.2f}× к норме категории")
@@ -806,8 +876,10 @@ def update_dynamic_score(
     previous_views: int | None = None,
     previous_elapsed_hours: float | None = None,
     repeatability: float = 0.5,
+    repeatability_available: bool | None = None,
     price_eur: int | None = None,
     market_median_eur: float | None = None,
+    market_cohort_size: int = 0,
 ) -> DynamicScore:
     elapsed = max(0.25, float(elapsed_hours))
     delta = max(0, int(current_views) - int(baseline_views))
@@ -846,13 +918,31 @@ def update_dynamic_score(
     persistence_factor = clamp(0.55 * persistence_floor + 0.45 * persistence_mean)
     price_fit, _price_delta = _price_factor(price_eur, market_median_eur)
 
+    if repeatability_available is None:
+        # Legacy candidates do not store an explicit evidence mask. A value that has
+        # materially moved away from the 0.5 prior is safe evidence; exact neutral
+        # remains non-voting until a future scan builds raw repeatability history.
+        repeatability_available = abs(float(repeatability) - 0.5) >= 0.025
+    evidence_available = {
+        "velocity": True,
+        "acceleration": elapsed >= 0.25,
+        "persistence": elapsed >= 0.75,
+        "repeatability": bool(repeatability_available),
+        "price_fit": (
+            price_eur is not None
+            and market_median_eur is not None
+            and int(market_cohort_size or 0) >= 3
+        ),
+    }
     score = _demand_score(
         velocity=velocity_factor,
         acceleration=acceleration_factor,
         persistence=persistence_factor,
         repeatability=repeatability,
         price_fit=price_fit,
+        available=evidence_available,
     )
+    evidence_weight = _evidence_weight(evidence_available)
     stage = stage_for_score(score)
 
     # Objective shadow-mode label. It is intentionally based on observed future
@@ -879,10 +969,23 @@ def update_dynamic_score(
         reasons.append("темп ускоряется относительно стартовой скорости")
     elif momentum < 0.75:
         reasons.append("темп замедляется относительно стартовой скорости")
+    active_names = [
+        label for key, label in (
+            ("velocity", "скорость"),
+            ("acceleration", "ускорение"),
+            ("persistence", "устойчивость"),
+            ("repeatability", "повторяемость"),
+            ("price_fit", "цена"),
+        ) if evidence_available[key]
+    ]
     reasons.append(
-        "DT Demand 2.0: "
+        "DT Demand 2.1: "
         f"скорость {velocity_factor*100:.0f}% · ускорение {acceleration_factor*100:.0f}% · "
         f"устойчивость {persistence_factor*100:.0f}%"
+    )
+    reasons.append(
+        f"Evidence Adaptive: реально доступны {', '.join(active_names)} "
+        f"({evidence_weight:.0f}/100 базового веса)"
     )
 
     return DynamicScore(

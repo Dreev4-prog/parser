@@ -1,3 +1,15 @@
+# DT PARSER 4.15.1 — DT Demand Score 2.1 Evidence Adaptive
+
+**Base:** 4.15.0 DT Demand Score 2.0.
+
+Keeps the single **40/20/15/15/10** DT Demand Score, but fixes live calibration: factors with no real evidence no longer vote as synthetic `0.5` values. Available evidence weights are renormalized, so an exceptional fresh listing can surface from real Relative View Velocity instead of being mechanically pinned near ~70 while future/history data is still unknown. Acceleration/Persistence/Repeatability/Price Fit join only when their evidence exists. Relative Velocity also gets an absolute-demand safety gate so tiny categories cannot produce 88+ from trivial `3 views vs 1 view` differences. Lifecycle remains outside the score. No DB migration or new Railway variable. Redeploy **AI Worker + Parser**.
+
+Expected AI model: `dt-demand-score-v2.1-evidence-adaptive`.
+
+See `DEPLOY_V4_15_1_DT_DEMAND_SCORE_2_1_EVIDENCE_ADAPTIVE.md`.
+
+---
+
 # DT PARSER 4.15.0 — DT Demand Score 2.0
 
 **Base:** 4.14.1 Radar Price & Return UX.
