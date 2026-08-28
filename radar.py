@@ -8,15 +8,19 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import case, func, select, text
+from sqlalchemy import case, delete, func, select, text
 
 from db import SessionLocal
 from early_winner import opportunity_family_key
 from filters import price_bounds
 from models import (
     AIEarlyWinnerCandidate,
+    AIEarlyWinnerEvent,
+    AIEarlyWinnerObservation,
+    AIEarlyWinnerRun,
     AppSetting,
     Listing,
+    ListingIntegrity,
     RadarFavorite,
     RadarLifecycleWatch,
     RadarProduct,
@@ -229,6 +233,11 @@ async def _upsert_signal(
     recorded_at: datetime | None = None,
 ) -> int | None:
     """Append one idempotent Radar snapshot and refresh its aggregate product."""
+    # v4.15.2: Radar is organic-demand only. Keep this defensive guard even
+    # though parser/AI sources filter earlier, so no future ingestion path can
+    # accidentally reintroduce paid TOP/bumped or price-reduced listings.
+    if bool(getattr(listing, "is_promoted", False)) or bool(getattr(listing, "is_price_reduced", False)):
+        return None
     now = recorded_at or datetime.utcnow()
     score = _clamp_score(score)
     confidence = _clamp_score(confidence)
@@ -403,7 +412,11 @@ async def record_scan_hot(scan_id: int, limit: int = RADAR_SCAN_TOP_LIMIT) -> in
         pairs = (await session.execute(
             select(Listing, ScanListing)
             .join(ScanListing, Listing.external_id == ScanListing.external_id)
-            .where(ScanListing.scan_id == int(scan_id), Listing.is_promoted.is_(False))
+            .where(
+                ScanListing.scan_id == int(scan_id),
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
+            )
         )).all()
     ranked = [(listing, snap) for listing, snap in pairs if snap.initial_view_count is not None]
     ranked.sort(key=lambda item: (int(item[1].initial_view_count or 0), item[0].first_seen_at), reverse=True)
@@ -464,6 +477,7 @@ async def record_autoscan_hot(
                 Listing.external_id.in_(ids),
                 Listing.category_key == str(category_key),
                 Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
                 Listing.view_count.is_not(None),
             )
         )).scalars().all())
@@ -513,7 +527,11 @@ async def record_ai_candidate(candidate_id: int, *, source_key: str | None = Non
         if candidate is None or candidate.is_control:
             return None
         listing = (await session.execute(
-            select(Listing).where(Listing.external_id == candidate.external_id).limit(1)
+            select(Listing).where(
+                Listing.external_id == candidate.external_id,
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
+            ).limit(1)
         )).scalar_one_or_none()
         if listing is None:
             return None
@@ -622,6 +640,20 @@ async def complete_lifecycle_check(
         listing = (await session.execute(
             select(Listing).where(Listing.external_id == str(watch.external_id)).limit(1)
         )).scalar_one_or_none()
+        if listing is not None and (
+            bool(getattr(listing, "is_promoted", False))
+            or bool(getattr(listing, "is_price_reduced", False))
+        ):
+            # A contamination flag can arrive while a Lifecycle check is leased.
+            # Never let that race create a Fast Sold signal from non-organic demand.
+            watch.status = "excluded"
+            watch.next_check_at = None
+            watch.last_result = "nonorganic"
+            watch.lease_owner = ""
+            watch.lease_until = None
+            watch.updated_at = now
+            await session.commit()
+            return "excluded"
 
         if active is True:
             watch.status = "watching"
@@ -980,8 +1012,24 @@ async def get_radar_product(product_id: int) -> tuple[RadarProduct | None, Listi
         listing = None
         if product.representative_external_id:
             listing = (await session.execute(select(Listing).where(
-                Listing.external_id == product.representative_external_id
+                Listing.external_id == product.representative_external_id,
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
             ).limit(1))).scalar_one_or_none()
+        if listing is None:
+            # Defensive fallback for a product being opened during/just before an
+            # integrity cleanup: choose another surviving organic association.
+            listing = (await session.execute(
+                select(Listing)
+                .join(RadarProductListing, RadarProductListing.external_id == Listing.external_id)
+                .where(
+                    RadarProductListing.product_id == int(product_id),
+                    Listing.is_promoted.is_(False),
+                    Listing.is_price_reduced.is_(False),
+                )
+                .order_by(RadarProductListing.last_seen_at.desc())
+                .limit(1)
+            )).scalar_one_or_none()
         snapshots = list((await session.execute(
             select(RadarSnapshot).where(RadarSnapshot.product_id == int(product_id))
             .order_by(RadarSnapshot.recorded_at.desc()).limit(8)
@@ -1012,6 +1060,237 @@ async def toggle_radar_favorite(user_id: int, product_id: int) -> bool:
             session.add(RadarFavorite(user_id=int(user_id), product_id=int(product_id)))
             await session.commit()
             return True
+
+
+async def purge_nonorganic_analytics(
+    external_ids: list[str] | set[str] | tuple[str, ...] | None = None,
+    *,
+    infer_historical_price_drops: bool = False,
+) -> dict[str, int]:
+    """Remove paid/reduced listings from AI + Radar analytical history.
+
+    The underlying Listing/PriceHistory/ViewHistory rows are intentionally kept for
+    audit/debugging, but every demand-learning surface is rebuilt from organic rows.
+    ``is_promoted`` and ``is_price_reduced`` are sticky contamination flags.
+    """
+    stats = {
+        "dirty_listings": 0, "ai_candidates": 0, "radar_snapshots": 0,
+        "radar_links": 0, "lifecycle_watches": 0, "radar_products_removed": 0,
+        "radar_products_rebuilt": 0,
+    }
+    now = datetime.utcnow()
+    async with _radar_lock:
+        async with SessionLocal() as session:
+            if infer_historical_price_drops:
+                # Infer old reductions from raw price history. Window LAG is supported
+                # by PostgreSQL and modern SQLite used in local tests. A reduction is
+                # sticky: even if a seller later raises the price again, its accumulated
+                # views are no longer a clean organic-demand sample.
+                await session.execute(text(
+                    """
+                    UPDATE listings
+                    SET is_price_reduced = TRUE
+                    WHERE COALESCE(is_price_reduced, FALSE) = FALSE
+                      AND external_id IN (
+                        SELECT external_id FROM (
+                          SELECT external_id, price_eur,
+                                 LAG(price_eur) OVER (
+                                   PARTITION BY external_id
+                                   ORDER BY recorded_at, id
+                                 ) AS previous_price
+                          FROM price_history
+                          WHERE price_eur IS NOT NULL
+                        ) price_steps
+                        WHERE previous_price IS NOT NULL
+                          AND price_eur < previous_price
+                      )
+                    """
+                ))
+
+            if external_ids is None:
+                dirty = list((await session.execute(
+                    select(Listing.external_id).where(
+                        (Listing.is_promoted.is_(True)) | (Listing.is_price_reduced.is_(True))
+                    )
+                )).scalars().all())
+            else:
+                requested = {str(x).strip() for x in external_ids if str(x).strip()}
+                if not requested:
+                    return stats
+                dirty = list((await session.execute(
+                    select(Listing.external_id).where(
+                        Listing.external_id.in_(sorted(requested)),
+                        (Listing.is_promoted.is_(True)) | (Listing.is_price_reduced.is_(True)),
+                    )
+                )).scalars().all())
+
+            dirty_ids = sorted({str(x) for x in dirty if str(x)})
+            stats["dirty_listings"] = len(dirty_ids)
+            if not dirty_ids:
+                await session.commit()
+                return stats
+
+            # Backfill the sticky registry too. This matters especially for price
+            # reductions inferred from historical PriceHistory at startup: the
+            # next clean-looking card must still remain excluded immediately.
+            dirty_rows = list((await session.execute(
+                select(Listing.external_id, Listing.is_promoted, Listing.is_price_reduced).where(
+                    Listing.external_id.in_(dirty_ids)
+                )
+            )).all())
+            registry_rows = list((await session.execute(
+                select(ListingIntegrity).where(ListingIntegrity.external_id.in_(dirty_ids))
+            )).scalars().all())
+            registry = {str(row.external_id): row for row in registry_rows}
+            for external_id, is_promoted, is_price_reduced in dirty_rows:
+                external_id = str(external_id)
+                entry = registry.get(external_id)
+                if entry is None:
+                    entry = ListingIntegrity(
+                        external_id=external_id,
+                        is_promoted=bool(is_promoted),
+                        is_price_reduced=bool(is_price_reduced),
+                        first_detected_at=now,
+                        last_detected_at=now,
+                    )
+                    session.add(entry)
+                    registry[external_id] = entry
+                else:
+                    entry.is_promoted = bool(entry.is_promoted or is_promoted)
+                    entry.is_price_reduced = bool(entry.is_price_reduced or is_price_reduced)
+                    entry.last_detected_at = now
+
+            candidate_rows = (await session.execute(
+                select(AIEarlyWinnerCandidate.id, AIEarlyWinnerCandidate.run_id).where(
+                    AIEarlyWinnerCandidate.external_id.in_(dirty_ids)
+                )
+            )).all()
+            candidate_ids = sorted({int(row[0]) for row in candidate_rows})
+            run_ids = sorted({int(row[1]) for row in candidate_rows})
+            if candidate_ids:
+                await session.execute(delete(AIEarlyWinnerObservation).where(
+                    AIEarlyWinnerObservation.candidate_id.in_(candidate_ids)
+                ))
+                await session.execute(delete(AIEarlyWinnerEvent).where(
+                    AIEarlyWinnerEvent.candidate_id.in_(candidate_ids)
+                ))
+                deleted_candidates = await session.execute(delete(AIEarlyWinnerCandidate).where(
+                    AIEarlyWinnerCandidate.id.in_(candidate_ids)
+                ))
+                stats["ai_candidates"] = int(deleted_candidates.rowcount or 0)
+
+            affected_product_ids = set((await session.execute(
+                select(RadarSnapshot.product_id).where(RadarSnapshot.external_id.in_(dirty_ids))
+            )).scalars().all())
+            affected_product_ids.update((await session.execute(
+                select(RadarProductListing.product_id).where(RadarProductListing.external_id.in_(dirty_ids))
+            )).scalars().all())
+            affected_product_ids.update((await session.execute(
+                select(RadarLifecycleWatch.product_id).where(RadarLifecycleWatch.external_id.in_(dirty_ids))
+            )).scalars().all())
+
+            deleted_snapshots = await session.execute(delete(RadarSnapshot).where(
+                RadarSnapshot.external_id.in_(dirty_ids)
+            ))
+            stats["radar_snapshots"] = int(deleted_snapshots.rowcount or 0)
+            deleted_links = await session.execute(delete(RadarProductListing).where(
+                RadarProductListing.external_id.in_(dirty_ids)
+            ))
+            stats["radar_links"] = int(deleted_links.rowcount or 0)
+            deleted_watches = await session.execute(delete(RadarLifecycleWatch).where(
+                RadarLifecycleWatch.external_id.in_(dirty_ids)
+            ))
+            stats["lifecycle_watches"] = int(deleted_watches.rowcount or 0)
+
+            # Keep admin run counters consistent after candidate removal.
+            for run_id in run_ids:
+                run = await session.get(AIEarlyWinnerRun, int(run_id))
+                if run is None:
+                    continue
+                remaining = list((await session.execute(
+                    select(AIEarlyWinnerCandidate.is_control).where(
+                        AIEarlyWinnerCandidate.run_id == int(run_id)
+                    )
+                )).scalars().all())
+                run.candidate_count = sum(1 for x in remaining if not bool(x))
+                run.control_count = sum(1 for x in remaining if bool(x))
+
+            # Rebuild every touched Radar family from surviving clean snapshots.
+            for product_id in sorted(int(x) for x in affected_product_ids if x is not None):
+                product = await session.get(RadarProduct, product_id)
+                if product is None:
+                    continue
+                snapshots = list((await session.execute(
+                    select(RadarSnapshot).where(RadarSnapshot.product_id == product_id)
+                    .order_by(RadarSnapshot.recorded_at.desc(), RadarSnapshot.id.desc())
+                )).scalars().all())
+                associations = list((await session.execute(
+                    select(RadarProductListing).where(RadarProductListing.product_id == product_id)
+                )).scalars().all())
+                if not snapshots:
+                    await session.execute(delete(RadarFavorite).where(RadarFavorite.product_id == product_id))
+                    await session.execute(delete(RadarLifecycleWatch).where(RadarLifecycleWatch.product_id == product_id))
+                    await session.execute(delete(RadarProductListing).where(RadarProductListing.product_id == product_id))
+                    await session.delete(product)
+                    stats["radar_products_removed"] += 1
+                    continue
+
+                latest_by_listing: dict[str, RadarSnapshot] = {}
+                for snap in snapshots:
+                    ext = str(snap.external_id or f"snapshot:{snap.id}")
+                    if ext not in latest_by_listing:
+                        latest_by_listing[ext] = snap
+                strongest = max(latest_by_listing.values(), key=lambda x: (int(x.score or 0), x.recorded_at or datetime.min))
+                newest = max(snapshots, key=lambda x: (x.recorded_at or datetime.min, int(x.id or 0)))
+
+                product.signal_count = len(snapshots)
+                product.confirmed_count = len({
+                    int(x.candidate_id) for x in snapshots
+                    if x.candidate_id is not None and str(x.outcome or "") == "confirmed"
+                })
+                product.listing_count = len(associations)
+                product.last_signal_score = max(int(x.score or 0) for x in latest_by_listing.values())
+                product.last_signal_at = max(x.recorded_at for x in latest_by_listing.values() if x.recorded_at is not None)
+                product.peak_score = max(int(x.score or 0) for x in snapshots)
+                product.confidence = max(int(x.confidence or 0) for x in latest_by_listing.values())
+                product.opportunity_type = str(strongest.opportunity_type or "spark")[:32]
+                product.latest_source = str(newest.source or "")[:32]
+                product.last_ai_candidate_id = newest.candidate_id
+                try:
+                    reasons = json.loads(newest.reasons_json or "[]")
+                    product.latest_reason = str(reasons[0] if isinstance(reasons, list) and reasons else "")[:800]
+                except Exception:
+                    product.latest_reason = ""
+                product.representative_external_id = str(strongest.external_id or "")
+                product.best_views = max(
+                    [int(x.best_views or 0) for x in associations]
+                    + [int(x.view_count or 0) for x in snapshots]
+                    + [0]
+                )
+                product.best_views_per_hour = max([float(x.views_per_hour or 0.0) for x in snapshots] + [0.0])
+                prices = [int(x.last_price_eur) for x in associations if x.last_price_eur is not None]
+                if not prices:
+                    prices = [int(x.price_eur) for x in snapshots if x.price_eur is not None]
+                product.min_price_eur = min(prices) if prices else None
+                product.max_price_eur = max(prices) if prices else None
+                if associations:
+                    product.first_seen_at = min(x.first_seen_at for x in associations if x.first_seen_at is not None)
+                    product.last_seen_at = max(x.last_seen_at for x in associations if x.last_seen_at is not None)
+                product.current_score = _effective_score(product, now)
+                product.status = _status_for_score(int(product.current_score or 0))
+                product.updated_at = now
+                stats["radar_products_rebuilt"] += 1
+
+            await session.commit()
+
+    if stats["dirty_listings"]:
+        log.warning(
+            "Organic Demand cleanup dirty=%s ai=%s radar_snapshots=%s radar_links=%s lifecycle=%s products_removed=%s products_rebuilt=%s",
+            stats["dirty_listings"], stats["ai_candidates"], stats["radar_snapshots"],
+            stats["radar_links"], stats["lifecycle_watches"],
+            stats["radar_products_removed"], stats["radar_products_rebuilt"],
+        )
+    return stats
 
 
 async def backfill_radar_once() -> tuple[int, int]:

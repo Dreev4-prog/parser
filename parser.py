@@ -277,6 +277,10 @@ class ParsedListing:
     price_eur: int | None
     url: str
     posted_text: str | None = None
+    # v4.15.2: explicit crossed/previous-price marker on the search card.
+    # The row may still be persisted for price-history tools, but never enters
+    # demand views / AI / Radar.
+    is_price_reduced: bool = False
 
 
 @dataclass
@@ -295,6 +299,8 @@ class CategoryPageInfo:
     raw_candidates: int = 0
     promoted_filtered: int = 0
     promoted_ids: list[str] | None = None
+    price_reduced_filtered: int = 0
+    price_reduced_ids: list[str] | None = None
     duplicate_cards: int = 0
     missing_date_count: int = 0
     missing_price_count: int = 0
@@ -645,8 +651,19 @@ PROMOTED_FEATURE_CLASS_RE = re.compile(
     re.IGNORECASE,
 )
 PROMOTED_LABEL_RE = re.compile(
-    r"^(?:Top[- ]?Anzeige|Werbeanzeige|Gesponsert|Sponsored|Promoted|"
+    r"^(?:TOP|Top[- ]?Anzeige|Werbeanzeige|Gesponsert|Sponsored|Promoted|"
     r"Hochgeschoben|Hochschieben|Highlight|Galerie)$",
+    re.IGNORECASE,
+)
+
+PRICE_REDUCED_CLASS_RE = re.compile(
+    r"(?:^|[-_: ])(?:old[-_ ]?price|original[-_ ]?price|former[-_ ]?price|previous[-_ ]?price|"
+    r"strike(?:through)?|strikethrough|crossed[-_ ]?price|price[-_ ]?old|price[-_ ]?reduced|"
+    r"reduced[-_ ]?price|discount[-_ ]?price)(?:$|[-_: ])",
+    re.IGNORECASE,
+)
+PRICE_REDUCED_TEXT_RE = re.compile(
+    r"(?:statt|vorher|urspr(?:u|ü)nglich|alter\s+preis)\s*[: ]*\d[\d.]*\s*€",
     re.IGNORECASE,
 )
 FILTER_PROMOTED_LISTINGS = os.getenv("FILTER_PROMOTED_LISTINGS", "1").strip().lower() not in {
@@ -749,31 +766,119 @@ def _is_promoted_listing_node(node) -> bool:
     return False
 
 
+def _is_price_reduced_listing_node(node) -> bool:
+    """Return True only for an explicit crossed/previous-price marker on the card.
+
+    DT Demand analytics must measure organic demand. A listing that visibly carries
+    an old crossed-out price can receive an artificial view surge after a reduction,
+    so it is excluded before view collection and AI/Radar ingestion.
+    """
+    wrapper = None
+    try:
+        if "ad-listitem" in _class_set(node):
+            wrapper = node
+        else:
+            wrapper = node.find_parent(
+                lambda tag: tag is not None and "ad-listitem" in _class_set(tag)
+            )
+    except Exception:
+        wrapper = None
+    if wrapper is None:
+        wrapper = node
+
+    try:
+        # Semantic HTML is the strongest signal. Only accept it when a monetary
+        # amount is actually crossed out, so decorative <s>/<del> text is harmless.
+        for element in wrapper.find_all(["del", "s"]):
+            text = " ".join(element.get_text(" ", strip=True).split())
+            if PRICE_NUMBER_RE.search(text):
+                return True
+
+        for element in wrapper.find_all(True):
+            text = " ".join(element.get_text(" ", strip=True).split())
+            if not text:
+                continue
+            classes = _class_set(element)
+            class_text = " ".join(classes)
+            style = str(element.get("style") or "")
+            attrs = " ".join(
+                str(element.get(name) or "")
+                for name in ("id", "data-testid", "aria-label", "title")
+            )
+            explicit_old_price = bool(
+                PRICE_REDUCED_CLASS_RE.search(class_text)
+                or PRICE_REDUCED_CLASS_RE.search(attrs)
+                or ("line-through" in style.lower())
+            )
+            if explicit_old_price and PRICE_NUMBER_RE.search(text):
+                return True
+
+        # Text labels such as "statt 199 €" are explicit price-reduction UI too.
+        compact = " ".join(wrapper.get_text(" ", strip=True).split())
+        if PRICE_REDUCED_TEXT_RE.search(compact):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _parse_category_html_with_stats(html_text: str) -> tuple[list[ParsedListing], dict[str, object]]:
     soup = BeautifulSoup(html_text, "html.parser")
     items: list[ParsedListing] = []
     seen_urls: set[str] = set()
     seen_ids: set[str] = set()
     promoted_ids: list[str] = []
+    price_reduced_ids: list[str] = []
 
-    candidates = soup.select("article, li.ad-listitem, .ad-listitem")
-    promoted = duplicate_cards = missing_date = missing_price = 0
-    for node in candidates:
-        if _is_promoted_listing_node(node):
-            promoted += 1
+    # Prefer the real outer Kleinanzeigen result wrapper. Older templates may
+    # expose only <article>, but selecting both wrapper + nested article would
+    # count one listing twice (and could double the promoted/reduced telemetry).
+    candidates = list(soup.select(".ad-listitem"))
+    if candidates:
+        outer_candidates = []
+        for candidate in candidates:
             try:
-                promoted_link = node.select_one("a[href*='/s-anzeige/']")
-                if promoted_link and promoted_link.get("href"):
-                    promoted_url = urljoin(BASE_URL, promoted_link["href"])
-                    if _allowed_url(promoted_url):
-                        promoted_id = extract_external_id(promoted_url)
-                        if promoted_id and promoted_id not in promoted_ids:
-                            promoted_ids.append(promoted_id)
+                nested_in_card = candidate.find_parent(
+                    lambda tag: tag is not None and "ad-listitem" in _class_set(tag)
+                )
+            except Exception:
+                nested_in_card = None
+            if nested_in_card is None:
+                outer_candidates.append(candidate)
+        candidates = outer_candidates or candidates
+    else:
+        candidates = [
+            article for article in soup.select("article")
+            if article.select_one("a[href*='/s-anzeige/']") is not None
+        ]
+
+    promoted = price_reduced = duplicate_cards = missing_date = missing_price = 0
+    for node in candidates:
+        link = node.select_one("a[href*='/s-anzeige/']")
+        promoted_node = _is_promoted_listing_node(node)
+        reduced_node = _is_price_reduced_listing_node(node)
+        if promoted_node:
+            promoted += 1
+        if reduced_node:
+            price_reduced += 1
+        if promoted_node or reduced_node:
+            try:
+                if link and link.get("href"):
+                    blocked_url = urljoin(BASE_URL, link["href"])
+                    if _allowed_url(blocked_url):
+                        blocked_id = extract_external_id(blocked_url)
+                        if promoted_node and blocked_id and blocked_id not in promoted_ids:
+                            promoted_ids.append(blocked_id)
+                        if reduced_node and blocked_id and blocked_id not in price_reduced_ids:
+                            price_reduced_ids.append(blocked_id)
             except Exception:
                 pass
+        # Paid visibility is never persisted from the result feed. Reduced-price
+        # cards continue through parsing only so PriceHistory can remain useful;
+        # their explicit flag prevents views/AI/Radar ingestion downstream.
+        if promoted_node:
             continue
 
-        link = node.select_one("a[href*='/s-anzeige/']")
         if not link or not link.get("href"):
             continue
 
@@ -809,6 +914,7 @@ def _parse_category_html_with_stats(html_text: str) -> tuple[list[ParsedListing]
                 price_eur=parse_price(price_text),
                 url=full_url,
                 posted_text=posted_text,
+                is_price_reduced=bool(reduced_node),
             )
         )
 
@@ -818,6 +924,8 @@ def _parse_category_html_with_stats(html_text: str) -> tuple[list[ParsedListing]
         "raw_candidates": len(candidates),
         "promoted_filtered": promoted,
         "promoted_ids": promoted_ids,
+        "price_reduced_filtered": price_reduced,
+        "price_reduced_ids": price_reduced_ids,
         "duplicate_cards": duplicate_cards,
         "missing_date_count": missing_date,
         "missing_price_count": missing_price,
@@ -1041,6 +1149,8 @@ def category_page_info_from_html(
         raw_candidates=int(stats["raw_candidates"]),
         promoted_filtered=int(stats["promoted_filtered"]),
         promoted_ids=list(stats.get("promoted_ids") or []),
+        price_reduced_filtered=int(stats.get("price_reduced_filtered") or 0),
+        price_reduced_ids=list(stats.get("price_reduced_ids") or []),
         duplicate_cards=int(stats["duplicate_cards"]),
         missing_date_count=int(stats["missing_date_count"]),
         missing_price_count=int(stats["missing_price_count"]),

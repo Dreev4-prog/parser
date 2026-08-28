@@ -266,6 +266,7 @@ class AIWorker:
                     Listing.category_key.in_(sorted(categories)),
                     Listing.first_seen_at >= cutoff,
                     Listing.is_promoted.is_(False),
+                    Listing.is_price_reduced.is_(False),
                 )
                 .order_by(Listing.first_seen_at.desc())
                 .limit(AI_MARKET_SAMPLE_LIMIT)
@@ -277,10 +278,14 @@ class AIWorker:
                     AIEarlyWinnerCandidate.cohort_key,
                     AIEarlyWinnerCandidate.outcome,
                     AIEarlyWinnerCandidate.current_score,
-                ).where(
+                )
+                .join(Listing, Listing.external_id == AIEarlyWinnerCandidate.external_id)
+                .where(
                     AIEarlyWinnerCandidate.created_at >= cutoff,
                     AIEarlyWinnerCandidate.is_control.is_(False),
                     AIEarlyWinnerCandidate.cohort_key.in_(sorted(target_keys)),
+                    Listing.is_promoted.is_(False),
+                    Listing.is_price_reduced.is_(False),
                 ).limit(AI_MARKET_SAMPLE_LIMIT)
             )).all()
 
@@ -290,6 +295,7 @@ class AIWorker:
                     Listing.first_seen_at >= start_at,
                     ViewHistory.recorded_at >= start_at,
                     Listing.is_promoted.is_(False),
+                    Listing.is_price_reduced.is_(False),
                 ]
                 if end_at is not None:
                     conditions.extend([Listing.first_seen_at < end_at, ViewHistory.recorded_at < end_at + timedelta(days=2)])
@@ -529,7 +535,11 @@ class AIWorker:
                 pairs = (await session.execute(
                     select(Listing, ScanListing)
                     .join(ScanListing, Listing.external_id == ScanListing.external_id)
-                    .where(ScanListing.scan_id == int(scan.id))
+                    .where(
+                        ScanListing.scan_id == int(scan.id),
+                        Listing.is_promoted.is_(False),
+                        Listing.is_price_reduced.is_(False),
+                    )
                 )).all()
 
             features: list[FeatureRow] = []
@@ -720,7 +730,9 @@ class AIWorker:
                 await session.commit()
                 return
             listing = (await session.execute(select(Listing).where(
-                Listing.external_id == candidate.external_id
+                Listing.external_id == candidate.external_id,
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
             ))).scalar_one_or_none()
             if listing is None:
                 obs.status = "error"
@@ -806,6 +818,8 @@ class AIWorker:
                 update(Listing)
                 .where(
                     Listing.external_id == listing.external_id,
+                    Listing.is_promoted.is_(False),
+                    Listing.is_price_reduced.is_(False),
                     or_(
                         Listing.views_checked_at.is_(None),
                         Listing.views_checked_at <= measured_at,
@@ -877,6 +891,8 @@ class AIWorker:
                 .where(
                     AIEarlyWinnerObservation.status == "pending",
                     AIEarlyWinnerObservation.due_at <= now,
+                    Listing.is_promoted.is_(False),
+                    Listing.is_price_reduced.is_(False),
                 )
                 .order_by(AIEarlyWinnerObservation.due_at.asc())
                 .limit(AI_OBSERVATION_BATCH)

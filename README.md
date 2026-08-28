@@ -1,3 +1,15 @@
+# DT PARSER 4.15.2 — Organic Demand Integrity
+
+**Base:** 4.15.1 DT Demand Score 2.1 Evidence Adaptive.
+
+Makes DT Radar/DT AI demand evidence organic-only without changing the **40/20/15/15/10** score. Paid Kleinanzeigen visibility (`TOP`, Top-Anzeige, Hochgeschoben, Highlight, Galerie and explicit promoted markers) and crossed/reduced-price listings are sticky exclusions. Dirty ads do not receive new demand view samples and do not enter AI cohorts, Radar or Lifecycle. A new additive `listing_integrity` registry prevents a previously paid/reduced external ID from becoming "organic" after the badge/old price disappears. Startup cleanup removes known dirty AI/Radar/Lifecycle contributions and rebuilds affected Radar families from surviving clean signals. Existing raw PriceHistory is retained so `📉 Снижение цены` keeps working. Redis Page cache and stable page-checkpoint payloads are schema-isolated as `v4152-organic`. No new Railway variable; additive DB schema is automatic.
+
+Redeploy **Parser + Page Worker + Date Worker + AI Worker + Lifecycle Worker** from the same release. View Worker behavior is unchanged.
+
+See `DEPLOY_V4_15_2_ORGANIC_DEMAND_INTEGRITY.md`.
+
+---
+
 # DT PARSER 4.15.1 — DT Demand Score 2.1 Evidence Adaptive
 
 **Base:** 4.15.0 DT Demand Score 2.0.

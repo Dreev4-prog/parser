@@ -20,6 +20,9 @@ STABLE_PAGE_CHECKPOINT_TTL_SECONDS = max(
 STABLE_DATE_INDEX_TTL_SECONDS = max(
     60, int(os.getenv("STABLE_DATE_INDEX_TTL_SECONDS", "900"))
 )
+# v4.15.2 changes page-card integrity semantics. Reject pre-release checkpoint
+# payloads for their short TTL instead of replaying a cached TOP/reduced card.
+STABLE_PAGE_PAYLOAD_SCHEMA = "v4152-organic"
 
 
 def feed_key(url: str) -> str:
@@ -33,6 +36,7 @@ def category_job_key(category_key: str, target_date: str, page_limit: int) -> st
 
 def _serialize_page_info(info: CategoryPageInfo) -> str:
     payload = {
+        "schema": STABLE_PAGE_PAYLOAD_SCHEMA,
         "requested_page": info.requested_page,
         "final_url": info.final_url,
         "items": [
@@ -43,6 +47,7 @@ def _serialize_page_info(info: CategoryPageInfo) -> str:
                 "price_eur": item.price_eur,
                 "url": item.url,
                 "posted_text": item.posted_text,
+                "is_price_reduced": bool(getattr(item, "is_price_reduced", False)),
             }
             for item in info.items
         ],
@@ -57,6 +62,8 @@ def _serialize_page_info(info: CategoryPageInfo) -> str:
         "raw_candidates": info.raw_candidates,
         "promoted_filtered": info.promoted_filtered,
         "promoted_ids": info.promoted_ids or [],
+        "price_reduced_filtered": info.price_reduced_filtered,
+        "price_reduced_ids": info.price_reduced_ids or [],
         "duplicate_cards": info.duplicate_cards,
         "missing_date_count": info.missing_date_count,
         "missing_price_count": info.missing_price_count,
@@ -70,6 +77,8 @@ def _serialize_page_info(info: CategoryPageInfo) -> str:
 
 def _deserialize_page_info(raw: str) -> CategoryPageInfo:
     payload = json.loads(raw)
+    if str(payload.pop("schema", "")) != STABLE_PAGE_PAYLOAD_SCHEMA:
+        raise ValueError("stale stable-page payload schema")
     items = [ParsedListing(**item) for item in payload.pop("items", [])]
     shards = payload.get("location_shards")
     if shards is not None:

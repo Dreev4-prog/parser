@@ -76,7 +76,7 @@ from filters import (
 )
 from models import (
     AIEarlyWinnerCandidate, AIEarlyWinnerEvent, AIEarlyWinnerObservation, AIEarlyWinnerRun,
-    AppSetting, BotUser, CategoryScanState, FreeRadarEvent, Listing, ParserRun, PriceHistory, RadarProduct, RadarSnapshot, ScanListing,
+    AppSetting, BotUser, CategoryScanState, FreeRadarEvent, Listing, ListingIntegrity, ParserRun, PriceHistory, RadarProduct, RadarSnapshot, ScanListing,
     ScanObservation, ScanViewHistory, SelectedCategory, StableCategoryJob, StablePageCheckpoint,
     SubscriptionPayment, SubscriptionPlan, UserScan, UserSettings, ViewHistory,
 )
@@ -121,8 +121,8 @@ from ai_manager import AI_MANAGER
 from radar import (
     RADAR_PAGE_SIZE, backfill_radar_once, get_fast_sold_info, get_fast_sold_infos,
     get_radar_product, is_radar_favorite, list_radar_products, radar_categories, radar_stats,
-    record_autoscan_hot, record_scan_hot, refresh_radar_scores, search_radar_products,
-    toggle_radar_favorite,
+    purge_nonorganic_analytics, record_autoscan_hot, record_scan_hot, refresh_radar_scores,
+    search_radar_products, toggle_radar_favorite,
 )
 from page_manager import (
     PAGE_PREFETCH_EXTRA_PAGES, PAGE_PREFETCH_LOW_WATER_PAGES, PAGE_PREFETCH_WINDOW_PAGES,
@@ -2025,6 +2025,7 @@ async def get_category_scan_rows(user_id: int, category_key: str) -> tuple[list[
                 ScanListing.scan_id == scan.id,
                 Listing.category_key == category_key,
                 Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
             )
         )
         rows = list(result.scalars().all())
@@ -2046,7 +2047,11 @@ async def get_scan_rows(scan_id: int) -> list[tuple[Listing, ScanListing]]:
         result = await session.execute(
             select(Listing, ScanListing)
             .join(ScanListing, Listing.external_id == ScanListing.external_id)
-            .where(ScanListing.scan_id == scan_id)
+            .where(
+                ScanListing.scan_id == scan_id,
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
+            )
         )
         return list(result.all())
 
@@ -2199,6 +2204,8 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
                     Listing.external_id.in_(matched_ids),
                     Listing.category_key.in_(job.category_keys),
                     Listing.posted_date_msk == job.target_date,
+                    Listing.is_promoted.is_(False),
+                    Listing.is_price_reduced.is_(False),
                 ))
                 rows = list(result.scalars().all())
             else:
@@ -2289,7 +2296,11 @@ async def update_scan_view_refresh(
             query = (
                 select(Listing.external_id, Listing.view_count, ScanListing)
                 .join(ScanListing, Listing.external_id == ScanListing.external_id)
-                .where(ScanListing.scan_id == scan_id)
+                .where(
+                    ScanListing.scan_id == scan_id,
+                    Listing.is_promoted.is_(False),
+                    Listing.is_price_reduced.is_(False),
+                )
             )
             if fresh_after is not None:
                 query = query.where(
@@ -2335,7 +2346,12 @@ async def get_scan_history_rounds(scan_id: int, limit: int = 12) -> list[tuple[d
                 func.count(ScanViewHistory.id),
                 func.sum(ScanViewHistory.view_count),
             )
-            .where(ScanViewHistory.scan_id == scan_id)
+            .join(Listing, Listing.external_id == ScanViewHistory.external_id)
+            .where(
+                ScanViewHistory.scan_id == scan_id,
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
+            )
             .group_by(ScanViewHistory.recorded_at)
         )
         baseline_result = await session.execute(
@@ -2344,9 +2360,12 @@ async def get_scan_history_rounds(scan_id: int, limit: int = 12) -> list[tuple[d
                 func.count(ScanListing.id),
                 func.sum(ScanListing.initial_view_count),
             )
+            .join(Listing, Listing.external_id == ScanListing.external_id)
             .where(
                 ScanListing.scan_id == scan_id,
                 ScanListing.initial_view_count.is_not(None),
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
             )
             .group_by(ScanListing.captured_at)
         )
@@ -2669,23 +2688,44 @@ async def backfill_product_identities() -> int:
 
 async def upsert_page_items(
     category_key: str, category_name: str, items: list[ParsedListing]
-) -> tuple[list[ParsedListing], int, int]:
+) -> tuple[list[ParsedListing], int, int, set[str]]:
+    """Persist one clean page and flag historical non-organic contamination.
+
+    v4.15.2 keeps paid-promotion and price-reduction flags sticky. A later clean
+    card must not make the accumulated views organic again. If a price drops
+    between two observations, that listing is immediately excluded even when the
+    search-card template temporarily omits the crossed old price.
+    """
     if not items:
-        return [], 0, 0
+        return [], 0, 0, set()
     unique = {item.external_id: item for item in items}
     ids = list(unique)
-    # v4.4.0: serialize this invariant at the function boundary. The previous
-    # caller-side lock was easy for a future code path to forget, allowing two
-    # simultaneous scans to race SELECT -> INSERT on Listing.external_id.
+    nonorganic_ids: set[str] = set()
     async with db_write_lock:
         async with SessionLocal() as session:
             result = await session.execute(select(Listing).where(Listing.external_id.in_(ids)))
             existing = {row.external_id: row for row in result.scalars().all()}
+            integrity_rows = list((await session.execute(
+                select(ListingIntegrity).where(ListingIntegrity.external_id.in_(ids))
+            )).scalars().all())
+            integrity = {row.external_id: row for row in integrity_rows}
             now = datetime.utcnow()
             new_items: list[ParsedListing] = []
             enriched_count = 0
             for external_id, item in unique.items():
                 row = existing.get(external_id)
+                integrity_row = integrity.get(external_id)
+                registry_blocked = bool(
+                    integrity_row is not None
+                    and (bool(integrity_row.is_promoted) or bool(integrity_row.is_price_reduced))
+                )
+                item_reduced = bool(getattr(item, "is_price_reduced", False))
+                if registry_blocked and not item_reduced:
+                    nonorganic_ids.add(str(external_id))
+                    if row is not None:
+                        row.is_promoted = bool(row.is_promoted or integrity_row.is_promoted)
+                        row.is_price_reduced = bool(row.is_price_reduced or integrity_row.is_price_reduced)
+                    continue
                 if row is None:
                     _identity, identity_values = _identity_kwargs(item.title, category_name)
                     session.add(Listing(
@@ -2693,7 +2733,7 @@ async def upsert_page_items(
                         title=item.title, price_text=item.price_text, price_eur=item.price_eur,
                         posted_text=item.posted_text, posted_date_msk=(posted_date_moscow(item.posted_text).isoformat() if posted_date_moscow(item.posted_text) else None),
                         url=item.url, first_seen_at=now, last_seen_at=now,
-                        is_active=True, is_promoted=False, disappeared_at=None,
+                        is_active=True, is_promoted=False, is_price_reduced=item_reduced, disappeared_at=None,
                         **identity_values,
                     ))
                     if item.price_text:
@@ -2701,63 +2741,154 @@ async def upsert_page_items(
                             external_id=item.external_id, price_text=item.price_text,
                             price_eur=item.price_eur, recorded_at=now,
                         ))
-                    new_items.append(item)
-                else:
-                    old_price_text = row.price_text
-                    old_price_eur = row.price_eur
-                    # Never erase a previously parsed price because of one weak HTML response.
-                    if item.price_text is not None:
-                        if old_price_text is None and item.price_text:
-                            enriched_count += 1
-                        if (old_price_text, old_price_eur) != (item.price_text, item.price_eur):
-                            if old_price_text is not None or old_price_eur is not None:
-                                session.add(PriceHistory(
-                                    external_id=external_id, price_text=old_price_text,
-                                    price_eur=old_price_eur, recorded_at=now - timedelta(microseconds=1),
-                                ))
+                    if item_reduced:
+                        if integrity_row is None:
+                            integrity_row = ListingIntegrity(
+                                external_id=str(external_id), is_price_reduced=True,
+                                first_detected_at=now, last_detected_at=now,
+                            )
+                            session.add(integrity_row)
+                            integrity[str(external_id)] = integrity_row
+                        else:
+                            integrity_row.is_price_reduced = True
+                            integrity_row.last_detected_at = now
+                        nonorganic_ids.add(str(external_id))
+                    else:
+                        new_items.append(item)
+                    continue
+
+                old_price_text = row.price_text
+                old_price_eur = row.price_eur
+                already_nonorganic = bool(getattr(row, "is_promoted", False)) or bool(
+                    getattr(row, "is_price_reduced", False)
+                )
+                if item_reduced:
+                    row.is_price_reduced = True
+                    already_nonorganic = True
+                    nonorganic_ids.add(str(external_id))
+                    if integrity_row is None:
+                        integrity_row = ListingIntegrity(
+                            external_id=str(external_id), is_price_reduced=True,
+                            first_detected_at=now, last_detected_at=now,
+                        )
+                        session.add(integrity_row)
+                        integrity[str(external_id)] = integrity_row
+                    else:
+                        integrity_row.is_price_reduced = True
+                        integrity_row.last_detected_at = now
+                price_dropped = bool(
+                    old_price_eur is not None
+                    and item.price_eur is not None
+                    and int(item.price_eur) < int(old_price_eur)
+                )
+                if price_dropped:
+                    row.is_price_reduced = True
+                    integrity_row = integrity.get(str(external_id))
+                    if integrity_row is None:
+                        integrity_row = ListingIntegrity(
+                            external_id=str(external_id), is_price_reduced=True,
+                            first_detected_at=now, last_detected_at=now,
+                        )
+                        session.add(integrity_row)
+                        integrity[str(external_id)] = integrity_row
+                    else:
+                        integrity_row.is_price_reduced = True
+                        integrity_row.last_detected_at = now
+                    nonorganic_ids.add(str(external_id))
+                    already_nonorganic = True
+
+                # Never erase a previously parsed price because of one weak HTML response.
+                if item.price_text is not None:
+                    if old_price_text is None and item.price_text and not already_nonorganic:
+                        enriched_count += 1
+                    if (old_price_text, old_price_eur) != (item.price_text, item.price_eur):
+                        if old_price_text is not None or old_price_eur is not None:
                             session.add(PriceHistory(
-                                external_id=external_id, price_text=item.price_text,
-                                price_eur=item.price_eur, recorded_at=now,
+                                external_id=external_id, price_text=old_price_text,
+                                price_eur=old_price_eur, recorded_at=now - timedelta(microseconds=1),
                             ))
-                        row.price_text = item.price_text
-                        row.price_eur = item.price_eur
-                    row.category_key = category_key
-                    row.category = category_name
-                    row.title = item.title
-                    _apply_identity(row, item.title, category_name)
-                    row.posted_text = item.posted_text
-                    parsed_day = posted_date_moscow(item.posted_text)
-                    row.posted_date_msk = parsed_day.isoformat() if parsed_day else row.posted_date_msk
-                    row.url = item.url
-                    row.last_seen_at = now
-                    row.is_active = True
-                    row.is_promoted = False
-                    row.disappeared_at = None
+                        session.add(PriceHistory(
+                            external_id=external_id, price_text=item.price_text,
+                            price_eur=item.price_eur, recorded_at=now,
+                        ))
+                    row.price_text = item.price_text
+                    row.price_eur = item.price_eur
+                row.category_key = category_key
+                row.category = category_name
+                row.title = item.title
+                _apply_identity(row, item.title, category_name)
+                row.posted_text = item.posted_text
+                parsed_day = posted_date_moscow(item.posted_text)
+                row.posted_date_msk = parsed_day.isoformat() if parsed_day else row.posted_date_msk
+                row.url = item.url
+                row.last_seen_at = now
+                row.is_active = True
+                # is_promoted / is_price_reduced are intentionally NOT reset here.
+                row.disappeared_at = None
+                if bool(getattr(row, "is_promoted", False)) or bool(getattr(row, "is_price_reduced", False)):
+                    if str(external_id) not in integrity:
+                        integrity_row = ListingIntegrity(
+                            external_id=str(external_id),
+                            is_promoted=bool(getattr(row, "is_promoted", False)),
+                            is_price_reduced=bool(getattr(row, "is_price_reduced", False)),
+                            first_detected_at=now, last_detected_at=now,
+                        )
+                        session.add(integrity_row)
+                        integrity[str(external_id)] = integrity_row
+                    nonorganic_ids.add(str(external_id))
+
             await session.commit()
-            return new_items, len(unique) - len(new_items), enriched_count
 
-async def mark_promoted_listings(external_ids: list[str] | set[str]) -> int:
-    """Hide paid-visibility ads that were already stored by an older parser run.
+    if nonorganic_ids:
+        await purge_nonorganic_analytics(nonorganic_ids)
+    clean_known = max(0, (len(unique) - len(new_items)) - len(nonorganic_ids))
+    return new_items, clean_known, enriched_count, nonorganic_ids
 
-    We do not create rows for promoted-only cards. Existing rows are marked so
-    today's global exports/popular lists stop showing them immediately. If the
-    feature expires, a later organic sighting resets is_promoted in upsert_page_items.
-    """
+
+async def _mark_nonorganic_flag(external_ids: list[str] | set[str], *, field: str) -> int:
     ids = {str(x).strip() for x in external_ids if str(x).strip()}
     if not ids:
         return 0
+    changed = 0
+    now = datetime.utcnow()
     async with db_write_lock:
         async with SessionLocal() as session:
             result = await session.execute(select(Listing).where(Listing.external_id.in_(list(ids))))
-            rows = list(result.scalars().all())
-            changed = 0
-            for row in rows:
-                if not getattr(row, "is_promoted", False):
-                    row.is_promoted = True
+            rows = {row.external_id: row for row in result.scalars().all()}
+            integrity_rows = list((await session.execute(
+                select(ListingIntegrity).where(ListingIntegrity.external_id.in_(list(ids)))
+            )).scalars().all())
+            registry = {row.external_id: row for row in integrity_rows}
+            for external_id in ids:
+                integrity_row = registry.get(external_id)
+                if integrity_row is None:
+                    integrity_row = ListingIntegrity(
+                        external_id=external_id, first_detected_at=now, last_detected_at=now
+                    )
+                    session.add(integrity_row)
+                    registry[external_id] = integrity_row
+                integrity_row.last_detected_at = now
+                if not bool(getattr(integrity_row, field, False)):
+                    setattr(integrity_row, field, True)
                     changed += 1
-            if changed:
-                await session.commit()
-            return changed
+                row = rows.get(external_id)
+                if row is not None and not bool(getattr(row, field, False)):
+                    setattr(row, field, True)
+            await session.commit()
+    # Purge even when the flag was already set: a stale Radar/AI signal from an
+    # older release may still exist and this operation is idempotent.
+    await purge_nonorganic_analytics(ids)
+    return changed
+
+
+async def mark_promoted_listings(external_ids: list[str] | set[str]) -> int:
+    """Permanently exclude a listing once paid visibility is observed."""
+    return await _mark_nonorganic_flag(external_ids, field="is_promoted")
+
+
+async def mark_price_reduced_listings(external_ids: list[str] | set[str]) -> int:
+    """Permanently exclude a listing once crossed/reduced pricing is observed."""
+    return await _mark_nonorganic_flag(external_ids, field="is_price_reduced")
 
 
 def berlin_date_key() -> str:
@@ -2780,13 +2911,16 @@ def berlin_today_utc_bounds() -> tuple[datetime, datetime]:
     )
 
 
-async def today_rows() -> list[Listing]:
+async def today_rows(*, include_price_reduced: bool = False) -> list[Listing]:
     start_utc, end_utc = berlin_today_utc_bounds()
+    conditions = [
+        Listing.first_seen_at >= start_utc, Listing.first_seen_at < end_utc,
+        Listing.is_promoted.is_(False),
+    ]
+    if not include_price_reduced:
+        conditions.append(Listing.is_price_reduced.is_(False))
     async with SessionLocal() as session:
-        result = await session.execute(select(Listing).where(
-            Listing.first_seen_at >= start_utc, Listing.first_seen_at < end_utc,
-            Listing.is_promoted.is_(False),
-        ))
+        result = await session.execute(select(Listing).where(*conditions))
         return list(result.scalars().all())
 
 
@@ -3350,7 +3484,11 @@ async def enrich_page_view_counts(
         return 0, 0, 0
 
     async with SessionLocal() as session:
-        result = await session.execute(select(Listing).where(Listing.external_id.in_(list(unique))))
+        result = await session.execute(select(Listing).where(
+            Listing.external_id.in_(list(unique)),
+            Listing.is_promoted.is_(False),
+            Listing.is_price_reduced.is_(False),
+        ))
         rows = {row.external_id: row for row in result.scalars().all()}
         # Accurate Views Core always verifies every target in the current
         # measurement. A previously stored value is never allowed to satisfy a
@@ -3398,7 +3536,11 @@ async def enrich_page_view_counts(
     url_to_id = {item.url: item.external_id for item in targets}
     async with db_write_lock:
         async with SessionLocal() as session:
-            db_result = await session.execute(select(Listing).where(Listing.external_id.in_([item.external_id for item in targets])))
+            db_result = await session.execute(select(Listing).where(
+                Listing.external_id.in_([item.external_id for item in targets]),
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
+            ))
             db_rows = {row.external_id: row for row in db_result.scalars().all()}
             for url, vr in results.items():
                 external_id = url_to_id.get(url)
@@ -3455,7 +3597,11 @@ async def enrich_autoscan_view_counts(
         return 0, 0, 0
 
     async with SessionLocal() as session:
-        result = await session.execute(select(Listing).where(Listing.external_id.in_(list(unique))))
+        result = await session.execute(select(Listing).where(
+            Listing.external_id.in_(list(unique)),
+            Listing.is_promoted.is_(False),
+            Listing.is_price_reduced.is_(False),
+        ))
         rows = {row.external_id: row for row in result.scalars().all()}
         targets = [unique[eid] for eid in rows if eid in unique]
         previous_views = {eid: int(row.view_count or -1) for eid, row in rows.items()}
@@ -3548,7 +3694,11 @@ async def enrich_autoscan_view_counts(
     async with db_write_lock:
         async with SessionLocal() as session:
             db_result = await session.execute(
-                select(Listing).where(Listing.external_id.in_([item.external_id for item in targets]))
+                select(Listing).where(
+                    Listing.external_id.in_([item.external_id for item in targets]),
+                    Listing.is_promoted.is_(False),
+                    Listing.is_price_reduced.is_(False),
+                )
             )
             db_rows = {row.external_id: row for row in db_result.scalars().all()}
             for url in urls:
@@ -3608,7 +3758,12 @@ async def refresh_view_counts(
     else:
         effective_ttl = VIEW_COUNT_CACHE_TTL_SECONDS if max_age_seconds is None else max(0, int(max_age_seconds))
     cutoff = datetime.utcnow() - timedelta(seconds=effective_ttl)
-    eligible = [row for row in rows if row.url]
+    eligible = [
+        row for row in rows
+        if row.url
+        and not bool(getattr(row, "is_promoted", False))
+        and not bool(getattr(row, "is_price_reduced", False))
+    ]
     targets = [
         row for row in eligible
         if force or row.views_checked_at is None or row.views_checked_at < cutoff
@@ -3676,7 +3831,11 @@ async def refresh_view_counts(
     url_to_id = {row.url: row.external_id for row in targets}
     async with db_write_lock:
         async with SessionLocal() as session:
-            result = await session.execute(select(Listing).where(Listing.external_id.in_(list(by_id))))
+            result = await session.execute(select(Listing).where(
+                Listing.external_id.in_(list(by_id)),
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
+            ))
             db_rows = {row.external_id: row for row in result.scalars().all()}
             for url, vr in results.items():
                 external_id = url_to_id.get(url)
@@ -4823,7 +4982,11 @@ async def send_smart_export(
     s = await get_settings(user_id)
     mode = s.output_mode
     effective_price_filter = (price_filter_override or "any").strip()
-    all_rows = list(rows_override) if rows_override is not None else await today_rows()
+    all_rows = (
+        list(rows_override)
+        if rows_override is not None
+        else await today_rows(include_price_reduced=(mode == "price_drop"))
+    )
     selected_keys = category_keys_override if category_keys_override is not None else await get_selected(user_id)
     if selected_keys:
         all_rows = [row for row in all_rows if row.category_key in selected_keys]
@@ -5072,6 +5235,7 @@ class ScanResult:
     missing_date_count: int = 0
     missing_price_count: int = 0
     promoted_filtered: int = 0
+    price_reduced_filtered: int = 0
     duplicate_count: int = 0
     invalid_pages: int = 0
     repeated_pages: int = 0
@@ -5502,6 +5666,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
     missing_date_count = 0
     missing_price_count = 0
     promoted_filtered = 0
+    price_reduced_filtered = 0
     duplicate_count = 0
     invalid_pages = 0
     repeated_pages = 0
@@ -5575,11 +5740,18 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         if not target_items:
             return 0
         processed_target_ids.update(item.external_id for item in target_items)
+        new_items, known_count, enriched_count, nonorganic_ids = await upsert_page_items(
+            cat.key, cat.name, target_items
+        )
+        if nonorganic_ids:
+            target_items = [item for item in target_items if item.external_id not in nonorganic_ids]
+        if not target_items:
+            update_quality_live()
+            return 0
         target_seen_any = True
         today_seen += len(target_items)
         if not first_page_head_ids:
             first_page_head_ids = [item.external_id for item in target_items[:INCREMENTAL_HEAD_SIZE]]
-        new_items, known_count, enriched_count = await upsert_page_items(cat.key, cat.name, target_items)
         live = category_live_progress.get(progress_key)
         if need_view_counts:
             for item in target_items:
@@ -5604,7 +5776,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         base_url = private_provider_url(base_url)
         """Locate the first target-date page inside one verified <=50-page feed."""
         nonlocal network_requests, cards_seen, listings_parsed, missing_date_count
-        nonlocal missing_price_count, promoted_filtered, duplicate_count, invalid_pages
+        nonlocal missing_price_count, promoted_filtered, price_reduced_filtered, duplicate_count, invalid_pages
         nonlocal repeated_pages, low_quality_pages, verified_pages
         cache: dict[int, object] = {}
         fingerprints: dict[str, int] = {}
@@ -5641,7 +5813,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
         async def fetch(page: int, phase: str):
             nonlocal network_requests, effective_limit, site_max_page, discovered_shards, invalid_note, last_invalid_kind
             nonlocal cards_seen, listings_parsed, missing_date_count, missing_price_count
-            nonlocal promoted_filtered, duplicate_count, invalid_pages, repeated_pages
+            nonlocal promoted_filtered, price_reduced_filtered, duplicate_count, invalid_pages, repeated_pages
             nonlocal low_quality_pages, verified_pages
             page = max(1, min(effective_limit, int(page)))
             fresh = page not in cache
@@ -5768,6 +5940,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 promoted_ids = list(getattr(info, "promoted_ids", None) or [])
                 if promoted_ids:
                     await mark_promoted_listings(promoted_ids)
+                price_reduced_ids = list(getattr(info, "price_reduced_ids", None) or [])
+                if price_reduced_ids:
+                    await mark_price_reduced_listings(price_reduced_ids)
                 if not from_checkpoint:
                     network_requests += 1
                 if getattr(info, "max_page", None):
@@ -5824,6 +5999,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     "missing_date": int(getattr(info, "missing_date_count", 0) or 0),
                     "missing_price": int(getattr(info, "missing_price_count", 0) or 0),
                     "promoted": int(getattr(info, "promoted_filtered", 0) or 0),
+                    "price_reduced": int(getattr(info, "price_reduced_filtered", 0) or 0),
                     "duplicates": int(getattr(info, "duplicate_cards", 0) or 0),
                     "verified": 1 if bool(getattr(info, "page_verified", False)) else 0,
                 }
@@ -5833,6 +6009,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 missing_date_count += current_metrics["missing_date"] - int(previous_metrics.get("missing_date", 0))
                 missing_price_count += current_metrics["missing_price"] - int(previous_metrics.get("missing_price", 0))
                 promoted_filtered += current_metrics["promoted"] - int(previous_metrics.get("promoted", 0))
+                price_reduced_filtered += current_metrics["price_reduced"] - int(previous_metrics.get("price_reduced", 0))
                 duplicate_count += current_metrics["duplicates"] - int(previous_metrics.get("duplicates", 0))
                 verified_pages += current_metrics["verified"] - int(previous_metrics.get("verified", 0))
                 page_quality_metrics[metric_key] = current_metrics
@@ -5912,13 +6089,14 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             last_invalid_kind = invalid_reason
             log.info(
                 "category=%s feed=%s phase=%s page=%s relation=%s actual=%s max=%s verified=%s "
-                "date_cov=%.0f%% parsed=%s missing_date=%s raw=%s promoted=%s duplicates=%s valid=%s "
+                "date_cov=%.0f%% parsed=%s missing_date=%s raw=%s promoted=%s reduced_price=%s duplicates=%s valid=%s "
                 "invalid_reason=%s requests=%s checkpoint=%s",
                 cat.name, feed_name, phase, page, relation,
                 getattr(info, "actual_page", None), getattr(info, "max_page", None),
                 getattr(info, "page_verified", False), float(getattr(info, "date_coverage", 0.0) or 0.0) * 100,
                 len(items), getattr(info, "missing_date_count", 0), getattr(info, "raw_candidates", 0),
-                getattr(info, "promoted_filtered", 0), getattr(info, "duplicate_cards", 0), valid, invalid_reason,
+                getattr(info, "promoted_filtered", 0), getattr(info, "price_reduced_filtered", 0),
+                getattr(info, "duplicate_cards", 0), valid, invalid_reason,
                 network_requests, from_checkpoint,
             )
             return items, relation, pairs, days
@@ -7190,6 +7368,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             missing_date_count=missing_date_count,
             missing_price_count=missing_price_count,
             promoted_filtered=promoted_filtered,
+            price_reduced_filtered=price_reduced_filtered,
             duplicate_count=duplicate_count,
             invalid_pages=invalid_pages,
             repeated_pages=repeated_pages,
@@ -7214,9 +7393,9 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 log.debug("Could not persist stable category job summary", exc_info=True)
         log.info(
             "category=%s v3.1-quality target=%s depth=%s requests=%s matched=%s complete=%s quality=%s "
-            "cards=%s parsed=%s missing_date=%s promoted=%s duplicates=%s invalid_pages=%s repeated_pages=%s low_quality=%s views_failed=%s reason=%s",
+            "cards=%s parsed=%s missing_date=%s promoted=%s reduced_price=%s duplicates=%s invalid_pages=%s repeated_pages=%s low_quality=%s views_failed=%s reason=%s",
             cat.name, target_date, depth, pages_scanned, today_seen, request_complete, quality_score,
-            cards_seen, listings_parsed, missing_date_count, promoted_filtered, duplicate_count,
+            cards_seen, listings_parsed, missing_date_count, promoted_filtered, price_reduced_filtered, duplicate_count,
             invalid_pages, repeated_pages, low_quality_pages, view_failures, reason,
         )
         await cancel_hidden_date_prewarm()
@@ -10099,7 +10278,11 @@ async def _ai_candidate_rows(kind: str, limit: int = 15) -> list[tuple[AIEarlyWi
             select(AIEarlyWinnerCandidate, Listing, UserScan)
             .join(Listing, Listing.external_id == AIEarlyWinnerCandidate.external_id)
             .join(UserScan, UserScan.id == AIEarlyWinnerCandidate.scan_id)
-            .where(AIEarlyWinnerCandidate.is_control.is_(False))
+            .where(
+                AIEarlyWinnerCandidate.is_control.is_(False),
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
+            )
         )
         if kind == "new":
             unread_ids = (
@@ -10194,7 +10377,11 @@ async def _admin_ai_candidate(candidate_id: int, requested_back_kind: str | None
             select(AIEarlyWinnerCandidate, Listing, UserScan)
             .join(Listing, Listing.external_id == AIEarlyWinnerCandidate.external_id)
             .join(UserScan, UserScan.id == AIEarlyWinnerCandidate.scan_id)
-            .where(AIEarlyWinnerCandidate.id == int(candidate_id))
+            .where(
+                AIEarlyWinnerCandidate.id == int(candidate_id),
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
+            )
         )).one_or_none()
         if row is None:
             return None
@@ -15889,6 +16076,14 @@ async def main() -> None:
             "disabled on Railway so production cannot silently run in mode=local."
         )
     await init_db()
+    organic_cleanup = await purge_nonorganic_analytics(
+        infer_historical_price_drops=True
+    )
+    if organic_cleanup.get("dirty_listings", 0):
+        log.warning(
+            "v4.15.2 Organic Demand Integrity cleanup: %s",
+            organic_cleanup,
+        )
     invalidated_views = await invalidate_untrusted_view_analytics_once()
     if invalidated_views:
         log.warning(

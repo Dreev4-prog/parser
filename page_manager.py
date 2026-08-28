@@ -40,6 +40,10 @@ REDIS_URL = os.getenv("REDIS_URL", "").strip()
 # rollback without changing code or removing the Railway service.
 REMOTE_PAGE_WORKER_ENABLED = _env_bool("REMOTE_PAGE_WORKER_ENABLED", bool(REDIS_URL))
 PAGE_REDIS_PREFIX = os.getenv("PAGE_REDIS_PREFIX", "dtparser:pageworker").strip() or "dtparser:pageworker"
+# v4.15.2 changes the page payload/filter semantics. Keep the 180-second cache
+# schema-scoped so a freshly deployed parser cannot consume a pre-v4.15.2 page
+# that still contains TOP or crossed-price cards.
+PAGE_CACHE_SCHEMA = "v4152-organic"
 # v4.8.3: cache is stable, queue/pending/worker state is release-scoped.
 PAGE_RUNTIME_PREFIX = os.getenv(
     "PAGE_RUNTIME_PREFIX", f"{PAGE_REDIS_PREFIX}:runtime:v483"
@@ -109,6 +113,7 @@ def serialize_page_info(info: CategoryPageInfo) -> str:
                 "price_eur": item.price_eur,
                 "url": str(item.url or ""),
                 "posted_text": item.posted_text,
+                "is_price_reduced": bool(getattr(item, "is_price_reduced", False)),
             }
             for item in (info.items or [])
         ],
@@ -123,6 +128,8 @@ def serialize_page_info(info: CategoryPageInfo) -> str:
         "raw_candidates": int(info.raw_candidates or 0),
         "promoted_filtered": int(info.promoted_filtered or 0),
         "promoted_ids": list(info.promoted_ids or []),
+        "price_reduced_filtered": int(info.price_reduced_filtered or 0),
+        "price_reduced_ids": list(info.price_reduced_ids or []),
         "duplicate_cards": int(info.duplicate_cards or 0),
         "missing_date_count": int(info.missing_date_count or 0),
         "missing_price_count": int(info.missing_price_count or 0),
@@ -158,6 +165,7 @@ def deserialize_page_info(raw: str | bytes | None) -> CategoryPageInfo | None:
                 price_eur=(int(row["price_eur"]) if row.get("price_eur") is not None else None),
                 url=url,
                 posted_text=row.get("posted_text"),
+                is_price_reduced=bool(row.get("is_price_reduced", False)),
             ))
         shards: list[tuple[str, int | None]] = []
         for shard in data.get("location_shards") or []:
@@ -188,6 +196,8 @@ def deserialize_page_info(raw: str | bytes | None) -> CategoryPageInfo | None:
             raw_candidates=int(data.get("raw_candidates") or 0),
             promoted_filtered=int(data.get("promoted_filtered") or 0),
             promoted_ids=[str(x) for x in (data.get("promoted_ids") or []) if str(x)],
+            price_reduced_filtered=int(data.get("price_reduced_filtered") or 0),
+            price_reduced_ids=[str(x) for x in (data.get("price_reduced_ids") or []) if str(x)],
             duplicate_cards=int(data.get("duplicate_cards") or 0),
             missing_date_count=int(data.get("missing_date_count") or 0),
             missing_price_count=int(data.get("missing_price_count") or 0),
@@ -262,7 +272,7 @@ class RemotePageManager:
                 pass
 
     def cache_key(self, cache_id: str) -> str:
-        return f"{PAGE_REDIS_PREFIX}:cache:{cache_id}"
+        return f"{PAGE_REDIS_PREFIX}:cache:{PAGE_CACHE_SCHEMA}:{cache_id}"
 
     def pending_key(self, cache_id: str) -> str:
         return f"{PAGE_RUNTIME_PREFIX}:pending:{cache_id}"

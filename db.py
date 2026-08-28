@@ -169,6 +169,23 @@ async def init_db() -> None:
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_invites_promo_eligible ON referral_invites (promo_eligible)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_invites_created_at ON referral_invites (created_at)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_referral_invites_rewarded_at ON referral_invites (rewarded_at)"))
+            # v4.15.2: sticky registry for ads whose demand is non-organic.
+            await conn.execute(text(
+                """
+                CREATE TABLE IF NOT EXISTS listing_integrity (
+                    external_id VARCHAR(64) PRIMARY KEY,
+                    is_promoted BOOLEAN NOT NULL DEFAULT FALSE,
+                    is_price_reduced BOOLEAN NOT NULL DEFAULT FALSE,
+                    first_detected_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_detected_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            ))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_listing_integrity_is_promoted ON listing_integrity (is_promoted)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_listing_integrity_is_price_reduced ON listing_integrity (is_price_reduced)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_listing_integrity_first_detected_at ON listing_integrity (first_detected_at)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_listing_integrity_last_detected_at ON listing_integrity (last_detected_at)"))
+
             # v4.14.0: DT Radar Lifecycle / Fast Sold. PostgreSQL itself is the
             # durable queue so a dedicated Lifecycle Worker needs no Redis and a
             # parser restart cannot lose pending availability checks.
@@ -268,12 +285,19 @@ async def init_db() -> None:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN is_active BOOLEAN DEFAULT TRUE"))
         if columns and "is_promoted" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN is_promoted BOOLEAN DEFAULT FALSE"))
+        if columns and "is_price_reduced" not in columns:
+            if _IS_POSTGRES:
+                await conn.execute(text("ALTER TABLE listings ADD COLUMN IF NOT EXISTS is_price_reduced BOOLEAN DEFAULT FALSE"))
+            else:
+                await conn.execute(text("ALTER TABLE listings ADD COLUMN is_price_reduced BOOLEAN DEFAULT FALSE"))
         if columns and "disappeared_at" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN disappeared_at TIMESTAMP"))
         if columns and "view_count" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN view_count INTEGER"))
         if columns and "views_checked_at" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN views_checked_at TIMESTAMP"))
+        if _IS_POSTGRES:
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_listings_is_price_reduced ON listings (is_price_reduced)"))
 
         identity_columns = {
             "identity_key": "VARCHAR(500)",

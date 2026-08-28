@@ -25,8 +25,12 @@ class Listing(Base):
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     # Paid Kleinanzeigen visibility feature (Hochschieben/Top/Highlight/Galerie).
-    # Kept separately from is_active so a promoted ad can become organic again later.
+    # v4.15.2 treats this as sticky demand contamination: accumulated views from
+    # paid visibility cannot become organic again merely because the badge expires.
     is_promoted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    # v4.15.2 Organic Demand Integrity. Sticky once detected: a listing that has
+    # ever shown an explicit crossed/previous price must never train demand stats.
+    is_price_reduced: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     disappeared_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     view_count: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     views_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
@@ -43,6 +47,23 @@ class Listing(Base):
     identity_ram_gb: Mapped[int | None] = mapped_column(Integer, nullable=True)
     identity_specs: Mapped[str | None] = mapped_column(String(300), nullable=True)
     identity_confidence: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
+
+class ListingIntegrity(Base):
+    """Sticky exclusion registry for non-organic demand samples.
+
+    A paid/reduced card may be filtered before a normal Listing row exists. Keeping
+    the external id here prevents the same ad from entering analytics later after
+    the paid badge/crossed price disappears while its accumulated views remain.
+    """
+
+    __tablename__ = "listing_integrity"
+
+    external_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    is_promoted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    is_price_reduced: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    first_detected_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    last_detected_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 class PriceHistory(Base):
