@@ -5,6 +5,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -37,6 +38,9 @@ log = logging.getLogger("dtparser-radar")
 RADAR_BACKFILL_SETTING = "dt_radar_v1_backfill_complete"
 RADAR_SCAN_TOP_LIMIT = 12
 RADAR_PAGE_SIZE = 8
+# v4.15.5: after parser-level HTTP + browser recovery, wait once and retry only
+# the blocked detail candidate. This is much cheaper than re-scanning its category.
+RADAR_DETAIL_FINAL_RETRY_SECONDS = 2.5
 
 # v4.14.0 Fast Sold / Lifecycle. Strong fresh Radar listings are watched at
 # absolute checkpoints after first discovery. A disappearance is never accepted
@@ -209,6 +213,19 @@ async def _live_detail_organic_gate(listing: Listing) -> tuple[bool, str, dateti
         verdict = await parser.inspect_detail_integrity(
             url, expected_external_id=external_id, traffic_priority=detail_priority
         )
+        if not verdict.verified and str(verdict.reason or "") != "unavailable":
+            # v4.15.5 targeted recovery: retry only this exact candidate after the
+            # parser exhausted HTTP + rendered-browser recovery. Do not re-scan 15
+            # category pages merely because one detail request was transiently weak.
+            if RADAR_DETAIL_FINAL_RETRY_SECONDS > 0:
+                await asyncio.sleep(RADAR_DETAIL_FINAL_RETRY_SECONDS)
+            try:
+                await parser.reset_scan_browser_context()
+            except Exception:
+                log.debug("Final detail retry context reset failed external_id=%s", external_id, exc_info=True)
+            verdict = await parser.inspect_detail_integrity(
+                url, expected_external_id=external_id, traffic_priority=detail_priority
+            )
     if not verdict.verified:
         return False, str(verdict.reason or "detail_unknown"), None
     if verdict.is_promoted or verdict.is_price_reduced:
@@ -234,6 +251,7 @@ class RadarAdmissionStats:
     promoted_blocked: int = 0
     reduced_blocked: int = 0
     unknown_blocked: int = 0
+    unknown_reasons: tuple[tuple[str, int], ...] = ()
     db_blocked: int = 0
     admitted: int = 0
     already_present: int = 0
@@ -749,6 +767,7 @@ async def record_autoscan_hot_detailed(
 
     clean_round = str(round_id or "round").replace(":", "-")[:48]
     considered = checked = organic = promoted = reduced = unknown = db_blocked = admitted = already_present = saved = 0
+    unknown_reasons: Counter[str] = Counter()
     for listing in reserve:
         if admitted >= target:
             break
@@ -762,6 +781,8 @@ async def record_autoscan_hot_detailed(
                 reduced += 1
             else:
                 unknown += 1
+                normalized_reason = str(detail_reason or "detail_unknown")
+                unknown_reasons[normalized_reason] += 1
             log.info(
                 "Radar organic candidate rejected round=%s category=%s external_id=%s rank=%s reason=%s",
                 clean_round, category_key, listing.external_id, considered, detail_reason,
@@ -815,6 +836,7 @@ async def record_autoscan_hot_detailed(
         promoted_blocked=promoted,
         reduced_blocked=reduced,
         unknown_blocked=unknown,
+        unknown_reasons=tuple(sorted(unknown_reasons.items(), key=lambda item: (-item[1], item[0]))),
         db_blocked=db_blocked,
         admitted=admitted,
         already_present=already_present,
@@ -827,6 +849,11 @@ async def record_autoscan_hot_detailed(
         stats.reduced_blocked, stats.unknown_blocked, stats.db_blocked, stats.admitted,
         stats.already_present, stats.saved, target,
     )
+    if stats.unknown_reasons:
+        log.info(
+            "DT Radar autoscan unknown reasons round=%s category=%s reasons=%s",
+            clean_round, category_key, dict(stats.unknown_reasons),
+        )
     return stats
 
 

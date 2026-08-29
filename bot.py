@@ -4136,6 +4136,7 @@ def _radar_autoscan_default_state() -> dict:
         "radar_promoted_blocked": 0,
         "radar_reduced_blocked": 0,
         "radar_unknown_blocked": 0,
+        "radar_unknown_reasons": {},
         "radar_db_blocked": 0,
         "radar_already_present": 0,
         "failed_categories": [],
@@ -4164,6 +4165,12 @@ def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
     state["stop_requested"] = bool(state.get("stop_requested"))
     state["waiting_for_users"] = bool(state.get("waiting_for_users"))
     state["history"] = list(state.get("history") or [])[:RADAR_AUTOSCAN_HISTORY_LIMIT]
+    raw_unknown_reasons = state.get("radar_unknown_reasons") or {}
+    state["radar_unknown_reasons"] = {
+        str(key)[:64]: max(0, int(value or 0))
+        for key, value in (raw_unknown_reasons.items() if isinstance(raw_unknown_reasons, dict) else [])
+        if str(key).strip()
+    }
 
     failures = []
     inferred_review = 0
@@ -4307,6 +4314,7 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
         "radar_promoted_blocked": 0,
         "radar_reduced_blocked": 0,
         "radar_unknown_blocked": 0,
+        "radar_unknown_reasons": {},
         "radar_db_blocked": 0,
         "radar_already_present": 0,
         "failed_categories": [],
@@ -4377,6 +4385,7 @@ def _radar_autoscan_retry_round(state: dict) -> dict | None:
         "radar_promoted_blocked": 0,
         "radar_reduced_blocked": 0,
         "radar_unknown_blocked": 0,
+        "radar_unknown_reasons": {},
         "radar_db_blocked": 0,
         "radar_already_present": 0,
         "failed_categories": [],
@@ -4416,6 +4425,16 @@ def _radar_autoscan_duration_seconds(started_at: str) -> int:
         return max(0, int((now - started.astimezone(MOSCOW)).total_seconds()))
     except Exception:
         return 0
+
+
+def _radar_unknown_reason_text(reasons: dict | None, *, limit: int = 5) -> str:
+    if not isinstance(reasons, dict):
+        return ""
+    rows = sorted(
+        ((str(k), int(v or 0)) for k, v in reasons.items() if int(v or 0) > 0),
+        key=lambda item: (-item[1], item[0]),
+    )[:max(1, int(limit))]
+    return " · ".join(f"{html.escape(key)} {value}" for key, value in rows)
 
 
 def _human_duration(seconds: int) -> str:
@@ -4498,7 +4517,8 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         f"TOP/Promo: <b>{int(state.get('radar_promoted_blocked') or 0)}</b> · "
         f"снижение: <b>{int(state.get('radar_reduced_blocked') or 0)}</b> · "
         f"unknown: <b>{int(state.get('radar_unknown_blocked') or 0)}</b>\n"
-        f"📡 Новых Radar-сигналов: <b>{int(state.get('radar_saved') or 0)}</b>"
+        + (f"↳ причины: {_radar_unknown_reason_text(state.get('radar_unknown_reasons'))}\n" if int(state.get('radar_unknown_blocked') or 0) else "")
+        + f"📡 Новых Radar-сигналов: <b>{int(state.get('radar_saved') or 0)}</b>"
         + (f" · ♻️ уже были: <b>{int(state.get('radar_already_present') or 0)}</b>" if int(state.get("radar_already_present") or 0) else "") + "\n\n"
         f"Ежедневный круг: <b>{'✅ ВКЛ' if state.get('daily_enabled') else '⏸ ВЫКЛ'}</b>\n"
         f"Время: <b>{html.escape(str(state.get('daily_time') or RADAR_AUTOSCAN_DEFAULT_TIME))} МСК</b>\n"
@@ -4635,6 +4655,7 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         "radar_promoted_blocked": int(state.get("radar_promoted_blocked") or 0),
         "radar_reduced_blocked": int(state.get("radar_reduced_blocked") or 0),
         "radar_unknown_blocked": int(state.get("radar_unknown_blocked") or 0),
+        "radar_unknown_reasons": dict(state.get("radar_unknown_reasons") or {}),
         "radar_db_blocked": int(state.get("radar_db_blocked") or 0),
         "radar_already_present": int(state.get("radar_already_present") or 0),
         "radar_saved": int(state.get("radar_saved") or 0),
@@ -4690,6 +4711,7 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         + f"\n🚫 Сразу исключено: TOP/Promo <b>{int(summary['search_promoted_filtered'])}</b> · снижение <b>{int(summary['search_reduced_filtered'])}</b>"
         + f"\n👁 Точные просмотры: <b>{int(summary['views_verified'])}/{int(summary['views_requested'])}</b>"
         + f"\n🛡 Organic: <b>{int(summary['radar_organic_passed'])}</b> · TOP/Promo <b>{int(summary['radar_promoted_blocked'])}</b> · снижение <b>{int(summary['radar_reduced_blocked'])}</b> · unknown <b>{int(summary['radar_unknown_blocked'])}</b>"
+        + (f"\n↳ unknown: {_radar_unknown_reason_text(summary.get('radar_unknown_reasons'))}" if int(summary.get('radar_unknown_blocked') or 0) else "")
         + f"\n📡 Новых Radar-сигналов: <b>+{int(summary['radar_saved'])}</b>"
         + (f" · уже были <b>{int(summary.get('radar_already_present') or 0)}</b>" if int(summary.get("radar_already_present") or 0) else "")
         + f"\n⏱ Время: <b>{_human_duration(duration)}</b>"
@@ -4832,9 +4854,11 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                     expected_slots = min(RADAR_SCAN_TOP_LIMIT, int(radar_stats.eligible_with_views or 0))
                     if int(radar_stats.unknown_blocked or 0) > 0:
                         failure_kind = "radar_gate_unknown"
+                        reason_text = _radar_unknown_reason_text(dict(radar_stats.unknown_reasons or ()))
                         error_text = (
                             f"Organic detail gate не подтвердил {int(radar_stats.unknown_blocked or 0)} "
                             f"вышестоящих кандидатов; подтверждено Radar {int(radar_stats.admitted or 0)}/{expected_slots}"
+                            + (f"; причины: {reason_text}" if reason_text else "")
                         )
                 else:
                     failure_kind = "partial"
@@ -4889,6 +4913,11 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                 state["radar_promoted_blocked"] = int(state.get("radar_promoted_blocked") or 0) + int(radar_stats.promoted_blocked or 0)
                 state["radar_reduced_blocked"] = int(state.get("radar_reduced_blocked") or 0) + int(radar_stats.reduced_blocked or 0)
                 state["radar_unknown_blocked"] = int(state.get("radar_unknown_blocked") or 0) + int(radar_stats.unknown_blocked or 0)
+                unknown_reasons = dict(state.get("radar_unknown_reasons") or {})
+                for reason, count in tuple(radar_stats.unknown_reasons or ()):
+                    key = str(reason or "detail_unknown")[:64]
+                    unknown_reasons[key] = int(unknown_reasons.get(key) or 0) + int(count or 0)
+                state["radar_unknown_reasons"] = unknown_reasons
                 state["radar_db_blocked"] = int(state.get("radar_db_blocked") or 0) + int(radar_stats.db_blocked or 0)
                 state["radar_already_present"] = int(state.get("radar_already_present") or 0) + int(radar_stats.already_present or 0)
 
@@ -6244,11 +6273,13 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 if attempt < STABLE_PAGE_RETRIES:
                     cache.pop(page, None)
                     await asyncio.sleep(STABLE_PAGE_RETRY_SECONDS * attempt)
-            # v4.2.0: if the exact page is still invalid after normal retries,
-            # recycle only this job's browser context and make one final request.
+            # v4.15.5: if the exact page is still invalid OR chronologically unknown
+            # after normal retries, recycle only this job's browser context and make
+            # one final request. A stale browser/session template must not make retry
+            # rounds reproduce the exact same UNKNOWN forever.
             # Do not restart the category and do not replay already verified pages.
             if (
-                STABLE_SINGLE_SERVICE_MODE and last is not None and last[1] == "invalid"
+                STABLE_SINGLE_SERVICE_MODE and last is not None and last[1] in {"unknown", "invalid"}
                 and getattr(parser, "scan_transport", "") == "browser"
             ):
                 try:
@@ -6448,10 +6479,14 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                                 if prev_relation == "newer":
                                     break
                                 if prev_relation == "unknown":
-                                    # Same conservative behaviour as the proven local
-                                    # locator: begin collection one page earlier so
-                                    # exact card dates, not the hint, decide inclusion.
-                                    candidate = prev
+                                    # v4.15.5: do not accept a remote hint across a
+                                    # persistently weak predecessor. Let the local
+                                    # locator/sequential recovery prove the boundary.
+                                    remote_weak = True
+                                    log.warning(
+                                        "Date Worker walkback predecessor unknown category=%s target=%s page=%s; local recovery",
+                                        cat.name, target_date, prev,
+                                    )
                                     break
                                 if prev_relation == "invalid":
                                     remote_weak = True
@@ -6496,6 +6531,11 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                     items, relation, pairs, days = await stable_fetch(page, "stable_scan")
                     if relation == "target":
                         saw_chronology = True
+                        if weak_total:
+                            return locator_result(
+                                "unknown",
+                                f"последовательный recovery встретил {weak_total} слабых страниц до найденной даты",
+                            )
                         try:
                             await save_date_index(
                                 cat.key, target_date, base_url, status="found",
@@ -6511,6 +6551,11 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                         page += 1
                         continue
                     if relation == "empty":
+                        if weak_total:
+                            return locator_result(
+                                "unknown",
+                                f"последовательный recovery завершился после {weak_total} слабых страниц",
+                            )
                         try:
                             await save_date_index(cat.key, target_date, base_url, status="absent", max_page=site_max_page)
                         except Exception:
@@ -6518,6 +6563,11 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                         return locator_result("absent", "последовательный проход завершил выдачу")
                     if relation == "older":
                         saw_chronology = True
+                        if weak_total:
+                            return locator_result(
+                                "unknown",
+                                f"последовательный recovery пересёк дату после {weak_total} слабых страниц",
+                            )
                         try:
                             await save_date_index(cat.key, target_date, base_url, status="absent", max_page=site_max_page)
                         except Exception:
@@ -6529,6 +6579,11 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                         return locator_result("absent", reason_text)
                     if relation == "mixed":
                         saw_chronology = True
+                        if weak_total:
+                            return locator_result(
+                                "unknown",
+                                f"последовательный recovery встретил границу после {weak_total} слабых страниц",
+                            )
                         try:
                             await save_date_index(cat.key, target_date, base_url, status="absent", max_page=site_max_page)
                         except Exception:
@@ -6552,6 +6607,19 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 except Exception:
                     pass
                 return locator_result("too_deep", "дата глубже публичного окна; перехожу к независимым регионам")
+
+            async def sequential_recovery(reason: str, start_page: int = 1):
+                start_page = max(1, min(effective_limit, int(start_page or 1)))
+                log.warning(
+                    "Date sequential recovery category=%s target=%s feed=%s start=%s reason=%s",
+                    cat.name, target_date, feed_name, start_page, reason,
+                )
+                result = await sequential_locator(start_page)
+                log.info(
+                    "Date sequential recovery result category=%s target=%s feed=%s status=%s candidate=%s requests=%s",
+                    cat.name, target_date, feed_name, result.get("status"), result.get("candidate_page"), network_requests,
+                )
+                return result
 
             async def recover_weak_probe(page: int, low_bound: int = 1, high_bound: int | None = None):
                 """Resolve one weak chronology probe locally, never with a full linear rewind.
@@ -6595,9 +6663,8 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                         cat.name, target_date, probe, recovered_page, recovered_relation,
                     )
                     if recovered_relation == "unknown":
-                        return locator_result(
-                            "unknown",
-                            f"не удалось подтвердить даты около страницы {probe}; полный линейный поиск отключён",
+                        return await sequential_recovery(
+                            f"weak exponential probe page={probe}", max(1, low_newer + 1)
                         )
                     probe = recovered_page
                     relation = recovered_relation
@@ -6633,9 +6700,8 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                         cat.name, target_date, mid, recovered_page, recovered_relation,
                     )
                     if recovered_relation == "unknown":
-                        return locator_result(
-                            "unknown",
-                            f"не удалось подтвердить границу даты около страницы {mid}",
+                        return await sequential_recovery(
+                            f"weak binary boundary page={mid}", max(1, low_newer + 1)
                         )
                     mid = recovered_page
                     relation = recovered_relation
@@ -6668,11 +6734,10 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                         if prev_relation == "newer":
                             break
                         if prev_relation == "unknown":
-                            # Start collection one page earlier rather than launching
-                            # an expensive full linear date search. Collection itself
-                            # will process only cards with an exact target-day date.
-                            candidate = prev
-                            break
+                            return await sequential_recovery(
+                                f"weak predecessor immediately before target page={candidate}",
+                                max(1, low_newer + 1),
+                            )
                         if prev_relation == "invalid":
                             return locator_result("invalid", invalid_note or f"не удалось получить страницу {prev}")
                         break
@@ -6709,14 +6774,15 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             if saw_older and low_newer == 0 and full_feed_visible and not saw_unknown:
                 return locator_result("absent", "самые новые объявления уже старше выбранной даты")
             if saw_unknown:
-                return locator_result("unknown", "часть страниц около границы даты не отдала надёжную дату")
+                return await sequential_recovery(
+                    "weak pages around verified boundary", max(1, low_newer + 1)
+                )
             # Large feeds need the existing hidden/regional logic rather than a
             # false zero when the public 50-page window cannot prove absence.
             if not full_feed_visible and saw_older:
                 return locator_result("ambiguous_absent", "large feed requires independent sub-feed verification")
-            return locator_result(
-                "unknown",
-                "быстрый поиск не смог надёжно определить границу даты без полного линейного прохода",
+            return await sequential_recovery(
+                "fast locator could not prove date boundary", max(1, low_newer + 1)
             )
 
         low_newer = 0

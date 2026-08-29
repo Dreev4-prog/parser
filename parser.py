@@ -42,6 +42,17 @@ CATEGORY_ACCESS_RETRY_MIN_SECONDS = max(0.25, min(5.0, float(os.getenv("CATEGORY
 CATEGORY_ACCESS_REFUSAL_RETRIES = max(0, min(2, int(os.getenv("CATEGORY_ACCESS_REFUSAL_RETRIES", "1"))))
 STOP_AFTER_EMPTY_TODAY_PAGES = max(1, int(os.getenv("STOP_AFTER_EMPTY_TODAY_PAGES", "2")))
 AVAILABILITY_TIMEOUT = max(5.0, float(os.getenv("AVAILABILITY_TIMEOUT", "20")))
+# v4.15.5 AutoScan Recovery Hardening. Radar detail admission is still fail-closed,
+# but a single transient HTTP response must not fail an otherwise healthy category.
+# The same public URL is retried gently, then one rendered Chromium check is used
+# as a compatibility fallback. No transport is allowed to convert UNKNOWN to clean
+# unless listing identity and organic markers are positively verified.
+DETAIL_INTEGRITY_HTTP_RETRIES = max(1, min(3, int(os.getenv("DETAIL_INTEGRITY_HTTP_RETRIES", "2"))))
+DETAIL_INTEGRITY_RETRY_DELAY_SECONDS = max(0.0, min(3.0, float(os.getenv("DETAIL_INTEGRITY_RETRY_DELAY_SECONDS", "0.45"))))
+DETAIL_INTEGRITY_BROWSER_FALLBACK = os.getenv("DETAIL_INTEGRITY_BROWSER_FALLBACK", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+DETAIL_INTEGRITY_BROWSER_SETTLE_MS = max(0, min(2000, int(os.getenv("DETAIL_INTEGRITY_BROWSER_SETTLE_MS", "180"))))
 # v3.1 parser-quality thresholds. A page with too few trustworthy publication
 # timestamps is never used as proof that a target date is absent.
 MIN_PAGE_DATE_COVERAGE = min(0.95, max(0.05, float(os.getenv("MIN_PAGE_DATE_COVERAGE", "0.20"))))
@@ -2999,31 +3010,11 @@ class KleinanzeigenParser:
         await report_progress()
         return results
 
-    async def inspect_detail_integrity(
-        self, url: str, *, expected_external_id: str = "", traffic_priority: str = "background"
+    def _evaluate_detail_integrity_document(
+        self, html_text: str, final_url: str, *, expected: str, status: int
     ) -> DetailIntegrityResult:
-        """Verify that a public detail page is the requested ad and looks organic.
-
-        This is intentionally fail-closed for Radar admission. 403/429/challenge pages,
-        transport failures and wrong redirects are UNKNOWN rather than clean. Paid
-        visibility or an explicit old/crossed price is a sticky non-organic verdict.
-        """
-        if not _allowed_url(url) or "/s-anzeige/" not in url:
-            return DetailIntegrityResult(False, reason="invalid_url", final_url=url)
-
-        expected = str(expected_external_id or extract_external_id(url) or "").strip()
-        try:
-            async with TRAFFIC.lease("view", traffic_priority):
-                response = await self.client.get(url, timeout=AVAILABILITY_TIMEOUT)
-        except httpx.HTTPError as exc:
-            return DetailIntegrityResult(False, reason=f"transport:{exc.__class__.__name__}")
-        except Exception as exc:
-            return DetailIntegrityResult(False, reason=f"transport:{exc.__class__.__name__}")
-
-        status = int(response.status_code)
-        final_url = str(response.url)
+        """Evaluate one already-fetched detail document without trusting related cards."""
         if status in {403, 429}:
-            await TRAFFIC.report_refusal(status, "view")
             return DetailIntegrityResult(False, reason=f"http_{status}", final_url=final_url, status_code=status)
         if status >= 500:
             return DetailIntegrityResult(False, reason=f"http_{status}", final_url=final_url, status_code=status)
@@ -3031,19 +3022,12 @@ class KleinanzeigenParser:
             return DetailIntegrityResult(False, reason="unavailable", final_url=final_url, status_code=status)
         if not (200 <= status < 400):
             return DetailIntegrityResult(False, reason=f"http_{status}", final_url=final_url, status_code=status)
-        await TRAFFIC.report_success("view")
-
-        html_text = response.text or ""
         if not html_text or len(html_text) < 500:
             return DetailIntegrityResult(False, reason="weak_document", final_url=final_url, status_code=status)
         if self._hybrid_html_is_challenge(html_text):
             return DetailIntegrityResult(False, reason="challenge", final_url=final_url, status_code=status)
 
         final_id = extract_external_id(final_url)
-        # Fail closed on identity. A wrong detail page can contain the requested ID
-        # inside recommendations/related links, so raw HTML substring matching is
-        # not proof that the response belongs to this ad. Public /s-anzeige/ URLs
-        # carry the listing ID in the final canonical URL; require that exact match.
         identity_ok = bool(expected and final_id == expected)
         if expected and not identity_ok:
             return DetailIntegrityResult(False, reason="wrong_identity", final_url=final_url, status_code=status)
@@ -3051,9 +3035,6 @@ class KleinanzeigenParser:
             return DetailIntegrityResult(False, reason="wrong_redirect", final_url=final_url, status_code=status)
 
         soup = BeautifulSoup(html_text, "html.parser")
-        # Restrict integrity evidence to the current ad's detail container whenever
-        # the template exposes one. Related/recommended cards elsewhere on the page
-        # must never contaminate the current listing's organic verdict.
         detail_root = (
             soup.select_one("#viewad-main")
             or soup.select_one("#viewad-content")
@@ -3062,43 +3043,36 @@ class KleinanzeigenParser:
             or soup.select_one("main")
             or soup
         )
-        # Generic image-gallery CSS is deliberately NOT considered paid Galerie by
-        # itself; only explicit paid-feature markers/badges count.
         promoted = False
-        if not promoted:
-            try:
-                explicit_feature_attr = re.compile(
-                    r"(?:^|[-_: ])(?:topad|top-ad|bumpup|bump-up|hochgeschoben|hochschieben|"
-                    r"paid-highlight|feature-highlight|paid-gallery|feature-gallery|galerie-ad|"
-                    r"promoted|sponsored)(?:$|[-_: ])", re.IGNORECASE
-                )
-                for element in detail_root.find_all(True):
-                    tag = str(getattr(element, "name", "") or "").lower()
-                    classes = _class_set(element)
-                    attrs = " ".join(str(element.get(name) or "") for name in ("id", "data-testid", "aria-label", "title"))
-                    class_text = " ".join(classes)
-                    if explicit_feature_attr.search(class_text) or explicit_feature_attr.search(attrs):
-                        promoted = True
-                        break
-                    if tag not in {"span", "small", "label", "button"} and not any("badge" in c for c in classes):
-                        continue
-                    label = " ".join(element.get_text(" ", strip=True).split())
-                    # "Galerie" can be a normal photo-gallery control on detail pages,
-                    # so text-only Galerie never proves paid visibility here. Paid
-                    # Galerie is accepted only through explicit feature classes/data.
-                    if label and len(label) <= 24 and re.fullmatch(
-                        r"(?:TOP|Top[- ]?Anzeige|Werbeanzeige|Gesponsert|Sponsored|Promoted|"
-                        r"Hochgeschoben|Hochschieben|Highlight)", label, flags=re.IGNORECASE
-                    ):
-                        promoted = True
-                        break
-                if not promoted:
-                    # Common JSON/data-state booleans used by A/B detail templates.
-                    sample = html_text[:1_500_000]
-                    if re.search(r'(?i)"(?:isTopAd|topAd|isBumped|bumpUp|isPromoted|sponsored)"\s*:\s*true', sample):
-                        promoted = True
-            except Exception:
-                promoted = False
+        try:
+            explicit_feature_attr = re.compile(
+                r"(?:^|[-_: ])(?:topad|top-ad|bumpup|bump-up|hochgeschoben|hochschieben|"
+                r"paid-highlight|feature-highlight|paid-gallery|feature-gallery|galerie-ad|"
+                r"promoted|sponsored)(?:$|[-_: ])", re.IGNORECASE
+            )
+            for element in detail_root.find_all(True):
+                tag = str(getattr(element, "name", "") or "").lower()
+                classes = _class_set(element)
+                attrs = " ".join(str(element.get(name) or "") for name in ("id", "data-testid", "aria-label", "title"))
+                class_text = " ".join(classes)
+                if explicit_feature_attr.search(class_text) or explicit_feature_attr.search(attrs):
+                    promoted = True
+                    break
+                if tag not in {"span", "small", "label", "button"} and not any("badge" in c for c in classes):
+                    continue
+                label = " ".join(element.get_text(" ", strip=True).split())
+                if label and len(label) <= 24 and re.fullmatch(
+                    r"(?:TOP|Top[- ]?Anzeige|Werbeanzeige|Gesponsert|Sponsored|Promoted|"
+                    r"Hochgeschoben|Hochschieben|Highlight)", label, flags=re.IGNORECASE
+                ):
+                    promoted = True
+                    break
+            if not promoted:
+                sample = html_text[:1_500_000]
+                if re.search(r'(?i)"(?:isTopAd|topAd|isBumped|bumpUp|isPromoted|sponsored)"\s*:\s*true', sample):
+                    promoted = True
+        except Exception:
+            promoted = False
 
         reduced = False
         try:
@@ -3111,6 +3085,109 @@ class KleinanzeigenParser:
         if reduced:
             return DetailIntegrityResult(True, is_promoted=False, is_price_reduced=True, reason="price_reduced", final_url=final_url, status_code=status)
         return DetailIntegrityResult(True, reason="organic", final_url=final_url, status_code=status)
+
+    async def _fetch_detail_browser_document(
+        self, url: str, *, traffic_priority: str
+    ) -> tuple[str, str, int]:
+        """One rendered public detail fetch used only after HTTP detail recovery failed."""
+        context = await self._ensure_view_browser()
+        page = await context.new_page()
+        await self._install_lightweight_route(page)
+        try:
+            async with TRAFFIC.lease("view", traffic_priority):
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+            if response is None:
+                return "", str(page.url or url), 0
+            status = int(response.status)
+            final_url = str(page.url or url)
+            if status in {403, 429}:
+                await TRAFFIC.report_refusal(status, "view")
+            elif status < 500:
+                await TRAFFIC.report_success("view")
+            if DETAIL_INTEGRITY_BROWSER_SETTLE_MS:
+                await page.wait_for_timeout(DETAIL_INTEGRITY_BROWSER_SETTLE_MS)
+            return await page.content(), final_url, status
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+    async def inspect_detail_integrity(
+        self, url: str, *, expected_external_id: str = "", traffic_priority: str = "background"
+    ) -> DetailIntegrityResult:
+        """Verify one exact public ad with bounded local recovery, still fail-closed.
+
+        v4.15.5 does not weaken the Organic Gate. It only prevents a single transient
+        HTTP/challenge/weak response from immediately failing the whole category:
+        HTTP is retried gently and one browser-rendered fetch is attempted. UNKNOWN
+        remains UNKNOWN unless an exact canonical ad page is positively verified.
+        """
+        if not _allowed_url(url) or "/s-anzeige/" not in url:
+            return DetailIntegrityResult(False, reason="invalid_url", final_url=url)
+
+        expected = str(expected_external_id or extract_external_id(url) or "").strip()
+        last = DetailIntegrityResult(False, reason="detail_unknown", final_url=url)
+        retryable_prefixes = ("transport:", "http_403", "http_429", "http_5", "weak_document", "challenge", "wrong_identity", "wrong_redirect")
+
+        for attempt in range(1, DETAIL_INTEGRITY_HTTP_RETRIES + 1):
+            try:
+                async with TRAFFIC.lease("view", traffic_priority):
+                    response = await self.client.get(url, timeout=AVAILABILITY_TIMEOUT)
+                status = int(response.status_code)
+                final_url = str(response.url)
+                if status in {403, 429}:
+                    await TRAFFIC.report_refusal(status, "view")
+                elif status < 500:
+                    await TRAFFIC.report_success("view")
+                last = self._evaluate_detail_integrity_document(
+                    response.text or "", final_url, expected=expected, status=status
+                )
+            except httpx.HTTPError as exc:
+                last = DetailIntegrityResult(False, reason=f"transport:{exc.__class__.__name__}", final_url=url)
+            except Exception as exc:
+                last = DetailIntegrityResult(False, reason=f"transport:{exc.__class__.__name__}", final_url=url)
+
+            if last.verified:
+                if attempt > 1:
+                    log.info("Detail Organic HTTP recovery succeeded external_id=%s attempt=%s", expected, attempt)
+                return last
+            reason = str(last.reason or "detail_unknown")
+            if reason == "unavailable" or reason == "invalid_url":
+                return last
+            if not reason.startswith(retryable_prefixes):
+                return last
+            if attempt < DETAIL_INTEGRITY_HTTP_RETRIES and DETAIL_INTEGRITY_RETRY_DELAY_SECONDS:
+                await asyncio.sleep(DETAIL_INTEGRITY_RETRY_DELAY_SECONDS * attempt)
+
+        if not DETAIL_INTEGRITY_BROWSER_FALLBACK:
+            return last
+
+        try:
+            # A fresh context matters for persistent challenge/weak-session templates.
+            await self.reset_scan_browser_context()
+        except Exception:
+            log.debug("Detail Organic context reset failed external_id=%s", expected, exc_info=True)
+        try:
+            html_text, final_url, status = await self._fetch_detail_browser_document(
+                url, traffic_priority=traffic_priority
+            )
+            browser_result = self._evaluate_detail_integrity_document(
+                html_text, final_url, expected=expected, status=status
+            )
+            if browser_result.verified:
+                log.info("Detail Organic browser recovery succeeded external_id=%s", expected)
+                return browser_result
+            log.info(
+                "Detail Organic recovery exhausted external_id=%s http_reason=%s browser_reason=%s",
+                expected, str(last.reason or ""), str(browser_result.reason or ""),
+            )
+            return browser_result
+        except TemporaryAccessError as exc:
+            return DetailIntegrityResult(False, reason=f"browser_http_{exc.status_code}", final_url=url, status_code=exc.status_code)
+        except Exception as exc:
+            log.info("Detail Organic browser recovery failed external_id=%s error=%s", expected, exc.__class__.__name__)
+            return DetailIntegrityResult(False, reason=f"browser_transport:{exc.__class__.__name__}", final_url=url)
 
 
     async def check_listing_active(self, url: str) -> bool | None:

@@ -1,3 +1,15 @@
+# DT PARSER 4.15.5 — AutoScan Recovery Hardening
+
+**Base:** 4.15.4 Organic Pipeline Correctness.
+
+Hardens the two remaining transient-failure points without loosening Organic rules or DT Demand Score. Date discovery now recycles the scan BrowserContext for persistent `unknown` chronology and actually uses the deterministic sequential locator when fast exponential/binary recovery cannot prove a boundary. The sequential fallback stays fail-closed if any page remains weak. Radar detail admission now uses bounded HTTP retries, a fresh rendered Chromium fallback, and one delayed retry of only the exact blocked candidate before a category becomes `⚠️ допроверка`. AutoScan telemetry records exact UNKNOWN reasons (`http_403`, `challenge`, `weak_document`, `wrong_identity`, transport errors, etc.).
+
+No score/Organic criteria changes. No manual DB migration and no new required Railway variable. Redeploy Parser; AI/Lifecycle should use the same checkout.
+
+See `DEPLOY_V4_15_5_AUTOSCAN_RECOVERY_HARDENING.md`.
+
+---
+
 # DT PARSER 4.15.4 — Organic Pipeline Correctness
 
 **Base:** 4.15.3 Strict Organic Radar Gate.
