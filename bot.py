@@ -10963,15 +10963,13 @@ AI_BADGE_EVENT_TYPES = ("winner", "confirmed")
 
 
 async def _ai_unread_signal_count() -> int:
-    """Count unique strong AI candidates not yet opened in the New section."""
-    async with SessionLocal() as session:
-        value = (await session.execute(
-            select(func.count(func.distinct(AIEarlyWinnerEvent.candidate_id))).where(
-                AIEarlyWinnerEvent.notified_at.is_(None),
-                AIEarlyWinnerEvent.event_type.in_(AI_BADGE_EVENT_TYPES),
-            )
-        )).scalar_one()
-    return int(value or 0)
+    """Radar 3.0 has no legacy AI unread queue.
+
+    v4.21.2: keep this helper for admin-keyboard compatibility, but never touch
+    retired Early Winner event storage. The old pipeline must not be required merely to
+    open the admin panel.
+    """
+    return 0
 
 
 async def _mark_ai_signals_seen(candidate_ids: list[int]) -> None:
@@ -10993,18 +10991,15 @@ async def _mark_ai_signals_seen(candidate_ids: list[int]) -> None:
 
 
 def admin_ai_keyboard(unread_count: int = 0) -> InlineKeyboardMarkup:
-    unread = max(0, int(unread_count or 0))
-    new_label = "🆕 Новые" if unread <= 0 else f"🔴 Новые · {min(unread, 99)}{'+' if unread > 99 else ''}"
+    """Pure Radar 3.0 admin navigation.
+
+    Legacy Early Winner sections were intentionally removed in v4.21.2.
+    Keeping them visible after retiring the worker made DT AI Lab depend on old
+    tables and made stale Telegram buttons fail.
+    """
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=new_label, callback_data="adminai:new")],
-        [InlineKeyboardButton(text="💎 Скрытые находки", callback_data="adminai:hidden"),
-         InlineKeyboardButton(text="🚀 Горячие / Набирают обороты", callback_data="adminai:momentum")],
-        [InlineKeyboardButton(text="⚡ Первичные сигналы / Наблюдение", callback_data="adminai:active")],
-        [InlineKeyboardButton(text="✅ Подтверждены", callback_data="adminai:confirmed"),
-         InlineKeyboardButton(text="❌ Не подтвердились", callback_data="adminai:rejected")],
-        [InlineKeyboardButton(text="📊 Точность AI", callback_data="adminai:accuracy"),
-         InlineKeyboardButton(text="🧪 Последние прогнозы", callback_data="adminai:recent")],
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminai")],
+        [InlineKeyboardButton(text="🔄 Обновить Radar 3.0", callback_data="adminai")],
+        [InlineKeyboardButton(text="🛰 Управление Radar AutoScan", callback_data="adminradarauto")],
         [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
     ])
 
@@ -12205,48 +12200,35 @@ async def admin_ai_handler(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("adminai:"))
 async def admin_ai_section_handler(callback: CallbackQuery) -> None:
+    """Compatibility redirect for old DT AI Lab messages.
+
+    Telegram users may still have buttons such as adminai:new/adminai:accuracy
+    in already-sent messages. Radar 3.0 must open cleanly instead of querying the
+    retired Early Winner tables.
+    """
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    kind = (callback.data.split(":", 1)[1] or "recent").strip().lower()
-    await callback.answer()
-    if kind == "accuracy":
-        await _edit_or_answer(
-            callback.message, await _admin_ai_accuracy_text(),
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminai:accuracy")],
-                [InlineKeyboardButton(text="⬅️ DT AI Lab", callback_data="adminai")],
-            ]),
-        )
-        return
-    if kind not in {"new", "hidden", "momentum", "winners", "active", "confirmed", "rejected", "recent"}:
-        kind = "recent"
-    rows = await _ai_candidate_rows(kind)
-    # Viewing the New list is the acknowledgement action. Only candidates actually
-    # rendered on this page are marked seen, so a backlog larger than 15 remains badged.
-    if kind == "new" and rows:
-        await _mark_ai_signals_seen([int(candidate.id) for candidate, _listing, _scan in rows[:15]])
-    await _edit_or_answer(callback.message, await _admin_ai_list_text(kind, rows), reply_markup=_ai_list_keyboard(kind, rows))
+    await callback.answer("Раздел перенесён в Radar 3.0")
+    await _edit_or_answer(
+        callback.message,
+        await _admin_ai_dashboard_text(),
+        reply_markup=admin_ai_keyboard(),
+    )
 
 
 @dp.callback_query(F.data.startswith("aic:"))
 async def admin_ai_candidate_handler(callback: CallbackQuery) -> None:
+    """Old candidate cards are no longer authoritative in Radar 3.0."""
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    try:
-        parts = callback.data.split(":", 2)
-        candidate_id = int(parts[1])
-        requested_back_kind = parts[2] if len(parts) > 2 else None
-    except Exception:
-        await callback.answer("Некорректный кандидат", show_alert=True)
-        return
-    detail = await _admin_ai_candidate(candidate_id, requested_back_kind=requested_back_kind)
-    if detail is None:
-        await callback.answer("Кандидат не найден", show_alert=True)
-        return
-    await callback.answer()
-    await _edit_or_answer(callback.message, detail[0], reply_markup=detail[1])
+    await callback.answer("Старая AI-карточка отключена · открываю Radar 3.0")
+    await _edit_or_answer(
+        callback.message,
+        await _admin_ai_dashboard_text(),
+        reply_markup=admin_ai_keyboard(),
+    )
 
 
 @dp.callback_query(F.data == "adminviews")

@@ -43,3 +43,11 @@ The initial counter never participates in this score.
 - `RadarObservation` now has an expiring cross-replica lease (`lease_owner`, `lease_until`). Due rows are atomically claimed with PostgreSQL `FOR UPDATE SKIP LOCKED`, preventing two Parser replicas from refreshing/writing the same observation batch.
 - Failed/unchanged refreshes release their claim for a clean retry; successful measurements release the lease while scheduling the next checkpoint.
 - The former AI Lab summary now reports Radar 3.0 baseline/observed/persistent counts instead of stale +1/+3/+6 Early Winner state.
+
+
+## v4.21.2 — DT AI Lab UI decoupling
+
+- DT AI Lab admin entry no longer queries retired Early Winner event/candidate tables.
+- The Lab keyboard is Radar 3.0-only: refresh, AutoScan management, back to admin.
+- Old `adminai:*` and `aic:*` buttons from previously sent Telegram messages safely redirect to the Radar 3.0 dashboard.
+- Legacy AI scoring remains disabled; this is a UI/routing repair only.
