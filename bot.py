@@ -76,7 +76,7 @@ from filters import (
 )
 from models import (
     AIEarlyWinnerCandidate, AIEarlyWinnerEvent, AIEarlyWinnerObservation, AIEarlyWinnerRun,
-    AppSetting, BotUser, CategoryScanState, FreeRadarEvent, Listing, ListingIntegrity, ParserRun, PriceHistory, RadarProduct, RadarSnapshot, ScanListing,
+    AppSetting, BotUser, CategoryScanState, FreeRadarEvent, Listing, ListingIntegrity, ParserRun, PriceHistory, RadarProduct, RadarObservation, RadarSnapshot, ScanListing,
     ScanObservation, ScanViewHistory, SelectedCategory, StableCategoryJob, StablePageCheckpoint,
     SubscriptionPayment, SubscriptionPlan, UserScan, UserSettings, ViewHistory,
 )
@@ -129,6 +129,7 @@ from radar import (
     get_radar_product, is_radar_favorite, list_radar_products, radar_categories, radar_stats,
     purge_nonorganic_analytics, record_autoscan_hot_detailed, record_scan_hot,
     record_verified_velocity_signals, refresh_radar_scores, verify_listing_organic_now,
+    prepare_radar_v3_once, radar_v3_due_external_ids, radar_v3_record_refreshed, radar_v3_expire_stale_products,
     search_radar_products, toggle_radar_favorite,
 )
 from page_manager import (
@@ -1181,6 +1182,7 @@ RADAR_TYPE_LABEL = {
     "saturated": "⚫ Saturated",
     "spark": "⚡ Signal",
     "fast_sold": "⚡ Fast Sold",
+    "observed_demand": "👁 DT Observed Demand",
 }
 
 
@@ -4332,59 +4334,62 @@ async def organic_velocity_scheduler() -> None:
 
 
 async def radar_maintenance_scheduler() -> None:
-    """Backfill historical strong products once, then cool live scores hourly.
-
-    v4.15.8: this scheduler is genuinely background. It waits for both user
-    foreground scans and the explicit AutoScan round pause before any historical
-    sweep/backfill can start. This removes the last startup race with category 1.
-    """
+    """Radar 3.0 maintenance: clean break, no legacy historical backfill."""
     async def foreground_busy() -> bool:
         running, queued = await _radar_foreground_counts()
         snap = await TRAFFIC.snapshot()
-        return bool(
-            running or queued
-            or int(getattr(snap, "scan_jobs_active", 0) or 0) > 0
-            or int(getattr(snap, "background_pauses", 0) or 0) > 0
-        )
-
+        return bool(running or queued or int(getattr(snap, "scan_jobs_active", 0) or 0) > 0 or int(getattr(snap, "background_pauses", 0) or 0) > 0)
     try:
-        # Let Telegram polling come online first, then wait until foreground is
-        # genuinely idle. Backfill may invoke Radar admission/detail checks, so it
-        # must not race the first AutoScan category either.
         await asyncio.sleep(8)
-        while await foreground_busy():
-            await asyncio.sleep(10)
-        sweep_stats = await bump_resurrection_integrity_sweep_once()
-        if any(int(v or 0) for v in sweep_stats.values()):
-            log.warning("v4.15.6 initial bump-resurrection sweep: %s", sweep_stats)
-        while await foreground_busy():
-            await asyncio.sleep(10)
-        ai_saved, scan_saved = await backfill_radar_once()
-        if ai_saved or scan_saved:
-            log.warning("DT Radar historical base imported | ai=%s scan_signals=%s", ai_saved, scan_saved)
+        await prepare_radar_v3_once()
     except asyncio.CancelledError:
         raise
     except Exception:
-        log.exception("DT Radar initial backfill failed")
-
+        log.exception("DT Radar 3.0 startup reset failed")
     while True:
         try:
-            if await foreground_busy():
-                await asyncio.sleep(60)
-                continue
-            await bump_resurrection_integrity_sweep_once()
-            if await foreground_busy():
-                await asyncio.sleep(60)
-                continue
-            changed = await refresh_radar_scores()
-            if changed:
-                log.info("DT Radar score maintenance changed=%s", changed)
+            if not await foreground_busy():
+                await bump_resurrection_integrity_sweep_once()
             await asyncio.sleep(3600)
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("DT Radar maintenance loop error")
+            log.exception("DT Radar 3.0 maintenance loop error")
             await asyncio.sleep(300)
+
+
+async def radar_v3_observation_scheduler() -> None:
+    """Background exact remeasurement for DT-owned Radar 3.0 baselines."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            running, queued = await _radar_foreground_counts()
+            traffic_snapshot = await TRAFFIC.snapshot()
+            if running or queued or int(getattr(traffic_snapshot, "scan_jobs_active", 0) or 0) > 0 or int(getattr(traffic_snapshot, "background_pauses", 0) or 0) > 0:
+                await asyncio.sleep(60)
+                continue
+            ids = await radar_v3_due_external_ids(limit=1000)
+            if not ids:
+                expired = await radar_v3_expire_stale_products()
+                if expired:
+                    log.info("DT Radar 3.0 expired stale products=%s", expired)
+                await asyncio.sleep(60)
+                continue
+            async with SessionLocal() as session:
+                rows = list((await session.execute(select(Listing).where(Listing.external_id.in_(ids)))).scalars().all())
+            if not rows:
+                await asyncio.sleep(30)
+                continue
+            async with background_view_refresh_lock:
+                requested, updated, failed = await refresh_view_counts(rows, None, force=True, max_age_seconds=0, traffic_priority="background")
+            saved = await radar_v3_record_refreshed([str(x.external_id) for x in rows])
+            log.info("DT Radar 3.0 observation batch due=%s requested=%s updated=%s failed=%s signals=%s", len(ids), requested, updated, failed, saved)
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("DT Radar 3.0 observation scheduler error")
+            await asyncio.sleep(60)
 
 
 def _radar_autoscan_category_allowed(cat) -> bool:
@@ -14643,7 +14648,7 @@ async def _radar_home_text(user_id: int | None = None) -> str:
             f"🎁 <b>Бесплатно:</b> первые {FREE_RADAR_PREVIEW_LIMIT} находок в каждом режиме «Лучшие сейчас».\n"
             "🔒 Поиск, Категории, Мой Radar и полные ленты открываются с подпиской.\n\n"
             f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих · 🚀 <b>{stats.rising}</b> набирают · ⚡ <b>{stats.fast_sold}</b> Fast Sold.\n\n"
-            "⭐ <b>DT Score</b> показывает силу каждого товара."
+            "👁 <b>Observed Score</b> строится только на росте просмотров, который DT увидел после своего baseline."
         )
     return (
         "📡 <b>DT Radar</b>\n\n"
@@ -14653,7 +14658,7 @@ async def _radar_home_text(user_id: int | None = None) -> str:
         "🗂 <b>Категории</b> — если хочешь посмотреть по разделам\n"
         "⭐ <b>Мой Radar</b> — сохранённые товары\n\n"
         f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих · 🚀 <b>{stats.rising}</b> набирают · ⚡ <b>{stats.fast_sold}</b> Fast Sold.\n\n"
-        "⭐ <b>DT Score</b> оставляем главным рейтингом товара."
+        "👁 <b>Observed Score</b>: первый счётчик не оценивается; Radar верит только собственным повторным замерам DT."
     )
 
 
@@ -14799,19 +14804,16 @@ async def _radar_product_payload(
         f"📡 <b>{html.escape(str(product.title or 'Товар'))}</b>",
         "",
         f"{status_icon} Статус: <b>{html.escape(status)}</b>",
-        f"⭐ DT Score: <b>{int(product.current_score or 0)}/100</b>",
-        f"📊 Radar Rank: <b>{float(getattr(product, 'radar_rank', 0.0) or 0.0):.1f}/100</b>",
-        f"🎯 Demand Gate: <b>{int(getattr(product, 'demand_views', 0) or 0)}/{int(getattr(product, 'demand_gate', 0) or 0)}</b> demand-safe views",
-        f"🏆 Peak Score: <b>{int(product.peak_score or 0)}/100</b>",
-        f"🧠 Сигнал: <b>{html.escape(type_label)}</b> · уверенность <b>{int(product.confidence or 0)}%</b>",
+        f"⭐ Observed Score: <b>{int(product.current_score or 0)}/100</b>",
+        f"👁 DT-наблюдаемый прирост: <b>+{int(getattr(product, 'demand_views', 0) or 0)}</b> просмотров",
+        f"🧠 Доказательство: <b>{html.escape(type_label)}</b> · уверенность <b>{int(product.confidence or 0)}%</b>",
         f"🗂 Категория: <b>{html.escape(cat_name)}</b>",
         f"💶 Диапазон замеченных цен: <b>{html.escape(price)}</b>",
-        f"👀 Лучший замер: <b>{int(product.best_views or 0)}</b> просмотров",
-        f"⚡ Лучший рост: <b>{float(product.best_views_per_hour or 0.0):.1f}/ч</b>",
-        f"🔁 Сильных сигналов: <b>{int(product.signal_count or 0)}</b>",
-        f"✅ AI-подтверждений: <b>{int(product.confirmed_count or 0)}</b>",
-        f"📦 Разных объявлений: <b>{int(product.listing_count or 0)}</b>",
-        f"🕒 В Radar с: <b>{html.escape(_moscow_text(product.first_radar_at))}</b>",
+        f"👀 Текущий счётчик: <b>{int(product.best_views or 0)}</b> просмотров (baseline не оценивается)",
+        f"⚡ Лучший DT-наблюдаемый рост: <b>{float(product.best_views_per_hour or 0.0):.1f}/ч</b>",
+        f"🔁 Подтверждённых замеров: <b>{int(product.signal_count or 0)}</b>",
+        f"📦 Независимых объявлений: <b>{int(product.listing_count or 0)}</b>",
+                f"🕒 В Radar с: <b>{html.escape(_moscow_text(product.first_radar_at))}</b>",
         f"📡 Последний сигнал: <b>{html.escape(_moscow_text(product.last_signal_at))}</b>",
         f"🕐 Свежесть: <b>{html.escape(_radar_freshness(product.last_signal_at))}</b>",
     ]
@@ -16960,6 +16962,8 @@ async def main() -> None:
     unified_repair = await prepare_unified_48h_ranking_once()
     if any(int(v or 0) for v in unified_repair.values()):
         log.warning("v4.20.0 Unified 48H Radar startup repair: %s", unified_repair)
+    # Radar 3.0 clean break must complete before Telegram polling/AutoScan can publish anything.
+    await prepare_radar_v3_once()
     if organic_cleanup.get("dirty_listings", 0):
         log.warning(
             "v4.15.3 Strict Organic Radar Gate cleanup: %s",
@@ -17061,7 +17065,7 @@ async def main() -> None:
         GUARANTEED_LOCAL_PARSER_LANES,
     )
     log.warning(
-        "v4.20.0 DT Radar Core 2.0 online | category_watchdog=%ss | view_recovery_watchdog=%ss | background_pause=round | detail_lanes=foreground+background",
+        "DT Radar 3.0 Observed Demand online | category_watchdog=%ss | view_recovery_watchdog=%ss | background_pause=round | detail_lanes=foreground+background",
         int(RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS), int(RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS),
     )
     ticker_task = None if DISTRIBUTED_WORKERS else asyncio.create_task(
@@ -17076,6 +17080,7 @@ async def main() -> None:
     )
     archive_task = asyncio.create_task(scan_archive_scheduler(), name="scan-archive-scheduler")
     radar_task = asyncio.create_task(radar_maintenance_scheduler(), name="dt-radar-maintenance")
+    radar_v3_observation_task = asyncio.create_task(radar_v3_observation_scheduler(), name="dt-radar-v3-observations")
     organic_velocity_task = asyncio.create_task(organic_velocity_scheduler(), name="verified-organic-velocity")
     radar_autoscan_task = asyncio.create_task(radar_autoscan_scheduler(bot), name="dt-radar-autoscan")
     radar_daily_digest_task = asyncio.create_task(radar_daily_digest_scheduler(bot), name="dt-radar-daily-digest")
@@ -17094,6 +17099,7 @@ async def main() -> None:
         subscription_task.cancel()
         archive_task.cancel()
         radar_task.cancel()
+        radar_v3_observation_task.cancel()
         organic_velocity_task.cancel()
         radar_autoscan_task.cancel()
         radar_daily_digest_task.cancel()
@@ -17101,7 +17107,7 @@ async def main() -> None:
             task.cancel()
         for task in worker_tasks:
             task.cancel()
-        shutdown_tasks = [payment_task, subscription_task, archive_task, radar_task, organic_velocity_task, radar_autoscan_task, radar_daily_digest_task, *observation_tasks, *worker_tasks]
+        shutdown_tasks = [payment_task, subscription_task, archive_task, radar_task, radar_v3_observation_task, organic_velocity_task, radar_autoscan_task, radar_daily_digest_task, *observation_tasks, *worker_tasks]
         if distributed_queue_ticker_task is not None:
             shutdown_tasks.insert(0, distributed_queue_ticker_task)
         if ticker_task is not None:

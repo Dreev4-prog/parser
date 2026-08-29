@@ -20,7 +20,7 @@ from organic_velocity import (
 )
 from parser import KleinanzeigenParser
 from radar_ranking import (
-    RADAR_48H_MAX_AGE_MINUTES, classify_radar_signal, demand_gate_for_age,
+    RADAR_48H_MAX_AGE_MINUTES, RadarRankEvidence, classify_radar_signal, demand_gate_for_age,
 )
 from traffic import TRAFFIC
 from models import (
@@ -35,6 +35,7 @@ from models import (
     RadarLifecycleWatch,
     RadarProduct,
     RadarProductListing,
+    RadarObservation,
     RadarSnapshot,
     ScanListing,
     UserScan,
@@ -47,6 +48,10 @@ RADAR_BUMP_SWEEP_SETTING = "dt_radar_v4156_bump_sweep_complete"
 RADAR_BUMP_QUARANTINE_SETTING = "dt_radar_v4156_bump_quarantine_applied"
 RADAR_VELOCITY_PREP_SETTING = "dt_radar_v4157_verified_velocity_prepared"
 RADAR_UNIFIED_48H_REPAIR_SETTING = "dt_radar_v4200_unified_48h_repair_v2"
+RADAR_V3_RESET_SETTING = "dt_radar_v3_observed_demand_reset_v1"
+RADAR_V3_FIRST_CHECK_MINUTES = 60
+RADAR_V3_NEXT_CHECK_MINUTES = 60
+RADAR_V3_MAX_OBSERVATION_HOURS = 6
 RADAR_SCAN_TOP_LIMIT = 12
 RADAR_PAGE_SIZE = 8
 # v4.15.5: after parser-level HTTP + browser recovery, wait once and retry only
@@ -580,6 +585,9 @@ def _snapshot_live_evidence(snapshot: RadarSnapshot, now: datetime):
     if recorded_at is not None:
         elapsed_minutes = max(0.0, (now - recorded_at).total_seconds() / 60.0)
     effective_age = max(0.0, float(getattr(snapshot, "demand_age_minutes", 0.0) or 0.0)) + elapsed_minutes
+    if str(getattr(snapshot, "source", "") or "") == "radar3_observed":
+        status = str(getattr(snapshot, "demand_status", "stable") or "stable")
+        return RadarRankEvidence(status, float(getattr(snapshot, "radar_rank", 0.0) or 0.0), 0, 1.0, 0.0, True)
     return classify_radar_signal(
         dt_score=int(snapshot.score or 0),
         confidence=int(snapshot.confidence or 0),
@@ -720,15 +728,22 @@ async def _upsert_signal(
                 demand_views = int(fallback_feature.views)
             if demand_age_minutes is None:
                 demand_age_minutes = float(fallback_feature.age_minutes)
-    evidence = classify_radar_signal(
-        dt_score=score, confidence=confidence, demand_views=demand_views, age_minutes=demand_age_minutes
-    )
-    # Central authority: no ingestion path may override the Demand Gate by passing
-    # a caller-computed status/rank. The optional arguments remain for API
-    # compatibility, but persisted evidence is always recomputed here.
-    radar_rank = float(evidence.radar_rank)
-    demand_status = str(evidence.status)
-    demand_gate = int(evidence.demand_gate if evidence.demand_gate < 10**9 else 0)
+    if str(source) == "radar3_observed":
+        # Radar 3.0 is governed by DT-owned observation checkpoints, not listing age
+        # or inherited counters. The caller status is evidence-stage based.
+        demand_status = str(demand_status or "stable")
+        radar_rank = float(radar_rank if radar_rank is not None else score)
+        demand_gate = 0
+        evidence = RadarRankEvidence(demand_status, radar_rank, 0, 1.0, 0.0, True)
+    else:
+        evidence = classify_radar_signal(
+            dt_score=score, confidence=confidence, demand_views=demand_views, age_minutes=demand_age_minutes
+        )
+        # Legacy admission paths retain their historical guard, but Radar 3.0
+        # publishers are the only active paths in this release.
+        radar_rank = float(evidence.radar_rank)
+        demand_status = str(evidence.status)
+        demand_gate = int(evidence.demand_gate if evidence.demand_gate < 10**9 else 0)
     demand_views = max(0, int(demand_views or 0))
     demand_age_minutes = max(0.0, float(demand_age_minutes or 0.0))
     radar_rank = max(0.0, min(100.0, radar_rank))
@@ -997,6 +1012,8 @@ async def record_scan_hot(scan_id: int, limit: int = RADAR_SCAN_TOP_LIMIT) -> in
     receives the real evidence-adaptive DT Demand Score, then must pass the age-aware
     absolute Demand Gate before it can be Strong/Hot.
     """
+    # Radar 3.0: legacy admission path disabled; only DT-observed checkpoints may publish.
+    return 0
     async with SessionLocal() as session:
         scan = await session.get(UserScan, int(scan_id))
         if scan is None or scan.status != "done" or not scan.target_complete:
@@ -1096,172 +1113,235 @@ async def record_autoscan_hot_detailed(
     limit: int = RADAR_SCAN_TOP_LIMIT,
     emit_signals: bool = True,
 ) -> RadarAdmissionStats:
-    """Admit the best *qualified* listings from the unified today+yesterday 48H Radar.
+    """Radar 3.0 baseline pass.
 
-    The old AutoScan formula awarded points for being TOP-1 inside one scan.  That
-    made a 10-15 view listing look Hot in a weak cohort.  Now every row receives the
-    actual DT Demand Score, an age-aware absolute Demand Gate and a separate Radar
-    Rank (70% score / 20% confidence / 10% maturity).
+    A first counter never votes. AutoScan only creates DT-owned baselines here;
+    all user-visible Radar signals are created later from measured post-baseline
+    growth. This makes hidden bumps with inherited counters harmless.
     """
-    ids = [str(x).strip() for x in matched_ids if str(x).strip()]
+    ids = list(dict.fromkeys(str(x).strip() for x in matched_ids if str(x).strip()))[:5000]
     if not ids:
         return RadarAdmissionStats()
-    ids = list(dict.fromkeys(ids))[:5000]
+    now = datetime.utcnow()
+    seeded = 0
     async with SessionLocal() as session:
-        raw_rows = list((await session.execute(
-            select(Listing).where(
-                Listing.external_id.in_(ids),
-                Listing.category_key == str(category_key),
-                Listing.is_promoted.is_(False),
-                Listing.is_price_reduced.is_(False),
-                ~_registry_dirty_exists(Listing.external_id),
-                Listing.view_count.is_not(None),
-            )
+        rows = list((await session.execute(select(Listing).where(
+            Listing.external_id.in_(ids),
+            Listing.category_key == str(category_key),
+            Listing.is_promoted.is_(False),
+            Listing.is_price_reduced.is_(False),
+            Listing.view_count.is_not(None),
+            ~_registry_dirty_exists(Listing.external_id),
+        ))).scalars().all())
+        existing_rows = list((await session.execute(
+            select(RadarObservation).where(RadarObservation.external_id.in_(ids))
         )).scalars().all())
-    high_pending_count = sum(1 for row in raw_rows if high_baseline_pending(row))
-    high_verified_count = sum(
-        1 for row in raw_rows
-        if is_high_baseline(row)
-        and demand_safe_metric(row, row.view_count, row.views_checked_at or row.last_seen_at).views is not None
-    )
+        existing_map = {str(x.external_id): x for x in existing_rows}
+        for listing in rows:
+            ext = str(listing.external_id)
+            measured_at = listing.views_checked_at or listing.last_seen_at or now
+            raw = max(0, int(listing.view_count or 0))
+            existing = existing_map.get(ext)
+            if existing is not None:
+                # A completed/quiet observation may be re-armed by a later Radar
+                # circle, but an active observation is never rebased mid-flight.
+                old_enough = (now - (existing.updated_at or existing.last_measured_at or now)).total_seconds() >= 3 * 3600
+                if str(existing.status or "") in {"quiet", "expired"} and old_enough:
+                    existing.baseline_views = raw
+                    existing.baseline_at = measured_at
+                    existing.last_views = raw
+                    existing.last_measured_at = measured_at
+                    existing.checkpoint_count = 0
+                    existing.positive_checkpoints = 0
+                    existing.consecutive_positive = 0
+                    existing.total_delta = 0
+                    existing.current_vph = 0.0
+                    existing.peak_vph = 0.0
+                    existing.status = "baseline"
+                    existing.next_check_at = measured_at + timedelta(minutes=RADAR_V3_FIRST_CHECK_MINUTES)
+                    existing.expires_at = measured_at + timedelta(hours=RADAR_V3_MAX_OBSERVATION_HOURS)
+                    existing.updated_at = now
+                    seeded += 1
+                continue
+            session.add(RadarObservation(
+                external_id=ext, category_key=str(category_key),
+                product_key=radar_product_key(listing),
+                baseline_views=raw, baseline_at=measured_at,
+                last_views=raw, last_measured_at=measured_at,
+                checkpoint_count=0, positive_checkpoints=0, consecutive_positive=0,
+                total_delta=0, current_vph=0.0, peak_vph=0.0, status="baseline",
+                next_check_at=measured_at + timedelta(minutes=RADAR_V3_FIRST_CHECK_MINUTES),
+                expires_at=measured_at + timedelta(hours=RADAR_V3_MAX_OBSERVATION_HOURS),
+                created_at=now, updated_at=now,
+            ))
+            seeded += 1
+        if seeded:
+            await session.commit()
+    log.info("DT Radar 3.0 baselines round=%s category=%s rows=%s seeded=%s first_counter_votes=0", round_id, category_key, len(rows), seeded)
+    return RadarAdmissionStats(eligible_with_views=len(rows), admitted=0, saved=0)
 
-    scored, cohort_size = await _score_unified_48h_category(str(category_key), set(ids))
-    if not scored:
-        return RadarAdmissionStats(
-            eligible_with_views=0,
-            high_baseline_pending=high_pending_count,
-            high_baseline_verified=high_verified_count,
-        )
 
-    ranked: list[tuple[float, Listing, FeatureRow, object, str, object]] = []
-    demand_gate_rejected = 0
-    for listing, feature, score, metric_kind in scored.values():
-        evidence = classify_radar_signal(
-            dt_score=int(score.score or 0), confidence=int(score.confidence or 0),
-            demand_views=int(feature.views), age_minutes=float(feature.age_minutes),
-        )
-        if not evidence.admitted:
-            demand_gate_rejected += 1
-            continue
-        ranked.append((float(evidence.radar_rank), listing, feature, score, metric_kind, evidence))
-    ranked.sort(
-        key=lambda item: (item[0], int(item[3].score or 0), int(item[2].views)),
-        reverse=True,
-    )
-    target = max(1, int(limit))
-    clean_round = str(round_id or "round").replace(":", "-")[:48]
-    considered = checked = organic = promoted = reduced = unknown = db_blocked = admitted = already_present = saved = 0
-    early_admitted = strong_admitted = hot_admitted = 0
-    unknown_reasons: Counter[str] = Counter()
+async def radar_v3_due_external_ids(limit: int = 1000) -> list[str]:
+    now = datetime.utcnow()
+    async with SessionLocal() as session:
+        return [str(x) for x in (await session.execute(
+            select(RadarObservation.external_id).where(
+                RadarObservation.next_check_at.is_not(None),
+                RadarObservation.next_check_at <= now,
+                RadarObservation.status.in_(["baseline", "observed", "confirmed"]),
+            ).order_by(RadarObservation.next_check_at.asc()).limit(max(1, int(limit)))
+        )).scalars().all()]
 
-    for _rank, listing, feature, score, metric_kind, evidence in ranked:
-        if admitted >= target:
-            break
-        considered += 1
-        checked += 1
-        allowed, detail_reason, verified_at = await _live_detail_organic_gate(listing)
-        if not allowed:
-            if "promoted" in detail_reason:
-                promoted += 1
-            elif "reduced" in detail_reason or "price_reduced" in detail_reason:
-                reduced += 1
-            else:
-                unknown += 1
-                normalized_reason = str(detail_reason or "detail_unknown")
-                unknown_reasons[normalized_reason] += 1
-            log.info(
-                "Radar unified candidate rejected round=%s category=%s external_id=%s rank=%.1f reason=%s",
-                clean_round, category_key, listing.external_id, float(evidence.radar_rank), detail_reason,
+
+def _percentile_rank(value: float, peers: list[float]) -> float:
+    vals = sorted(float(x) for x in peers if x >= 0)
+    if not vals:
+        return 0.0
+    if len(vals) == 1:
+        return 0.5
+    below = sum(1 for x in vals if x < value)
+    equal = sum(1 for x in vals if x == value)
+    return max(0.0, min(1.0, (below + 0.5 * equal) / len(vals)))
+
+
+async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | set[str]) -> int:
+    """Convert exact refreshed counters into Radar 3.0 evidence.
+
+    Early = one positive DT-observed interval. Strong = two consecutive positive
+    intervals OR two independent listings in the same product family. Hot = at
+    least two independent family listings with persistent DT-observed growth.
+    Absolute pre-DT counters are never used in score or status.
+    """
+    ids = list(dict.fromkeys(str(x).strip() for x in external_ids if str(x).strip()))
+    if not ids:
+        return 0
+    now = datetime.utcnow()
+    prepared: list[tuple[Listing, RadarObservation, int, float, int]] = []
+    async with SessionLocal() as session:
+        pairs = (await session.execute(
+            select(Listing, RadarObservation).join(RadarObservation, RadarObservation.external_id == Listing.external_id).where(
+                Listing.external_id.in_(ids), Listing.view_count.is_not(None),
+                Listing.is_promoted.is_(False), Listing.is_price_reduced.is_(False),
+                ~_registry_dirty_exists(Listing.external_id),
             )
-            if "promoted" not in detail_reason and "reduced" not in detail_reason:
-                break
-            continue
-        organic += 1
-        if not emit_signals:
-            admitted += 1
-            continue
+        )).all()
+        for listing, obs in pairs:
+            measured_at = listing.views_checked_at or now
+            if measured_at <= obs.last_measured_at:
+                continue
+            current = max(0, int(listing.view_count or 0))
+            interval_delta = max(0, current - int(obs.last_views or 0))
+            hours = max(1/60, (measured_at - obs.last_measured_at).total_seconds()/3600.0)
+            vph = interval_delta / hours
+            obs.checkpoint_count = int(obs.checkpoint_count or 0) + 1
+            if interval_delta > 0:
+                obs.positive_checkpoints = int(obs.positive_checkpoints or 0) + 1
+                obs.consecutive_positive = int(obs.consecutive_positive or 0) + 1
+            else:
+                obs.consecutive_positive = 0
+            obs.last_views = current
+            obs.last_measured_at = measured_at
+            obs.total_delta = max(0, current - int(obs.baseline_views or 0))
+            obs.current_vph = float(vph)
+            obs.peak_vph = max(float(obs.peak_vph or 0.0), float(vph))
+            obs.updated_at = now
+            if interval_delta <= 0 and int(obs.checkpoint_count) >= 1:
+                obs.status = "quiet"
+                obs.next_check_at = None
+            elif int(obs.consecutive_positive) >= 2:
+                obs.status = "confirmed"
+                obs.next_check_at = measured_at + timedelta(minutes=RADAR_V3_NEXT_CHECK_MINUTES)
+            else:
+                obs.status = "observed"
+                obs.next_check_at = measured_at + timedelta(minutes=RADAR_V3_NEXT_CHECK_MINUTES)
+            if obs.expires_at and obs.next_check_at and obs.next_check_at > obs.expires_at:
+                obs.next_check_at = None
+            prepared.append((listing, obs, interval_delta, vph, current))
+        await session.commit()
 
-        source_key = f"autoscan:{clean_round}:{listing.external_id}"
+    emitted = 0
+    for listing, obs, interval_delta, vph, current in prepared:
+        if interval_delta <= 0:
+            continue
         async with SessionLocal() as session:
-            was_existing = bool((await session.execute(
-                select(RadarSnapshot.id).where(RadarSnapshot.source_key == source_key).limit(1)
-            )).scalar_one_or_none())
-        raw_views = max(0, int(listing.view_count or 0))
+            peers = [float(x or 0.0) for x in (await session.execute(select(RadarObservation.current_vph).where(
+                RadarObservation.category_key == str(obs.category_key), RadarObservation.checkpoint_count >= 1,
+                RadarObservation.updated_at >= now - timedelta(hours=6),
+            ))).scalars().all()]
+            family = list((await session.execute(select(RadarObservation).where(
+                RadarObservation.product_key == str(obs.product_key),
+                RadarObservation.positive_checkpoints >= 1,
+                RadarObservation.updated_at >= now - timedelta(hours=6),
+            ))).scalars().all())
+        family_positive = len({str(x.external_id) for x in family})
+        family_persistent = len({str(x.external_id) for x in family if int(x.consecutive_positive or 0) >= 2})
+        velocity_points = round(60 * _percentile_rank(float(vph), peers))
+        persistence_points = 25 if int(obs.consecutive_positive or 0) >= 3 else (15 if int(obs.consecutive_positive or 0) >= 2 else 5)
+        repeat_points = 15 if family_positive >= 3 else (8 if family_positive >= 2 else 0)
+        score = max(1, min(100, int(velocity_points + persistence_points + repeat_points)))
+        if family_persistent >= 2:
+            demand_status, stage = "hot", "product_hot"
+        elif int(obs.consecutive_positive or 0) >= 2 or family_positive >= 2:
+            demand_status, stage = "rising", "confirmed"
+        else:
+            demand_status, stage = "stable", "observed"
+        allowed, detail_reason, verified_at = await _live_detail_organic_gate(listing, force_priority="background")
+        if not allowed:
+            continue
+        elapsed_hours = max(1/60, (obs.last_measured_at - obs.baseline_at).total_seconds()/3600.0)
         result = await _upsert_signal(
-            source_key=source_key,
-            source="radar_autoscan",
-            listing=listing,
-            product_key=radar_product_key(listing, score.cohort_key),
-            score=int(score.score),
-            confidence=int(score.confidence or 0),
-            stage=str(score.stage or "watch"),
-            opportunity_type=str(score.opportunity_type or "spark"),
-            view_count=raw_views,
-            views_per_hour=float(score.views_per_hour or 0.0),
+            source_key=f"radar3:{obs.external_id}:{int(obs.last_measured_at.timestamp())}",
+            source="radar3_observed", listing=listing, product_key=str(obs.product_key),
+            score=score, confidence=min(95, 35 + int(obs.positive_checkpoints or 0)*20 + min(20, family_positive*5)),
+            stage=stage, opportunity_type="observed_demand", view_count=current, views_per_hour=float(vph),
             reasons=[
-                f"Unified 48H: {evidence.status} · DT Score {int(score.score)}/100 · Radar Rank {float(evidence.radar_rank):.1f}",
-                f"Demand Gate: {int(feature.views)}/{int(evidence.demand_gate)} demand-safe views · age {float(feature.age_minutes)/60.0:.1f}h",
-                (f"DT-observed delta: {int(feature.views)}" if metric_kind == "observed_delta" else "Fresh total verified after Organic Gate"),
-                f"48H category cohort: {cohort_size} demand-safe listings",
-                *[str(x) for x in tuple(score.reasons or ())[:2]],
+                f"Radar 3.0: DT observed +{int(obs.total_delta)} views in {elapsed_hours:.1f}h after baseline",
+                f"Current interval: +{int(interval_delta)} · {float(vph):.1f}/h · consecutive positive={int(obs.consecutive_positive or 0)}",
+                f"Independent family listings with observed growth: {family_positive} · persistent: {family_persistent}",
+                "Initial counter is baseline-only and contributed 0 points",
             ],
-            recorded_at=listing.views_checked_at or listing.last_seen_at or datetime.utcnow(),
-            live_detail_verified_at=verified_at,
-            demand_views=int(feature.views),
-            demand_age_minutes=float(feature.age_minutes),
-            radar_rank=float(evidence.radar_rank),
-            demand_status=str(evidence.status),
-            demand_gate=int(evidence.demand_gate),
+            recorded_at=obs.last_measured_at, live_detail_verified_at=verified_at,
+            demand_views=int(obs.total_delta), demand_age_minutes=float(elapsed_hours*60), radar_rank=float(score),
+            demand_status=demand_status, demand_gate=0,
         )
         if result is not None:
-            admitted += 1
-            if str(evidence.status) == "hot":
-                hot_admitted += 1
-            elif str(evidence.status) == "rising":
-                strong_admitted += 1
-            elif str(evidence.status) == "stable":
-                early_admitted += 1
-            if was_existing:
-                already_present += 1
-            else:
-                saved += 1
-        else:
-            db_blocked += 1
+            emitted += 1
+    return emitted
 
-    stats = RadarAdmissionStats(
-        eligible_with_views=len(scored),
-        high_baseline_pending=high_pending_count,
-        high_baseline_verified=high_verified_count,
-        reserve_considered=considered,
-        detail_checked=checked,
-        organic_passed=organic,
-        promoted_blocked=promoted,
-        reduced_blocked=reduced,
-        unknown_blocked=unknown,
-        unknown_reasons=tuple(sorted(unknown_reasons.items(), key=lambda item: (-item[1], item[0]))),
-        db_blocked=db_blocked,
-        demand_gate_rejected=demand_gate_rejected,
-        qualified_candidates=len(ranked),
-        early_admitted=early_admitted,
-        strong_admitted=strong_admitted,
-        hot_admitted=hot_admitted,
-        admitted=admitted,
-        already_present=already_present,
-        saved=saved,
-    )
-    log.info(
-        "DT Radar unified 48H funnel round=%s category=%s safe=%s cohort=%s below_early=%s qualified=%s checked=%s organic=%s promoted=%s reduced=%s unknown=%s admitted=%s early=%s strong=%s hot=%s existing=%s new=%s target=%s",
-        clean_round, category_key, stats.eligible_with_views, cohort_size, stats.demand_gate_rejected, stats.qualified_candidates,
-        stats.detail_checked, stats.organic_passed, stats.promoted_blocked, stats.reduced_blocked,
-        stats.unknown_blocked, stats.admitted, stats.early_admitted, stats.strong_admitted, stats.hot_admitted,
-        stats.already_present, stats.saved, target,
-    )
-    if stats.unknown_reasons:
-        log.info(
-            "DT Radar unified unknown reasons round=%s category=%s reasons=%s",
-            clean_round, category_key, dict(stats.unknown_reasons),
+
+async def radar_v3_expire_stale_products(max_age_hours: int = 6) -> int:
+    cutoff = datetime.utcnow() - timedelta(hours=max(1, int(max_age_hours)))
+    async with SessionLocal() as session:
+        result = await session.execute(
+            update(RadarProduct).where(
+                RadarProduct.latest_source == "radar3_observed",
+                RadarProduct.last_signal_at < cutoff,
+                RadarProduct.status != "historical",
+            ).values(status="historical", current_score=0, radar_rank=0.0, updated_at=datetime.utcnow())
         )
-    return stats
+        await session.commit()
+        return int(result.rowcount or 0)
+
+
+async def prepare_radar_v3_once() -> bool:
+    """One-time clean break: purge old Radar output, preserve raw listing/view history."""
+    async with SessionLocal() as session:
+        existing = await session.get(AppSetting, RADAR_V3_RESET_SETTING)
+        if existing is not None and str(existing.value or "") == "done":
+            return False
+        await session.execute(delete(RadarFavorite))
+        await session.execute(delete(RadarLifecycleWatch))
+        await session.execute(delete(RadarSnapshot))
+        await session.execute(delete(RadarProductListing))
+        await session.execute(delete(RadarProduct))
+        await session.execute(delete(RadarObservation))
+        if existing is None:
+            session.add(AppSetting(key=RADAR_V3_RESET_SETTING, value="done"))
+        else:
+            existing.value = "done"
+        await session.commit()
+    log.warning("DT Radar 3.0 reset complete: old Radar products/signals removed; listing/view history preserved")
+    return True
 
 
 async def record_autoscan_hot(
@@ -1281,6 +1361,8 @@ async def record_verified_velocity_signals(
     external_ids: list[str] | tuple[str, ...] | set[str], *, traffic_priority: str = "normal"
 ) -> int:
     """Admit newly certified 400+ baselines using only their observed organic delta."""
+    # Radar 3.0: legacy admission path disabled; only DT-observed checkpoints may publish.
+    return 0
     ids = list(dict.fromkeys(str(x).strip() for x in external_ids if str(x).strip()))
     if not ids:
         return 0
@@ -1367,6 +1449,8 @@ async def record_verified_velocity_signals(
 
 async def record_ai_candidate(candidate_id: int, *, source_key: str | None = None, source: str = "ai") -> int | None:
     """Merge the latest AI state into Radar. Control candidates never enter Radar."""
+    # Radar 3.0: legacy admission path disabled; only DT-observed checkpoints may publish.
+    return None
     async with SessionLocal() as session:
         candidate = await session.get(AIEarlyWinnerCandidate, int(candidate_id))
         if candidate is None or candidate.is_control:

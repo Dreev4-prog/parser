@@ -1,6 +1,11 @@
-# DT Parser 4.20.0 — DT Radar Core 2.0
+# DT Parser 4.21.0 — DT Radar 3.0 Observed Demand
 
 Production Telegram/Railway parser and DT Radar for Kleinanzeigen.
+
+
+## Radar 3.0: first counter is never demand
+
+Kleinanzeigen can surface an old listing as if it were fresh while keeping its historical view counter. Radar 3.0 therefore treats the first exact counter only as a baseline. Public signals are created solely from growth DT measures afterwards. See `docs/RADAR_3_0.md`.
 
 ## Unified 48H Radar
 

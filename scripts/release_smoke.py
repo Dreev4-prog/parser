@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.20.0", "VERSION=4.20.0")
+    check((ROOT / "VERSION").read_text().strip() == "4.21.0", "VERSION=4.21.0")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -30,30 +30,31 @@ def main() -> int:
     check('RADAR_CONTEXT_DEPTH = 15' in bot, "Context depth=15")
     check('mode in {"manual", "daily"}' in bot, "manual/daily Fresh can queue Context")
     check('target_day = context_day - timedelta(days=1)' in bot, "Context targets yesterday")
-    check('emit_signals=True' in bot and '_score_unified_48h_category' in radar,
-          "Context can publish only through unified 48H scoring")
-    ranking = (ROOT / 'radar_ranking.py').read_text(encoding='utf-8')
-    check('(3.0 * 60.0, 30)' in ranking and '(48.0 * 60.0, 100)' in ranking,
-          "age-aware Demand Gate present")
-    check('0.70 * score + 0.20 * conf + 0.10 * maturity' in ranking,
-          "Radar Rank is separate 70/20/10 ordering layer")
-    check('58 + percentile * 20' not in radar and 'view_bonus' not in radar,
-          "synthetic TOP-position score removed")
-    check('ORGANIC_HIGH_BASELINE_VIEWS = 400' in velocity, "400+ baseline policy preserved")
-    check('24.0 * 60.0, 48.0 * 60.0' in score, "24-48h age cohort present")
-    ai_source = (ROOT / 'ai_worker.py').read_text(encoding='utf-8')
-    check('velocity_window_minutes: float | None = None' in score
-          and 'age_minutes, exact_clock = listing_age_minutes(listing.posted_text, when)' in radar
-          and 'velocity_window_minutes=velocity_window_minutes' in radar
-          and 'velocity_window_minutes=velocity_window_minutes' in ai_source,
-          "listing-age cohort clock is separate from verified-delta velocity clock")
+    check('RADAR_AUTOSCAN_DEPTH = 15' in bot and 'RADAR_CONTEXT_DEPTH = 15' in bot,
+          "Unified circle keeps 15 today + 15 yesterday")
+    check('class RadarObservation(Base):' in (ROOT / 'models.py').read_text(encoding='utf-8'),
+          "Radar 3.0 observation table present")
+    check('baseline_views=raw' in radar and 'admitted=0, saved=0' in radar,
+          "first exact counter is baseline-only and cannot publish")
+    check('RADAR_V3_FIRST_CHECK_MINUTES = 60' in radar and 'radar_v3_observation_scheduler' in bot,
+          "first DT-owned remeasurement scheduled after 60 minutes")
+    check('family_persistent >= 2' in radar and 'consecutive_positive' in radar,
+          "Strong/Hot require observed persistence/repeatability")
+    check('Initial counter is baseline-only and contributed 0 points' in radar,
+          "initial counter contributes zero score")
+    check('delete(RadarSnapshot)' in radar and 'delete(RadarProduct)' in radar and 'RADAR_V3_RESET_SETTING' in radar,
+          "one-time Radar 3.0 clean break present")
+    check('Radar 3.0 maintenance: clean break, no legacy historical backfill.' in bot,
+          "legacy historical backfill disabled")
+    check('Radar 3.0: legacy admission path disabled' in radar,
+          "legacy scan/AI/verified-velocity publishers disabled")
     check('RadarAutoScanStopped' in bot and '_radar_autoscan_stop_event' in bot,
           "Hard Stop preserved")
     check('RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS' in bot, "AutoScan watchdog preserved")
     traffic = (ROOT / 'traffic.py').read_text(encoding='utf-8')
     check('priority == "background" and kind in {"view", "browser"}' in traffic, "background browser obeys foreground pause")
     check('else "normal"' in radar and 'background_during_scans' not in radar[radar.find('detail_priority = ('):radar.find('detail_lane =', radar.find('detail_priority = ('))], "foreground Radar detail gate never self-classifies as background")
-    check('newly_verified_ids, traffic_priority="background"' in bot and 'traffic_priority: str = "normal"' in radar, "Verified Organic Velocity keeps maintenance priority explicit")
+    check('traffic_priority="background"' in bot and 'radar_v3_record_refreshed' in bot, "Radar 3.0 remeasurement stays background")
     check('autoscan_view_priority = "scan_inline"' in bot, "AutoScan exact views stay foreground")
     page = (ROOT / 'page_manager.py').read_text(encoding='utf-8')
     stable = (ROOT / 'stable_engine.py').read_text(encoding='utf-8')
@@ -76,9 +77,8 @@ def main() -> int:
     check('item.page == expected_page' in date_manager, "Date Worker hint is bound to requested page")
     check('_category_feed_identity_matches(requested_url, final_url)' in parser_source, "category redirects preserve requested feed identity")
     check('for item in targets:' in bot and 'vr = results.get(url)' in bot, "partial exact-view maps cannot preserve stale counters")
-    check('return matched' in (ROOT / 'early_winner.py').read_text(encoding='utf-8'), "48H age cohorts do not fall back to all ages")
     check(not list(ROOT.glob('DEPLOY_V4_*.md')), "historical deploy files removed from root")
-    print("\nDT Parser 4.20.0 release smoke: PASS")
+    print("\nDT Parser 4.21.0 Radar 3.0 release smoke: PASS")
     return 0
 
 

@@ -13,7 +13,7 @@ class ReleaseStaticTests(unittest.TestCase):
             ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
     def test_release_version(self):
-        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.20.0")
+        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.21.0")
 
     def test_48h_context_can_publish_only_through_unified_demand_gate(self):
         bot = (ROOT / "bot.py").read_text(encoding="utf-8")

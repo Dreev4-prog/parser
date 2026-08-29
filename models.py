@@ -458,6 +458,32 @@ class RadarProductListing(Base):
     last_price_eur: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
+class RadarObservation(Base):
+    """Radar 3.0 listing-level observation anchored only to DT-owned measurements."""
+
+    __tablename__ = "radar_observations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    external_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    category_key: Mapped[str] = mapped_column(String(80), default="", index=True)
+    product_key: Mapped[str] = mapped_column(String(600), default="", index=True)
+    baseline_views: Mapped[int] = mapped_column(Integer, default=0)
+    baseline_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    last_views: Mapped[int] = mapped_column(Integer, default=0)
+    last_measured_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    checkpoint_count: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    positive_checkpoints: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    consecutive_positive: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    total_delta: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    current_vph: Mapped[float] = mapped_column(Float, default=0.0, index=True)
+    peak_vph: Mapped[float] = mapped_column(Float, default=0.0, index=True)
+    status: Mapped[str] = mapped_column(String(24), default="baseline", index=True)
+    next_check_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
 class RadarLifecycleWatch(Base):
     """Adaptive availability watch for fresh, strong DT Radar listings.
 
