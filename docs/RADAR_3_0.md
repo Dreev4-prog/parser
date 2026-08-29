@@ -51,3 +51,10 @@ The initial counter never participates in this score.
 - The Lab keyboard is Radar 3.0-only: refresh, AutoScan management, back to admin.
 - Old `adminai:*` and `aic:*` buttons from previously sent Telegram messages safely redirect to the Radar 3.0 dashboard.
 - Legacy AI scoring remains disabled; this is a UI/routing repair only.
+
+
+## v4.21.3 — DT AI Lab non-blocking entry
+
+- The DT AI Lab callback opens its control-plane screen before any Radar statistics query.
+- Radar statistics have a short timeout; DB contention/schema errors are rendered as diagnostics instead of making the button appear dead.
+- Legacy `adminai:*` and `aic:*` redirects use the same non-blocking path.

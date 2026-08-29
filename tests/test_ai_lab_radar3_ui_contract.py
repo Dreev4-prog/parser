@@ -21,12 +21,12 @@ def test_ai_lab_keyboard_is_radar3_only():
 
 def test_stale_adminai_sections_redirect_without_legacy_queries():
     block = BOT.split('async def admin_ai_section_handler', 1)[1].split('@dp.callback_query(F.data.startswith("aic:"))', 1)[0]
-    assert "_admin_ai_dashboard_text" in block
+    assert "_admin_ai_dashboard_safe_text" in block
     assert "_ai_candidate_rows" not in block
     assert "_admin_ai_accuracy_text" not in block
 
 
 def test_stale_candidate_buttons_redirect_to_radar3():
     block = BOT.split('async def admin_ai_candidate_handler', 1)[1].split('@dp.callback_query(F.data == "adminviews")', 1)[0]
-    assert "_admin_ai_dashboard_text" in block
+    assert "_admin_ai_dashboard_safe_text" in block
     assert "_admin_ai_candidate(" not in block

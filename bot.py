@@ -11115,6 +11115,44 @@ async def _admin_ai_dashboard_text() -> str:
     ])
 
 
+def _admin_ai_dashboard_loading_text() -> str:
+    return "\n".join([
+        "<b>🧠 DT RADAR 3.0 · OBSERVED DEMAND</b>",
+        "",
+        "Панель открыта: <b>✅</b>",
+        "Статистика: <b>⏳ загружается</b>",
+        "",
+        "<i>Даже если PostgreSQL занят, DT AI Lab больше не блокирует вход в раздел.</i>",
+    ])
+
+
+async def _admin_ai_dashboard_safe_text(timeout_seconds: float = 3.0) -> str:
+    """Never let Radar statistics make the Telegram section unavailable.
+
+    v4.21.3: admin navigation is a control-plane action and must not be coupled to
+    a potentially blocked analytics transaction. A short timeout turns database
+    contention/schema drift into visible diagnostics while keeping the Lab open.
+    """
+    try:
+        return await asyncio.wait_for(_admin_ai_dashboard_text(), timeout=max(0.5, float(timeout_seconds)))
+    except asyncio.TimeoutError:
+        log.warning("DT AI Lab Radar 3.0 stats timeout after %.1fs", float(timeout_seconds))
+        reason = "PostgreSQL занят дольше допустимого времени"
+    except Exception as exc:
+        log.exception("DT AI Lab Radar 3.0 stats failed")
+        reason = f"{type(exc).__name__}: {str(exc)[:180]}"
+    return "\n".join([
+        "<b>🧠 DT RADAR 3.0 · OBSERVED DEMAND</b>",
+        "",
+        "Панель открыта: <b>✅</b>",
+        "Движок Radar 3.0: <b>🟢 активен</b>",
+        "Статистика: <b>⚠️ временно недоступна</b>",
+        f"Диагностика: <code>{html.escape(reason)}</code>",
+        "",
+        "<i>Это не закрывает DT AI Lab. Нажми «Обновить Radar 3.0», когда база освободится.</i>",
+    ])
+
+
 async def _ai_candidate_rows(kind: str, limit: int = 15) -> list[tuple[AIEarlyWinnerCandidate, Listing, UserScan]]:
     async with SessionLocal() as session:
         query = (
@@ -12194,8 +12232,15 @@ async def admin_ai_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer()
-    unread = await _ai_unread_signal_count()
-    await _edit_or_answer(callback.message, await _admin_ai_dashboard_text(), reply_markup=admin_ai_keyboard(unread))
+    # v4.21.3: open the control plane first. Radar statistics are secondary and
+    # must never make the button appear dead when PostgreSQL is busy/locked.
+    await _edit_or_answer(
+        callback.message,
+        _admin_ai_dashboard_loading_text(),
+        reply_markup=admin_ai_keyboard(),
+    )
+    text = await _admin_ai_dashboard_safe_text()
+    await _edit_or_answer(callback.message, text, reply_markup=admin_ai_keyboard())
 
 
 @dp.callback_query(F.data.startswith("adminai:"))
@@ -12210,11 +12255,8 @@ async def admin_ai_section_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer("Раздел перенесён в Radar 3.0")
-    await _edit_or_answer(
-        callback.message,
-        await _admin_ai_dashboard_text(),
-        reply_markup=admin_ai_keyboard(),
-    )
+    await _edit_or_answer(callback.message, _admin_ai_dashboard_loading_text(), reply_markup=admin_ai_keyboard())
+    await _edit_or_answer(callback.message, await _admin_ai_dashboard_safe_text(), reply_markup=admin_ai_keyboard())
 
 
 @dp.callback_query(F.data.startswith("aic:"))
@@ -12224,11 +12266,8 @@ async def admin_ai_candidate_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer("Старая AI-карточка отключена · открываю Radar 3.0")
-    await _edit_or_answer(
-        callback.message,
-        await _admin_ai_dashboard_text(),
-        reply_markup=admin_ai_keyboard(),
-    )
+    await _edit_or_answer(callback.message, _admin_ai_dashboard_loading_text(), reply_markup=admin_ai_keyboard())
+    await _edit_or_answer(callback.message, await _admin_ai_dashboard_safe_text(), reply_markup=admin_ai_keyboard())
 
 
 @dp.callback_query(F.data == "adminviews")
