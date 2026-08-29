@@ -49,15 +49,13 @@ class Radar3ObservedDemandContractTests(unittest.TestCase):
 
     def test_scheduler_remeasures_exact_views_after_baseline(self):
         self.assertIn('radar_v3_observation_scheduler', BOT)
-        self.assertIn('refresh_view_counts(rows, None, force=True, max_age_seconds=0, traffic_priority="background")', BOT)
+        self.assertIn('refresh_view_counts(rows, None, force=True, max_age_seconds=0, traffic_priority="radar_checkpoint")', BOT)
         self.assertIn('radar_v3_record_refreshed', BOT)
 
-    def test_legacy_ai_pipeline_is_hard_disabled(self):
-        ai = (ROOT / 'ai_worker.py').read_text(encoding='utf-8')
-        self.assertIn('AI_ENABLED = False', ai)
-        self.assertIn('RADAR3_ENGINE_LABEL = "radar3-observed-demand-main-bot"', ai)
-        self.assertIn('if not AI_ENABLED:', ai)
-        self.assertIn('no writes that can deadlock with Radar 3.0', ai)
+    def test_legacy_ai_runtime_files_are_removed(self):
+        self.assertFalse((ROOT / 'ai_worker.py').exists())
+        self.assertFalse((ROOT / 'ai_manager.py').exists())
+        self.assertTrue((ROOT / 'retired_ai_worker.py').exists())
 
     def test_cross_replica_claim_uses_skip_locked_and_lease(self):
         self.assertIn('radar_v3_claim_due_external_ids', RADAR)
@@ -65,12 +63,33 @@ class Radar3ObservedDemandContractTests(unittest.TestCase):
         self.assertIn('RadarObservation.lease_until', RADAR)
         self.assertIn('row.lease_owner = owner', RADAR)
         self.assertIn('radar_v3_release_claims', RADAR)
-        self.assertIn('radar_v3_claim_due_external_ids(owner, limit=1000)', BOT)
+        self.assertIn('radar_v3_claim_due_external_ids(owner, limit=250)', BOT)
 
-    def test_admin_ai_page_reports_radar3_not_old_plus_1_3_6(self):
-        self.assertIn('DT RADAR 3.0 · OBSERVED DEMAND', BOT)
-        self.assertIn('Старая AI-модель: <b>⛔ отключена</b>', BOT)
-        self.assertIn('+1/+3/+6 Early Winner больше не работает', BOT)
+    def test_admin_radar3_page_replaces_old_ai_lab(self):
+        self.assertIn('DT Radar 3.0 · OBSERVED DEMAND', BOT)
+        admin = BOT.split('def admin_keyboard', 1)[1].split('def admin_back_keyboard', 1)[0]
+        self.assertNotIn('DT AI Lab', admin)
+        self.assertIn('DT Radar 3.0', admin)
+
+    def test_checkpoint_lane_survives_autoscan_without_becoming_foreground(self):
+        traffic = (ROOT / 'traffic.py').read_text(encoding='utf-8')
+        self.assertIn('priority == "radar_checkpoint"', traffic)
+        self.assertIn('not is_radar_checkpoint', traffic)
+        self.assertIn('traffic_priority="radar_checkpoint"', BOT)
+        self.assertIn('radar_v3_view_refresh_lock', BOT)
+
+    def test_ttl_is_authoritative_and_expiry_is_independent(self):
+        self.assertIn('RadarObservation.expires_at > now', RADAR)
+        self.assertIn('async def radar_v3_expire_observations()', RADAR)
+        self.assertIn('if obs.expires_at and measured_at > obs.expires_at:', RADAR)
+        self.assertIn('expired_obs = await radar_v3_expire_observations()', BOT)
+        self.assertIn('expired_products = await radar_v3_expire_stale_products()', BOT)
+
+    def test_startup_reset_is_cross_replica_atomic(self):
+        start = RADAR.index('async def prepare_radar_v3_once(')
+        src = RADAR[start:RADAR.index('async def record_autoscan_hot(', start)]
+        self.assertIn('pg_advisory_xact_lock', src)
+        self.assertIn('RADAR_V3_RESET_SETTING', src)
 
 
 if __name__ == '__main__':

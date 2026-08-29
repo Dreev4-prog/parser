@@ -1,5 +1,20 @@
 # DT Radar 3.0 — Observed Demand
 
+## v4.21.5 — Live Today
+
+- AutoScan scans **20 pages for today only** in every eligible product category.
+- Yesterday/24–48H Context is retired and cannot be scheduled.
+- The first exact counter is baseline only and contributes zero demand evidence.
+- Radar remeasures baselines after 60 minutes and evaluates only DT-observed delta.
+- Completed user scans for **today** also seed baseline observations when they have exact views and pass organic integrity filters.
+- Duplicate `adId` values reuse the same `RadarObservation`.
+- DT AI Lab and its legacy runtime files are removed. The single admin surface is DT Radar 3.0.
+- The Radar 3.0 admin panel shows baseline/due/observed/persistent/quiet counts, total observed delta, Early/Strong/Hot, and categories with live growth.
+
+## Historical notes
+
+# DT Radar 3.0 — Observed Demand
+
 Radar 3.0 stops trusting the publication age and the counter already present when DT first sees an ad. Hidden bumps can make an old listing look new while preserving old views, so neither value is allowed to create a signal.
 
 ## Core contract

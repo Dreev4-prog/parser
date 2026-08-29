@@ -69,9 +69,8 @@ def main() -> None:
     role = _role()
     service_name = os.getenv("RAILWAY_SERVICE_NAME", "local")
     if role == "ai-worker":
-        # The AI worker delegates tiny +1/+3/+6 candidate checks to the existing
-        # exact View Worker fleet; it never opens its own browser.
-        os.environ.setdefault("REMOTE_VIEW_WORKER_ENABLED", "1")
+        # DT AI Lab/legacy scoring was removed in v4.21.5. Keep an existing Railway AI
+        # service harmless until the user deletes that service from Railway.
         os.environ.setdefault("DISTRIBUTED_WORKERS", "1")
     if role == "lifecycle-worker":
         # Fast Sold uses PostgreSQL as its durable queue and direct lightweight
@@ -81,7 +80,7 @@ def main() -> None:
         "view-worker": "view_counter_worker.py",
         "page-worker": "page_worker.py",
         "date-worker": "date_worker.py",
-        "ai-worker": "ai_worker.py",
+        "ai-worker": "retired_ai_worker.py",
         "lifecycle-worker": "lifecycle_worker.py",
     }.get(role, "bot.py")
 

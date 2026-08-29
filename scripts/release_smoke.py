@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.21.3", "VERSION=4.21.3")
+    check((ROOT / "VERSION").read_text().strip() == "4.21.5", "VERSION=4.21.5")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -27,11 +27,11 @@ def main() -> int:
     velocity = (ROOT / "organic_velocity.py").read_text(encoding="utf-8")
     score = (ROOT / "early_winner.py").read_text(encoding="utf-8")
 
-    check('RADAR_CONTEXT_DEPTH = 15' in bot, "Context depth=15")
-    check('mode in {"manual", "daily"}' in bot, "manual/daily Fresh can queue Context")
-    check('target_day = context_day - timedelta(days=1)' in bot, "Context targets yesterday")
-    check('RADAR_AUTOSCAN_DEPTH = 15' in bot and 'RADAR_CONTEXT_DEPTH = 15' in bot,
-          "Unified circle keeps 15 today + 15 yesterday")
+    check('RADAR_AUTOSCAN_DEPTH = 20' in bot, "Radar AutoScan depth=20")
+    check('RADAR_CONTEXT_ENABLED = False' in bot and 'RADAR_CONTEXT_DEPTH = 0' in bot, "yesterday Context retired")
+    scheduler = bot.split('async def radar_autoscan_scheduler', 1)[1].split('async def send_smart_export', 1)[0]
+    check('_radar_autoscan_new_context_round' not in scheduler, "scheduler cannot launch yesterday Context")
+    check('record_user_scan_radar3_baselines' in bot and 'record_user_scan_radar3_baselines' in radar, "today user scans feed Radar 3.0 baselines")
     check('class RadarObservation(Base):' in (ROOT / 'models.py').read_text(encoding='utf-8'),
           "Radar 3.0 observation table present")
     check('baseline_views=raw' in radar and 'admitted=0, saved=0' in radar,
@@ -52,14 +52,16 @@ def main() -> int:
           "Hard Stop preserved")
     check('RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS' in bot, "AutoScan watchdog preserved")
     traffic = (ROOT / 'traffic.py').read_text(encoding='utf-8')
-    check('priority == "background" and kind in {"view", "browser"}' in traffic, "background browser obeys foreground pause")
+    check('priority in {"background", "radar_checkpoint"}' in traffic and 'self._background_pauses > 0 and not is_radar_checkpoint' in traffic, "background pause preserved with dedicated Radar checkpoint exception")
     check('else "normal"' in radar and 'background_during_scans' not in radar[radar.find('detail_priority = ('):radar.find('detail_lane =', radar.find('detail_priority = ('))], "foreground Radar detail gate never self-classifies as background")
-    check('traffic_priority="background"' in bot and 'radar_v3_record_refreshed' in bot, "Radar 3.0 remeasurement stays background")
-    ai = (ROOT / 'ai_worker.py').read_text(encoding='utf-8')
+    check('traffic_priority="radar_checkpoint"' in bot and 'radar_v3_record_refreshed' in bot, "Radar 3.0 remeasurement uses throttled checkpoint lane")
     models = (ROOT / 'models.py').read_text(encoding='utf-8')
-    check('AI_ENABLED = False' in ai and 'radar3-observed-demand-main-bot' in ai, "legacy AI Early Winner hard-disabled")
+    launcher = (ROOT / 'service_launcher.py').read_text(encoding='utf-8')
+    check('"ai-worker": "retired_ai_worker.py"' in launcher, "legacy AI service is inert")
     check('.with_for_update(skip_locked=True)' in radar and 'radar_v3_claim_due_external_ids' in radar, "cross-replica Radar claims use SKIP LOCKED")
     check('lease_owner' in models and 'lease_until' in models, "Radar observation lease fields present")
+    check('radar_v3_expire_observations' in radar and 'RadarObservation.expires_at > now' in radar, "Radar observation TTL enforced before claims")
+    check('pg_advisory_xact_lock(hashtext(:key))' in radar, "Radar 3.0 clean reset serialized across Parser replicas")
     check('autoscan_view_priority = "scan_inline"' in bot, "AutoScan exact views stay foreground")
     page = (ROOT / 'page_manager.py').read_text(encoding='utf-8')
     stable = (ROOT / 'stable_engine.py').read_text(encoding='utf-8')
@@ -83,7 +85,7 @@ def main() -> int:
     check('_category_feed_identity_matches(requested_url, final_url)' in parser_source, "category redirects preserve requested feed identity")
     check('for item in targets:' in bot and 'vr = results.get(url)' in bot, "partial exact-view maps cannot preserve stale counters")
     check(not list(ROOT.glob('DEPLOY_V4_*.md')), "historical deploy files removed from root")
-    print("\nDT Parser 4.21.3 Radar 3.0 release smoke: PASS")
+    print("\nDT Parser 4.21.5 Radar 3.0 Live Today release smoke: PASS")
     return 0
 
 

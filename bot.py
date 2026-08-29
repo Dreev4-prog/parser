@@ -75,7 +75,6 @@ from filters import (
     unique_rows,
 )
 from models import (
-    AIEarlyWinnerCandidate, AIEarlyWinnerEvent, AIEarlyWinnerObservation, AIEarlyWinnerRun,
     AppSetting, BotUser, CategoryScanState, FreeRadarEvent, Listing, ListingIntegrity, ParserRun, PriceHistory, RadarProduct, RadarObservation, RadarSnapshot, ScanListing,
     ScanObservation, ScanViewHistory, SelectedCategory, StableCategoryJob, StablePageCheckpoint,
     SubscriptionPayment, SubscriptionPlan, UserScan, UserSettings, ViewHistory,
@@ -122,14 +121,13 @@ from parser import (
     private_provider_url,
 )
 from view_manager import REMOTE_VIEW_MANAGER, REMOTE_VIEW_WORKER_ENABLED
-from ai_manager import AI_MANAGER
 from radar import (
-    RADAR_PAGE_SIZE, RADAR_SCAN_TOP_LIMIT, backfill_radar_once, bump_resurrection_integrity_sweep_once,
+    RADAR_PAGE_SIZE, RADAR_SCAN_TOP_LIMIT, bump_resurrection_integrity_sweep_once,
     prepare_bump_resurrection_sweep_once, prepare_verified_organic_velocity_once, prepare_unified_48h_ranking_once, get_fast_sold_info, get_fast_sold_infos,
     get_radar_product, is_radar_favorite, list_radar_products, radar_categories, radar_stats,
-    purge_nonorganic_analytics, record_autoscan_hot_detailed, record_scan_hot,
+    purge_nonorganic_analytics, record_autoscan_hot_detailed, record_user_scan_radar3_baselines,
     record_verified_velocity_signals, refresh_radar_scores, verify_listing_organic_now,
-    prepare_radar_v3_once, radar_v3_due_external_ids, radar_v3_claim_due_external_ids, radar_v3_release_claims, radar_v3_record_refreshed, radar_v3_expire_stale_products,
+    prepare_radar_v3_once, radar_v3_due_external_ids, radar_v3_claim_due_external_ids, radar_v3_release_claims, radar_v3_record_refreshed, radar_v3_expire_observations, radar_v3_expire_stale_products,
     search_radar_products, toggle_radar_favorite,
 )
 from page_manager import (
@@ -168,16 +166,17 @@ _trial_credit_guard = asyncio.Lock()
 # backoff after partial/system failures. Non-product/service categories remain available
 # to the normal parser; they are excluded only from the automatic Radar seeding round.
 RADAR_AUTOSCAN_SETTING_KEY = "dt_radar_autoscan_v1"
-RADAR_AUTOSCAN_POLICY_VERSION = 3
-RADAR_AUTOSCAN_DEPTH = 15
-RADAR_CONTEXT_DEPTH = 15
-RADAR_CONTEXT_ENABLED = True
+RADAR_AUTOSCAN_POLICY_VERSION = 4
+RADAR_AUTOSCAN_DEPTH = 20
+# Radar 3.0 observes live demand only on today's market. Yesterday context was retired in v4.21.5.
+RADAR_CONTEXT_DEPTH = 0
+RADAR_CONTEXT_ENABLED = False
 
 
 def _radar_layer_depth(state: dict | None = None) -> int:
     """Return the configured page depth for the active Radar layer."""
     layer = str((state or {}).get("layer") or "fresh")
-    return RADAR_CONTEXT_DEPTH if layer == "context" else RADAR_AUTOSCAN_DEPTH
+    return RADAR_AUTOSCAN_DEPTH
 
 
 RADAR_AUTOSCAN_USER_ID = -411000001
@@ -2202,10 +2201,13 @@ async def backfill_recent_observation_plans() -> int:
 
 
 async def _safe_record_scan_hot(scan_id: int) -> None:
+    """Feed today's completed user scans into Radar 3.0 as baseline-only evidence."""
     try:
-        await record_scan_hot(int(scan_id))
+        seeded = await record_user_scan_radar3_baselines(int(scan_id))
+        if seeded:
+            log.info("DT Radar 3.0 user-scan baselines scan=%s seeded=%s", scan_id, seeded)
     except Exception:
-        log.exception("DT Radar scan merge failed scan=%s", scan_id)
+        log.exception("DT Radar 3.0 user-scan baseline merge failed scan=%s", scan_id)
 
 
 async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None:
@@ -4369,24 +4371,29 @@ async def radar_v3_observation_scheduler() -> None:
     while True:
         try:
             running, queued = await _radar_foreground_counts()
-            traffic_snapshot = await TRAFFIC.snapshot()
-            if running or queued or int(getattr(traffic_snapshot, "scan_jobs_active", 0) or 0) > 0 or int(getattr(traffic_snapshot, "background_pauses", 0) or 0) > 0:
-                await asyncio.sleep(60)
+            # User scans remain absolute priority. AutoScan itself is allowed to run
+            # concurrently with one throttled Radar checkpoint lane; otherwise +60m
+            # observations can drift by hours during a large 15+15 circle.
+            if running or queued:
+                await asyncio.sleep(30)
                 continue
-            ids = await radar_v3_claim_due_external_ids(owner, limit=1000)
+            expired_obs = await radar_v3_expire_observations()
+            expired_products = await radar_v3_expire_stale_products()
+            if expired_obs or expired_products:
+                log.info("DT Radar 3.0 expiry observations=%s products=%s", expired_obs, expired_products)
+            ids = await radar_v3_claim_due_external_ids(owner, limit=250)
             if not ids:
-                expired = await radar_v3_expire_stale_products()
-                if expired:
-                    log.info("DT Radar 3.0 expired stale products=%s", expired)
-                await asyncio.sleep(60)
+                await asyncio.sleep(30)
                 continue
             async with SessionLocal() as session:
                 rows = list((await session.execute(select(Listing).where(Listing.external_id.in_(ids)))).scalars().all())
             if not rows:
+                released = await radar_v3_release_claims(owner, ids)
+                log.warning("DT Radar 3.0 claimed rows missing listings due=%s released=%s", len(ids), released)
                 await asyncio.sleep(30)
                 continue
-            async with background_view_refresh_lock:
-                requested, updated, failed = await refresh_view_counts(rows, None, force=True, max_age_seconds=0, traffic_priority="background")
+            async with radar_v3_view_refresh_lock:
+                requested, updated, failed = await refresh_view_counts(rows, None, force=True, max_age_seconds=0, traffic_priority="radar_checkpoint")
             saved = await radar_v3_record_refreshed([str(x.external_id) for x in rows])
             # Successful observations release their own lease while being recorded;
             # failed/unchanged rows are released here for a clean retry next poll.
@@ -4549,7 +4556,19 @@ def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
     # deploy cannot corrupt current_index/counters midway through a persisted round.
     # Every new/retry round uses the current policy and only product-oriented categories.
     stored_policy = max(0, int(raw_state.get("policy_version") or 0))
-    legacy_active = stored_policy < RADAR_AUTOSCAN_POLICY_VERSION and str(state.get("status") or "idle") in {"running", "paused"} and bool(raw_state.get("category_keys"))
+    if stored_policy < RADAR_AUTOSCAN_POLICY_VERSION and str(state.get("status") or "idle") in {"running", "paused"}:
+        # v4.21.5 retires yesterday/context entirely. Never resume a persisted
+        # 15+15 round after deploy; a new run must use 20 pages for today only.
+        state["status"] = "idle"
+        state["stop_requested"] = False
+        state["waiting_for_users"] = False
+        state["current_index"] = 0
+        state["current_category_key"] = ""
+        state["current_category_name"] = ""
+        state["mode"] = ""
+        state["layer"] = "fresh"
+        state["target_date"] = ""
+    legacy_active = False
     if legacy_active:
         keys = [str(x) for x in (state.get("category_keys") or []) if str(x) in CATEGORIES and not CATEGORIES[str(x)].is_group]
         state["legacy_policy_round"] = True
@@ -4678,57 +4697,6 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
     return new_state
 
 
-def _radar_autoscan_new_context_round(state: dict, for_date=None) -> dict:
-    """Build the once-daily 24-48h Context Layer over yesterday.
-
-    Context uses the same exact page/view/integrity pipeline as Fresh Layer.
-    Yesterday listings may enter the same public 48H Radar only when their demand
-    evidence is safe and passes the age-aware Demand Gate; inherited unknown totals
-    still cannot vote. The layer also enriches Persistence/Repeatability history.
-    """
-    keys = [cat.key for cat in _radar_autoscan_categories()]
-    now = datetime.now(MOSCOW)
-    context_day = for_date or now.date()
-    if isinstance(context_day, str):
-        try:
-            context_day = datetime.strptime(context_day[:10], "%Y-%m-%d").date()
-        except Exception:
-            context_day = now.date()
-    target_day = context_day - timedelta(days=1)
-    keep = {
-        "daily_enabled": bool(state.get("daily_enabled")),
-        "daily_time": str(state.get("daily_time") or RADAR_AUTOSCAN_DEFAULT_TIME),
-        "skip_daily_if_completed_today": bool(state.get("skip_daily_if_completed_today", True)),
-        "last_completed_date": str(state.get("last_completed_date") or ""),
-        "last_daily_date": str(state.get("last_daily_date") or ""),
-        "last_context_date": str(state.get("last_context_date") or ""),
-        "last_summary": dict(state.get("last_summary") or {}),
-        "history": list(state.get("history") or [])[:RADAR_AUTOSCAN_HISTORY_LIMIT],
-    }
-    new_state = _radar_autoscan_default_state()
-    new_state.update(keep)
-    new_state.update({
-        "policy_version": RADAR_AUTOSCAN_POLICY_VERSION,
-        "status": "running",
-        "stop_requested": False,
-        "waiting_for_users": False,
-        "round_id": f"context-{now.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:5]}",
-        "mode": "context",
-        "layer": "context",
-        "context_for_date": context_day.isoformat(),
-        "target_date": target_day.isoformat(),
-        "category_keys": keys,
-        "current_index": 0,
-        "current_category_key": "",
-        "current_category_name": "Запуск этапа 2/2 · вчера…",
-        "current_stage": "starting",
-        "current_stage_started_at": now.replace(microsecond=0).isoformat(),
-        "total": len(keys),
-        "started_at": now.replace(microsecond=0).isoformat(),
-    })
-    return new_state
-
-
 def _radar_autoscan_retry_round(state: dict) -> dict | None:
     """Create one low-priority round containing only failures from the last report."""
     last = dict(state.get("last_summary") or {})
@@ -4762,9 +4730,9 @@ def _radar_autoscan_retry_round(state: dict) -> dict | None:
         "waiting_for_users": False,
         "round_id": f"retry-{now.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:5]}",
         "mode": "retry",
-        "layer": str(last.get("layer") or ("context" if last.get("mode") == "context" else "fresh")),
+        "layer": "fresh",
         "context_for_date": str(last.get("context_for_date") or ""),
-        "target_date": str(last.get("target_date") or now.date().isoformat()),
+        "target_date": now.date().isoformat(),
         "category_keys": keys,
         "current_index": 0,
         "current_category_key": "",
@@ -4880,6 +4848,93 @@ def _radar_autoscan_next_run_text(state: dict) -> str:
     return candidate.strftime("%d.%m · %H:%M МСК")
 
 
+
+
+async def _radar3_dashboard_snapshot() -> dict:
+    """Compact Radar 3.0 control-plane snapshot for the single admin dashboard."""
+    now = datetime.utcnow()
+    async with SessionLocal() as session:
+        active = int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.status.in_(["baseline", "observed", "confirmed"]),
+            RadarObservation.expires_at > now,
+        ))).scalar_one() or 0)
+        baseline = int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.checkpoint_count == 0, RadarObservation.expires_at > now,
+        ))).scalar_one() or 0)
+        due = int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.next_check_at.is_not(None), RadarObservation.next_check_at <= now,
+            RadarObservation.expires_at > now,
+            RadarObservation.status.in_(["baseline", "observed", "confirmed"]),
+        ))).scalar_one() or 0)
+        observed = int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.positive_checkpoints >= 1, RadarObservation.expires_at > now,
+        ))).scalar_one() or 0)
+        persistent = int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.consecutive_positive >= 2, RadarObservation.expires_at > now,
+        ))).scalar_one() or 0)
+        quiet = int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.status == "quiet",
+        ))).scalar_one() or 0)
+        total_delta = int((await session.execute(select(func.coalesce(func.sum(RadarObservation.total_delta), 0)).where(
+            RadarObservation.positive_checkpoints >= 1, RadarObservation.expires_at > now,
+        ))).scalar_one() or 0)
+        early = int((await session.execute(select(func.count(RadarProduct.id)).where(
+            RadarProduct.latest_source == "radar3_observed", RadarProduct.demand_status == "stable",
+        ))).scalar_one() or 0)
+        strong = int((await session.execute(select(func.count(RadarProduct.id)).where(
+            RadarProduct.latest_source == "radar3_observed", RadarProduct.demand_status == "rising",
+        ))).scalar_one() or 0)
+        hot = int((await session.execute(select(func.count(RadarProduct.id)).where(
+            RadarProduct.latest_source == "radar3_observed", RadarProduct.demand_status == "hot",
+        ))).scalar_one() or 0)
+        category_rows = list((await session.execute(
+            select(
+                RadarObservation.category_key,
+                func.count(RadarObservation.id),
+                func.coalesce(func.sum(RadarObservation.total_delta), 0),
+            )
+            .where(RadarObservation.positive_checkpoints >= 1, RadarObservation.expires_at > now)
+            .group_by(RadarObservation.category_key)
+            .order_by(func.coalesce(func.sum(RadarObservation.total_delta), 0).desc(), func.count(RadarObservation.id).desc())
+            .limit(12)
+        )).all())
+        signal_rows = list((await session.execute(
+            select(RadarProduct.category_key, RadarProduct.demand_status, func.count(RadarProduct.id))
+            .where(RadarProduct.latest_source == "radar3_observed")
+            .group_by(RadarProduct.category_key, RadarProduct.demand_status)
+        )).all())
+
+    signal_map: dict[str, dict[str, int]] = {}
+    for key, status, count in signal_rows:
+        slot = signal_map.setdefault(str(key or "unknown"), {"stable": 0, "rising": 0, "hot": 0})
+        slot[str(status or "")] = int(count or 0)
+    category_lines = []
+    for key, count, delta in category_rows:
+        key = str(key or "unknown")
+        cat = CATEGORIES.get(key)
+        name = str(getattr(cat, "name", None) or key)
+        sig = signal_map.get(key, {})
+        suffix = []
+        if int(sig.get("hot", 0)): suffix.append(f"🔥{int(sig['hot'])}")
+        if int(sig.get("rising", 0)): suffix.append(f"📈{int(sig['rising'])}")
+        if int(sig.get("stable", 0)): suffix.append(f"🟡{int(sig['stable'])}")
+        signal_text = (" · " + " ".join(suffix)) if suffix else ""
+        category_lines.append(f"• <b>{html.escape(name)}</b>: +{int(delta or 0)} · {int(count or 0)} растут{signal_text}")
+    return {
+        "active": active, "baseline": baseline, "due": due, "observed": observed,
+        "persistent": persistent, "quiet": quiet, "total_delta": total_delta,
+        "early": early, "strong": strong, "hot": hot, "category_lines": category_lines,
+    }
+
+
+async def _radar3_dashboard_safe_snapshot(timeout_seconds: float = 2.5) -> dict:
+    try:
+        return await asyncio.wait_for(_radar3_dashboard_snapshot(), timeout=max(0.5, float(timeout_seconds)))
+    except Exception:
+        log.exception("DT Radar 3.0 dashboard snapshot failed")
+        return {"category_lines": ["⚠️ Статистика замеров временно недоступна"]}
+
+
 async def _radar_autoscan_text() -> tuple[str, dict]:
     state = await load_radar_autoscan_state()
     total = max(1, int(state.get("total") or len(_radar_autoscan_categories()) or 1))
@@ -4887,10 +4942,7 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
     pct = int(round(processed / total * 100))
     status = str(state.get("status") or "idle")
     if status == "running":
-        if state.get("waiting_for_users"):
-            status_text = "🟡 ждёт освобождения пользовательских сканов"
-        else:
-            status_text = "🟢 идёт круг"
+        status_text = "🟡 ждёт освобождения пользовательских сканов" if state.get("waiting_for_users") else "🟢 идёт круг"
     elif status == "paused":
         status_text = "⏸ круг остановлен"
     else:
@@ -4899,23 +4951,8 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
     live_stage_line = _radar_autoscan_live_stage_line(state) if status == "running" else ""
     mode = str(state.get("mode") or "")
     is_retry = mode == "retry"
-    mode_label = "Повтор ошибок" if is_retry else "Unified 48H Radar · сегодня + вчера"
-    layer = str(state.get("layer") or "fresh")
-    if is_retry:
-        stage_label = "допроверка проблемных категорий"
-        overall_progress_line = ""
-    elif layer == "context":
-        stage_label = "② Вчера · 15 страниц · 24–48H Context"
-        overall_done = total + processed
-        overall_total = total * 2
-        overall_pct = int(round(overall_done / max(1, overall_total) * 100))
-        overall_progress_line = f"Общий прогресс круга: <b>{overall_done}/{overall_total} · {overall_pct}%</b>\n"
-    else:
-        stage_label = "① Сегодня · 15 страниц · Fresh"
-        overall_done = processed
-        overall_total = total * 2
-        overall_pct = int(round(overall_done / max(1, overall_total) * 100))
-        overall_progress_line = f"Общий прогресс круга: <b>{overall_done}/{overall_total} · {overall_pct}%</b>\n"
+    mode_label = "Повтор ошибок" if is_retry else "Radar 3.0 · Live Today"
+    stage_label = "допроверка проблемных категорий" if is_retry else "Сегодня · 20 страниц"
     last = dict(state.get("last_summary") or {})
     if last:
         coverage_total = int(last.get("coverage_total") or last.get("total") or 0)
@@ -4923,71 +4960,44 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         last_line = (
             f"#{html.escape(str(last.get('round_id') or '—'))} · "
             f"{coverage_success}/{coverage_total} покрыто · "
-            f"Radar +{int(last.get('radar_saved') or 0)}"
+            f"Baseline {int(last.get('radar_candidates') or 0)}"
         )
     else:
         last_line = "—"
+
+    radar3 = await _radar3_dashboard_safe_snapshot()
+    category_lines = list(radar3.get("category_lines") or [])
+    category_text = "\n".join(category_lines[:8]) if category_lines else "Пока подтверждённых категорий нет"
     text = (
-        "<b>📡 DT Radar AutoScan</b>\n\n"
-        f"Статус: <b>{status_text}</b>\n"
+        "<b>📡 DT Radar 3.0 · OBSERVED DEMAND</b>\n\n"
+        f"Статус AutoScan: <b>{status_text}</b>\n"
         f"Режим: <b>{mode_label}</b>\n"
-        + ("Глубина круга: <b>15 сегодня + 15 вчера на категорию</b>\n" if not is_retry else f"Глубина: <b>{_radar_layer_depth(state)} страниц на категорию</b>\n")
+        + (f"Глубина: <b>{RADAR_AUTOSCAN_DEPTH} страниц только за сегодня на категорию</b>\n" if not is_retry else f"Глубина: <b>{_radar_layer_depth(state)} страниц на категорию</b>\n")
         + f"Текущий этап: <b>{stage_label}</b>\n"
-        + f"Категории: <b>{len(_radar_autoscan_categories())}</b> товарных категорий\n"
-        + f"Прогресс этапа: <b>{processed}/{total} · {pct}%</b>\n"
-        + overall_progress_line
+        + f"Категории AutoScan: <b>{len(_radar_autoscan_categories())}</b>\n"
+        + f"Прогресс: <b>{processed}/{total} · {pct}%</b>\n"
         + f"Сейчас: <b>{html.escape(current)}</b>\n"
         + (live_stage_line + "\n" if live_stage_line else "")
-        + f"⏱ Watchdog категории: <b>{int(RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS // 60)} мин.</b>\n\n"
-        f"✅ Успешно: <b>{int(state.get('successful') or 0)}</b> · "
-        f"⚠️ допроверка: <b>{int(state.get('needs_review') or 0)}</b> · "
-        f"❌ системных: <b>{int(state.get('system_errors') or 0)}</b>\n"
-        + (f"⏭ Нетоварных пропущено: <b>{int(state.get('skipped_nonproduct') or 0)}</b>\n" if int(state.get("skipped_nonproduct") or 0) else "")
         + f"📄 Подтверждено страниц: <b>{int(state.get('pages_verified') or 0)}</b>\n"
-        f"🧾 Чистых объявлений даты: <b>{int(state.get('listings_seen') or 0)}</b> · "
-        f"новых: <b>{int(state.get('new_listings') or 0)}</b>\n"
-        f"🚫 Сразу исключено: TOP/Promo <b>{int(state.get('search_promoted_filtered') or 0)}</b> · "
-        f"снижение <b>{int(state.get('search_reduced_filtered') or 0)}</b>\n"
-        f"👁 Точные просмотры: <b>{int(state.get('views_verified') or 0)}/{int(state.get('views_requested') or 0)}</b>"
-        + (f" · ⚠️ неизвестно: <b>{int(state.get('views_failed') or 0)}</b>" if int(state.get('views_failed') or 0) else "") + "\n"
-        + (
-            f"🟡 Initial ≥{ORGANIC_HIGH_BASELINE_VIEWS}: <b>{int(state.get('radar_high_baseline_pending') or 0)}</b> ждут 2 замера · "
-            f"✅ delta verified: <b>{int(state.get('radar_high_baseline_verified') or 0)}</b>\n"
-            if int(state.get('radar_high_baseline_pending') or 0) or int(state.get('radar_high_baseline_verified') or 0) else ""
-        )
-        + f"🎯 Demand-safe: <b>{int(state.get('radar_candidates') or 0)}</b> · "
-        f"ниже Early: <b>{int(state.get('radar_demand_gate_rejected') or 0)}</b> · "
-        f"к отбору: <b>{int(state.get('radar_qualified_candidates') or 0)}</b> · "
-        f"detail-check: <b>{int(state.get('radar_detail_checked') or 0)}</b>\n"
-        + f"🟡 Early: <b>{int(state.get('radar_early_admitted') or 0)}</b> · "
-        f"📈 Strong: <b>{int(state.get('radar_strong_admitted') or 0)}</b> · 🔥 Hot: <b>{int(state.get('radar_hot_admitted') or 0)}</b>\n"
-        f"🛡 Organic прошло: <b>{int(state.get('radar_organic_passed') or 0)}</b> · "
-        f"TOP/Promo: <b>{int(state.get('radar_promoted_blocked') or 0)}</b> · "
-        f"снижение: <b>{int(state.get('radar_reduced_blocked') or 0)}</b> · "
-        f"unknown: <b>{int(state.get('radar_unknown_blocked') or 0)}</b>\n"
-        + (f"↳ причины: {_radar_unknown_reason_text(state.get('radar_unknown_reasons'))}\n" if int(state.get('radar_unknown_blocked') or 0) else "")
-        + f"📡 Новых Radar-сигналов: <b>{int(state.get('radar_saved') or 0)}</b>"
-        + (f" · ♻️ уже были: <b>{int(state.get('radar_already_present') or 0)}</b>" if int(state.get("radar_already_present") or 0) else "") + "\n\n"
-        f"Ежедневный круг: <b>{'✅ ВКЛ' if state.get('daily_enabled') else '⏸ ВЫКЛ'}</b>\n"
-        f"Время: <b>{html.escape(str(state.get('daily_time') or RADAR_AUTOSCAN_DEFAULT_TIME))} МСК</b>\n"
-        f"Следующий запуск: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>\n"
-        f"Если полный ручной круг уже прошёл сегодня: <b>{'пропустить Fresh, но Context всё равно собрать' if state.get('skip_daily_if_completed_today', True) else 'всё равно запустить Fresh'}</b>\n"
-        f"Этап 2/2 · вчера: <b>{'✅ собран сегодня' if state.get('last_context_date') == datetime.now(MOSCOW).date().isoformat() else '⏳ ещё не собран сегодня'}</b>\n\n"
-        f"Последний круг: <b>{last_line}</b>\n"
-        + (
-            f"📊 Покрытие последнего: <b>{int(last.get('category_coverage_pct') or 0)}% категорий</b> · "
-            f"<b>{int(last.get('page_coverage_pct') or 0)}% страниц от максимума</b>\n\n"
-            if last else "\n"
-        )
-        + ("⚠️ Текущий круг начат на старой политике 141 категорий. После его завершения/перезапуска новые круги используют только товарные категории.\n\n" if state.get("legacy_policy_round") else "")
-        + "AutoScan низкоприоритетный: новый 15-страничный блок начинается только когда пользовательская очередь свободна."
+        + f"🧾 Чистых сегодняшних объявлений: <b>{int(state.get('listings_seen') or 0)}</b> · новых: <b>{int(state.get('new_listings') or 0)}</b>\n"
+        + f"👁 Точные просмотры: <b>{int(state.get('views_verified') or 0)}/{int(state.get('views_requested') or 0)}</b>\n"
+        + f"📡 Baseline создано в этом круге: <b>{int(state.get('radar_candidates') or 0)}</b>\n\n"
+        + "<b>🔬 Живые замеры Radar 3.0</b>\n"
+        + f"Всего активных наблюдений: <b>{int(radar3.get('active') or 0)}</b>\n"
+        + f"Ждут первого повторного замера: <b>{int(radar3.get('baseline') or 0)}</b>\n"
+        + f"Готовы к замеру сейчас: <b>{int(radar3.get('due') or 0)}</b>\n"
+        + f"Получили реальный прирост: <b>{int(radar3.get('observed') or 0)}</b>\n"
+        + f"Рост подтвердился ≥2 раза: <b>{int(radar3.get('persistent') or 0)}</b>\n"
+        + f"Без роста / остановлены: <b>{int(radar3.get('quiet') or 0)}</b>\n"
+        + f"Суммарный DT-observed прирост: <b>+{int(radar3.get('total_delta') or 0)}</b> просмотров\n"
+        + f"🟡 Early: <b>{int(radar3.get('early') or 0)}</b> · 📈 Strong: <b>{int(radar3.get('strong') or 0)}</b> · 🔥 Hot: <b>{int(radar3.get('hot') or 0)}</b>\n\n"
+        + "<b>🗂 Категории с живым приростом</b>\n"
+        + category_text + "\n\n"
+        + "<i>Первый счётчик = только baseline. В оценку входит только прирост, который DT сам увидел после baseline. Сегодняшние пользовательские сканы тоже могут добавлять baseline без дублей по adId.</i>\n\n"
+        + f"Последний круг: <b>{last_line}</b>\n"
+        + f"Следующий ежедневный: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>"
     )
     return text, state
-
-
-def _radar_autoscan_failure_list(state: dict) -> list[dict]:
-    last = dict(state.get("last_summary") or {})
-    return [item for item in list(last.get("failed_categories") or []) if isinstance(item, dict)]
 
 
 async def _radar_autoscan_errors_text(page: int = 0, per_page: int = 15) -> tuple[str, dict, int, int]:
@@ -5030,7 +5040,7 @@ async def _radar_autoscan_history_text() -> str:
         lines += ["", "Кругов пока не было."]
         return "\n".join(lines)
     for item in history:
-        mode = ("fresh" if item.get("mode") == "daily" else ("48H context" if item.get("mode") == "context" else ("повтор" if item.get("mode") == "retry" else "ручной")))
+        mode = ("ежедневный" if item.get("mode") == "daily" else ("повтор" if item.get("mode") == "retry" else "ручной"))
         lines += [
             "",
             f"<b>#{html.escape(str(item.get('round_id') or '—'))}</b> · {mode}",
@@ -5038,7 +5048,7 @@ async def _radar_autoscan_history_text() -> str:
             f"📊 {int(item.get('category_coverage_pct') or 0)}% кат. · {int(item.get('page_coverage_pct') or 0)}% стр. от max",
             f"📄 {int(item.get('pages_verified') or 0)} стр. · 🧾 {int(item.get('listings_seen') or 0)} объявлений",
             f"👁 {int(item.get('views_verified') or 0)}/{int(item.get('views_requested') or 0)} exact · 🛡 {int(item.get('radar_organic_passed') or 0)} organic",
-            f"📡 Radar +{int(item.get('radar_saved') or 0)} · ⏱ {_radar_autoscan_human_duration(int(item.get('duration_seconds') or 0))}",
+            f"📡 Baseline {int(item.get('radar_candidates') or 0)} · ⏱ {_radar_autoscan_human_duration(int(item.get('duration_seconds') or 0))}",
             f"🕒 {html.escape(str(item.get('finished_at_text') or '—'))}",
         ]
     return "\n".join(lines)
@@ -5138,11 +5148,7 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
     state["current_category_key"] = ""
     state["current_category_name"] = ""
     state = await save_radar_autoscan_state(state)
-    start_context_after_fresh = bool(
-        RADAR_CONTEXT_ENABLED
-        and mode in {"manual", "daily"}
-        and str(state.get("last_context_date") or "") != now.date().isoformat()
-    )
+    start_context_after_fresh = False
     icon = "✅" if failed == 0 else "⚠️"
     if mode == "retry":
         headline = f"📡 <b>DT Radar — повтор ошибок завершён {icon}</b>"
@@ -5152,14 +5158,14 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         if system_errors:
             scope_line += f" · ❌ системных <b>{system_errors}</b>"
     elif mode == "context":
-        headline = f"📡 <b>DT Radar — Unified 48H круг завершён {icon}</b>"
-        scope_line = f"Этап 2/2 · вчера: <b>{run_successful}/{run_total}</b> категорий подтверждено"
+        headline = f"📡 <b>DT Radar 3.0 — круг завершён {icon}</b>"
+        scope_line = f"Сегодня: <b>{run_successful}/{run_total}</b> категорий подтверждено"
         if needs_review:
             scope_line += f" · ⚠️ допроверка <b>{needs_review}</b>"
         if system_errors:
             scope_line += f" · ❌ системных <b>{system_errors}</b>"
     else:
-        headline = f"📡 <b>DT Radar — этап 1/2 · сегодня завершён {icon}</b>"
+        headline = f"📡 <b>DT Radar 3.0 — сегодняшний круг завершён {icon}</b>"
         scope_line = f"Сегодня: <b>{run_successful}/{run_total}</b> категорий подтверждено"
         if needs_review:
             scope_line += f" · ⚠️ допроверка <b>{needs_review}</b>"
@@ -5187,17 +5193,14 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
             f"✅ delta verified <b>{int(summary.get('radar_high_baseline_verified') or 0)}</b>"
             if int(summary.get('radar_high_baseline_pending') or 0) or int(summary.get('radar_high_baseline_verified') or 0) else ""
         )
-        + f"\n🎯 48H отбор: ниже Early <b>{int(summary.get('radar_demand_gate_rejected') or 0)}</b> · 🟡 Early <b>{int(summary.get('radar_early_admitted') or 0)}</b> · 📈 Strong <b>{int(summary.get('radar_strong_admitted') or 0)}</b> · 🔥 Hot <b>{int(summary.get('radar_hot_admitted') or 0)}</b>"
+        + f"\n📡 Radar 3.0 baseline создано: <b>{int(summary.get('radar_candidates') or 0)}</b>"
+        + "\n⏱ Первый счётчик не оценивается; сигналы появятся только после повторных замеров DT"
         + f"\n🛡 Organic: <b>{int(summary['radar_organic_passed'])}</b> · TOP/Promo <b>{int(summary['radar_promoted_blocked'])}</b> · снижение <b>{int(summary['radar_reduced_blocked'])}</b> · unknown <b>{int(summary['radar_unknown_blocked'])}</b>"
         + (f"\n↳ unknown: {_radar_unknown_reason_text(summary.get('radar_unknown_reasons'))}" if int(summary.get('radar_unknown_blocked') or 0) else "")
-        + f"\n📡 Новых Radar-сигналов: <b>+{int(summary['radar_saved'])}</b>"
+        + f"\n📍 Немедленных сигналов из baseline: <b>{int(summary['radar_saved'])}</b> (должно быть 0)"
         + (f" · уже были <b>{int(summary.get('radar_already_present') or 0)}</b>" if int(summary.get("radar_already_present") or 0) else "")
         + f"\n⏱ Время: <b>{_radar_autoscan_human_duration(duration)}</b>"
-        + (
-            "\n\n➡️ Этап 1/2 готов. Тот же <b>Unified 48H круг</b> автоматически продолжится этапом 2/2: "
-            "15 страниц за вчера. После него круг будет полностью завершён."
-            if start_context_after_fresh else "\n\nAutoScan остановлен."
-        )
+        + "\n\nКруг завершён. Повторные DT-замеры baseline продолжаются автоматически."
         + (
             f" Следующий ежедневный запуск: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>."
             if state.get("daily_enabled") and not start_context_after_fresh else ""
@@ -5734,8 +5737,8 @@ async def radar_autoscan_scheduler(bot: Bot) -> None:
                             state = await save_radar_autoscan_state(state)
                             await _notify_radar_autoscan_admins(
                                 bot,
-                                "📡 <b>DT Radar — этап 1/2 уже готов</b>\n\n"
-                                "Сегодняшние 15 страниц уже собраны ручным запуском. Unified 48H круг продолжится этапом 2/2 за вчера.",
+                                "📡 <b>DT Radar 3.0 — сегодняшний круг уже готов</b>\n\n"
+                                "20 страниц за сегодня уже собраны ручным запуском. Повторные DT-замеры продолжаются автоматически.",
                             )
                         else:
                             async with _radar_autoscan_guard:
@@ -5746,26 +5749,11 @@ async def radar_autoscan_scheduler(bot: Bot) -> None:
                                     _radar_autoscan_stop_event.clear()
                                     await _notify_radar_autoscan_admins(
                                         bot,
-                                        f"📡 <b>DT Radar — Unified 48H круг запущен</b>\n\n"
-                                        f"Этап 1/2 · сегодня: {len(current.get('category_keys') or [])} товарных категорий × {RADAR_AUTOSCAN_DEPTH} страниц. "
-                                        f"Затем автоматически этап 2/2 · вчера: × {RADAR_CONTEXT_DEPTH} страниц. Пользовательские сканы имеют приоритет.",
+                                        f"📡 <b>DT Radar 3.0 — сегодняшний круг запущен</b>\n\n"
+                                        f"{len(current.get('category_keys') or [])} товарных категорий × {RADAR_AUTOSCAN_DEPTH} страниц только за сегодня. "
+                                        "Пользовательские сканы имеют приоритет и тоже добавляют сегодняшние baseline.",
                                     )
                                     continue
-                    state = await load_radar_autoscan_state()
-                    if RADAR_CONTEXT_ENABLED and state.get("status") == "idle" and state.get("last_context_date") != today:
-                        async with _radar_autoscan_guard:
-                            current = await load_radar_autoscan_state()
-                            if current.get("status") == "idle" and current.get("last_context_date") != today:
-                                current = _radar_autoscan_new_context_round(current, now.date())
-                                await save_radar_autoscan_state(current)
-                                _radar_autoscan_stop_event.clear()
-                                await _notify_radar_autoscan_admins(
-                                    bot,
-                                    f"📡 <b>DT Radar — Unified 48H · этап 2/2</b>\n\n"
-                                    f"Вчера: {len(current.get('category_keys') or [])} товарных категорий × {RADAR_CONTEXT_DEPTH} страниц. "
-                                    "Это продолжение того же 48H круга; подтверждённые сигналы входят в единый Radar.",
-                                )
-                                continue
 
             try:
                 await asyncio.wait_for(_radar_autoscan_wakeup.wait(), timeout=RADAR_AUTOSCAN_POLL_SECONDS)
@@ -6250,6 +6238,7 @@ manual_view_tasks_guard = asyncio.Lock()
 # One lightweight background collector at a time. This makes DB cache reuse deterministic
 # across users/scans and prevents automatic checkpoints from multiplying the same ID requests.
 background_view_refresh_lock = asyncio.Lock()
+radar_v3_view_refresh_lock = asyncio.Lock()
 
 
 def scan_job_from_record(scan: UserScan, *, recovered: bool = False) -> ScanJob:
@@ -10125,22 +10114,19 @@ def payment_invoice_keyboard(payment: SubscriptionPayment) -> InlineKeyboardMark
 
 
 def admin_keyboard(ai_unread: int = 0, active_scans: int = 0) -> InlineKeyboardMarkup:
-    unread = max(0, int(ai_unread or 0))
     active = max(0, int(active_scans or 0))
-    ai_label = "🧠 DT AI Lab" if unread <= 0 else f"🧠 DT AI Lab 🔴 {min(unread, 99)}{'+' if unread > 99 else ''}"
     parsing_label = "👀 Кто сейчас парсит" if active <= 0 else f"👀 Сейчас парсят · {active}"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adminstats")],
         [InlineKeyboardButton(text="⚙️ Воркеры", callback_data="adminworkers"),
          InlineKeyboardButton(text=parsing_label, callback_data="adminactive")],
-        [InlineKeyboardButton(text=ai_label, callback_data="adminai")],
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="adminusers"),
          InlineKeyboardButton(text="💳 Платежи", callback_data="adminpayments")],
         [InlineKeyboardButton(text="🎟 Тарифы", callback_data="adminplans"),
          InlineKeyboardButton(text="🔐 Режим доступа", callback_data="adminmode")],
         [InlineKeyboardButton(text="🎁 Бесплатные сканы", callback_data="admintrial"),
          InlineKeyboardButton(text="👥 Рефералы", callback_data="adminreferral")],
-        [InlineKeyboardButton(text="📡 Radar AutoScan", callback_data="adminradarauto")],
+        [InlineKeyboardButton(text="📡 DT Radar 3.0", callback_data="adminradarauto")],
         [InlineKeyboardButton(text="🔎 Найти пользователя", callback_data="adminusersearch")],
         [InlineKeyboardButton(text="📨 Daily Radar", callback_data="admindailyradar"),
          InlineKeyboardButton(text="📣 Рассылка", callback_data="adminbroadcast")],
@@ -10322,7 +10308,6 @@ def admin_workers_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📅 Date", callback_data="admindates"),
          InlineKeyboardButton(text="📄 Page", callback_data="adminpages"),
          InlineKeyboardButton(text="👁 View", callback_data="adminviews")],
-        [InlineKeyboardButton(text="🧠 DT AI Lab", callback_data="adminai")],
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="adminworkers")],
         [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
     ])
@@ -10761,11 +10746,8 @@ async def _admin_running_scan_count() -> int:
 
 
 async def _admin_live_keyboard() -> InlineKeyboardMarkup:
-    ai_unread, active_scans = await asyncio.gather(
-        _ai_unread_signal_count(),
-        _admin_running_scan_count(),
-    )
-    return admin_keyboard(ai_unread, active_scans)
+    active_scans = await _admin_running_scan_count()
+    return admin_keyboard(0, active_scans)
 
 
 def _worker_health_label(status: dict, *, active_key: str = "active_total") -> str:
@@ -10780,15 +10762,11 @@ def _worker_health_label(status: dict, *, active_key: str = "active_total") -> s
 
 
 async def _admin_workers_text() -> str:
-    date_status, page_status, view_status, ai_status = await asyncio.gather(
+    date_status, page_status, view_status = await asyncio.gather(
         REMOTE_DATE_MANAGER.status(),
         REMOTE_PAGE_MANAGER.status(),
         REMOTE_VIEW_MANAGER.status(),
-        AI_MANAGER.status(),
     )
-    # v4.21.1: legacy AI scoring is retired. The optional service may still
-    # heartbeat for deployment compatibility, but it performs no DB analysis.
-    ai_label = "⛔ legacy pipeline отключён · Radar 3.0 в Main Bot"
     total_active = (
         int(date_status.get("active_total", 0) or 0)
         + int(page_status.get("active_total", 0) or 0)
@@ -10805,7 +10783,6 @@ async def _admin_workers_text() -> str:
         f"📅 Date Worker: <b>{_worker_health_label(date_status)}</b>",
         f"📄 Page Worker: <b>{_worker_health_label(page_status)}</b>",
         f"👁 View Worker: <b>{_worker_health_label(view_status, active_key='active_jobs')}</b>",
-        f"🧠 AI Worker: <b>{ai_label}</b>",
         "",
         f"Всего активных worker-задач: <b>{total_active}</b>",
         f"Всего в worker-очередях: <b>{total_queue}</b>",
@@ -10960,463 +10937,6 @@ async def _admin_view_worker_text() -> str:
 
 
 AI_BADGE_EVENT_TYPES = ("winner", "confirmed")
-
-
-async def _ai_unread_signal_count() -> int:
-    """Radar 3.0 has no legacy AI unread queue.
-
-    v4.21.2: keep this helper for admin-keyboard compatibility, but never touch
-    retired Early Winner event storage. The old pipeline must not be required merely to
-    open the admin panel.
-    """
-    return 0
-
-
-async def _mark_ai_signals_seen(candidate_ids: list[int]) -> None:
-    ids = sorted({int(x) for x in candidate_ids if int(x) > 0})
-    if not ids:
-        return
-    async with SessionLocal() as session:
-        await session.execute(
-            update(AIEarlyWinnerEvent)
-            .where(
-                AIEarlyWinnerEvent.candidate_id.in_(ids),
-                AIEarlyWinnerEvent.notified_at.is_(None),
-                AIEarlyWinnerEvent.event_type.in_(AI_BADGE_EVENT_TYPES),
-            )
-            .values(notified_at=datetime.utcnow())
-            .execution_options(synchronize_session=False)
-        )
-        await session.commit()
-
-
-def admin_ai_keyboard(unread_count: int = 0) -> InlineKeyboardMarkup:
-    """Pure Radar 3.0 admin navigation.
-
-    Legacy Early Winner sections were intentionally removed in v4.21.2.
-    Keeping them visible after retiring the worker made DT AI Lab depend on old
-    tables and made stale Telegram buttons fail.
-    """
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить Radar 3.0", callback_data="adminai")],
-        [InlineKeyboardButton(text="🛰 Управление Radar AutoScan", callback_data="adminradarauto")],
-        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
-    ])
-
-
-def _ai_stage_label(stage: str, outcome: str = "pending") -> str:
-    if outcome == "confirmed":
-        return "✅ Подтверждён"
-    if outcome == "rejected":
-        return "❌ Не подтвердился"
-    return {
-        "early_winner": "🔥 Сильный сигнал 90+",
-        "rising": "⚡ Рост",
-        "watch": "🟡 Наблюдение",
-    }.get(stage or "", "🟡 Наблюдение")
-
-
-def _ai_opportunity_label(value: str | None) -> str:
-    return {
-        "hidden_gem": "💎 Скрытая находка",
-        "emerging": "🚀 Набирает обороты",
-        "hot_product": "🔥 Горячий товар",
-        "saturated": "⚫ Перенасыщен",
-        "spark": "⚡ Первичный сигнал",
-    }.get(str(value or ""), "⚡ Первичный сигнал")
-
-
-def _ai_saturation_label(value: int | float | None) -> str:
-    score = int(value or 0)
-    if score >= 70:
-        return "высокая"
-    if score >= 45:
-        return "средняя"
-    return "низкая"
-
-
-def _ai_json_list(raw: str | None) -> list[str]:
-    try:
-        data = json.loads(raw or "[]")
-        if isinstance(data, list):
-            return [str(x) for x in data if str(x).strip()]
-    except Exception:
-        pass
-    return []
-
-
-def _moscow_today_start_utc_naive() -> datetime:
-    now_msk = datetime.now(MOSCOW)
-    start_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
-    return start_msk.astimezone(timezone.utc).replace(tzinfo=None)
-
-
-async def _admin_ai_dashboard_text() -> str:
-    """Radar 3.0 observation dashboard.
-
-    The old AI Early Winner/evidence-adaptive pipeline is intentionally retired;
-    this admin page now reports only DT-owned post-baseline evidence.
-    """
-    now = datetime.utcnow()
-    async with SessionLocal() as session:
-        total = int((await session.execute(select(func.count(RadarObservation.id)))).scalar_one() or 0)
-        baseline = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.checkpoint_count == 0,
-        ))).scalar_one() or 0)
-        due = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.next_check_at.is_not(None),
-            RadarObservation.next_check_at <= now,
-            RadarObservation.status.in_(["baseline", "observed", "confirmed"]),
-        ))).scalar_one() or 0)
-        observed = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.positive_checkpoints >= 1,
-        ))).scalar_one() or 0)
-        persistent = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.consecutive_positive >= 2,
-        ))).scalar_one() or 0)
-        quiet = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.status == "quiet",
-        ))).scalar_one() or 0)
-        leased = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.lease_until.is_not(None),
-            RadarObservation.lease_until >= now,
-        ))).scalar_one() or 0)
-        early = int((await session.execute(select(func.count(RadarProduct.id)).where(
-            RadarProduct.latest_source == "radar3_observed", RadarProduct.demand_status == "stable",
-        ))).scalar_one() or 0)
-        strong = int((await session.execute(select(func.count(RadarProduct.id)).where(
-            RadarProduct.latest_source == "radar3_observed", RadarProduct.demand_status == "rising",
-        ))).scalar_one() or 0)
-        hot = int((await session.execute(select(func.count(RadarProduct.id)).where(
-            RadarProduct.latest_source == "radar3_observed", RadarProduct.demand_status == "hot",
-        ))).scalar_one() or 0)
-
-    return "\n".join([
-        "<b>🧠 DT RADAR 3.0 · OBSERVED DEMAND</b>",
-        "",
-        "Движок: <b>🟢 Main Bot + View Worker</b>",
-        "Старая AI-модель: <b>⛔ отключена</b>",
-        "Первичный счётчик: <b>baseline · 0 баллов</b>",
-        "Оценка: <b>только прирост, который DT увидел после baseline</b>",
-        "",
-        "<b>📡 Наблюдения</b>",
-        f"Всего baseline-наблюдений: <b>{total}</b>",
-        f"Ждут первого повторного замера: <b>{baseline}</b>",
-        f"Готовы к замеру сейчас: <b>{due}</b>",
-        f"Сейчас взяты одной репликой в работу: <b>{leased}</b>",
-        f"Получили реальный прирост: <b>{observed}</b>",
-        f"Рост подтвердился ≥2 раза: <b>{persistent}</b>",
-        f"Без дальнейшего роста / остановлены: <b>{quiet}</b>",
-        "",
-        "<b>🎯 Сигналы Radar 3.0</b>",
-        f"🟡 Early: <b>{early}</b> · 📈 Strong: <b>{strong}</b> · 🔥 Hot: <b>{hot}</b>",
-        "",
-        "<i>+1/+3/+6 Early Winner больше не работает и не пишет в Listing/ViewHistory. Повторные замеры принадлежат только Radar 3.0.</i>",
-    ])
-
-
-def _admin_ai_dashboard_loading_text() -> str:
-    return "\n".join([
-        "<b>🧠 DT RADAR 3.0 · OBSERVED DEMAND</b>",
-        "",
-        "Панель открыта: <b>✅</b>",
-        "Статистика: <b>⏳ загружается</b>",
-        "",
-        "<i>Даже если PostgreSQL занят, DT AI Lab больше не блокирует вход в раздел.</i>",
-    ])
-
-
-async def _admin_ai_dashboard_safe_text(timeout_seconds: float = 3.0) -> str:
-    """Never let Radar statistics make the Telegram section unavailable.
-
-    v4.21.3: admin navigation is a control-plane action and must not be coupled to
-    a potentially blocked analytics transaction. A short timeout turns database
-    contention/schema drift into visible diagnostics while keeping the Lab open.
-    """
-    try:
-        return await asyncio.wait_for(_admin_ai_dashboard_text(), timeout=max(0.5, float(timeout_seconds)))
-    except asyncio.TimeoutError:
-        log.warning("DT AI Lab Radar 3.0 stats timeout after %.1fs", float(timeout_seconds))
-        reason = "PostgreSQL занят дольше допустимого времени"
-    except Exception as exc:
-        log.exception("DT AI Lab Radar 3.0 stats failed")
-        reason = f"{type(exc).__name__}: {str(exc)[:180]}"
-    return "\n".join([
-        "<b>🧠 DT RADAR 3.0 · OBSERVED DEMAND</b>",
-        "",
-        "Панель открыта: <b>✅</b>",
-        "Движок Radar 3.0: <b>🟢 активен</b>",
-        "Статистика: <b>⚠️ временно недоступна</b>",
-        f"Диагностика: <code>{html.escape(reason)}</code>",
-        "",
-        "<i>Это не закрывает DT AI Lab. Нажми «Обновить Radar 3.0», когда база освободится.</i>",
-    ])
-
-
-async def _ai_candidate_rows(kind: str, limit: int = 15) -> list[tuple[AIEarlyWinnerCandidate, Listing, UserScan]]:
-    async with SessionLocal() as session:
-        query = (
-            select(AIEarlyWinnerCandidate, Listing, UserScan)
-            .join(Listing, Listing.external_id == AIEarlyWinnerCandidate.external_id)
-            .join(UserScan, UserScan.id == AIEarlyWinnerCandidate.scan_id)
-            .where(
-                AIEarlyWinnerCandidate.is_control.is_(False),
-                Listing.is_promoted.is_(False),
-                Listing.is_price_reduced.is_(False),
-            )
-        )
-        if kind == "new":
-            unread_ids = (
-                select(AIEarlyWinnerEvent.candidate_id)
-                .where(
-                    AIEarlyWinnerEvent.notified_at.is_(None),
-                    AIEarlyWinnerEvent.event_type.in_(AI_BADGE_EVENT_TYPES),
-                )
-                .distinct()
-            )
-            query = query.where(AIEarlyWinnerCandidate.id.in_(unread_ids)).order_by(
-                AIEarlyWinnerCandidate.created_at.desc(), AIEarlyWinnerCandidate.current_score.desc()
-            )
-        elif kind == "hidden":
-            query = query.where(
-                AIEarlyWinnerCandidate.outcome == "pending",
-                AIEarlyWinnerCandidate.opportunity_type == "hidden_gem",
-            ).order_by(AIEarlyWinnerCandidate.current_score.desc(), AIEarlyWinnerCandidate.latest_at.desc())
-        elif kind == "momentum":
-            query = query.where(
-                AIEarlyWinnerCandidate.outcome == "pending",
-                AIEarlyWinnerCandidate.opportunity_type.in_(["hot_product", "emerging"]),
-            ).order_by(AIEarlyWinnerCandidate.current_score.desc(), AIEarlyWinnerCandidate.latest_at.desc())
-        elif kind == "winners":
-            query = query.where(
-                AIEarlyWinnerCandidate.outcome == "pending",
-                AIEarlyWinnerCandidate.stage == "early_winner",
-            ).order_by(AIEarlyWinnerCandidate.current_score.desc(), AIEarlyWinnerCandidate.latest_at.desc())
-        elif kind == "active":
-            query = query.where(
-                AIEarlyWinnerCandidate.outcome == "pending",
-                AIEarlyWinnerCandidate.opportunity_type.in_(["spark", "saturated"]),
-            ).order_by(AIEarlyWinnerCandidate.current_score.desc(), AIEarlyWinnerCandidate.latest_at.desc())
-        elif kind == "confirmed":
-            query = query.where(AIEarlyWinnerCandidate.outcome == "confirmed").order_by(AIEarlyWinnerCandidate.resolved_at.desc())
-        elif kind == "rejected":
-            query = query.where(AIEarlyWinnerCandidate.outcome == "rejected").order_by(AIEarlyWinnerCandidate.resolved_at.desc())
-        else:
-            query = query.order_by(AIEarlyWinnerCandidate.created_at.desc())
-        return list((await session.execute(query.limit(max(1, min(30, limit))))).all())
-
-
-def _ai_list_keyboard(kind: str, rows: list[tuple[AIEarlyWinnerCandidate, Listing, UserScan]]) -> InlineKeyboardMarkup:
-    buttons: list[list[InlineKeyboardButton]] = []
-    for candidate, listing, _scan in rows[:15]:
-        title = " ".join((listing.title or "Объявление").split())[:27]
-        if candidate.outcome == "confirmed":
-            icon = "✅"
-        elif candidate.outcome == "rejected":
-            icon = "❌"
-        else:
-            icon = {"hidden_gem": "💎", "hot_product": "🔥", "emerging": "🚀", "saturated": "⚫"}.get(candidate.opportunity_type, "⚡")
-        buttons.append([InlineKeyboardButton(
-            text=f"{icon} {int(candidate.current_score or 0)} · {title}",
-            callback_data=f"aic:{int(candidate.id)}:{kind[:10]}",
-        )])
-    buttons.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"adminai:{kind}")])
-    buttons.append([InlineKeyboardButton(text="⬅️ DT AI Lab", callback_data="adminai")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-async def _admin_ai_list_text(kind: str, rows: list[tuple[AIEarlyWinnerCandidate, Listing, UserScan]]) -> str:
-    titles = {
-        "new": "🔴 Новые сигналы",
-        "hidden": "💎 Скрытые находки",
-        "momentum": "🚀 Горячие / Набирают обороты",
-        "winners": "🔥 Сильные сигналы 90+",
-        "active": "⚡ Первичные / Перенасыщенные",
-        "confirmed": "✅ Подтверждённые",
-        "rejected": "❌ Не подтвердились",
-        "recent": "🧪 Последние прогнозы",
-    }
-    lines = [f"<b>{titles.get(kind, '🧠 Поиск возможностей')}</b>", ""]
-    if not rows:
-        lines.append("Пока нет объявлений в этом разделе.")
-        return "\n".join(lines)
-    for idx, (candidate, listing, scan) in enumerate(rows[:15], start=1):
-        price = f"{listing.price_eur} €" if listing.price_eur is not None else (listing.price_text or "—")
-        lines.append(
-            f"{idx}. {_ai_opportunity_label(candidate.opportunity_type)} · {_ai_stage_label(candidate.stage, candidate.outcome)}\n"
-            f"   DT Demand Score <b>{int(candidate.current_score or 0)}/100</b> · уверенность {int(candidate.confidence or 0)}%\n"
-            f"   {html.escape((listing.title or 'Объявление')[:80])} · <b>{html.escape(str(price))}</b>\n"
-            f"   👁 {int(candidate.latest_views or 0)} · скан #{scan.id} · {_utc_to_msk_text(candidate.latest_at)} МСК"
-        )
-    lines.extend(["", "Нажми на объявление ниже, чтобы увидеть причины, прогноз и контрольные точки."])
-    return "\n".join(lines)
-
-
-async def _admin_ai_candidate(candidate_id: int, requested_back_kind: str | None = None) -> tuple[str, InlineKeyboardMarkup] | None:
-    async with SessionLocal() as session:
-        row = (await session.execute(
-            select(AIEarlyWinnerCandidate, Listing, UserScan)
-            .join(Listing, Listing.external_id == AIEarlyWinnerCandidate.external_id)
-            .join(UserScan, UserScan.id == AIEarlyWinnerCandidate.scan_id)
-            .where(
-                AIEarlyWinnerCandidate.id == int(candidate_id),
-                Listing.is_promoted.is_(False),
-                Listing.is_price_reduced.is_(False),
-            )
-        )).one_or_none()
-        if row is None:
-            return None
-        candidate, listing, scan = row
-        observations = list((await session.execute(
-            select(AIEarlyWinnerObservation)
-            .where(AIEarlyWinnerObservation.candidate_id == int(candidate.id))
-            .order_by(AIEarlyWinnerObservation.target_hours.asc())
-        )).scalars().all())
-
-    price = f"{listing.price_eur} €" if listing.price_eur is not None else (listing.price_text or "—")
-    cat = CATEGORIES.get(candidate.category_key)
-    cat_name = cat.name if cat is not None else (listing.category or candidate.category_key or "—")
-    reasons = _ai_json_list(candidate.reasons_json)
-    latest_reasons = _ai_json_list(candidate.latest_reasons_json)
-    lines = [
-        f"<b>{_ai_opportunity_label(candidate.opportunity_type)}</b> · {_ai_stage_label(candidate.stage, candidate.outcome)}",
-        f"<b>{html.escape((listing.title or 'Объявление')[:180])}</b>",
-        "",
-        f"⭐ DT Demand Score: <b>{int(candidate.current_score or 0)}/100</b> · старт {int(candidate.initial_score or 0)}",
-        f"🌊 Насыщенность рынка: <b>{_ai_saturation_label(candidate.saturation_score)}</b> · процентиль предложения {float(candidate.supply_percentile or 0)*100:.0f}%",
-        f"📈 Тренд спроса: <b>{float(candidate.demand_growth_ratio or 1.0):.2f}×</b> · тренд предложения: <b>{float(candidate.supply_growth_ratio or 1.0):.2f}×</b>",
-        f"⚖️ Спрос / предложение: <b>{float(candidate.demand_supply_ratio or 1.0):.2f}×</b> · повторяемость <b>{float(candidate.repeatability or 0)*100:.0f}%</b>",
-        f"🎯 Уверенность данных: <b>{int(candidate.confidence or 0)}%</b>",
-        f"🗂 {html.escape(cat_name)} · скан <b>#{scan.id}</b>",
-        f"💶 Цена: <b>{html.escape(str(price))}</b>",
-        f"👁 Старт: <b>{int(candidate.baseline_views or 0)}</b> · сейчас: <b>{int(candidate.latest_views or 0)}</b>",
-        f"⏱ Возраст при обнаружении: <b>{float(candidate.age_minutes or 0)/60.0:.1f} ч</b>",
-        f"⚡ Стартовый темп: <b>{float(candidate.initial_views_per_hour or 0):.1f}/ч</b> · процентиль <b>{float(candidate.velocity_percentile or 0)*100:.0f}%</b>",
-    ]
-    market_n = int(candidate.market_cohort_size or 0)
-    if candidate.market_median_eur is not None:
-        delta = candidate.price_delta_pct
-        if delta is None:
-            delta_text = ""
-        elif delta >= 0:
-            delta_text = f" · цена ниже медианы на {delta:.0f}%"
-        else:
-            delta_text = f" · цена выше медианы на {abs(delta):.0f}%"
-        lines.append(
-            f"📦 Рынок 30д: <b>{market_n}</b> сопоставимых · медиана <b>{float(candidate.market_median_eur):.0f} €</b>{delta_text}"
-        )
-    else:
-        lines.append(f"📦 Рынок 30д: <b>{market_n}</b> сопоставимых публикаций")
-    lines.extend([
-        "",
-        "<b>🔮 Первичный прогноз</b>",
-        f"+3ч: <b>{int(candidate.predicted_3h_low or 0)}–{int(candidate.predicted_3h_high or 0)}</b> просмотров",
-        f"+6ч: <b>{int(candidate.predicted_6h_low or 0)}–{int(candidate.predicted_6h_high or 0)}</b> просмотров",
-    ])
-    if reasons:
-        lines.extend(["", "<b>Почему такая стартовая оценка</b>"])
-        lines.extend([f"• {html.escape(reason)}" for reason in reasons[:6]])
-    if latest_reasons:
-        lines.extend(["", "<b>Что изменилось после замеров</b>"])
-        lines.extend([f"• {html.escape(reason)}" for reason in latest_reasons[:5]])
-
-    lines.extend(["", "<b>🧪 Контрольные точки</b>"])
-    for obs in observations:
-        if obs.status == "done" and obs.view_count is not None:
-            lines.append(
-                f"+{obs.target_hours}ч ✅ <b>{obs.view_count}</b> просмотров · Δ{int(obs.delta_views or 0):+d} "
-                f"· {float(obs.observed_views_per_hour or 0):.1f}/ч · оценка {int(obs.score_after or 0)}"
-            )
-        elif obs.status in {"error", "missed"}:
-            lines.append(f"+{obs.target_hours}ч ⚠️ {'ошибка' if obs.status == 'error' else 'пропущен'}")
-        else:
-            lines.append(f"+{obs.target_hours}ч ⏳ ожидается {_utc_to_msk_text(obs.due_at)} МСК")
-
-    if requested_back_kind in {"new", "hidden", "momentum", "winners", "active", "confirmed", "rejected", "recent"}:
-        back_kind = requested_back_kind
-    elif candidate.outcome == "confirmed":
-        back_kind = "confirmed"
-    elif candidate.outcome == "rejected":
-        back_kind = "rejected"
-    elif candidate.opportunity_type == "hidden_gem":
-        back_kind = "hidden"
-    elif candidate.opportunity_type in {"hot_product", "emerging"}:
-        back_kind = "momentum"
-    else:
-        back_kind = "active"
-    buttons: list[list[InlineKeyboardButton]] = []
-    if listing.url:
-        buttons.append([InlineKeyboardButton(text="🔗 Открыть объявление", url=listing.url)])
-    buttons.append([InlineKeyboardButton(text="⬅️ К списку", callback_data=f"adminai:{back_kind}")])
-    buttons.append([InlineKeyboardButton(text="🧠 DT AI Lab", callback_data="adminai")])
-    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-async def _admin_ai_accuracy_text() -> str:
-    cutoff = datetime.utcnow() - timedelta(days=30)
-    async with SessionLocal() as session:
-        candidates = list((await session.execute(select(AIEarlyWinnerCandidate).where(
-            AIEarlyWinnerCandidate.created_at >= cutoff
-        ))).scalars().all())
-        observations = list((await session.execute(
-            select(AIEarlyWinnerObservation)
-            .join(AIEarlyWinnerCandidate, AIEarlyWinnerCandidate.id == AIEarlyWinnerObservation.candidate_id)
-            .where(
-                AIEarlyWinnerObservation.status == "done",
-                AIEarlyWinnerObservation.view_count.is_not(None),
-                AIEarlyWinnerCandidate.created_at >= cutoff,
-            )
-        )).scalars().all())
-
-    resolved = [x for x in candidates if not x.is_control and x.outcome in {"confirmed", "rejected"}]
-    confirmed = [x for x in resolved if x.outcome == "confirmed"]
-    lines = ["<b>📊 DT AI · Точность · 30 дней</b>", ""]
-    if not resolved:
-        lines.append("Пока мало завершённых +3/+6 контрольных точек. Теневой режим продолжает собирать выборку.")
-    else:
-        lines.append(f"Завершённых кандидатов: <b>{len(resolved)}</b>")
-        lines.append(f"Подтвердились: <b>{len(confirmed)}/{len(resolved)} · {len(confirmed)/len(resolved)*100:.1f}%</b>")
-        lines.extend(["", "<b>По стартовой оценке</b>"])
-        for lo, hi, label in ((90, 100, "90–100"), (80, 89, "80–89"), (65, 79, "65–79")):
-            group = [x for x in resolved if lo <= int(x.initial_score or 0) <= hi]
-            hits = sum(1 for x in group if x.outcome == "confirmed")
-            rate = f"{hits/len(group)*100:.1f}%" if group else "—"
-            lines.append(f"{label}: <b>{rate}</b> · {hits}/{len(group)}")
-
-    by_candidate = {int(x.id): x for x in candidates}
-    lines.extend(["", "<b>Попадание факта в прогнозный диапазон</b>"])
-    for target in (3, 6):
-        usable = []
-        hits = 0
-        for obs in observations:
-            if int(obs.target_hours or 0) != target:
-                continue
-            cand = by_candidate.get(int(obs.candidate_id))
-            if cand is None or cand.is_control or obs.view_count is None:
-                continue
-            low = int(cand.predicted_3h_low if target == 3 else cand.predicted_6h_low)
-            high = int(cand.predicted_3h_high if target == 3 else cand.predicted_6h_high)
-            usable.append(obs)
-            if low <= int(obs.view_count) <= high:
-                hits += 1
-        rate = f"{hits/len(usable)*100:.1f}%" if usable else "—"
-        lines.append(f"+{target}ч: <b>{rate}</b> · {hits}/{len(usable)}")
-
-    controls = [x for x in candidates if x.is_control and x.outcome in {"confirmed", "rejected"}]
-    if controls:
-        control_hits = sum(1 for x in controls if x.outcome == "confirmed")
-        lines.extend([
-            "",
-            f"🧪 Контрольная группа: неожиданных сильных сигналов <b>{control_hits}/{len(controls)}</b>",
-            "Она нужна, чтобы видеть не только удачные прогнозы, но и возможные пропуски модели.",
-        ])
-    return "\n".join(lines)
-
-
-async def ai_admin_notification_scheduler(bot: Bot) -> None:
-    """Legacy compatibility stub. v4.6.2 stores AI alerts in the Lab badge instead of sending chat pushes."""
-    while True:
-        await asyncio.sleep(3600.0)
 
 
 async def _edit_or_answer(target: Message, text: str, *, reply_markup=None) -> None:
@@ -12228,46 +11748,33 @@ async def admin_active_scans_handler(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "adminai")
 async def admin_ai_handler(callback: CallbackQuery) -> None:
+    """Compatibility redirect for old admin messages after legacy AI retirement."""
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    await callback.answer()
-    # v4.21.3: open the control plane first. Radar statistics are secondary and
-    # must never make the button appear dead when PostgreSQL is busy/locked.
-    await _edit_or_answer(
-        callback.message,
-        _admin_ai_dashboard_loading_text(),
-        reply_markup=admin_ai_keyboard(),
-    )
-    text = await _admin_ai_dashboard_safe_text()
-    await _edit_or_answer(callback.message, text, reply_markup=admin_ai_keyboard())
+    await callback.answer("Открываю DT Radar 3.0")
+    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
 @dp.callback_query(F.data.startswith("adminai:"))
 async def admin_ai_section_handler(callback: CallbackQuery) -> None:
-    """Compatibility redirect for old DT AI Lab messages.
-
-    Telegram users may still have buttons such as adminai:new/adminai:accuracy
-    in already-sent messages. Radar 3.0 must open cleanly instead of querying the
-    retired Early Winner tables.
-    """
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    await callback.answer("Раздел перенесён в Radar 3.0")
-    await _edit_or_answer(callback.message, _admin_ai_dashboard_loading_text(), reply_markup=admin_ai_keyboard())
-    await _edit_or_answer(callback.message, await _admin_ai_dashboard_safe_text(), reply_markup=admin_ai_keyboard())
+    await callback.answer("Раздел удалён · DT Radar 3.0")
+    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
 @dp.callback_query(F.data.startswith("aic:"))
 async def admin_ai_candidate_handler(callback: CallbackQuery) -> None:
-    """Old candidate cards are no longer authoritative in Radar 3.0."""
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    await callback.answer("Старая AI-карточка отключена · открываю Radar 3.0")
-    await _edit_or_answer(callback.message, _admin_ai_dashboard_loading_text(), reply_markup=admin_ai_keyboard())
-    await _edit_or_answer(callback.message, await _admin_ai_dashboard_safe_text(), reply_markup=admin_ai_keyboard())
+    await callback.answer("Старая AI-карточка удалена · DT Radar 3.0")
+    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
 @dp.callback_query(F.data == "adminviews")
@@ -17070,7 +16577,7 @@ async def main() -> None:
         GUARANTEED_LOCAL_PARSER_LANES,
     )
     log.warning(
-        "DT Radar 3.0 Observed Demand online | category_watchdog=%ss | view_recovery_watchdog=%ss | background_pause=round | detail_lanes=foreground+background",
+        "DT Radar 3.0 Live Today online | category_watchdog=%ss | view_recovery_watchdog=%ss | background_pause=round | radar_checkpoint=throttled-during-autoscan | detail_lanes=foreground+background",
         int(RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS), int(RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS),
     )
     ticker_task = None if DISTRIBUTED_WORKERS else asyncio.create_task(
@@ -17144,10 +16651,6 @@ async def main() -> None:
             await REMOTE_PAGE_MANAGER.close()
         except Exception:
             log.debug("Page Manager Redis shutdown failed", exc_info=True)
-        try:
-            await AI_MANAGER.close()
-        except Exception:
-            log.debug("AI Manager Redis shutdown failed", exc_info=True)
         await bot.session.close()
 
 

@@ -13,17 +13,15 @@ class ReleaseStaticTests(unittest.TestCase):
             ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
     def test_release_version(self):
-        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.21.3")
+        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.21.5")
 
-    def test_48h_context_can_publish_only_through_unified_demand_gate(self):
+    def test_radar3_autoscan_is_today_only_and_baseline_only(self):
         bot = (ROOT / "bot.py").read_text(encoding="utf-8")
         radar = (ROOT / "radar.py").read_text(encoding="utf-8")
-        self.assertIn('"mode": "context"', bot)
-        self.assertIn('target_day = context_day - timedelta(days=1)', bot)
-        self.assertIn('emit_signals=True', bot)
-        self.assertIn('_score_unified_48h_category', radar)
-        self.assertIn('classify_radar_signal(', radar)
-        self.assertIn('Demand Gate:', radar)
+        self.assertIn("RADAR_AUTOSCAN_DEPTH = 20", bot)
+        self.assertIn("RADAR_CONTEXT_ENABLED = False", bot)
+        self.assertIn("A first counter never votes", radar)
+        self.assertIn("admitted=0, saved=0", radar)
 
     def test_old_synthetic_top_position_score_is_gone(self):
         radar = (ROOT / "radar.py").read_text(encoding="utf-8")
@@ -53,12 +51,9 @@ class ReleaseStaticTests(unittest.TestCase):
 
     def test_observed_delta_does_not_rejuvenate_listing_age_cohort(self):
         radar = (ROOT / "radar.py").read_text(encoding="utf-8")
-        ai = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
         feature = (ROOT / "early_winner.py").read_text(encoding="utf-8")
         self.assertIn('age_minutes, exact_clock = listing_age_minutes(listing.posted_text, when)', radar)
         self.assertIn('velocity_window_minutes = (', radar)
-        self.assertIn('age_minutes, exact_clock = listing_age_minutes(listing.posted_text, snap.captured_at)', ai)
-        self.assertIn('velocity_window_minutes=velocity_window_minutes', ai)
         self.assertIn('velocity_window_minutes: float | None = None', feature)
 
     def test_hard_stop_and_watchdog_survived_consolidation(self):
@@ -86,10 +81,11 @@ class ReleaseStaticTests(unittest.TestCase):
                     self.assertNotIn(node.name, seen, f"duplicate top-level definition {node.name} in {path}")
                     seen[node.name] = node.lineno
 
-    def test_manual_fresh_can_queue_daily_context(self):
+    def test_manual_round_does_not_queue_yesterday_context(self):
         bot = (ROOT / "bot.py").read_text(encoding="utf-8")
-        self.assertIn('mode in {"manual", "daily"}', bot)
-        self.assertIn('_radar_autoscan_new_context_round(current, now.date())', bot)
+        scheduler = bot.split("async def radar_autoscan_scheduler", 1)[1].split("async def send_smart_export", 1)[0]
+        self.assertNotIn("_radar_autoscan_new_context_round", scheduler)
+        self.assertIn("RADAR_AUTOSCAN_DEPTH = 20", bot)
 
     def test_card_cache_schema_matches_manager_worker_and_stable_payload(self):
         page = (ROOT / "page_manager.py").read_text(encoding="utf-8")
@@ -109,11 +105,10 @@ class ReleaseStaticTests(unittest.TestCase):
         self.assertIn('DATE_CACHE_SCHEMA,', worker)
         self.assertIn('f"{DATE_REDIS_PREFIX}:cache:{DATE_CACHE_SCHEMA}:{cache_id}"', worker)
 
-    def test_ai_public_candidate_default_remains_fresh(self):
-        ai = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
-        env = (ROOT / ".env.example").read_text(encoding="utf-8")
-        self.assertIn('os.getenv("AI_EARLY_MAX_AGE_HOURS", "24")', ai)
-        self.assertIn("AI_EARLY_MAX_AGE_HOURS=24", env)
+    def test_legacy_ai_service_is_retired(self):
+        launcher = (ROOT / "service_launcher.py").read_text(encoding="utf-8")
+        self.assertIn('"ai-worker": "retired_ai_worker.py"', launcher)
+        self.assertTrue((ROOT / "retired_ai_worker.py").is_file())
 
 
 if __name__ == "__main__":

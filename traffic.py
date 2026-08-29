@@ -228,7 +228,11 @@ class AdaptiveTrafficManager:
     async def lease(self, kind: str, priority: str = "normal"):
         if kind not in {"scan", "view", "browser"}:
             raise ValueError(f"Unknown traffic kind: {kind}")
-        is_background = priority == "background" and kind in {"view", "browser"}
+        # Radar 3.0 checkpoints are low-priority like background traffic, but unlike
+        # generic maintenance they may use the single reserved background lane during
+        # an AutoScan round. Otherwise a +60m checkpoint could be delayed for hours.
+        is_radar_checkpoint = priority == "radar_checkpoint" and kind in {"view", "browser"}
+        is_background = priority in {"background", "radar_checkpoint"} and kind in {"view", "browser"}
         acquired = False
         try:
             while not acquired:
@@ -248,10 +252,12 @@ class AdaptiveTrafficManager:
                     spacing_wait = max(0.0, self._next_allowed[kind] - now)
                     background_ok = True
                     if is_background:
-                        if self._background_pauses > 0:
+                        if self._background_pauses > 0 and not is_radar_checkpoint:
                             background_ok = False
                         elif self._scan_jobs_active > 0:
-                            background_ok = self._background_view_active < self.background_during_scans
+                            # Keep at most the configured background lane alive while
+                            # scans run. radar_checkpoint never bypasses this capacity cap.
+                            background_ok = self._background_view_active < max(1 if is_radar_checkpoint else 0, self.background_during_scans)
 
                     # Reserve part of the global pool for interactive category-page
                     # work while any scan job is alive. This prevents a large view

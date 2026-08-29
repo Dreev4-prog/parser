@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import case, delete, func, or_, select, text, update
 
-from db import SessionLocal
+from db import DATABASE_BACKEND, SessionLocal
 from early_winner import FeatureRow, listing_age_minutes, opportunity_family_key, score_initial_rows
 from filters import price_bounds
 from organic_velocity import (
@@ -73,12 +73,12 @@ _radar_lock = asyncio.Lock()
 # must never share a lock+parser pair. In v4.15.7 a background task could hold
 # the old global lock, then wait for a background traffic lease after AutoScan
 # became active, while AutoScan waited for that same lock: a true lock inversion.
-_detail_gate_locks = {"normal": asyncio.Lock(), "background": asyncio.Lock()}
+_detail_gate_locks = {"normal": asyncio.Lock(), "background": asyncio.Lock(), "radar_checkpoint": asyncio.Lock()}
 _detail_gate_parsers: dict[str, KleinanzeigenParser] = {}
 
 
 async def _detail_gate_client(priority: str = "normal") -> KleinanzeigenParser:
-    lane = "background" if str(priority) == "background" else "normal"
+    lane = str(priority) if str(priority) in {"background", "radar_checkpoint"} else "normal"
     parser = _detail_gate_parsers.get(lane)
     if parser is None:
         parser = KleinanzeigenParser()
@@ -282,10 +282,10 @@ async def _live_detail_organic_gate(
     # explicitly (sweep / Verified Organic Velocity).
     detail_priority = (
         str(force_priority)
-        if force_priority in {"normal", "background"}
+        if force_priority in {"normal", "background", "radar_checkpoint"}
         else "normal"
     )
-    detail_lane = "background" if detail_priority == "background" else "normal"
+    detail_lane = detail_priority if detail_priority in {"background", "radar_checkpoint"} else "normal"
     async with _detail_gate_locks[detail_lane]:
         parser = await _detail_gate_client(detail_lane)
         verdict = await parser.inspect_detail_integrity(
@@ -1181,6 +1181,70 @@ async def record_autoscan_hot_detailed(
     return RadarAdmissionStats(eligible_with_views=len(rows), admitted=0, saved=0)
 
 
+async def record_user_scan_radar3_baselines(scan_id: int) -> int:
+    """Seed Radar 3.0 from a completed *today* user scan without extra web requests.
+
+    ScanListing.initial_view_count/captured_at are authoritative baseline points.
+    User scans never publish a signal by themselves and duplicate adIds reuse the
+    existing RadarObservation instead of creating another observation.
+    """
+    now = datetime.utcnow()
+    today_msk = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
+    seeded = 0
+    async with SessionLocal() as session:
+        # Multiple users can finish scans containing the same adId at nearly the
+        # same moment. Serialize this very short DB-only seeding section so the
+        # unique RadarObservation.external_id constraint never becomes a race.
+        if DATABASE_BACKEND == "postgresql":
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                {"key": "radar3-user-scan-baseline-seed"},
+            )
+        scan = await session.get(UserScan, int(scan_id))
+        if scan is None or str(scan.target_date or "") != today_msk or str(scan.status or "") not in {"done", "partial"}:
+            return 0
+        rows = list((await session.execute(
+            select(ScanListing, Listing)
+            .join(Listing, Listing.external_id == ScanListing.external_id)
+            .where(
+                ScanListing.scan_id == int(scan_id),
+                ScanListing.initial_view_count.is_not(None),
+                Listing.posted_date_msk == today_msk,
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
+                ~_registry_dirty_exists(Listing.external_id),
+            )
+        )).all())
+        ids = [str(listing.external_id) for _snap, listing in rows]
+        existing_map = {}
+        if ids:
+            existing_map = {str(x.external_id): x for x in (await session.execute(
+                select(RadarObservation).where(RadarObservation.external_id.in_(ids))
+            )).scalars().all()}
+        for snap, listing in rows:
+            ext = str(listing.external_id)
+            if ext in existing_map:
+                continue
+            measured_at = snap.captured_at or now
+            raw = max(0, int(snap.initial_view_count or 0))
+            session.add(RadarObservation(
+                external_id=ext, category_key=str(listing.category_key or "unknown"),
+                product_key=radar_product_key(listing),
+                baseline_views=raw, baseline_at=measured_at,
+                last_views=raw, last_measured_at=measured_at,
+                checkpoint_count=0, positive_checkpoints=0, consecutive_positive=0,
+                total_delta=0, current_vph=0.0, peak_vph=0.0, status="baseline",
+                next_check_at=measured_at + timedelta(minutes=RADAR_V3_FIRST_CHECK_MINUTES),
+                expires_at=measured_at + timedelta(hours=RADAR_V3_MAX_OBSERVATION_HOURS),
+                created_at=now, updated_at=now,
+            ))
+            existing_map[ext] = True
+            seeded += 1
+        if seeded:
+            await session.commit()
+    return seeded
+
+
 async def radar_v3_due_external_ids(limit: int = 1000) -> list[str]:
     """Read-only diagnostic view of due Radar 3.0 observations."""
     now = datetime.utcnow()
@@ -1190,6 +1254,7 @@ async def radar_v3_due_external_ids(limit: int = 1000) -> list[str]:
                 RadarObservation.next_check_at.is_not(None),
                 RadarObservation.next_check_at <= now,
                 RadarObservation.status.in_(["baseline", "observed", "confirmed"]),
+                or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now),
                 or_(RadarObservation.lease_until.is_(None), RadarObservation.lease_until < now),
             ).order_by(RadarObservation.next_check_at.asc()).limit(max(1, int(limit)))
         )).scalars().all()]
@@ -1212,6 +1277,7 @@ async def radar_v3_claim_due_external_ids(owner: str, limit: int = 1000, lease_m
                 RadarObservation.next_check_at.is_not(None),
                 RadarObservation.next_check_at <= now,
                 RadarObservation.status.in_(["baseline", "observed", "confirmed"]),
+                or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now),
                 or_(RadarObservation.lease_until.is_(None), RadarObservation.lease_until < now),
             )
             .order_by(RadarObservation.next_check_at.asc(), RadarObservation.id.asc())
@@ -1280,6 +1346,15 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
         )).all()
         for listing, obs in pairs:
             measured_at = listing.views_checked_at or now
+            # Observation TTL is authoritative. A delayed checkpoint must never
+            # turn many hours of accumulated growth into a supposedly fresh signal.
+            if obs.expires_at and measured_at > obs.expires_at:
+                obs.status = "expired"
+                obs.next_check_at = None
+                obs.lease_owner = ""
+                obs.lease_until = None
+                obs.updated_at = now
+                continue
             if measured_at <= obs.last_measured_at:
                 continue
             current = max(0, int(listing.view_count or 0))
@@ -1342,7 +1417,7 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
             demand_status, stage = "rising", "confirmed"
         else:
             demand_status, stage = "stable", "observed"
-        allowed, detail_reason, verified_at = await _live_detail_organic_gate(listing, force_priority="background")
+        allowed, detail_reason, verified_at = await _live_detail_organic_gate(listing, force_priority="radar_checkpoint")
         if not allowed:
             continue
         elapsed_hours = max(1/60, (obs.last_measured_at - obs.baseline_at).total_seconds()/3600.0)
@@ -1366,6 +1441,23 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
     return emitted
 
 
+async def radar_v3_expire_observations() -> int:
+    """Expire active observation rows whose DT-owned measurement window ended."""
+    now = datetime.utcnow()
+    async with SessionLocal() as session:
+        result = await session.execute(
+            update(RadarObservation).where(
+                RadarObservation.status.in_(["baseline", "observed", "confirmed"]),
+                RadarObservation.expires_at.is_not(None),
+                RadarObservation.expires_at <= now,
+            ).values(
+                status="expired", next_check_at=None, lease_owner="", lease_until=None, updated_at=now
+            ).execution_options(synchronize_session=False)
+        )
+        await session.commit()
+        return int(result.rowcount or 0)
+
+
 async def radar_v3_expire_stale_products(max_age_hours: int = 6) -> int:
     cutoff = datetime.utcnow() - timedelta(hours=max(1, int(max_age_hours)))
     async with SessionLocal() as session:
@@ -1381,8 +1473,13 @@ async def radar_v3_expire_stale_products(max_age_hours: int = 6) -> int:
 
 
 async def prepare_radar_v3_once() -> bool:
-    """One-time clean break: purge old Radar output, preserve raw listing/view history."""
+    """One-time clean break, serialized across Parser replicas."""
     async with SessionLocal() as session:
+        bind = session.get_bind()
+        if bind is not None and str(bind.dialect.name).startswith("postgres"):
+            # Transaction-scoped lock makes rolling deploys safe: only one replica
+            # can test/purge/set the reset marker at a time.
+            await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": RADAR_V3_RESET_SETTING})
         existing = await session.get(AppSetting, RADAR_V3_RESET_SETTING)
         if existing is not None and str(existing.value or "") == "done":
             return False
