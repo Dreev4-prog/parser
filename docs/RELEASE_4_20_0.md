@@ -120,3 +120,7 @@ Pre-unified `radar_autoscan` and `scan_hot` snapshots used TOP position to manuf
 ## Repository cleanup
 
 Historical release notes/checksums remain consolidated under `docs/`; behavior-critical runtime files stay at repository root for Railway compatibility.
+
+### Unified AutoScan circle UI
+
+AutoScan is now presented to the administrator exactly as the product contract works: one **Unified 48H circle** with two stages — **15 pages today + 15 pages yesterday**. The live panel shows the current stage and a combined 2-stage progress counter. Completing Fresh no longer says that the whole circle is finished; only completion of the yesterday stage closes the Unified 48H circle. The underlying two-stage execution remains isolated internally for runtime stability.

@@ -4707,7 +4707,7 @@ def _radar_autoscan_new_context_round(state: dict, for_date=None) -> dict:
         "category_keys": keys,
         "current_index": 0,
         "current_category_key": "",
-        "current_category_name": "Запуск 48H Context Layer…",
+        "current_category_name": "Запуск этапа 2/2 · вчера…",
         "current_stage": "starting",
         "current_stage_started_at": now.replace(microsecond=0).isoformat(),
         "total": len(keys),
@@ -4884,7 +4884,25 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         status_text = "🔴 не запущен"
     current = str(state.get("current_category_name") or "—")
     live_stage_line = _radar_autoscan_live_stage_line(state) if status == "running" else ""
-    mode_label = ("Ежедневный · Fresh Layer" if state.get("mode") == "daily" else ("48H Context · вчера" if state.get("mode") == "context" else ("Повтор ошибок" if state.get("mode") == "retry" else ("Ручной · Fresh Layer" if state.get("mode") == "manual" else "—"))))
+    mode = str(state.get("mode") or "")
+    is_retry = mode == "retry"
+    mode_label = "Повтор ошибок" if is_retry else "Unified 48H Radar · сегодня + вчера"
+    layer = str(state.get("layer") or "fresh")
+    if is_retry:
+        stage_label = "допроверка проблемных категорий"
+        overall_progress_line = ""
+    elif layer == "context":
+        stage_label = "② Вчера · 15 страниц · 24–48H Context"
+        overall_done = total + processed
+        overall_total = total * 2
+        overall_pct = int(round(overall_done / max(1, overall_total) * 100))
+        overall_progress_line = f"Общий прогресс круга: <b>{overall_done}/{overall_total} · {overall_pct}%</b>\n"
+    else:
+        stage_label = "① Сегодня · 15 страниц · Fresh"
+        overall_done = processed
+        overall_total = total * 2
+        overall_pct = int(round(overall_done / max(1, overall_total) * 100))
+        overall_progress_line = f"Общий прогресс круга: <b>{overall_done}/{overall_total} · {overall_pct}%</b>\n"
     last = dict(state.get("last_summary") or {})
     if last:
         coverage_total = int(last.get("coverage_total") or last.get("total") or 0)
@@ -4899,12 +4917,13 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
     text = (
         "<b>📡 DT Radar AutoScan</b>\n\n"
         f"Статус: <b>{status_text}</b>\n"
-        f"Режим круга: <b>{mode_label}</b>\n"
-        f"Глубина: <b>{_radar_layer_depth(state)} страниц на категорию</b>\n"
-        f"Слой: <b>{'сегодня · Fresh' if str(state.get('layer') or 'fresh') == 'fresh' else 'вчера · 24–48H Context'}</b>\n"
-        f"Категории: <b>{len(_radar_autoscan_categories())}</b> товарных категорий\n"
-        f"Прогресс: <b>{processed}/{total} · {pct}%</b>\n"
-        f"Сейчас: <b>{html.escape(current)}</b>\n"
+        f"Режим: <b>{mode_label}</b>\n"
+        + ("Глубина круга: <b>15 сегодня + 15 вчера на категорию</b>\n" if not is_retry else f"Глубина: <b>{_radar_layer_depth(state)} страниц на категорию</b>\n")
+        + f"Текущий этап: <b>{stage_label}</b>\n"
+        + f"Категории: <b>{len(_radar_autoscan_categories())}</b> товарных категорий\n"
+        + f"Прогресс этапа: <b>{processed}/{total} · {pct}%</b>\n"
+        + overall_progress_line
+        + f"Сейчас: <b>{html.escape(current)}</b>\n"
         + (live_stage_line + "\n" if live_stage_line else "")
         + f"⏱ Watchdog категории: <b>{int(RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS // 60)} мин.</b>\n\n"
         f"✅ Успешно: <b>{int(state.get('successful') or 0)}</b> · "
@@ -4940,7 +4959,7 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         f"Время: <b>{html.escape(str(state.get('daily_time') or RADAR_AUTOSCAN_DEFAULT_TIME))} МСК</b>\n"
         f"Следующий запуск: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>\n"
         f"Если полный ручной круг уже прошёл сегодня: <b>{'пропустить Fresh, но Context всё равно собрать' if state.get('skip_daily_if_completed_today', True) else 'всё равно запустить Fresh'}</b>\n"
-        f"48H Context: <b>{'✅ собран сегодня' if state.get('last_context_date') == datetime.now(MOSCOW).date().isoformat() else '⏳ ещё не собран сегодня'}</b>\n\n"
+        f"Этап 2/2 · вчера: <b>{'✅ собран сегодня' if state.get('last_context_date') == datetime.now(MOSCOW).date().isoformat() else '⏳ ещё не собран сегодня'}</b>\n\n"
         f"Последний круг: <b>{last_line}</b>\n"
         + (
             f"📊 Покрытие последнего: <b>{int(last.get('category_coverage_pct') or 0)}% категорий</b> · "
@@ -5120,15 +5139,15 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         if system_errors:
             scope_line += f" · ❌ системных <b>{system_errors}</b>"
     elif mode == "context":
-        headline = f"🧠 <b>DT Radar — 48H Context Layer завершён {icon}</b>"
-        scope_line = f"Вчерашний рынок: <b>{run_successful}/{run_total}</b> категорий подтверждено"
+        headline = f"📡 <b>DT Radar — Unified 48H круг завершён {icon}</b>"
+        scope_line = f"Этап 2/2 · вчера: <b>{run_successful}/{run_total}</b> категорий подтверждено"
         if needs_review:
             scope_line += f" · ⚠️ допроверка <b>{needs_review}</b>"
         if system_errors:
             scope_line += f" · ❌ системных <b>{system_errors}</b>"
     else:
-        headline = f"📡 <b>DT Radar — круг завершён {icon}</b>"
-        scope_line = f"Категории: <b>{run_successful}/{run_total}</b> успешно"
+        headline = f"📡 <b>DT Radar — этап 1/2 · сегодня завершён {icon}</b>"
+        scope_line = f"Сегодня: <b>{run_successful}/{run_total}</b> категорий подтверждено"
         if needs_review:
             scope_line += f" · ⚠️ допроверка <b>{needs_review}</b>"
         if system_errors:
@@ -5162,8 +5181,8 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         + (f" · уже были <b>{int(summary.get('radar_already_present') or 0)}</b>" if int(summary.get("radar_already_present") or 0) else "")
         + f"\n⏱ Время: <b>{_radar_autoscan_human_duration(duration)}</b>"
         + (
-            "\n\n🧠 Fresh Layer готов. Следом автоматически запустится <b>48H Context Layer</b>: "
-            "15 страниц за вчера; подтверждённые сильные объявления входят в тот же единый 48H Radar."
+            "\n\n➡️ Этап 1/2 готов. Тот же <b>Unified 48H круг</b> автоматически продолжится этапом 2/2: "
+            "15 страниц за вчера. После него круг будет полностью завершён."
             if start_context_after_fresh else "\n\nAutoScan остановлен."
         )
         + (
@@ -5702,8 +5721,8 @@ async def radar_autoscan_scheduler(bot: Bot) -> None:
                             state = await save_radar_autoscan_state(state)
                             await _notify_radar_autoscan_admins(
                                 bot,
-                                "📡 <b>DT Radar — Fresh Layer уже готов</b>\n\n"
-                                "Сегодня был полностью завершён ручной круг. Fresh повторять не буду; 48H Context за вчера всё равно будет собран.",
+                                "📡 <b>DT Radar — этап 1/2 уже готов</b>\n\n"
+                                "Сегодняшние 15 страниц уже собраны ручным запуском. Unified 48H круг продолжится этапом 2/2 за вчера.",
                             )
                         else:
                             async with _radar_autoscan_guard:
@@ -5714,9 +5733,9 @@ async def radar_autoscan_scheduler(bot: Bot) -> None:
                                     _radar_autoscan_stop_event.clear()
                                     await _notify_radar_autoscan_admins(
                                         bot,
-                                        f"📡 <b>DT Radar — Fresh Layer запущен</b>\n\n"
-                                        f"Сегодня: {len(current.get('category_keys') or [])} товарных категорий × {RADAR_AUTOSCAN_DEPTH} страниц. "
-                                        "После него один раз запустится отдельный 48H Context за вчера. Пользовательские сканы имеют приоритет.",
+                                        f"📡 <b>DT Radar — Unified 48H круг запущен</b>\n\n"
+                                        f"Этап 1/2 · сегодня: {len(current.get('category_keys') or [])} товарных категорий × {RADAR_AUTOSCAN_DEPTH} страниц. "
+                                        f"Затем автоматически этап 2/2 · вчера: × {RADAR_CONTEXT_DEPTH} страниц. Пользовательские сканы имеют приоритет.",
                                     )
                                     continue
                     state = await load_radar_autoscan_state()
@@ -5729,9 +5748,9 @@ async def radar_autoscan_scheduler(bot: Bot) -> None:
                                 _radar_autoscan_stop_event.clear()
                                 await _notify_radar_autoscan_admins(
                                     bot,
-                                    f"🧠 <b>DT Radar — 48H Context Layer запущен</b>\n\n"
+                                    f"📡 <b>DT Radar — Unified 48H · этап 2/2</b>\n\n"
                                     f"Вчера: {len(current.get('category_keys') or [])} товарных категорий × {RADAR_CONTEXT_DEPTH} страниц. "
-                                    "Слой собирает market history и не публикует вчерашние totals напрямую в Radar.",
+                                    "Это продолжение того же 48H круга; подтверждённые сигналы входят в единый Radar.",
                                 )
                                 continue
 
