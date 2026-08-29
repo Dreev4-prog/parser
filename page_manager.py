@@ -43,7 +43,7 @@ PAGE_REDIS_PREFIX = os.getenv("PAGE_REDIS_PREFIX", "dtparser:pageworker").strip(
 # v4.15.2 changes the page payload/filter semantics. Keep the 180-second cache
 # schema-scoped so a freshly deployed parser cannot consume a pre-v4.15.2 page
 # that still contains TOP or crossed-price cards.
-PAGE_CACHE_SCHEMA = "v4152-organic"
+PAGE_CACHE_SCHEMA = "v4156-bump-resurrection"
 # v4.8.3: cache is stable, queue/pending/worker state is release-scoped.
 PAGE_RUNTIME_PREFIX = os.getenv(
     "PAGE_RUNTIME_PREFIX", f"{PAGE_REDIS_PREFIX}:runtime:v483"

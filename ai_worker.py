@@ -551,7 +551,22 @@ class AIWorker:
                 snapshot_by_id[listing.external_id] = snap
                 if snap.initial_view_count is None:
                     continue
-                age_minutes, exact_clock = listing_age_minutes(listing.posted_text, snap.captured_at)
+                history_status = str(getattr(listing, "organic_history_status", "unknown") or "unknown")
+                effective_views = int(snap.initial_view_count)
+                if history_status in {"unknown", "baseline"}:
+                    # Pre-DT history is unknown and only one clean counter exists.
+                    # Wait for a second observation instead of treating the inherited
+                    # total as organic velocity.
+                    continue
+                if history_status == "observed" and getattr(listing, "organic_baseline_views", None) is not None:
+                    baseline_at = getattr(listing, "organic_baseline_at", None)
+                    if baseline_at is None or snap.captured_at <= baseline_at:
+                        continue
+                    effective_views = max(0, int(snap.initial_view_count) - int(listing.organic_baseline_views or 0))
+                    age_minutes = max(0.0, (snap.captured_at - baseline_at).total_seconds() / 60.0)
+                    exact_clock = True
+                else:
+                    age_minutes, exact_clock = listing_age_minutes(listing.posted_text, snap.captured_at)
                 if not exact_clock or age_minutes is None:
                     continue
                 if age_minutes < 5.0 or age_minutes > AI_MAX_AGE_HOURS * 60.0:
@@ -565,7 +580,7 @@ class AIWorker:
                     identity_label=listing.identity_label,
                     identity_confidence=listing.identity_confidence,
                     price_eur=listing.price_eur,
-                    views=int(snap.initial_view_count),
+                    views=int(effective_views),
                     age_minutes=float(age_minutes),
                     title=str(listing.title or ""),
                     family_key=opportunity_family_key(str(listing.title or ""), category_key),

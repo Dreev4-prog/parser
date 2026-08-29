@@ -22,7 +22,7 @@ STABLE_DATE_INDEX_TTL_SECONDS = max(
 )
 # v4.15.2 changes page-card integrity semantics. Reject pre-release checkpoint
 # payloads for their short TTL instead of replaying a cached TOP/reduced card.
-STABLE_PAGE_PAYLOAD_SCHEMA = "v4152-organic"
+STABLE_PAGE_PAYLOAD_SCHEMA = "v4156-bump-resurrection"
 
 
 def feed_key(url: str) -> str:

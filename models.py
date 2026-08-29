@@ -20,6 +20,10 @@ class Listing(Base):
     price_eur: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     posted_text: Mapped[str | None] = mapped_column(String(100), nullable=True)
     posted_date_msk: Mapped[str | None] = mapped_column(String(10), nullable=True, index=True)
+    # v4.15.6: earliest publication-day value DT ever observed for this external_id.
+    # Unlike posted_date_msk this is never moved forward, so a later date jump on the
+    # same id is strong evidence that an old ad resurfaced via paid visibility.
+    first_posted_date_msk: Mapped[str | None] = mapped_column(String(10), nullable=True, index=True)
     url: Mapped[str] = mapped_column(String(1200), unique=True)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
@@ -34,6 +38,12 @@ class Listing(Base):
     disappeared_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     view_count: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     views_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    # v4.15.6 Organic Baseline. Raw total views stay auditable in view_count /
+    # ViewHistory; this baseline marks the point after which DT directly observed
+    # organic growth for listings whose pre-DT history cannot be reconstructed.
+    organic_baseline_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    organic_baseline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    organic_history_status: Mapped[str] = mapped_column(String(24), default="unknown", index=True)
 
     # v3.0 deterministic product identity. These columns are intentionally
     # denormalized on the listing so analytics do not have to re-parse titles.
@@ -64,6 +74,8 @@ class ListingIntegrity(Base):
     is_price_reduced: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     first_detected_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     last_detected_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    # Last sticky promotion reason (search marker, bump icon, resurfaced date, ...).
+    promotion_reason: Mapped[str] = mapped_column(String(80), default="")
 
 
 class PriceHistory(Base):
@@ -395,6 +407,10 @@ class RadarProduct(Base):
     # v4.15.4: user-facing Radar families are visible only after at least one
     # live detail-page organic verification in the strict admission pipeline.
     organic_verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    # v4.15.6: one-time historical bump sweep verification is separate from
+    # Organic Radar certification. Old families stay hidden until a fresh strict
+    # v4.15.6 signal rebuilds them, even after their old links were sweep-checked.
+    bump_sweep_verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     last_signal_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     last_signal_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
     current_score: Mapped[int] = mapped_column(Integer, default=0, index=True)

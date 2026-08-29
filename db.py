@@ -177,7 +177,8 @@ async def init_db() -> None:
                     is_promoted BOOLEAN NOT NULL DEFAULT FALSE,
                     is_price_reduced BOOLEAN NOT NULL DEFAULT FALSE,
                     first_detected_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    last_detected_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    last_detected_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    promotion_reason VARCHAR(80) NOT NULL DEFAULT ''
                 )
                 """
             ))
@@ -296,8 +297,23 @@ async def init_db() -> None:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN view_count INTEGER"))
         if columns and "views_checked_at" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN views_checked_at TIMESTAMP"))
+        # v4.15.6 Bump Resurrection Integrity / Organic Baseline.
+        if columns and "first_posted_date_msk" not in columns:
+            await conn.execute(text("ALTER TABLE listings ADD COLUMN first_posted_date_msk VARCHAR(10)"))
+        if columns and "organic_baseline_views" not in columns:
+            await conn.execute(text("ALTER TABLE listings ADD COLUMN organic_baseline_views INTEGER"))
+        if columns and "organic_baseline_at" not in columns:
+            await conn.execute(text("ALTER TABLE listings ADD COLUMN organic_baseline_at TIMESTAMP"))
+        if columns and "organic_history_status" not in columns:
+            await conn.execute(text("ALTER TABLE listings ADD COLUMN organic_history_status VARCHAR(24) DEFAULT 'unknown'"))
+        integrity_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "listing_integrity"))
+        if integrity_columns and "promotion_reason" not in integrity_columns:
+            await conn.execute(text("ALTER TABLE listing_integrity ADD COLUMN promotion_reason VARCHAR(80) DEFAULT ''"))
         if _IS_POSTGRES:
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_listings_is_price_reduced ON listings (is_price_reduced)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_listings_first_posted_date_msk ON listings (first_posted_date_msk)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_listings_organic_baseline_at ON listings (organic_baseline_at)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_listings_organic_history_status ON listings (organic_history_status)"))
 
         # v4.15.4 Strict Organic Pipeline: legacy Radar families remain
         # quarantined until a new live detail-page organic verdict certifies them.
@@ -309,6 +325,13 @@ async def init_db() -> None:
                 await conn.execute(text("ALTER TABLE radar_products ADD COLUMN organic_verified_at TIMESTAMP"))
         if _IS_POSTGRES:
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_radar_products_organic_verified_at ON radar_products (organic_verified_at)"))
+        if radar_product_columns and "bump_sweep_verified_at" not in radar_product_columns:
+            if _IS_POSTGRES:
+                await conn.execute(text("ALTER TABLE radar_products ADD COLUMN IF NOT EXISTS bump_sweep_verified_at TIMESTAMP"))
+            else:
+                await conn.execute(text("ALTER TABLE radar_products ADD COLUMN bump_sweep_verified_at TIMESTAMP"))
+        if _IS_POSTGRES:
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_radar_products_bump_sweep_verified_at ON radar_products (bump_sweep_verified_at)"))
 
         identity_columns = {
             "identity_key": "VARCHAR(500)",

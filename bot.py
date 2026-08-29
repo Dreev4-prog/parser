@@ -119,7 +119,8 @@ from parser import (
 from view_manager import REMOTE_VIEW_MANAGER, REMOTE_VIEW_WORKER_ENABLED
 from ai_manager import AI_MANAGER
 from radar import (
-    RADAR_PAGE_SIZE, RADAR_SCAN_TOP_LIMIT, backfill_radar_once, get_fast_sold_info, get_fast_sold_infos,
+    RADAR_PAGE_SIZE, RADAR_SCAN_TOP_LIMIT, backfill_radar_once, bump_resurrection_integrity_sweep_once,
+    prepare_bump_resurrection_sweep_once, get_fast_sold_info, get_fast_sold_infos,
     get_radar_product, is_radar_favorite, list_radar_products, radar_categories, radar_stats,
     purge_nonorganic_analytics, record_autoscan_hot_detailed, record_scan_hot, refresh_radar_scores,
     search_radar_products, toggle_radar_favorite,
@@ -2672,6 +2673,63 @@ def _identity_display(row: Listing) -> str:
     return row.title
 
 
+def _parse_iso_day(value: str | None):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_seen_moscow_day(value: datetime | None):
+    if value is None:
+        return None
+    aware = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+    return aware.astimezone(MOSCOW).date()
+
+
+def _resurfaced_listing_reason(row: Listing, incoming_day) -> str:
+    """Return strong same-external-id resurrection evidence, never a view-count guess."""
+    if incoming_day is None:
+        return ""
+    original_day = _parse_iso_day(getattr(row, "first_posted_date_msk", None))
+    previous_day = _parse_iso_day(getattr(row, "posted_date_msk", None))
+    stable_day = original_day or previous_day
+    if stable_day is not None and incoming_day > stable_day:
+        return "resurfaced_posted_date_shift"
+    first_seen_day = _first_seen_moscow_day(getattr(row, "first_seen_at", None))
+    # DT cannot have observed a normal listing before its claimed publication day.
+    if first_seen_day is not None and incoming_day > first_seen_day:
+        return "resurfaced_after_first_seen"
+    return ""
+
+
+def _apply_organic_view_baseline(row: Listing, views: int, measured_at: datetime) -> None:
+    """Persist the first DT-observed counter and mark later clean growth as observed.
+
+    Raw totals remain untouched. This does not classify high-view ads as promoted; it
+    only records the boundary between unknown pre-DT history and directly observed growth.
+    """
+    if bool(getattr(row, "is_promoted", False)) or bool(getattr(row, "is_price_reduced", False)):
+        return
+    status = str(getattr(row, "organic_history_status", "unknown") or "unknown")
+    if getattr(row, "organic_baseline_at", None) is None:
+        row.organic_baseline_views = max(0, int(views))
+        row.organic_baseline_at = measured_at
+        # A listing first observed on the same displayed publication day can use
+        # its fresh total after the strict bump gate. Older/ambiguous history must
+        # establish a second DT-observed point before its pre-DT total is trusted.
+        row.organic_history_status = "trusted" if status in {"trusted", "trusted_new"} else "baseline"
+        return
+    baseline_views = getattr(row, "organic_baseline_views", None)
+    baseline_at = getattr(row, "organic_baseline_at", None)
+    if baseline_views is not None and baseline_at is not None and measured_at > baseline_at and int(views) >= int(baseline_views):
+        if status not in {"trusted", "trusted_new"}:
+            row.organic_history_status = "observed"
+
+
 async def backfill_product_identities() -> int:
     """Fill v3.0 identity fields for listings collected by older versions."""
     async with db_write_lock:
@@ -2728,12 +2786,19 @@ async def upsert_page_items(
                     continue
                 if row is None:
                     _identity, identity_values = _identity_kwargs(item.title, category_name)
+                    initial_posted_day = posted_date_moscow(item.posted_text)
+                    first_seen_day = _first_seen_moscow_day(now)
+                    initial_history_status = (
+                        "trusted_new" if initial_posted_day is not None and initial_posted_day == first_seen_day else "unknown"
+                    )
                     session.add(Listing(
                         external_id=item.external_id, category_key=category_key, category=category_name,
                         title=item.title, price_text=item.price_text, price_eur=item.price_eur,
                         posted_text=item.posted_text, posted_date_msk=(posted_date_moscow(item.posted_text).isoformat() if posted_date_moscow(item.posted_text) else None),
+                        first_posted_date_msk=(posted_date_moscow(item.posted_text).isoformat() if posted_date_moscow(item.posted_text) else None),
                         url=item.url, first_seen_at=now, last_seen_at=now,
                         is_active=True, is_promoted=False, is_price_reduced=item_reduced, disappeared_at=None,
+                        organic_history_status=initial_history_status,
                         **identity_values,
                     ))
                     if item.price_text:
@@ -2759,6 +2824,40 @@ async def upsert_page_items(
 
                 old_price_text = row.price_text
                 old_price_eur = row.price_eur
+                incoming_day = posted_date_moscow(item.posted_text)
+                if not getattr(row, "first_posted_date_msk", None):
+                    # Preserve the oldest defensible publication day for future id-resurrection checks.
+                    previous_day = _parse_iso_day(getattr(row, "posted_date_msk", None))
+                    first_seen_day = _first_seen_moscow_day(getattr(row, "first_seen_at", None))
+                    seed_day = previous_day if previous_day is not None and (first_seen_day is None or previous_day <= first_seen_day) else None
+                    row.first_posted_date_msk = seed_day.isoformat() if seed_day is not None else None
+                resurrection_reason = _resurfaced_listing_reason(row, incoming_day)
+                if (
+                    not resurrection_reason
+                    and str(getattr(row, "organic_history_status", "unknown") or "unknown") == "unknown"
+                    and incoming_day is not None
+                    and incoming_day == _first_seen_moscow_day(getattr(row, "first_seen_at", None))
+                ):
+                    row.organic_history_status = "trusted_new"
+                if resurrection_reason:
+                    row.is_promoted = True
+                    if integrity_row is None:
+                        integrity_row = ListingIntegrity(
+                            external_id=str(external_id), is_promoted=True, promotion_reason=resurrection_reason,
+                            first_detected_at=now, last_detected_at=now,
+                        )
+                        session.add(integrity_row)
+                        integrity[str(external_id)] = integrity_row
+                    else:
+                        integrity_row.is_promoted = True
+                        integrity_row.promotion_reason = resurrection_reason
+                        integrity_row.last_detected_at = now
+                    nonorganic_ids.add(str(external_id))
+                    log.warning(
+                        "Bump resurrection detected external_id=%s reason=%s previous=%s incoming=%s first_seen=%s",
+                        external_id, resurrection_reason, getattr(row, "first_posted_date_msk", None),
+                        incoming_day.isoformat() if incoming_day else "", getattr(row, "first_seen_at", None),
+                    )
                 already_nonorganic = bool(getattr(row, "is_promoted", False)) or bool(
                     getattr(row, "is_price_reduced", False)
                 )
@@ -2819,6 +2918,8 @@ async def upsert_page_items(
                 _apply_identity(row, item.title, category_name)
                 row.posted_text = item.posted_text
                 parsed_day = posted_date_moscow(item.posted_text)
+                if parsed_day and not getattr(row, "first_posted_date_msk", None):
+                    row.first_posted_date_msk = parsed_day.isoformat()
                 row.posted_date_msk = parsed_day.isoformat() if parsed_day else row.posted_date_msk
                 row.url = item.url
                 row.last_seen_at = now
@@ -2845,7 +2946,9 @@ async def upsert_page_items(
     return new_items, clean_known, enriched_count, nonorganic_ids
 
 
-async def _mark_nonorganic_flag(external_ids: list[str] | set[str], *, field: str) -> int:
+async def _mark_nonorganic_flag(
+    external_ids: list[str] | set[str], *, field: str, reason: str = ""
+) -> int:
     ids = {str(x).strip() for x in external_ids if str(x).strip()}
     if not ids:
         return 0
@@ -2869,6 +2972,8 @@ async def _mark_nonorganic_flag(external_ids: list[str] | set[str], *, field: st
                     session.add(integrity_row)
                     registry[external_id] = integrity_row
                 integrity_row.last_detected_at = now
+                if field == "is_promoted" and reason:
+                    integrity_row.promotion_reason = str(reason)[:80]
                 if not bool(getattr(integrity_row, field, False)):
                     setattr(integrity_row, field, True)
                     changed += 1
@@ -2882,9 +2987,11 @@ async def _mark_nonorganic_flag(external_ids: list[str] | set[str], *, field: st
     return changed
 
 
-async def mark_promoted_listings(external_ids: list[str] | set[str]) -> int:
+async def mark_promoted_listings(
+    external_ids: list[str] | set[str], *, reason: str = "search_promotion_marker"
+) -> int:
     """Permanently exclude a listing once paid visibility is observed."""
-    return await _mark_nonorganic_flag(external_ids, field="is_promoted")
+    return await _mark_nonorganic_flag(external_ids, field="is_promoted", reason=reason)
 
 
 async def mark_price_reduced_listings(external_ids: list[str] | set[str]) -> int:
@@ -3558,6 +3665,7 @@ async def enrich_page_view_counts(
                 old = row.view_count
                 row.view_count = int(vr.views)
                 row.views_checked_at = now
+                _apply_organic_view_baseline(row, row.view_count, now)
                 if old != row.view_count:
                     session.add(ViewHistory(
                         external_id=row.external_id,
@@ -3717,6 +3825,7 @@ async def enrich_autoscan_view_counts(
                 old = row.view_count
                 row.view_count = int(vr.views)
                 row.views_checked_at = now
+                _apply_organic_view_baseline(row, row.view_count, now)
                 if old != row.view_count:
                     session.add(ViewHistory(
                         external_id=row.external_id,
@@ -3857,6 +3966,7 @@ async def refresh_view_counts(
                 old = row.view_count
                 row.view_count = int(vr.views)
                 row.views_checked_at = now
+                _apply_organic_view_baseline(row, row.view_count, now)
                 if old != row.view_count:
                     session.add(ViewHistory(
                         external_id=row.external_id,
@@ -4059,6 +4169,9 @@ async def radar_maintenance_scheduler() -> None:
         # Let Telegram polling come online first. Radar migration is DB-only and
         # idempotent, so a large historical base never delays bot availability.
         await asyncio.sleep(8)
+        sweep_stats = await bump_resurrection_integrity_sweep_once()
+        if any(int(v or 0) for v in sweep_stats.values()):
+            log.warning("v4.15.6 initial bump-resurrection sweep: %s", sweep_stats)
         ai_saved, scan_saved = await backfill_radar_once()
         if ai_saved or scan_saved:
             log.warning("DT Radar historical base imported | ai=%s scan_signals=%s", ai_saved, scan_saved)
@@ -4069,6 +4182,7 @@ async def radar_maintenance_scheduler() -> None:
 
     while True:
         try:
+            await bump_resurrection_integrity_sweep_once()
             changed = await refresh_radar_scores()
             if changed:
                 log.info("DT Radar score maintenance changed=%s", changed)
@@ -6092,7 +6206,7 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 cache[page] = info
                 promoted_ids = list(getattr(info, "promoted_ids", None) or [])
                 if promoted_ids:
-                    await mark_promoted_listings(promoted_ids)
+                    await mark_promoted_listings(promoted_ids, reason="search_promotion_marker")
                 price_reduced_ids = list(getattr(info, "price_reduced_ids", None) or [])
                 if price_reduced_ids:
                     await mark_price_reduced_listings(price_reduced_ids)
@@ -16275,6 +16389,10 @@ async def main() -> None:
             "disabled on Railway so production cannot silently run in mode=local."
         )
     await init_db()
+    # v4.15.6 correctness-first: hide the pre-v4.15.6 Radar immediately, before
+    # Telegram polling starts. The sweep only marks historical links checked; a
+    # fresh v4.15.6 demand-safe signal is required to certify/rebuild a family.
+    await prepare_bump_resurrection_sweep_once()
     organic_cleanup = await purge_nonorganic_analytics(
         infer_historical_price_drops=True
     )

@@ -9,7 +9,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import case, delete, func, select, text
+from sqlalchemy import case, delete, func, select, text, update
 
 from db import SessionLocal
 from early_winner import opportunity_family_key
@@ -36,6 +36,8 @@ from models import (
 log = logging.getLogger("dtparser-radar")
 
 RADAR_BACKFILL_SETTING = "dt_radar_v1_backfill_complete"
+RADAR_BUMP_SWEEP_SETTING = "dt_radar_v4156_bump_sweep_complete"
+RADAR_BUMP_QUARANTINE_SETTING = "dt_radar_v4156_bump_quarantine_applied"
 RADAR_SCAN_TOP_LIMIT = 12
 RADAR_PAGE_SIZE = 8
 # v4.15.5: after parser-level HTTP + browser recovery, wait once and retry only
@@ -166,7 +168,36 @@ async def _strict_organic_gate(session, external_id: str) -> tuple[bool, str]:
     return True, "organic"
 
 
-async def _mark_detail_nonorganic(external_id: str, *, promoted: bool, reduced: bool) -> None:
+def _safe_iso_day(value: str | None):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _listing_resurrection_reason(listing: Listing) -> str:
+    """Detect impossible chronology for the same external_id without guessing from views."""
+    current_day = _safe_iso_day(getattr(listing, "posted_date_msk", None))
+    original_day = _safe_iso_day(getattr(listing, "first_posted_date_msk", None))
+    if current_day is None:
+        return ""
+    if original_day is not None and current_day > original_day:
+        return "resurfaced_posted_date_shift"
+    first_seen = getattr(listing, "first_seen_at", None)
+    if first_seen is not None:
+        aware = first_seen.replace(tzinfo=timezone.utc) if first_seen.tzinfo is None else first_seen.astimezone(timezone.utc)
+        first_seen_day = aware.astimezone(ZoneInfo("Europe/Moscow")).date()
+        if current_day > first_seen_day:
+            return "resurfaced_after_first_seen"
+    return ""
+
+
+async def _mark_detail_nonorganic(
+    external_id: str, *, promoted: bool, reduced: bool, promotion_reason: str = ""
+) -> None:
     """Persist a live detail-page dirty verdict, then purge only that ad's analytics."""
     external_id = str(external_id or "").strip()
     if not external_id or not (promoted or reduced):
@@ -188,11 +219,14 @@ async def _mark_detail_nonorganic(external_id: str, *, promoted: bool, reduced: 
                 is_price_reduced=bool(reduced),
                 first_detected_at=now,
                 last_detected_at=now,
+                promotion_reason=(str(promotion_reason)[:80] if promoted and promotion_reason else ""),
             )
             session.add(entry)
         else:
             entry.is_promoted = bool(entry.is_promoted or promoted)
             entry.is_price_reduced = bool(entry.is_price_reduced or reduced)
+            if promoted and promotion_reason:
+                entry.promotion_reason = str(promotion_reason)[:80]
             entry.last_detected_at = now
         await session.commit()
     # Targeted idempotent cleanup keeps AI/Radar/Lifecycle history consistent.
@@ -201,13 +235,30 @@ async def _mark_detail_nonorganic(external_id: str, *, promoted: bool, reduced: 
     )
 
 
-async def _live_detail_organic_gate(listing: Listing) -> tuple[bool, str, datetime | None]:
-    """Final public detail-page gate. Unknown is never promoted to organic."""
+async def _live_detail_organic_gate(
+    listing: Listing, *, force_priority: str | None = None
+) -> tuple[bool, str, datetime | None]:
+    """Final public detail-page gate. Unknown is never promoted to organic.
+
+    Maintenance sweeps may force background priority so they never steal traffic
+    from a foreground user/AutoScan job. Normal Radar admission keeps the existing
+    v4.15.5 priority behavior.
+    """
     external_id = str(getattr(listing, "external_id", "") or "").strip()
     url = str(getattr(listing, "url", "") or "").strip()
     if not external_id or not url:
         return False, "missing_detail_identity", None
-    detail_priority = "normal" if int(getattr(TRAFFIC, "background_during_scans", 0)) <= 0 else "background"
+    resurrection_reason = _listing_resurrection_reason(listing)
+    if resurrection_reason:
+        await _mark_detail_nonorganic(
+            external_id, promoted=True, reduced=False, promotion_reason=resurrection_reason
+        )
+        return False, f"detail_promoted:{resurrection_reason}", None
+    detail_priority = (
+        str(force_priority)
+        if force_priority in {"normal", "background"}
+        else ("normal" if int(getattr(TRAFFIC, "background_during_scans", 0)) <= 0 else "background")
+    )
     async with _detail_gate_lock:
         parser = await _detail_gate_client()
         verdict = await parser.inspect_detail_integrity(
@@ -230,7 +281,8 @@ async def _live_detail_organic_gate(listing: Listing) -> tuple[bool, str, dateti
         return False, str(verdict.reason or "detail_unknown"), None
     if verdict.is_promoted or verdict.is_price_reduced:
         await _mark_detail_nonorganic(
-            external_id, promoted=bool(verdict.is_promoted), reduced=bool(verdict.is_price_reduced)
+            external_id, promoted=bool(verdict.is_promoted), reduced=bool(verdict.is_price_reduced),
+            promotion_reason=str(getattr(verdict, "promotion_reason", "") or "detail_promoted"),
         )
         if verdict.is_promoted and verdict.is_price_reduced:
             reason = "detail_promoted_and_reduced"
@@ -302,6 +354,28 @@ class FastSoldInfo:
 
 def _clamp_score(value: int | float) -> int:
     return max(0, min(100, int(round(float(value)))))
+
+
+def _organic_view_metric(
+    listing: Listing, raw_views: int | None, measured_at: datetime | None = None
+) -> tuple[int | None, str]:
+    """Return the demand-safe view quantity for ranking/scoring.
+
+    Fresh same-day listings that passed the strict bump gate may use their total.
+    Listings with unknown pre-DT history are withheld after the first baseline. Once
+    a second clean observation exists, only growth after DT's baseline is used.
+    """
+    if raw_views is None:
+        return None, "missing_views"
+    raw = max(0, int(raw_views))
+    status = str(getattr(listing, "organic_history_status", "unknown") or "unknown")
+    baseline = getattr(listing, "organic_baseline_views", None)
+    baseline_at = getattr(listing, "organic_baseline_at", None)
+    if status in {"unknown", "baseline"}:
+        return None, "history_baseline_pending"
+    if status == "observed" and baseline is not None:
+        return max(0, raw - int(baseline)), "observed_delta"
+    return raw, "trusted_total"
 
 
 def radar_product_key(listing: Listing, cohort_key: str | None = None) -> str:
@@ -511,6 +585,7 @@ async def _upsert_signal(
                     last_seen_at=listing.last_seen_at or now,
                     first_radar_at=now,
                     organic_verified_at=live_detail_verified_at or datetime.utcnow(),
+                    bump_sweep_verified_at=live_detail_verified_at or datetime.utcnow(),
                     last_signal_at=now,
                     last_signal_score=score,
                     current_score=score,
@@ -552,6 +627,7 @@ async def _upsert_signal(
                 product.latest_source = ""
                 product.last_ai_candidate_id = None
             product.organic_verified_at = live_detail_verified_at or datetime.utcnow()
+            product.bump_sweep_verified_at = live_detail_verified_at or datetime.utcnow()
 
             assoc = (await session.execute(
                 select(RadarProductListing).where(
@@ -677,14 +753,19 @@ async def record_scan_hot(scan_id: int, limit: int = RADAR_SCAN_TOP_LIMIT) -> in
                 ~_registry_dirty_exists(Listing.external_id),
             )
         )).all()
-    ranked = [(listing, snap) for listing, snap in pairs if snap.initial_view_count is not None]
-    ranked.sort(key=lambda item: (int(item[1].initial_view_count or 0), item[0].first_seen_at), reverse=True)
+    ranked: list[tuple[Listing, ScanListing, int, str]] = []
+    for listing, snap in pairs:
+        metric, metric_kind = _organic_view_metric(listing, snap.initial_view_count, snap.captured_at)
+        if metric is None:
+            continue
+        ranked.append((listing, snap, int(metric), metric_kind))
+    ranked.sort(key=lambda item: (int(item[2]), item[0].first_seen_at), reverse=True)
     target = max(1, int(limit))
     reserve = ranked
     if not reserve:
         return 0
     saved = 0
-    for listing, snap in reserve:
+    for listing, snap, demand_views, metric_kind in reserve:
         if saved >= target:
             break
         allowed, detail_reason, verified_at = await _live_detail_organic_gate(listing)
@@ -702,7 +783,7 @@ async def record_scan_hot(scan_id: int, limit: int = RADAR_SCAN_TOP_LIMIT) -> in
         organic_index = saved
         percentile = 1.0 if target == 1 else 1.0 - (organic_index / max(1, target - 1))
         views = max(0, int(snap.initial_view_count or 0))
-        view_bonus = min(8, int(round(math.log10(max(1, views) + 1) * 2.5)))
+        view_bonus = min(8, int(round(math.log10(max(1, demand_views) + 1) * 2.5)))
         score = _clamp_score(58 + percentile * 20 + view_bonus)
         result = await _upsert_signal(
             source_key=f"scan-hot:{scan_id}:{listing.external_id}",
@@ -715,7 +796,10 @@ async def record_scan_hot(scan_id: int, limit: int = RADAR_SCAN_TOP_LIMIT) -> in
             opportunity_type="hot_product" if score >= 82 else "spark",
             scan_id=int(scan_id),
             view_count=views,
-            reasons=[f"Organic TOP-{organic_index + 1} по реальным просмотрам в завершённом скане"],
+            reasons=[
+                f"Organic TOP-{organic_index + 1} по demand-safe просмотрам в завершённом скане",
+                (f"DT-observed delta: {demand_views}" if metric_kind == "observed_delta" else "Fresh total verified after bump gate"),
+            ],
             recorded_at=snap.captured_at,
             live_detail_verified_at=verified_at,
         )
@@ -756,19 +840,27 @@ async def record_autoscan_hot_detailed(
                 Listing.view_count.is_not(None),
             )
         )).scalars().all())
-    rows.sort(
-        key=lambda listing: (int(listing.view_count or 0), listing.first_seen_at or datetime.min),
+    ranked_rows: list[tuple[Listing, int, str]] = []
+    for listing in rows:
+        metric, metric_kind = _organic_view_metric(
+            listing, listing.view_count, listing.views_checked_at or listing.last_seen_at
+        )
+        if metric is None:
+            continue
+        ranked_rows.append((listing, int(metric), metric_kind))
+    ranked_rows.sort(
+        key=lambda item: (int(item[1]), item[0].first_seen_at or datetime.min),
         reverse=True,
     )
     target = max(1, int(limit))
-    reserve = rows
+    reserve = ranked_rows
     if not reserve:
-        return RadarAdmissionStats(eligible_with_views=len(rows))
+        return RadarAdmissionStats(eligible_with_views=0)
 
     clean_round = str(round_id or "round").replace(":", "-")[:48]
     considered = checked = organic = promoted = reduced = unknown = db_blocked = admitted = already_present = saved = 0
     unknown_reasons: Counter[str] = Counter()
-    for listing in reserve:
+    for listing, demand_views, metric_kind in reserve:
         if admitted >= target:
             break
         considered += 1
@@ -796,7 +888,7 @@ async def record_autoscan_hot_detailed(
         organic_index = admitted
         percentile = 1.0 if target == 1 else 1.0 - (organic_index / max(1, target - 1))
         views = max(0, int(listing.view_count or 0))
-        view_bonus = min(8, int(round(math.log10(max(1, views) + 1) * 2.5)))
+        view_bonus = min(8, int(round(math.log10(max(1, demand_views) + 1) * 2.5)))
         score = _clamp_score(58 + percentile * 20 + view_bonus)
         source_key = f"autoscan:{clean_round}:{listing.external_id}"
         async with SessionLocal() as session:
@@ -815,7 +907,10 @@ async def record_autoscan_hot_detailed(
             stage="rising" if score >= 72 else "watch",
             opportunity_type="hot_product" if score >= 82 else "spark",
             view_count=views,
-            reasons=[f"Organic TOP-{organic_index + 1} по точным просмотрам в автокруге DT Radar"],
+            reasons=[
+                f"Organic TOP-{organic_index + 1} по demand-safe просмотрам в автокруге DT Radar",
+                (f"DT-observed delta: {demand_views}" if metric_kind == "observed_delta" else "Fresh total verified after bump gate"),
+            ],
             recorded_at=listing.views_checked_at or listing.last_seen_at or datetime.utcnow(),
             live_detail_verified_at=verified_at,
         )
@@ -829,7 +924,7 @@ async def record_autoscan_hot_detailed(
             db_blocked += 1
 
     stats = RadarAdmissionStats(
-        eligible_with_views=len(rows),
+        eligible_with_views=len(ranked_rows),
         reserve_considered=considered,
         detail_checked=checked,
         organic_passed=organic,
@@ -1736,6 +1831,112 @@ async def purge_nonorganic_analytics(
             stats["radar_links"], stats["lifecycle_watches"],
             stats["radar_products_removed"], stats["radar_products_rebuilt"],
         )
+    return stats
+
+
+async def prepare_bump_resurrection_sweep_once() -> bool:
+    """Quarantine pre-v4.15.6 Radar once so polluted families cannot flash during sweep."""
+    async with SessionLocal() as session:
+        done = await session.get(AppSetting, RADAR_BUMP_SWEEP_SETTING)
+        if done is not None and str(done.value or "").strip() == "1":
+            return False
+        applied = await session.get(AppSetting, RADAR_BUMP_QUARANTINE_SETTING)
+        if applied is None or str(applied.value or "").strip() != "1":
+            await session.execute(update(RadarProduct).values(organic_verified_at=None))
+            now = datetime.utcnow()
+            if applied is None:
+                session.add(AppSetting(key=RADAR_BUMP_QUARANTINE_SETTING, value="1", updated_at=now))
+            else:
+                applied.value = "1"
+                applied.updated_at = now
+            await session.commit()
+            log.warning("v4.15.6 quarantined existing Radar pending bump-resurrection integrity sweep")
+        return True
+
+
+async def bump_resurrection_integrity_sweep_once() -> dict[str, int]:
+    """Re-verify every current Radar association with v4.15.6 bump semantics.
+
+    Dirty ads are stickily marked and purged through the normal cleanup path. Clean
+    legacy families are only marked sweep-verified and stay user-hidden until a fresh
+    v4.15.6 demand-safe signal rebuilds/certifies them. UNKNOWN remains quarantined
+    and is retried on the next maintenance cycle/restart rather than guessed organic.
+    """
+    needed = await prepare_bump_resurrection_sweep_once()
+    if not needed:
+        return {"products": 0, "checked": 0, "clean": 0, "dirty": 0, "unknown": 0, "sweep_verified": 0}
+
+    stats = {"products": 0, "checked": 0, "clean": 0, "dirty": 0, "unknown": 0, "sweep_verified": 0}
+    async with SessionLocal() as session:
+        product_ids = list((await session.execute(
+            select(RadarProduct.id)
+            .where(RadarProduct.bump_sweep_verified_at.is_(None))
+            .order_by(RadarProduct.id.asc())
+        )).scalars().all())
+
+    for product_id in product_ids:
+        stats["products"] += 1
+        async with SessionLocal() as session:
+            pairs = (await session.execute(
+                select(Listing, RadarProductListing)
+                .join(RadarProductListing, RadarProductListing.external_id == Listing.external_id)
+                .where(RadarProductListing.product_id == int(product_id))
+                .order_by(RadarProductListing.last_seen_at.desc())
+            )).all()
+        if not pairs:
+            continue
+        product_clean = True
+        any_clean = False
+        for listing, _assoc in pairs:
+            stats["checked"] += 1
+            allowed, reason, _verified_at = await _live_detail_organic_gate(
+                listing, force_priority="background"
+            )
+            if allowed:
+                any_clean = True
+                stats["clean"] += 1
+                continue
+            if "promoted" in reason or "reduced" in reason:
+                stats["dirty"] += 1
+                # purge may remove this association/product; continue checking the
+                # detached list only for telemetry, then re-query before certification.
+                continue
+            product_clean = False
+            stats["unknown"] += 1
+            log.info(
+                "v4.15.6 Radar sweep kept family quarantined product=%s external_id=%s reason=%s",
+                product_id, listing.external_id, reason,
+            )
+        if product_clean and any_clean:
+            async with SessionLocal() as session:
+                product = await session.get(RadarProduct, int(product_id))
+                if product is not None:
+                    remaining = int((await session.execute(
+                        select(func.count(RadarProductListing.id)).where(RadarProductListing.product_id == int(product_id))
+                    )).scalar_one() or 0)
+                    if remaining > 0:
+                        # Historical detail cleanliness is not enough to trust old
+                        # accumulated view totals. Mark the one-time sweep complete for
+                        # this family, but keep organic_verified_at NULL. A fresh strict
+                        # v4.15.6 signal will reset legacy snapshots and certify it.
+                        product.bump_sweep_verified_at = datetime.utcnow()
+                        product.updated_at = datetime.utcnow()
+                        await session.commit()
+                        stats["sweep_verified"] += 1
+        if stats["checked"] and stats["checked"] % 25 == 0:
+            await asyncio.sleep(0.25)
+
+    if stats["unknown"] == 0:
+        async with SessionLocal() as session:
+            setting = await session.get(AppSetting, RADAR_BUMP_SWEEP_SETTING)
+            now = datetime.utcnow()
+            if setting is None:
+                session.add(AppSetting(key=RADAR_BUMP_SWEEP_SETTING, value="1", updated_at=now))
+            else:
+                setting.value = "1"
+                setting.updated_at = now
+            await session.commit()
+    log.warning("v4.15.6 bump-resurrection Radar sweep: %s", stats)
     return stats
 
 

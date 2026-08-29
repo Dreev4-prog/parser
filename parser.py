@@ -274,6 +274,9 @@ class DetailIntegrityResult:
     is_promoted: bool = False
     is_price_reduced: bool = False
     reason: str = ""
+    # v4.15.6: preserve the concrete paid-visibility evidence for sticky registry
+    # telemetry (e.g. bump_icon, top_badge, promoted_metadata).
+    promotion_reason: str = ""
     final_url: str | None = None
     status_code: int | None = None
 
@@ -677,6 +680,22 @@ PROMOTED_LABEL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# v4.15.6: Kleinanzeigen also renders paid Hochschieben as a purple circular
+# up-arrow icon. In some templates the SVG carries no visible "Hochschieben" text,
+# so old text/class-only detection missed it. Match only semantic icon/sprite tokens
+# or an up-arrow inside an explicit feature/promotion wrapper; never a generic arrow.
+PROMOTED_BUMP_ICON_TOKEN_RE = re.compile(
+    r"(?:bump[-_ ]?up|bumpup|hochschieb|push[-_ ]?up|boost[-_ ]?ad|feature[-_ ]?up)",
+    re.IGNORECASE,
+)
+PROMOTED_UP_ARROW_TOKEN_RE = re.compile(
+    r"(?:arrow[-_ ]?up|chevron[-_ ]?up|up[-_ ]?arrow)", re.IGNORECASE
+)
+PROMOTION_CONTEXT_TOKEN_RE = re.compile(
+    r"(?:feature|promotion|promoted|visibility|boost|bump|topad|top-ad|ad-badge|badge-ad)",
+    re.IGNORECASE,
+)
+
 PRICE_REDUCED_CLASS_RE = re.compile(
     r"(?:^|[-_: ])(?:old[-_ ]?price|original[-_ ]?price|former[-_ ]?price|previous[-_ ]?price|"
     r"strike(?:through)?|strikethrough|crossed[-_ ]?price|price[-_ ]?old|price[-_ ]?reduced|"
@@ -699,6 +718,66 @@ def _class_set(element) -> set[str]:
     if isinstance(value, str):
         value = value.split()
     return {str(x).strip().lower() for x in value if str(x).strip()}
+
+
+def _promotion_attr_blob(element) -> str:
+    """Return promotion-relevant semantic tokens from one DOM element.
+
+    SVG sprite hrefs/data-icon attributes are included because the live paid
+    Hochschieben marker can be icon-only and therefore has no visible label text.
+    """
+    if element is None or not hasattr(element, "get"):
+        return ""
+    values: list[str] = []
+    values.extend(sorted(_class_set(element)))
+    for attr_name in (
+        "id", "data-testid", "data-test", "data-icon", "data-name", "name",
+        "aria-label", "title", "alt", "href", "xlink:href", "src", "data-src",
+        "srcset", "role", "style",
+    ):
+        try:
+            value = element.get(attr_name)
+        except Exception:
+            value = None
+        if value:
+            values.append(str(value))
+    return " ".join(values)
+
+
+def _is_paid_bump_icon(element) -> bool:
+    """Detect the icon-only Hochschieben marker without matching generic UI arrows."""
+    blob = _promotion_attr_blob(element)
+    if not blob:
+        return False
+    if PROMOTED_BUMP_ICON_TOKEN_RE.search(blob):
+        return True
+    tag_name = str(getattr(element, "name", "") or "").lower()
+    if tag_name not in {"svg", "use", "i", "span"} or not PROMOTED_UP_ARROW_TOKEN_RE.search(blob):
+        return False
+    # Generic back-to-top/navigation arrows are common. Accept an arrow token only
+    # when its own/nearby wrapper semantics explicitly identify an ad feature.
+    contexts = [blob]
+    try:
+        parent = element.parent
+        for _ in range(3):
+            if parent is None:
+                break
+            contexts.append(_promotion_attr_blob(parent))
+            parent = getattr(parent, "parent", None)
+    except Exception:
+        pass
+    return any(PROMOTION_CONTEXT_TOKEN_RE.search(text or "") for text in contexts)
+
+
+def _paid_promotion_marker_reason(root) -> str:
+    """Return a concrete paid-feature reason from a card/detail subtree, or empty."""
+    try:
+        for element in root.find_all(True):
+            if _is_paid_bump_icon(element):
+                return "bump_icon"
+    except Exception:
+        pass
+    return ""
 
 
 def _is_promoted_listing_node(node) -> bool:
@@ -734,6 +813,8 @@ def _is_promoted_listing_node(node) -> bool:
     if wrapper_classes & PROMOTED_WRAPPER_CLASSES:
         return True
     if any(PROMOTED_FEATURE_CLASS_RE.match(cls) for cls in wrapper_classes):
+        return True
+    if _paid_promotion_marker_reason(wrapper):
         return True
 
     # Some promotion variants expose a featurelabel/featuretag/icon-feature
@@ -3044,7 +3125,12 @@ class KleinanzeigenParser:
             or soup
         )
         promoted = False
+        promotion_reason = ""
         try:
+            icon_reason = _paid_promotion_marker_reason(detail_root)
+            if icon_reason:
+                promoted = True
+                promotion_reason = icon_reason
             explicit_feature_attr = re.compile(
                 r"(?:^|[-_: ])(?:topad|top-ad|bumpup|bump-up|hochgeschoben|hochschieben|"
                 r"paid-highlight|feature-highlight|paid-gallery|feature-gallery|galerie-ad|"
@@ -3057,6 +3143,7 @@ class KleinanzeigenParser:
                 class_text = " ".join(classes)
                 if explicit_feature_attr.search(class_text) or explicit_feature_attr.search(attrs):
                     promoted = True
+                    promotion_reason = promotion_reason or "promoted_dom_marker"
                     break
                 if tag not in {"span", "small", "label", "button"} and not any("badge" in c for c in classes):
                     continue
@@ -3066,11 +3153,13 @@ class KleinanzeigenParser:
                     r"Hochgeschoben|Hochschieben|Highlight)", label, flags=re.IGNORECASE
                 ):
                     promoted = True
+                    promotion_reason = promotion_reason or "promoted_label"
                     break
             if not promoted:
                 sample = html_text[:1_500_000]
                 if re.search(r'(?i)"(?:isTopAd|topAd|isBumped|bumpUp|isPromoted|sponsored)"\s*:\s*true', sample):
                     promoted = True
+                    promotion_reason = "promoted_metadata"
         except Exception:
             promoted = False
 
@@ -3081,7 +3170,11 @@ class KleinanzeigenParser:
             reduced = False
 
         if promoted:
-            return DetailIntegrityResult(True, is_promoted=True, is_price_reduced=reduced, reason="promoted", final_url=final_url, status_code=status)
+            return DetailIntegrityResult(
+                True, is_promoted=True, is_price_reduced=reduced, reason="promoted",
+                promotion_reason=promotion_reason or "promoted_marker",
+                final_url=final_url, status_code=status,
+            )
         if reduced:
             return DetailIntegrityResult(True, is_promoted=False, is_price_reduced=True, reason="price_reduced", final_url=final_url, status_code=status)
         return DetailIntegrityResult(True, reason="organic", final_url=final_url, status_code=status)

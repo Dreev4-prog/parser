@@ -1,3 +1,15 @@
+# DT PARSER 4.15.6 — Bump Resurrection Integrity
+
+**Base:** 4.15.5 AutoScan Recovery Hardening.
+
+Closes the icon-only `Hochschieben` hole and removes old bumped/resurfaced evidence from Organic Radar. Search cards and live detail pages detect semantic Kleinanzeigen bump SVG/assets (including `bumpup`), while the same `external_id` moving to a later displayed publication day is sticky promotion evidence. High views alone are never used as a promotion verdict.
+
+On first deploy the pre-4.15.6 Radar is quarantined immediately. A background one-time sweep marks current bump/reduced IDs dirty and purges their Radar/AI/Lifecycle contributions. Sweep-clean legacy families stay hidden until a fresh v4.15.6 signal resets old snapshots and rebuilds the family from demand-safe evidence. Unknown pre-DT view history receives an Organic Baseline; only later DT-observed growth is used, while genuinely fresh same-day clean listings can still use verified totals. Page/stable cache schemas move to `v4156-bump-resurrection`. DT Demand Score stays 40/20/15/15/10.
+
+See `DEPLOY_V4_15_6_BUMP_RESURRECTION_INTEGRITY.md`.
+
+---
+
 # DT PARSER 4.15.5 — AutoScan Recovery Hardening
 
 **Base:** 4.15.4 Organic Pipeline Correctness.
