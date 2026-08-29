@@ -133,10 +133,18 @@ class FeatureRow:
     age_minutes: float
     title: str = ""
     family_key: str | None = None
+    # Age determines the 0-3 / 3-6 / 6-12 / 12-24 / 24-48h comparison cohort.
+    # For baseline/delta evidence the velocity clock is intentionally separate:
+    # a 29h-old listing observed by DT for 1h belongs to the 24-48h cohort, while
+    # its verified +delta is still divided by that 1h observation window.
+    velocity_window_minutes: float | None = None
 
     @property
     def views_per_hour(self) -> float:
-        return float(self.views) / max(0.25, self.age_minutes / 60.0)
+        window = self.velocity_window_minutes
+        if window is None or float(window) <= 0.0:
+            window = self.age_minutes
+        return float(self.views) / max(0.25, float(window) / 60.0)
 
 
 @dataclass(frozen=True)
@@ -397,7 +405,12 @@ def _age_matched_rows(row: FeatureRow, category_rows: list[FeatureRow]) -> list[
         low, high = 12.0 * 60.0, 24.0 * 60.0
     else:
         low, high = 24.0 * 60.0, 48.0 * 60.0
-    matched = [x for x in category_rows if low <= float(x.age_minutes) <= high]
+    if low <= 5.0:
+        matched = [x for x in category_rows if low <= float(x.age_minutes) <= high]
+    else:
+        # Cohort boundaries are non-overlapping: exactly 3h belongs to 0–3h,
+        # exactly 6h to 3–6h, etc. This keeps one listing from voting in two bands.
+        matched = [x for x in category_rows if low < float(x.age_minutes) <= high]
     return matched
 
 

@@ -30,10 +30,23 @@ def main() -> int:
     check('RADAR_CONTEXT_DEPTH = 15' in bot, "Context depth=15")
     check('mode in {"manual", "daily"}' in bot, "manual/daily Fresh can queue Context")
     check('target_day = context_day - timedelta(days=1)' in bot, "Context targets yesterday")
-    check('emit_signals=not context_only' in bot and 'if not emit_signals:' in radar,
-          "Context cannot publish inherited yesterday totals directly")
+    check('emit_signals=True' in bot and '_score_unified_48h_category' in radar,
+          "Context can publish only through unified 48H scoring")
+    ranking = (ROOT / 'radar_ranking.py').read_text(encoding='utf-8')
+    check('(3.0 * 60.0, 30)' in ranking and '(48.0 * 60.0, 100)' in ranking,
+          "age-aware Demand Gate present")
+    check('0.70 * score + 0.20 * conf + 0.10 * maturity' in ranking,
+          "Radar Rank is separate 70/20/10 ordering layer")
+    check('58 + percentile * 20' not in radar and 'view_bonus' not in radar,
+          "synthetic TOP-position score removed")
     check('ORGANIC_HIGH_BASELINE_VIEWS = 400' in velocity, "400+ baseline policy preserved")
     check('24.0 * 60.0, 48.0 * 60.0' in score, "24-48h age cohort present")
+    ai_source = (ROOT / 'ai_worker.py').read_text(encoding='utf-8')
+    check('velocity_window_minutes: float | None = None' in score
+          and 'age_minutes, exact_clock = listing_age_minutes(listing.posted_text, when)' in radar
+          and 'velocity_window_minutes=velocity_window_minutes' in radar
+          and 'velocity_window_minutes=velocity_window_minutes' in ai_source,
+          "listing-age cohort clock is separate from verified-delta velocity clock")
     check('RadarAutoScanStopped' in bot and '_radar_autoscan_stop_event' in bot,
           "Hard Stop preserved")
     check('RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS' in bot, "AutoScan watchdog preserved")

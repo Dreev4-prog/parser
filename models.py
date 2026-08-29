@@ -421,6 +421,13 @@ class RadarProduct(Base):
     current_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
     peak_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
     confidence: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    # v4.20.0 unified 48H Radar: internal ordering is deliberately separate from
+    # the public DT Demand Score.  It blends DT Score, evidence confidence and
+    # maturity while status is guarded by an absolute demand floor.
+    radar_rank: Mapped[float] = mapped_column(Float, default=0.0, index=True)
+    demand_views: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    demand_age_minutes: Mapped[float] = mapped_column(Float, default=0.0)
+    demand_gate: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(24), default="stable", index=True)
     opportunity_type: Mapped[str] = mapped_column(String(32), default="spark", index=True)
     signal_count: Mapped[int] = mapped_column(Integer, default=0, index=True)
@@ -506,6 +513,11 @@ class RadarSnapshot(Base):
     source: Mapped[str] = mapped_column(String(32), default="", index=True)
     score: Mapped[int] = mapped_column(Integer, default=0, index=True)
     confidence: Mapped[int] = mapped_column(Integer, default=0)
+    radar_rank: Mapped[float] = mapped_column(Float, default=0.0, index=True)
+    demand_views: Mapped[int] = mapped_column(Integer, default=0)
+    demand_age_minutes: Mapped[float] = mapped_column(Float, default=0.0)
+    demand_gate: Mapped[int] = mapped_column(Integer, default=0)
+    demand_status: Mapped[str] = mapped_column(String(24), default="historical", index=True)
     stage: Mapped[str] = mapped_column(String(24), default="", index=True)
     outcome: Mapped[str] = mapped_column(String(24), default="", index=True)
     opportunity_type: Mapped[str] = mapped_column(String(32), default="", index=True)

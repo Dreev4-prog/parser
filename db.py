@@ -353,6 +353,42 @@ async def init_db() -> None:
         if _IS_POSTGRES:
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_radar_products_bump_sweep_verified_at ON radar_products (bump_sweep_verified_at)"))
 
+        # v4.20.0 Unified 48H Radar ranking. DT Demand Score remains public;
+        # these additive fields store the separate internal rank + absolute-demand
+        # gate so young 10-20 view listings cannot become Hot from relative score alone.
+        radar_product_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "radar_products"))
+        radar_product_rank_columns = {
+            "radar_rank": "FLOAT DEFAULT 0",
+            "demand_views": "INTEGER DEFAULT 0",
+            "demand_age_minutes": "FLOAT DEFAULT 0",
+            "demand_gate": "INTEGER DEFAULT 0",
+        }
+        for column_name, sql_type in radar_product_rank_columns.items():
+            if radar_product_columns and column_name not in radar_product_columns:
+                if _IS_POSTGRES:
+                    await conn.execute(text(f"ALTER TABLE radar_products ADD COLUMN IF NOT EXISTS {column_name} {sql_type}"))
+                else:
+                    await conn.execute(text(f"ALTER TABLE radar_products ADD COLUMN {column_name} {sql_type}"))
+        radar_snapshot_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "radar_snapshots"))
+        radar_snapshot_rank_columns = {
+            "radar_rank": "FLOAT DEFAULT 0",
+            "demand_views": "INTEGER DEFAULT 0",
+            "demand_age_minutes": "FLOAT DEFAULT 0",
+            "demand_gate": "INTEGER DEFAULT 0",
+            "demand_status": "VARCHAR(24) DEFAULT 'historical'",
+        }
+        for column_name, sql_type in radar_snapshot_rank_columns.items():
+            if radar_snapshot_columns and column_name not in radar_snapshot_columns:
+                if _IS_POSTGRES:
+                    await conn.execute(text(f"ALTER TABLE radar_snapshots ADD COLUMN IF NOT EXISTS {column_name} {sql_type}"))
+                else:
+                    await conn.execute(text(f"ALTER TABLE radar_snapshots ADD COLUMN {column_name} {sql_type}"))
+        if _IS_POSTGRES:
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_radar_products_radar_rank ON radar_products (radar_rank)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_radar_products_demand_views ON radar_products (demand_views)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_radar_snapshots_radar_rank ON radar_snapshots (radar_rank)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_radar_snapshots_demand_status ON radar_snapshots (demand_status)"))
+
         identity_columns = {
             "identity_key": "VARCHAR(500)",
             "identity_label": "VARCHAR(500)",

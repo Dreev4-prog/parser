@@ -15,13 +15,51 @@ class ReleaseStaticTests(unittest.TestCase):
     def test_release_version(self):
         self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.20.0")
 
-    def test_48h_context_is_separate_from_public_radar_emission(self):
+    def test_48h_context_can_publish_only_through_unified_demand_gate(self):
         bot = (ROOT / "bot.py").read_text(encoding="utf-8")
         radar = (ROOT / "radar.py").read_text(encoding="utf-8")
         self.assertIn('"mode": "context"', bot)
         self.assertIn('target_day = context_day - timedelta(days=1)', bot)
-        self.assertIn('emit_signals=not context_only', bot)
-        self.assertIn('if not emit_signals:', radar)
+        self.assertIn('emit_signals=True', bot)
+        self.assertIn('_score_unified_48h_category', radar)
+        self.assertIn('classify_radar_signal(', radar)
+        self.assertIn('Demand Gate:', radar)
+
+    def test_old_synthetic_top_position_score_is_gone(self):
+        radar = (ROOT / "radar.py").read_text(encoding="utf-8")
+        self.assertNotIn('58 + percentile * 20', radar)
+        self.assertNotIn('view_bonus', radar)
+        self.assertNotIn('def _status_for_score', radar)
+
+    def test_unified_radar_fields_have_additive_db_migrations(self):
+        models = (ROOT / "models.py").read_text(encoding="utf-8")
+        db = (ROOT / "db.py").read_text(encoding="utf-8")
+        for field in ("radar_rank", "demand_views", "demand_age_minutes", "demand_gate"):
+            self.assertIn(field, models)
+            self.assertIn(f'"{field}"', db)
+        self.assertIn("demand_status", models)
+        self.assertIn('"demand_status"', db)
+
+    def test_radar_score_has_no_post_model_signal_bonus(self):
+        radar = (ROOT / "radar.py").read_text(encoding="utf-8")
+        self.assertNotIn('repeat_bonus =', radar)
+        self.assertNotIn('confirmed_bonus =', radar)
+        self.assertIn('return _clamp_score(int(product.last_signal_score or 0))', radar)
+
+    def test_stale_hot_signal_ages_against_demand_gate(self):
+        radar = (ROOT / "radar.py").read_text(encoding="utf-8")
+        self.assertIn('effective_age_minutes = (', radar)
+        self.assertIn('_snapshot_live_evidence', radar)
+
+    def test_observed_delta_does_not_rejuvenate_listing_age_cohort(self):
+        radar = (ROOT / "radar.py").read_text(encoding="utf-8")
+        ai = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
+        feature = (ROOT / "early_winner.py").read_text(encoding="utf-8")
+        self.assertIn('age_minutes, exact_clock = listing_age_minutes(listing.posted_text, when)', radar)
+        self.assertIn('velocity_window_minutes = (', radar)
+        self.assertIn('age_minutes, exact_clock = listing_age_minutes(listing.posted_text, snap.captured_at)', ai)
+        self.assertIn('velocity_window_minutes=velocity_window_minutes', ai)
+        self.assertIn('velocity_window_minutes: float | None = None', feature)
 
     def test_hard_stop_and_watchdog_survived_consolidation(self):
         bot = (ROOT / "bot.py").read_text(encoding="utf-8")

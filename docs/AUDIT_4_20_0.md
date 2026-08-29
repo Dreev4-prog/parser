@@ -65,8 +65,8 @@ The audit covered the complete runtime chain:
     live-stage return were removed; failed-category depth and active Context depth
     remain consistent; hard-stop/watchdog/cooldown paths stay interruptible.
 16. **48H Context scheduling** — every completed manual or daily Fresh layer can queue
-    one yesterday Context layer per Moscow day. Context is verification/statistics
-    only and does not publish inherited yesterday totals directly into Radar.
+    one yesterday Context layer per Moscow day. Context enriches history and may publish
+    a yesterday listing only through demand-safe unified 48H scoring + Organic Gate.
 17. **48H age cohorts** — Relative View Velocity does not borrow a different age band
     when its own cohort is sparse. Missing evidence stays missing and evidence-adaptive
     scoring renormalizes the available factors.
@@ -104,6 +104,12 @@ The audit covered the complete runtime chain:
     parsed-page schemas use `v4200-core2-audit3`. The earlier pre-audit 4.20.0 build
     cannot consume or satisfy audited jobs/caches during a rolling deployment.
 
+29. **Unified 48H clock separation** — listing age now exclusively chooses the
+    `0–3 / 3–6 / 6–12 / 12–24 / 24–48h` cohort and absolute Demand Gate, while
+    verified post-baseline delta uses its own DT observation window only for
+    views/hour. A 29h-old listing observed for 1h can no longer be rejuvenated into
+    the 0–3h cohort; inherited baseline views still contribute zero.
+
 ## Invariants intentionally unchanged
 
 - DT Demand Score weights are **40 / 20 / 15 / 15 / 10**.
@@ -111,7 +117,8 @@ The audit covered the complete runtime chain:
   two later clean checkpoints; only the DT-observed delta can score.
 - Fresh Layer is today, 15 pages/category.
 - Context Layer is yesterday, 15 pages/category, at most once per Moscow calendar
-  day, and cannot publish inherited yesterday totals directly into Radar.
+  day. Unknown inherited totals still cannot score; qualified demand-safe yesterday
+  evidence may enter the same public 48H Radar.
 - Sticky TOP/Hochschieben/Highlight/Galerie/sponsored/reduced/resurrection integrity
   remains fail-closed.
 
@@ -122,3 +129,19 @@ services. A final production smoke still has to be performed after Railway deplo
 against the real Kleinanzeigen site, Railway PostgreSQL, Redis, and the live Page/Date/
 View/AI/Lifecycle worker fleet. The local audit cannot promise that an external site
 will never change its HTML, rate limits, redirects, or counter endpoint in the future.
+
+## Final Unified 48H ranking audit addendum
+
+After the parser/infrastructure audit, the public Radar ranking layer received one final correctness pass:
+
+- removed the legacy synthetic AutoScan TOP-position score path;
+- today and yesterday now feed one 48H Radar only through demand-safe evidence;
+- added absolute age-aware Demand Gate (`30/40/60/80/100`) so tiny relative cohorts cannot call 15 views Hot;
+- added separate Radar Rank (`70% DT Score / 20% confidence / 10% maturity`) without changing public DT Score;
+- removed post-model repeat/confirmed score bonuses so `current_score` is always a real 40/20/15/15/10 model score;
+- live product aggregate fields now come from one coherent representative signal instead of mixing confidence/time/demand across different listings;
+- stale frozen demand is aged conservatively against stricter gates and can downgrade Hot -> Strong -> Early;
+- public AI Picks and Lifecycle admission require unified Hot/Strong status;
+- startup repair removes old synthetic `radar_autoscan` / `scan_hot` snapshots, clears contaminated live scores/statuses and recomputes Peak only from surviving non-synthetic evidence;
+- explicit age cohort boundaries are non-overlapping.
+- baseline/delta observation time is decoupled from listing age, so verified delta keeps its true views/hour while Demand Gate/cohort use the actual ad age.

@@ -19,6 +19,9 @@ from organic_velocity import (
     demand_safe_metric, high_baseline_pending, is_high_baseline,
 )
 from parser import KleinanzeigenParser
+from radar_ranking import (
+    RADAR_48H_MAX_AGE_MINUTES, classify_radar_signal, demand_gate_for_age,
+)
 from traffic import TRAFFIC
 from models import (
     AIEarlyWinnerCandidate,
@@ -43,6 +46,7 @@ RADAR_BACKFILL_SETTING = "dt_radar_v1_backfill_complete"
 RADAR_BUMP_SWEEP_SETTING = "dt_radar_v4156_bump_sweep_complete"
 RADAR_BUMP_QUARANTINE_SETTING = "dt_radar_v4156_bump_quarantine_applied"
 RADAR_VELOCITY_PREP_SETTING = "dt_radar_v4157_verified_velocity_prepared"
+RADAR_UNIFIED_48H_REPAIR_SETTING = "dt_radar_v4200_unified_48h_repair_v2"
 RADAR_SCAN_TOP_LIMIT = 12
 RADAR_PAGE_SIZE = 8
 # v4.15.5: after parser-level HTTP + browser recovery, wait once and retry only
@@ -348,6 +352,11 @@ class RadarAdmissionStats:
     unknown_blocked: int = 0
     unknown_reasons: tuple[tuple[str, int], ...] = ()
     db_blocked: int = 0
+    demand_gate_rejected: int = 0
+    qualified_candidates: int = 0
+    early_admitted: int = 0
+    strong_admitted: int = 0
+    hot_admitted: int = 0
     admitted: int = 0
     already_present: int = 0
     saved: int = 0
@@ -407,6 +416,133 @@ def _organic_view_metric(
     return metric.views, metric.kind
 
 
+def _feature_for_listing(
+    listing: Listing, *, raw_views: int | None = None, measured_at: datetime | None = None
+) -> tuple[FeatureRow, str] | None:
+    """Build one demand-safe 48H feature or reject evidence with an unsafe clock."""
+    when = measured_at or listing.views_checked_at or listing.last_seen_at or datetime.utcnow()
+    raw = listing.view_count if raw_views is None else raw_views
+    metric = demand_safe_metric(listing, raw, when)
+    if metric.views is None:
+        return None
+
+    # v4.20.0 Unified 48H uses two different clocks by design:
+    #   * listing age -> age cohort + Demand Gate;
+    #   * DT observation window -> verified-delta views/hour.
+    # Never let a yesterday listing become a 0-3h listing merely because DT first
+    # established its organic baseline one hour ago.
+    age_minutes, exact_clock = listing_age_minutes(listing.posted_text, when)
+    if not exact_clock or age_minutes is None:
+        return None
+    age = float(age_minutes)
+    if age < 5.0 or age > RADAR_48H_MAX_AGE_MINUTES:
+        return None
+    velocity_window_minutes = (
+        float(metric.age_minutes)
+        if metric.kind == "observed_delta" and metric.age_minutes is not None
+        else age
+    )
+    if velocity_window_minutes <= 0.0:
+        return None
+    category_key = str(listing.category_key or "unknown")
+    return FeatureRow(
+        external_id=str(listing.external_id),
+        category_key=category_key,
+        identity_key=listing.identity_key,
+        identity_label=listing.identity_label,
+        identity_confidence=listing.identity_confidence,
+        price_eur=listing.price_eur,
+        views=int(metric.views),
+        age_minutes=age,
+        title=str(listing.title or ""),
+        family_key=opportunity_family_key(str(listing.title or ""), category_key),
+        velocity_window_minutes=velocity_window_minutes,
+    ), str(metric.kind)
+
+
+def _simple_48h_market_stats(features: list[FeatureRow]) -> dict[str, dict]:
+    """Use the 48H cohort itself for price-fit evidence without inventing history."""
+    prices: dict[str, list[int]] = {}
+    counts: Counter[str] = Counter()
+    for row in features:
+        key = (
+            f"id:{row.identity_key}"
+            if row.identity_key and int(row.identity_confidence or 0) >= 70
+            else (row.family_key or opportunity_family_key(row.title, row.category_key))
+        )
+        if not key:
+            continue
+        counts[key] += 1
+        if row.price_eur is not None and int(row.price_eur) > 0:
+            prices.setdefault(key, []).append(int(row.price_eur))
+    result: dict[str, dict] = {}
+    for key, count in counts.items():
+        values = sorted(prices.get(key, []))
+        median = None
+        if values:
+            mid = len(values) // 2
+            median = float(values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2.0)
+        result[key] = {"median": median, "count": int(count)}
+    return result
+
+
+async def _score_unified_48h_category(
+    category_key: str,
+    candidate_ids: set[str] | list[str] | tuple[str, ...],
+    *,
+    overrides: dict[str, tuple[int | None, datetime | None]] | None = None,
+) -> tuple[dict[str, tuple[Listing, FeatureRow, object, str]], int]:
+    """Score candidates against all demand-safe listings in the same 48H category.
+
+    This is the core of the unified today+yesterday Radar.  A 2-hour listing and a
+    30-hour listing are allowed into the same public TOP, while ``score_initial_rows``
+    compares Relative Velocity inside its explicit age bands.
+    """
+    ids = {str(x).strip() for x in candidate_ids if str(x).strip()}
+    if not ids:
+        return {}, 0
+    now = datetime.utcnow()
+    async with SessionLocal() as session:
+        peers = list((await session.execute(
+            select(Listing).where(
+                Listing.category_key == str(category_key),
+                Listing.last_seen_at >= now - timedelta(hours=52),
+                Listing.is_active.is_(True),
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
+                Listing.view_count.is_not(None),
+                ~_registry_dirty_exists(Listing.external_id),
+            ).order_by(Listing.last_seen_at.desc()).limit(5000)
+        )).scalars().all())
+    overrides = overrides or {}
+    features: list[FeatureRow] = []
+    kind_by_id: dict[str, str] = {}
+    listing_by_id: dict[str, Listing] = {}
+    for listing in peers:
+        ext = str(listing.external_id)
+        raw, measured = overrides.get(ext, (listing.view_count, listing.views_checked_at or listing.last_seen_at))
+        built = _feature_for_listing(listing, raw_views=raw, measured_at=measured)
+        if built is None:
+            continue
+        feature, metric_kind = built
+        features.append(feature)
+        kind_by_id[ext] = metric_kind
+        listing_by_id[ext] = listing
+    if not features:
+        return {}, 0
+    market_stats = _simple_48h_market_stats(features)
+    score_map = {score.external_id: score for score in score_initial_rows(features, market_stats)}
+    feature_map = {feature.external_id: feature for feature in features}
+    result: dict[str, tuple[Listing, FeatureRow, object, str]] = {}
+    for ext in ids:
+        listing = listing_by_id.get(ext)
+        feature = feature_map.get(ext)
+        score = score_map.get(ext)
+        if listing is not None and feature is not None and score is not None:
+            result[ext] = (listing, feature, score, kind_by_id.get(ext, "unknown"))
+    return result, len(features)
+
+
 def radar_product_key(listing: Listing, cohort_key: str | None = None) -> str:
     """Stable family key shared by scan TOPs and the AI worker."""
     if cohort_key:
@@ -421,31 +557,35 @@ def radar_product_key(listing: Listing, cohort_key: str | None = None) -> str:
     return f"listing:{listing.external_id}"[:600]
 
 
-def _status_for_score(score: int) -> str:
-    if score >= 85:
-        return "hot"
-    if score >= 72:
-        return "rising"
-    if score >= 58:
-        return "stable"
-    if score >= 38:
-        return "cooling"
-    return "historical"
-
-
 def _effective_score(product: RadarProduct, now: datetime) -> int:
-    """Fresh signals rise; old signals cool but never disappear from Radar."""
-    raw = int(product.last_signal_score or product.current_score or 0)
-    if product.last_signal_at is None:
-        return _clamp_score(raw)
-    age_hours = max(0.0, (now - product.last_signal_at).total_seconds() / 3600.0)
-    # Give a signal three full days before cooling. Afterwards the live score loses
-    # two points/day, while repeatability/confirmed evidence contributes a small,
-    # bounded durable bonus. Peak score is never reduced.
-    decay = max(0.0, age_hours - 72.0) / 24.0 * 2.0
-    repeat_bonus = min(6.0, math.log2(max(1, int(product.signal_count or 0)) + 1) * 1.5)
-    confirmed_bonus = min(6.0, float(int(product.confirmed_count or 0)) * 2.0)
-    return _clamp_score(raw + repeat_bonus + confirmed_bonus - decay)
+    """Return the real DT Demand Score of the live representative signal.
+
+    Unified 48H ranking must never manufacture extra DT Score points from signal
+    count, confirmation count or time decay. Repeatability/Persistence already live
+    inside the fixed 40/20/15/15/10 model; Radar Rank is the separate ordering layer.
+    """
+    return _clamp_score(int(product.last_signal_score or 0))
+
+
+def _snapshot_live_evidence(snapshot: RadarSnapshot, now: datetime):
+    """Re-evaluate one persisted signal at *current* age without inventing new views.
+
+    A listing that had just enough demand to be Hot at 3h must not stay Hot forever
+    if no new views arrive. We conservatively advance the evidence clock while
+    keeping demand_views frozen at the last exact measurement, so Demand Gate can
+    downgrade stale signals until a fresh observation proves continued growth.
+    """
+    recorded_at = snapshot.recorded_at
+    elapsed_minutes = 0.0
+    if recorded_at is not None:
+        elapsed_minutes = max(0.0, (now - recorded_at).total_seconds() / 60.0)
+    effective_age = max(0.0, float(getattr(snapshot, "demand_age_minutes", 0.0) or 0.0)) + elapsed_minutes
+    return classify_radar_signal(
+        dt_score=int(snapshot.score or 0),
+        confidence=int(snapshot.confidence or 0),
+        demand_views=int(getattr(snapshot, "demand_views", 0) or 0),
+        age_minutes=effective_age,
+    )
 
 
 def _next_lifecycle_checkpoint(first_seen_at: datetime, now: datetime) -> tuple[int, datetime] | None:
@@ -457,7 +597,8 @@ def _next_lifecycle_checkpoint(first_seen_at: datetime, now: datetime) -> tuple[
 
 
 async def _maybe_queue_lifecycle_watch(
-    session, *, product: RadarProduct, listing: Listing, score: int, now: datetime
+    session, *, product: RadarProduct, listing: Listing, score: int, now: datetime,
+    demand_status: str = "historical",
 ) -> None:
     """Enroll a fresh strong listing in the durable Lifecycle queue.
 
@@ -465,6 +606,8 @@ async def _maybe_queue_lifecycle_watch(
     watches are only refreshed; disappeared/expired history is never resurrected.
     """
     if int(score or 0) < RADAR_LIFECYCLE_MIN_SCORE:
+        return
+    if str(demand_status or "") not in {"hot", "rising"}:
         return
     if not bool(listing.is_active) or not str(listing.url or "").strip():
         return
@@ -544,6 +687,11 @@ async def _upsert_signal(
     reasons: list[str] | tuple[str, ...] | None = None,
     recorded_at: datetime | None = None,
     live_detail_verified_at: datetime | None = None,
+    demand_views: int | None = None,
+    demand_age_minutes: float | None = None,
+    radar_rank: float | None = None,
+    demand_status: str | None = None,
+    demand_gate: int | None = None,
 ) -> int | None:
     """Append one idempotent Radar snapshot and refresh its aggregate product."""
     # v4.15.2: Radar is organic-demand only. Keep this defensive guard even
@@ -562,6 +710,30 @@ async def _upsert_signal(
     now = recorded_at or datetime.utcnow()
     score = _clamp_score(score)
     confidence = _clamp_score(confidence)
+    if demand_views is None or demand_age_minutes is None:
+        built = _feature_for_listing(
+            listing, raw_views=(view_count if view_count is not None else listing.view_count), measured_at=now
+        )
+        if built is not None:
+            fallback_feature, _fallback_kind = built
+            if demand_views is None:
+                demand_views = int(fallback_feature.views)
+            if demand_age_minutes is None:
+                demand_age_minutes = float(fallback_feature.age_minutes)
+    evidence = classify_radar_signal(
+        dt_score=score, confidence=confidence, demand_views=demand_views, age_minutes=demand_age_minutes
+    )
+    # Central authority: no ingestion path may override the Demand Gate by passing
+    # a caller-computed status/rank. The optional arguments remain for API
+    # compatibility, but persisted evidence is always recomputed here.
+    radar_rank = float(evidence.radar_rank)
+    demand_status = str(evidence.status)
+    demand_gate = int(evidence.demand_gate if evidence.demand_gate < 10**9 else 0)
+    demand_views = max(0, int(demand_views or 0))
+    demand_age_minutes = max(0.0, float(demand_age_minutes or 0.0))
+    radar_rank = max(0.0, min(100.0, radar_rank))
+    demand_status = demand_status[:24]
+    demand_gate = max(0, demand_gate)
     reason_list = [str(x) for x in (reasons or []) if str(x).strip()]
     latest_reason = (reason_list[0] if reason_list else "")[:800]
 
@@ -620,7 +792,11 @@ async def _upsert_signal(
                     current_score=score,
                     peak_score=score,
                     confidence=confidence,
-                    status=_status_for_score(score),
+                    radar_rank=radar_rank,
+                    demand_views=demand_views,
+                    demand_age_minutes=demand_age_minutes,
+                    demand_gate=demand_gate,
+                    status=demand_status,
                     opportunity_type=(opportunity_type or "spark")[:32],
                     signal_count=0,
                     confirmed_count=0,
@@ -652,6 +828,11 @@ async def _upsert_signal(
                 product.max_price_eur = None
                 product.current_score = score
                 product.peak_score = score
+                product.radar_rank = radar_rank
+                product.demand_views = demand_views
+                product.demand_age_minutes = demand_age_minutes
+                product.demand_gate = demand_gate
+                product.status = demand_status
                 product.latest_reason = ""
                 product.latest_source = ""
                 product.last_ai_candidate_id = None
@@ -699,6 +880,11 @@ async def _upsert_signal(
                 source=source[:32],
                 score=score,
                 confidence=confidence,
+                radar_rank=radar_rank,
+                demand_views=demand_views,
+                demand_age_minutes=demand_age_minutes,
+                demand_gate=demand_gate,
+                demand_status=demand_status,
                 stage=stage[:24],
                 outcome=outcome[:24],
                 opportunity_type=(opportunity_type or "")[:32],
@@ -724,6 +910,10 @@ async def _upsert_signal(
                 product.last_signal_at = now
                 product.last_signal_score = score
                 product.confidence = max(int(product.confidence or 0), confidence)
+                product.radar_rank = max(float(product.radar_rank or 0.0), radar_rank)
+                product.demand_views = max(int(product.demand_views or 0), demand_views)
+                product.demand_age_minutes = max(float(product.demand_age_minutes or 0.0), demand_age_minutes)
+                product.demand_gate = max(int(product.demand_gate or 0), demand_gate)
                 product.opportunity_type = (opportunity_type or product.opportunity_type or "spark")[:32]
                 product.latest_reason = latest_reason or product.latest_reason
                 product.latest_source = source[:32]
@@ -744,7 +934,10 @@ async def _upsert_signal(
             await session.flush()
             recent_snapshots = list((await session.execute(
                 select(RadarSnapshot)
-                .where(RadarSnapshot.product_id == int(product.id))
+                .where(
+                    RadarSnapshot.product_id == int(product.id),
+                    RadarSnapshot.recorded_at >= now - timedelta(hours=48),
+                )
                 .order_by(RadarSnapshot.recorded_at.desc(), RadarSnapshot.id.desc())
                 .limit(300)
             )).scalars().all())
@@ -753,21 +946,57 @@ async def _upsert_signal(
                 ext = str(snap.external_id or f"snapshot:{snap.id}")
                 if ext not in latest_by_listing:
                     latest_by_listing[ext] = snap
-            if latest_by_listing:
-                product.last_signal_score = max(int(x.score or 0) for x in latest_by_listing.values())
-                product.last_signal_at = max(x.recorded_at for x in latest_by_listing.values() if x.recorded_at is not None)
-            product.current_score = _effective_score(product, now)
-            product.status = _status_for_score(int(product.current_score or 0))
+            live_ranked = []
+            for snap in latest_by_listing.values():
+                live_evidence = _snapshot_live_evidence(snap, now)
+                if live_evidence.admitted:
+                    live_ranked.append((snap, live_evidence))
+            if live_ranked:
+                strongest_ranked, strongest_evidence = max(
+                    live_ranked,
+                    key=lambda pair: (float(pair[1].radar_rank), int(pair[0].score or 0), int(pair[0].confidence or 0)),
+                )
+                product.last_signal_score = int(strongest_ranked.score or 0)
+                product.last_signal_at = strongest_ranked.recorded_at
+                product.radar_rank = float(strongest_evidence.radar_rank)
+                product.demand_views = int(getattr(strongest_ranked, "demand_views", 0) or 0)
+                product.demand_age_minutes = float(getattr(strongest_ranked, "demand_age_minutes", 0.0) or 0.0)
+                product.demand_gate = int(strongest_evidence.demand_gate if strongest_evidence.demand_gate < 10**9 else 0)
+                product.status = str(strongest_evidence.status)
+                product.confidence = int(strongest_ranked.confidence or 0)
+                product.opportunity_type = str(strongest_ranked.opportunity_type or "spark")[:32]
+                product.representative_external_id = str(strongest_ranked.external_id or listing.external_id)
+                product.latest_source = str(strongest_ranked.source or "")[:32]
+                product.last_ai_candidate_id = strongest_ranked.candidate_id
+                try:
+                    strongest_reasons = json.loads(strongest_ranked.reasons_json or "[]")
+                    product.latest_reason = str(strongest_reasons[0] if isinstance(strongest_reasons, list) and strongest_reasons else "")[:800]
+                except Exception:
+                    product.latest_reason = ""
+                product.current_score = _effective_score(product, now)
+            else:
+                product.last_signal_score = 0
+                product.current_score = 0
+                product.radar_rank = 0.0
+                product.demand_views = 0
+                product.demand_age_minutes = 0.0
+                product.demand_gate = 0
+                product.status = "historical"
             product.updated_at = now
             await _maybe_queue_lifecycle_watch(
-                session, product=product, listing=listing, score=score, now=now
+                session, product=product, listing=listing, score=score, now=now, demand_status=demand_status
             )
             await session.commit()
             return int(product.id)
 
 
 async def record_scan_hot(scan_id: int, limit: int = RADAR_SCAN_TOP_LIMIT) -> int:
-    """Merge up to TOP-N live-detail-verified organic listings from a user scan."""
+    """Merge unified 48H demand-scored listings from a completed user scan.
+
+    v4.20.0 no longer manufactures a Hot score from TOP position. Every candidate
+    receives the real evidence-adaptive DT Demand Score, then must pass the age-aware
+    absolute Demand Gate before it can be Strong/Hot.
+    """
     async with SessionLocal() as session:
         scan = await session.get(UserScan, int(scan_id))
         if scan is None or scan.status != "done" or not scan.target_complete:
@@ -782,19 +1011,39 @@ async def record_scan_hot(scan_id: int, limit: int = RADAR_SCAN_TOP_LIMIT) -> in
                 ~_registry_dirty_exists(Listing.external_id),
             )
         )).all()
-    ranked: list[tuple[Listing, ScanListing, int, str]] = []
+    by_category: dict[str, list[tuple[Listing, ScanListing]]] = {}
     for listing, snap in pairs:
-        metric, metric_kind = _organic_view_metric(listing, snap.initial_view_count, snap.captured_at)
-        if metric is None:
+        if snap.initial_view_count is None:
             continue
-        ranked.append((listing, snap, int(metric), metric_kind))
-    ranked.sort(key=lambda item: (int(item[2]), item[0].first_seen_at), reverse=True)
+        by_category.setdefault(str(listing.category_key or "unknown"), []).append((listing, snap))
+
+    ranked: list[tuple[float, Listing, ScanListing, FeatureRow, object, str, object]] = []
+    for category_key, category_pairs in by_category.items():
+        ids = {str(listing.external_id) for listing, _snap in category_pairs}
+        overrides = {
+            str(listing.external_id): (int(snap.initial_view_count), snap.captured_at)
+            for listing, snap in category_pairs if snap.initial_view_count is not None
+        }
+        scored, _cohort_size = await _score_unified_48h_category(
+            category_key, ids, overrides=overrides
+        )
+        snap_by_id = {str(listing.external_id): snap for listing, snap in category_pairs}
+        for ext, (listing, feature, score, metric_kind) in scored.items():
+            evidence = classify_radar_signal(
+                dt_score=int(score.score or 0), confidence=int(score.confidence or 0),
+                demand_views=int(feature.views), age_minutes=float(feature.age_minutes),
+            )
+            if not evidence.admitted:
+                continue
+            snap = snap_by_id.get(ext)
+            if snap is None:
+                continue
+            ranked.append((float(evidence.radar_rank), listing, snap, feature, score, metric_kind, evidence))
+
+    ranked.sort(key=lambda item: (item[0], int(item[4].score or 0), int(item[3].views)), reverse=True)
     target = max(1, int(limit))
-    reserve = ranked
-    if not reserve:
-        return 0
     saved = 0
-    for listing, snap, demand_views, metric_kind in reserve:
+    for _rank, listing, snap, feature, score, metric_kind, evidence in ranked:
         if saved >= target:
             break
         allowed, detail_reason, verified_at = await _live_detail_organic_gate(listing)
@@ -803,39 +1052,39 @@ async def record_scan_hot(scan_id: int, limit: int = RADAR_SCAN_TOP_LIMIT) -> in
                 "Radar scan candidate rejected scan=%s external_id=%s reason=%s",
                 scan_id, listing.external_id, detail_reason,
             )
-            # Proven paid/reduced evidence can be skipped safely. UNKNOWN cannot:
-            # the candidate may be organic and therefore may belong in the real
-            # Organic TOP-N ahead of every lower-ranked ad. Stop fail-closed.
             if "promoted" not in detail_reason and "reduced" not in detail_reason:
                 break
             continue
-        organic_index = saved
-        percentile = 1.0 if target == 1 else 1.0 - (organic_index / max(1, target - 1))
-        views = max(0, int(snap.initial_view_count or 0))
-        view_bonus = min(8, int(round(math.log10(max(1, demand_views) + 1) * 2.5)))
-        score = _clamp_score(58 + percentile * 20 + view_bonus)
         result = await _upsert_signal(
             source_key=f"scan-hot:{scan_id}:{listing.external_id}",
             source="scan_hot",
             listing=listing,
-            product_key=radar_product_key(listing),
-            score=score,
-            confidence=55,
-            stage="rising" if score >= 72 else "watch",
-            opportunity_type="hot_product" if score >= 82 else "spark",
+            product_key=radar_product_key(listing, score.cohort_key),
+            score=int(score.score),
+            confidence=int(score.confidence or 0),
+            stage=str(score.stage or "watch"),
+            opportunity_type=str(score.opportunity_type or "spark"),
             scan_id=int(scan_id),
-            view_count=views,
+            view_count=int(snap.initial_view_count or 0),
+            views_per_hour=float(score.views_per_hour or 0.0),
             reasons=[
-                f"Organic TOP-{organic_index + 1} по demand-safe просмотрам в завершённом скане",
-                (f"DT-observed delta: {demand_views}" if metric_kind == "observed_delta" else "Fresh total verified after bump gate"),
+                f"Unified 48H: {evidence.status} · DT Score {int(score.score)}/100 · Radar Rank {float(evidence.radar_rank):.1f}",
+                f"Demand Gate: {int(feature.views)}/{int(evidence.demand_gate)} demand-safe views · age {float(feature.age_minutes)/60.0:.1f}h",
+                (f"DT-observed delta: {int(feature.views)}" if metric_kind == "observed_delta" else "Fresh total verified after Organic Gate"),
+                *[str(x) for x in tuple(score.reasons or ())[:2]],
             ],
             recorded_at=snap.captured_at,
             live_detail_verified_at=verified_at,
+            demand_views=int(feature.views),
+            demand_age_minutes=float(feature.age_minutes),
+            radar_rank=float(evidence.radar_rank),
+            demand_status=str(evidence.status),
+            demand_gate=int(evidence.demand_gate),
         )
         if result is not None:
             saved += 1
     if saved:
-        log.info("DT Radar scan merge scan=%s products=%s reserve=%s", scan_id, saved, len(reserve))
+        log.info("DT Radar unified scan merge scan=%s products=%s candidates=%s", scan_id, saved, len(ranked))
     return saved
 
 
@@ -847,22 +1096,19 @@ async def record_autoscan_hot_detailed(
     limit: int = RADAR_SCAN_TOP_LIMIT,
     emit_signals: bool = True,
 ) -> RadarAdmissionStats:
-    """Fill TOP-N with verified organic ads, using a bounded ranked reserve.
+    """Admit the best *qualified* listings from the unified today+yesterday 48H Radar.
 
-    v4.15.4 fixes the old ``rows[:12]`` dead end. Exact-view candidates are
-    considered in rank order and proven paid/reduced rows are skipped until
-    ``limit`` live-detail-verified organic rows are admitted or the ranked list
-    ends. With ``emit_signals=False`` the v4.20.0 Context Layer performs the same
-    hidden-promotion cleanup without emitting public Radar snapshots. An UNKNOWN
-    detail verdict stops the category fail-closed because that
-    candidate may belong ahead of every lower-ranked ad.
+    The old AutoScan formula awarded points for being TOP-1 inside one scan.  That
+    made a 10-15 view listing look Hot in a weak cohort.  Now every row receives the
+    actual DT Demand Score, an age-aware absolute Demand Gate and a separate Radar
+    Rank (70% score / 20% confidence / 10% maturity).
     """
     ids = [str(x).strip() for x in matched_ids if str(x).strip()]
     if not ids:
         return RadarAdmissionStats()
     ids = list(dict.fromkeys(ids))[:5000]
     async with SessionLocal() as session:
-        rows = list((await session.execute(
+        raw_rows = list((await session.execute(
             select(Listing).where(
                 Listing.external_id.in_(ids),
                 Listing.category_key == str(category_key),
@@ -872,37 +1118,43 @@ async def record_autoscan_hot_detailed(
                 Listing.view_count.is_not(None),
             )
         )).scalars().all())
-    ranked_rows: list[tuple[Listing, int, str]] = []
-    high_pending_count = 0
-    high_verified_count = 0
-    for listing in rows:
-        metric, metric_kind = _organic_view_metric(
-            listing, listing.view_count, listing.views_checked_at or listing.last_seen_at
-        )
-        if high_baseline_pending(listing):
-            high_pending_count += 1
-        elif is_high_baseline(listing) and metric is not None:
-            high_verified_count += 1
-        if metric is None:
-            continue
-        ranked_rows.append((listing, int(metric), metric_kind))
-    ranked_rows.sort(
-        key=lambda item: (int(item[1]), item[0].first_seen_at or datetime.min),
-        reverse=True,
+    high_pending_count = sum(1 for row in raw_rows if high_baseline_pending(row))
+    high_verified_count = sum(
+        1 for row in raw_rows
+        if is_high_baseline(row)
+        and demand_safe_metric(row, row.view_count, row.views_checked_at or row.last_seen_at).views is not None
     )
-    target = max(1, int(limit))
-    reserve = ranked_rows
-    if not reserve:
+
+    scored, cohort_size = await _score_unified_48h_category(str(category_key), set(ids))
+    if not scored:
         return RadarAdmissionStats(
             eligible_with_views=0,
             high_baseline_pending=high_pending_count,
             high_baseline_verified=high_verified_count,
         )
 
+    ranked: list[tuple[float, Listing, FeatureRow, object, str, object]] = []
+    demand_gate_rejected = 0
+    for listing, feature, score, metric_kind in scored.values():
+        evidence = classify_radar_signal(
+            dt_score=int(score.score or 0), confidence=int(score.confidence or 0),
+            demand_views=int(feature.views), age_minutes=float(feature.age_minutes),
+        )
+        if not evidence.admitted:
+            demand_gate_rejected += 1
+            continue
+        ranked.append((float(evidence.radar_rank), listing, feature, score, metric_kind, evidence))
+    ranked.sort(
+        key=lambda item: (item[0], int(item[3].score or 0), int(item[2].views)),
+        reverse=True,
+    )
+    target = max(1, int(limit))
     clean_round = str(round_id or "round").replace(":", "-")[:48]
     considered = checked = organic = promoted = reduced = unknown = db_blocked = admitted = already_present = saved = 0
+    early_admitted = strong_admitted = hot_admitted = 0
     unknown_reasons: Counter[str] = Counter()
-    for listing, demand_views, metric_kind in reserve:
+
+    for _rank, listing, feature, score, metric_kind, evidence in ranked:
         if admitted >= target:
             break
         considered += 1
@@ -918,50 +1170,57 @@ async def record_autoscan_hot_detailed(
                 normalized_reason = str(detail_reason or "detail_unknown")
                 unknown_reasons[normalized_reason] += 1
             log.info(
-                "Radar organic candidate rejected round=%s category=%s external_id=%s rank=%s reason=%s",
-                clean_round, category_key, listing.external_id, considered, detail_reason,
+                "Radar unified candidate rejected round=%s category=%s external_id=%s rank=%.1f reason=%s",
+                clean_round, category_key, listing.external_id, float(evidence.radar_rank), detail_reason,
             )
             if "promoted" not in detail_reason and "reduced" not in detail_reason:
-                # Do not backfill past an unknown higher-ranked candidate. It could
-                # be organic, so inserting lower-ranked rows would make TOP-N false.
                 break
             continue
         organic += 1
-        organic_index = admitted
-        percentile = 1.0 if target == 1 else 1.0 - (organic_index / max(1, target - 1))
-        views = max(0, int(listing.view_count or 0))
-        view_bonus = min(8, int(round(math.log10(max(1, demand_views) + 1) * 2.5)))
-        score = _clamp_score(58 + percentile * 20 + view_bonus)
         if not emit_signals:
-            # 48H Context is evidence, not a second public feed. Exact counters and
-            # ViewHistory remain available for persistence/repeatability, but an
-            # inherited yesterday total cannot create a Radar snapshot.
             admitted += 1
             continue
+
         source_key = f"autoscan:{clean_round}:{listing.external_id}"
         async with SessionLocal() as session:
             was_existing = bool((await session.execute(
                 select(RadarSnapshot.id).where(RadarSnapshot.source_key == source_key).limit(1)
             )).scalar_one_or_none())
+        raw_views = max(0, int(listing.view_count or 0))
         result = await _upsert_signal(
             source_key=source_key,
             source="radar_autoscan",
             listing=listing,
-            product_key=radar_product_key(listing),
-            score=score,
-            confidence=55,
-            stage="rising" if score >= 72 else "watch",
-            opportunity_type="hot_product" if score >= 82 else "spark",
-            view_count=views,
+            product_key=radar_product_key(listing, score.cohort_key),
+            score=int(score.score),
+            confidence=int(score.confidence or 0),
+            stage=str(score.stage or "watch"),
+            opportunity_type=str(score.opportunity_type or "spark"),
+            view_count=raw_views,
+            views_per_hour=float(score.views_per_hour or 0.0),
             reasons=[
-                f"Organic TOP-{organic_index + 1} по demand-safe просмотрам в автокруге DT Radar",
-                (f"DT-observed delta: {demand_views}" if metric_kind == "observed_delta" else "Fresh total verified after bump gate"),
+                f"Unified 48H: {evidence.status} · DT Score {int(score.score)}/100 · Radar Rank {float(evidence.radar_rank):.1f}",
+                f"Demand Gate: {int(feature.views)}/{int(evidence.demand_gate)} demand-safe views · age {float(feature.age_minutes)/60.0:.1f}h",
+                (f"DT-observed delta: {int(feature.views)}" if metric_kind == "observed_delta" else "Fresh total verified after Organic Gate"),
+                f"48H category cohort: {cohort_size} demand-safe listings",
+                *[str(x) for x in tuple(score.reasons or ())[:2]],
             ],
             recorded_at=listing.views_checked_at or listing.last_seen_at or datetime.utcnow(),
             live_detail_verified_at=verified_at,
+            demand_views=int(feature.views),
+            demand_age_minutes=float(feature.age_minutes),
+            radar_rank=float(evidence.radar_rank),
+            demand_status=str(evidence.status),
+            demand_gate=int(evidence.demand_gate),
         )
         if result is not None:
             admitted += 1
+            if str(evidence.status) == "hot":
+                hot_admitted += 1
+            elif str(evidence.status) == "rising":
+                strong_admitted += 1
+            elif str(evidence.status) == "stable":
+                early_admitted += 1
             if was_existing:
                 already_present += 1
             else:
@@ -970,7 +1229,7 @@ async def record_autoscan_hot_detailed(
             db_blocked += 1
 
     stats = RadarAdmissionStats(
-        eligible_with_views=len(ranked_rows),
+        eligible_with_views=len(scored),
         high_baseline_pending=high_pending_count,
         high_baseline_verified=high_verified_count,
         reserve_considered=considered,
@@ -981,20 +1240,25 @@ async def record_autoscan_hot_detailed(
         unknown_blocked=unknown,
         unknown_reasons=tuple(sorted(unknown_reasons.items(), key=lambda item: (-item[1], item[0]))),
         db_blocked=db_blocked,
+        demand_gate_rejected=demand_gate_rejected,
+        qualified_candidates=len(ranked),
+        early_admitted=early_admitted,
+        strong_admitted=strong_admitted,
+        hot_admitted=hot_admitted,
         admitted=admitted,
         already_present=already_present,
         saved=saved,
     )
     log.info(
-        "DT Radar autoscan funnel round=%s category=%s eligible_views=%s high_pending=%s high_verified=%s considered=%s checked=%s organic=%s promoted=%s reduced=%s unknown=%s db_blocked=%s admitted=%s existing=%s new=%s target=%s",
-        clean_round, category_key, stats.eligible_with_views, stats.high_baseline_pending, stats.high_baseline_verified, stats.reserve_considered,
-        stats.detail_checked, stats.organic_passed, stats.promoted_blocked,
-        stats.reduced_blocked, stats.unknown_blocked, stats.db_blocked, stats.admitted,
+        "DT Radar unified 48H funnel round=%s category=%s safe=%s cohort=%s below_early=%s qualified=%s checked=%s organic=%s promoted=%s reduced=%s unknown=%s admitted=%s early=%s strong=%s hot=%s existing=%s new=%s target=%s",
+        clean_round, category_key, stats.eligible_with_views, cohort_size, stats.demand_gate_rejected, stats.qualified_candidates,
+        stats.detail_checked, stats.organic_passed, stats.promoted_blocked, stats.reduced_blocked,
+        stats.unknown_blocked, stats.admitted, stats.early_admitted, stats.strong_admitted, stats.hot_admitted,
         stats.already_present, stats.saved, target,
     )
     if stats.unknown_reasons:
         log.info(
-            "DT Radar autoscan unknown reasons round=%s category=%s reasons=%s",
+            "DT Radar unified unknown reasons round=%s category=%s reasons=%s",
             clean_round, category_key, dict(stats.unknown_reasons),
         )
     return stats
@@ -1016,17 +1280,10 @@ async def record_autoscan_hot(
 async def record_verified_velocity_signals(
     external_ids: list[str] | tuple[str, ...] | set[str], *, traffic_priority: str = "normal"
 ) -> int:
-    """Admit newly certified 400+ baselines only from their observed delta.
-
-    This is intentionally not a shortcut back to the inherited total.  After two
-    clean checkpoints, build a category/age-relative DT Demand Score cohort from
-    demand-safe metrics and emit a Radar signal only when the verified velocity is
-    actually strong (score >=72).
-    """
+    """Admit newly certified 400+ baselines using only their observed organic delta."""
     ids = list(dict.fromkeys(str(x).strip() for x in external_ids if str(x).strip()))
     if not ids:
         return 0
-    now = datetime.utcnow()
     async with SessionLocal() as session:
         targets = list((await session.execute(
             select(Listing).where(
@@ -1042,72 +1299,35 @@ async def record_verified_velocity_signals(
         )).scalars().all())
     if not targets:
         return 0
-
-    target_by_category: dict[str, set[str]] = {}
+    by_category: dict[str, set[str]] = {}
     for row in targets:
-        target_by_category.setdefault(str(row.category_key or "unknown"), set()).add(str(row.external_id))
+        by_category.setdefault(str(row.category_key or "unknown"), set()).add(str(row.external_id))
 
     saved = 0
-    for category_key, target_ids in target_by_category.items():
-        async with SessionLocal() as session:
-            peers = list((await session.execute(
-                select(Listing).where(
-                    Listing.category_key == category_key,
-                    Listing.last_seen_at >= now - timedelta(days=2),
-                    Listing.is_promoted.is_(False),
-                    Listing.is_price_reduced.is_(False),
-                    Listing.view_count.is_not(None),
-                    ~_registry_dirty_exists(Listing.external_id),
-                ).order_by(Listing.last_seen_at.desc()).limit(2000)
-            )).scalars().all())
-
-        features: list[FeatureRow] = []
-        listing_by_id: dict[str, Listing] = {}
-        for listing in peers:
-            measured_at = listing.views_checked_at or listing.last_seen_at or now
-            metric = demand_safe_metric(listing, listing.view_count, measured_at)
-            if metric.views is None:
-                continue
-            if metric.kind == "observed_delta":
-                age_minutes = metric.age_minutes
-                exact_clock = age_minutes is not None
-            else:
-                age_minutes, exact_clock = listing_age_minutes(listing.posted_text, measured_at)
-            if not exact_clock or age_minutes is None or age_minutes < 5.0 or age_minutes > 48.0 * 60.0:
-                continue
-            ext = str(listing.external_id)
-            listing_by_id[ext] = listing
-            features.append(FeatureRow(
-                external_id=ext,
-                category_key=category_key,
-                identity_key=listing.identity_key,
-                identity_label=listing.identity_label,
-                identity_confidence=listing.identity_confidence,
-                price_eur=listing.price_eur,
-                views=int(metric.views),
-                age_minutes=float(age_minutes),
-                title=str(listing.title or ""),
-                family_key=opportunity_family_key(str(listing.title or ""), category_key),
-            ))
-        if not features:
-            continue
-        score_map = {score.external_id: score for score in score_initial_rows(features, {})}
+    for category_key, target_ids in by_category.items():
+        scored, cohort_size = await _score_unified_48h_category(category_key, target_ids)
         for external_id in target_ids:
-            score = score_map.get(external_id)
-            listing = listing_by_id.get(external_id)
-            if score is None or listing is None or int(score.score or 0) < 72:
+            data = scored.get(external_id)
+            if data is None:
                 continue
-            metric = demand_safe_metric(listing, listing.view_count, listing.views_checked_at or listing.last_seen_at)
-            if metric.views is None or metric.kind != "observed_delta":
+            listing, feature, score, metric_kind = data
+            if metric_kind != "observed_delta":
+                continue
+            evidence = classify_radar_signal(
+                dt_score=int(score.score or 0), confidence=int(score.confidence or 0),
+                demand_views=int(feature.views), age_minutes=float(feature.age_minutes),
+            )
+            if not evidence.admitted:
+                log.info(
+                    "Verified velocity below unified admission external_id=%s score=%s demand=%s gate=%s",
+                    external_id, score.score, feature.views, evidence.demand_gate,
+                )
                 continue
             allowed, reason, verified_at = await _live_detail_organic_gate(
                 listing, force_priority=("background" if traffic_priority == "background" else "normal")
             )
             if not allowed:
-                log.info(
-                    "Verified velocity Radar admission blocked external_id=%s reason=%s",
-                    external_id, reason,
-                )
+                log.info("Verified velocity Radar admission blocked external_id=%s reason=%s", external_id, reason)
                 continue
             baseline_at = getattr(listing, "organic_baseline_at", None)
             baseline_token = int(baseline_at.timestamp()) if baseline_at is not None else 0
@@ -1117,24 +1337,30 @@ async def record_verified_velocity_signals(
                 listing=listing,
                 product_key=radar_product_key(listing, score.cohort_key),
                 score=int(score.score),
-                confidence=max(65, int(score.confidence or 0)),
+                confidence=int(score.confidence or 0),
                 stage=str(score.stage or "rising"),
                 opportunity_type=str(score.opportunity_type or "spark"),
                 view_count=int(listing.view_count or 0),
                 views_per_hour=float(score.views_per_hour or 0.0),
                 reasons=[
-                    f"Verified Organic Velocity: +{int(metric.views)} после baseline {int(listing.organic_baseline_views or 0)}",
-                    f"2 clean checkpoints · {float(score.views_per_hour or 0.0):.1f} views/h",
-                    *[str(x) for x in tuple(score.reasons or ())[:3]],
+                    f"Verified Organic Velocity: +{int(feature.views)} after baseline {int(listing.organic_baseline_views or 0)}",
+                    f"Unified 48H: {evidence.status} · Score {int(score.score)} · Rank {float(evidence.radar_rank):.1f}",
+                    f"Demand Gate: {int(feature.views)}/{int(evidence.demand_gate)} · cohort {cohort_size}",
+                    *[str(x) for x in tuple(score.reasons or ())[:2]],
                 ],
-                recorded_at=listing.views_checked_at or now,
+                recorded_at=listing.views_checked_at or datetime.utcnow(),
                 live_detail_verified_at=verified_at,
+                demand_views=int(feature.views),
+                demand_age_minutes=float(feature.age_minutes),
+                radar_rank=float(evidence.radar_rank),
+                demand_status=str(evidence.status),
+                demand_gate=int(evidence.demand_gate),
             )
             if result is not None:
                 saved += 1
                 log.info(
-                    "Verified Organic Velocity entered Radar external_id=%s score=%s delta=%s vph=%.2f",
-                    external_id, score.score, metric.views, score.views_per_hour,
+                    "Verified Organic Velocity entered unified Radar external_id=%s score=%s rank=%.1f delta=%s vph=%.2f",
+                    external_id, score.score, float(evidence.radar_rank), feature.views, score.views_per_hour,
                 )
     return saved
 
@@ -1441,7 +1667,7 @@ async def lifecycle_queue_stats() -> dict[str, int]:
 
 
 async def refresh_radar_scores() -> int:
-    """Apply age cooling to current score without deleting historical products."""
+    """Refresh the 48H rank/status without letting score alone manufacture Hot."""
     now = datetime.utcnow()
     changed = 0
     async with _radar_lock:
@@ -1453,10 +1679,34 @@ async def refresh_radar_scores() -> int:
             )).scalars().all())
             for product in products:
                 new_score = _effective_score(product, now)
-                new_status = _status_for_score(new_score)
-                if int(product.current_score or 0) != new_score or product.status != new_status:
+                signal_age_hours = (
+                    max(0.0, (now - product.last_signal_at).total_seconds() / 3600.0)
+                    if product.last_signal_at is not None else 10**6
+                )
+                if signal_age_hours > 48.0:
+                    new_status = "historical"
+                    new_rank = 0.0
+                else:
+                    effective_age_minutes = (
+                        float(getattr(product, "demand_age_minutes", 0.0) or 0.0)
+                        + signal_age_hours * 60.0
+                    )
+                    evidence = classify_radar_signal(
+                        dt_score=new_score, confidence=int(product.confidence or 0),
+                        demand_views=int(getattr(product, "demand_views", 0) or 0),
+                        age_minutes=effective_age_minutes,
+                    )
+                    new_status = str(evidence.status)
+                    new_rank = float(evidence.radar_rank) if evidence.admitted else 0.0
+                    product.demand_gate = int(evidence.demand_gate if evidence.demand_gate < 10**9 else 0)
+                if (
+                    int(product.current_score or 0) != new_score
+                    or product.status != new_status
+                    or abs(float(getattr(product, "radar_rank", 0.0) or 0.0) - new_rank) > 1e-6
+                ):
                     product.current_score = new_score
                     product.status = new_status
+                    product.radar_rank = new_rank
                     product.updated_at = now
                     changed += 1
             if changed:
@@ -1482,6 +1732,7 @@ async def radar_stats() -> RadarStats:
         ))).scalar_one() or 0)
         ai_picks = int((await session.execute(select(func.count(RadarProduct.id)).where(
             visible,
+            RadarProduct.status.in_(["hot", "rising"]),
             RadarProduct.opportunity_type.in_(["hot_product", "hidden_gem", "emerging"]),
             RadarProduct.confidence >= 55,
         ))).scalar_one() or 0)
@@ -1549,16 +1800,17 @@ async def list_radar_products(
             )
         if mode == "hot":
             conditions.append(RadarProduct.status == "hot")
-            order = (RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
+            order = (RadarProduct.radar_rank.desc(), RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
         elif mode == "rising":
             conditions.append(RadarProduct.status == "rising")
-            order = (RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
+            order = (RadarProduct.radar_rank.desc(), RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
         elif mode == "ai":
             conditions.extend([
+                RadarProduct.status.in_(["hot", "rising"]),
                 RadarProduct.opportunity_type.in_(["hot_product", "hidden_gem", "emerging"]),
                 RadarProduct.confidence >= 55,
             ])
-            order = (RadarProduct.current_score.desc(), RadarProduct.confidence.desc(), RadarProduct.last_signal_at.desc())
+            order = (RadarProduct.radar_rank.desc(), RadarProduct.current_score.desc(), RadarProduct.confidence.desc(), RadarProduct.last_signal_at.desc())
         elif mode == "fastsold":
             fast_product_ids = select(RadarLifecycleWatch.product_id).where(
                 RadarLifecycleWatch.status == "disappeared",
@@ -1595,13 +1847,13 @@ async def list_radar_products(
         elif mode == "favorites" and user_id is not None:
             fav_ids = select(RadarFavorite.product_id).where(RadarFavorite.user_id == int(user_id))
             conditions.append(RadarProduct.id.in_(fav_ids))
-            order = (RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
+            order = (RadarProduct.radar_rank.desc(), RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
         elif mode == "category_best" and category_key:
-            order = (RadarProduct.current_score.desc(), RadarProduct.first_radar_at.desc(), RadarProduct.last_signal_at.desc())
+            order = (RadarProduct.radar_rank.desc(), RadarProduct.current_score.desc(), RadarProduct.first_radar_at.desc(), RadarProduct.last_signal_at.desc())
         elif mode == "category_new" and category_key:
             order = (RadarProduct.first_radar_at.desc(), RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
         else:
-            order = (RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
+            order = (RadarProduct.radar_rank.desc(), RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
         if conditions:
             query = query.where(*conditions)
             count_query = count_query.where(*conditions)
@@ -1653,7 +1905,7 @@ async def search_radar_products(
         rows = list((await session.execute(
             select(RadarProduct)
             .where(*conditions)
-            .order_by(RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
+            .order_by(RadarProduct.radar_rank.desc(), RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
             .offset(page * page_size).limit(page_size)
         )).scalars().all())
     return rows, total
@@ -1962,7 +2214,22 @@ async def purge_nonorganic_analytics(
                     ext = str(snap.external_id or f"snapshot:{snap.id}")
                     if ext not in latest_by_listing:
                         latest_by_listing[ext] = snap
-                strongest = max(latest_by_listing.values(), key=lambda x: (int(x.score or 0), x.recorded_at or datetime.min))
+                cutoff_48h = now - timedelta(hours=48)
+                live_ranked = []
+                for snap in latest_by_listing.values():
+                    if snap.recorded_at is None or snap.recorded_at < cutoff_48h:
+                        continue
+                    live_evidence = _snapshot_live_evidence(snap, now)
+                    if live_evidence.admitted:
+                        live_ranked.append((snap, live_evidence))
+                if live_ranked:
+                    strongest, strongest_evidence = max(
+                        live_ranked,
+                        key=lambda pair: (float(pair[1].radar_rank), int(pair[0].score or 0), pair[0].recorded_at or datetime.min),
+                    )
+                else:
+                    strongest = None
+                    strongest_evidence = None
                 newest = max(snapshots, key=lambda x: (x.recorded_at or datetime.min, int(x.id or 0)))
 
                 product.signal_count = len(snapshots)
@@ -1971,19 +2238,34 @@ async def purge_nonorganic_analytics(
                     if x.candidate_id is not None and str(x.outcome or "") == "confirmed"
                 })
                 product.listing_count = len(associations)
-                product.last_signal_score = max(int(x.score or 0) for x in latest_by_listing.values())
-                product.last_signal_at = max(x.recorded_at for x in latest_by_listing.values() if x.recorded_at is not None)
                 product.peak_score = max(int(x.score or 0) for x in snapshots)
-                product.confidence = max(int(x.confidence or 0) for x in latest_by_listing.values())
-                product.opportunity_type = str(strongest.opportunity_type or "spark")[:32]
-                product.latest_source = str(newest.source or "")[:32]
-                product.last_ai_candidate_id = newest.candidate_id
-                try:
-                    reasons = json.loads(newest.reasons_json or "[]")
-                    product.latest_reason = str(reasons[0] if isinstance(reasons, list) and reasons else "")[:800]
-                except Exception:
+                if strongest is not None:
+                    product.last_signal_score = int(strongest.score or 0)
+                    product.last_signal_at = strongest.recorded_at
+                    product.confidence = int(strongest.confidence or 0)
+                    product.radar_rank = float(strongest_evidence.radar_rank)
+                    product.demand_views = int(getattr(strongest, "demand_views", 0) or 0)
+                    product.demand_age_minutes = float(getattr(strongest, "demand_age_minutes", 0.0) or 0.0)
+                    product.demand_gate = int(strongest_evidence.demand_gate if strongest_evidence.demand_gate < 10**9 else 0)
+                    product.opportunity_type = str(strongest.opportunity_type or "spark")[:32]
+                    product.latest_source = str(strongest.source or "")[:32]
+                    product.last_ai_candidate_id = strongest.candidate_id
+                    try:
+                        reasons = json.loads(strongest.reasons_json or "[]")
+                        product.latest_reason = str(reasons[0] if isinstance(reasons, list) and reasons else "")[:800]
+                    except Exception:
+                        product.latest_reason = ""
+                    product.representative_external_id = str(strongest.external_id or "")
+                else:
+                    product.last_signal_score = 0
+                    product.confidence = 0
+                    product.radar_rank = 0.0
+                    product.demand_views = 0
+                    product.demand_age_minutes = 0.0
+                    product.demand_gate = 0
+                    product.latest_source = str(newest.source or "")[:32]
+                    product.last_ai_candidate_id = newest.candidate_id
                     product.latest_reason = ""
-                product.representative_external_id = str(strongest.external_id or "")
                 product.best_views = max(
                     [int(x.best_views or 0) for x in associations]
                     + [int(x.view_count or 0) for x in snapshots]
@@ -1998,8 +2280,13 @@ async def purge_nonorganic_analytics(
                 if associations:
                     product.first_seen_at = min(x.first_seen_at for x in associations if x.first_seen_at is not None)
                     product.last_seen_at = max(x.last_seen_at for x in associations if x.last_seen_at is not None)
-                product.current_score = _effective_score(product, now)
-                product.status = _status_for_score(int(product.current_score or 0))
+                if strongest is not None:
+                    product.current_score = _effective_score(product, now)
+                    product.status = str(strongest_evidence.status)
+                else:
+                    product.current_score = 0
+                    product.status = "historical"
+                    product.radar_rank = 0.0
                 product.updated_at = now
                 stats["radar_products_rebuilt"] += 1
 
@@ -2012,6 +2299,74 @@ async def purge_nonorganic_analytics(
             stats["radar_links"], stats["lifecycle_watches"],
             stats["radar_products_removed"], stats["radar_products_rebuilt"],
         )
+    return stats
+
+
+async def prepare_unified_48h_ranking_once() -> dict[str, int]:
+    """One-time cleanup of pre-unified AutoScan ranking evidence.
+
+    Older AutoScan/scan-hot snapshots used TOP position to manufacture a score.
+    Remove those snapshots and clear every *live* aggregate field they could have
+    contaminated. Product ids/favorites/associations remain as catalogue history.
+    Peak Score is recomputed only from surviving non-synthetic snapshots.
+    """
+    stats = {
+        "snapshots_removed": 0, "products_reset": 0,
+        "active_lifecycle_removed": 0, "peaks_recomputed": 0,
+    }
+    async with SessionLocal() as session:
+        done = await session.get(AppSetting, RADAR_UNIFIED_48H_REPAIR_SETTING)
+        if done is not None and str(done.value or "").strip() == "1":
+            return stats
+        deleted = await session.execute(delete(RadarSnapshot).where(
+            RadarSnapshot.source.in_(["radar_autoscan", "scan_hot"])
+        ))
+        stats["snapshots_removed"] = int(deleted.rowcount or 0)
+        active_watches = await session.execute(delete(RadarLifecycleWatch).where(
+            RadarLifecycleWatch.status.in_(["watching", "confirming"])
+        ))
+        stats["active_lifecycle_removed"] = int(active_watches.rowcount or 0)
+
+        surviving = (await session.execute(
+            select(
+                RadarSnapshot.product_id,
+                func.max(RadarSnapshot.score),
+                func.count(RadarSnapshot.id),
+            ).group_by(RadarSnapshot.product_id)
+        )).all()
+        surviving_by_product = {
+            int(product_id): (int(peak or 0), int(count or 0))
+            for product_id, peak, count in surviving if product_id is not None
+        }
+        products = list((await session.execute(select(RadarProduct))).scalars().all())
+        for product in products:
+            peak, signal_count = surviving_by_product.get(int(product.id), (0, 0))
+            product.peak_score = _clamp_score(peak)
+            product.signal_count = signal_count
+            product.last_signal_score = 0
+            product.current_score = 0
+            product.confidence = 0
+            product.radar_rank = 0.0
+            product.demand_views = 0
+            product.demand_age_minutes = 0.0
+            product.demand_gate = 0
+            product.status = "historical"
+            product.latest_reason = ""
+            product.latest_source = ""
+            product.updated_at = datetime.utcnow()
+            stats["products_reset"] += 1
+            if signal_count:
+                stats["peaks_recomputed"] += 1
+
+        now = datetime.utcnow()
+        if done is None:
+            session.add(AppSetting(key=RADAR_UNIFIED_48H_REPAIR_SETTING, value="1", updated_at=now))
+        else:
+            done.value = "1"
+            done.updated_at = now
+        await session.commit()
+    if any(stats.values()):
+        log.warning("v4.20.0 Unified 48H ranking repair: %s", stats)
     return stats
 
 

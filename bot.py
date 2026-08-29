@@ -125,7 +125,7 @@ from view_manager import REMOTE_VIEW_MANAGER, REMOTE_VIEW_WORKER_ENABLED
 from ai_manager import AI_MANAGER
 from radar import (
     RADAR_PAGE_SIZE, RADAR_SCAN_TOP_LIMIT, backfill_radar_once, bump_resurrection_integrity_sweep_once,
-    prepare_bump_resurrection_sweep_once, prepare_verified_organic_velocity_once, get_fast_sold_info, get_fast_sold_infos,
+    prepare_bump_resurrection_sweep_once, prepare_verified_organic_velocity_once, prepare_unified_48h_ranking_once, get_fast_sold_info, get_fast_sold_infos,
     get_radar_product, is_radar_favorite, list_radar_products, radar_categories, radar_stats,
     purge_nonorganic_analytics, record_autoscan_hot_detailed, record_scan_hot,
     record_verified_velocity_signals, refresh_radar_scores, verify_listing_organic_now,
@@ -1162,15 +1162,15 @@ def popular_category_keyboard(scan_id: int, category_key: str) -> InlineKeyboard
 
 RADAR_STATUS_ICON = {
     "hot": "🔥",
-    "rising": "🚀",
-    "stable": "✅",
+    "rising": "📈",
+    "stable": "🟡",
     "cooling": "💤",
     "historical": "🗄",
 }
 RADAR_STATUS_LABEL = {
-    "hot": "Горячий сейчас",
-    "rising": "Набирает обороты",
-    "stable": "Стабильный",
+    "hot": "Hot · спрос доказан",
+    "rising": "Strong · спрос подтверждается",
+    "stable": "Early · ранний сигнал",
     "cooling": "Остывает",
     "historical": "История",
 }
@@ -4450,6 +4450,11 @@ def _radar_autoscan_default_state() -> dict:
         "radar_unknown_blocked": 0,
         "radar_unknown_reasons": {},
         "radar_db_blocked": 0,
+        "radar_demand_gate_rejected": 0,
+        "radar_qualified_candidates": 0,
+        "radar_early_admitted": 0,
+        "radar_strong_admitted": 0,
+        "radar_hot_admitted": 0,
         "radar_already_present": 0,
         "failed_categories": [],
         "retry_parent_total": 0,
@@ -4645,6 +4650,11 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
         "radar_unknown_blocked": 0,
         "radar_unknown_reasons": {},
         "radar_db_blocked": 0,
+        "radar_demand_gate_rejected": 0,
+        "radar_qualified_candidates": 0,
+        "radar_early_admitted": 0,
+        "radar_strong_admitted": 0,
+        "radar_hot_admitted": 0,
         "radar_already_present": 0,
         "failed_categories": [],
         "retry_parent_total": 0,
@@ -4658,10 +4668,10 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
 def _radar_autoscan_new_context_round(state: dict, for_date=None) -> dict:
     """Build the once-daily 24-48h Context Layer over yesterday.
 
-    Context uses the same exact page/view/integrity pipeline as Fresh Layer, but
-    its strongest rows are verification-only: inherited yesterday totals do not
-    become public Radar signals. The observations enrich ViewHistory and the
-    Persistence/Repeatability/price-history evidence used by DT Demand Score.
+    Context uses the same exact page/view/integrity pipeline as Fresh Layer.
+    Yesterday listings may enter the same public 48H Radar only when their demand
+    evidence is safe and passes the age-aware Demand Gate; inherited unknown totals
+    still cannot vote. The layer also enriches Persistence/Repeatability history.
     """
     keys = [cat.key for cat in _radar_autoscan_categories()]
     now = datetime.now(MOSCOW)
@@ -4774,6 +4784,11 @@ def _radar_autoscan_retry_round(state: dict) -> dict | None:
         "radar_unknown_blocked": 0,
         "radar_unknown_reasons": {},
         "radar_db_blocked": 0,
+        "radar_demand_gate_rejected": 0,
+        "radar_qualified_candidates": 0,
+        "radar_early_admitted": 0,
+        "radar_strong_admitted": 0,
+        "radar_hot_admitted": 0,
         "radar_already_present": 0,
         "failed_categories": [],
         "retry_parent_total": max(coverage_total, len(keys)),
@@ -4908,8 +4923,12 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
             f"✅ delta verified: <b>{int(state.get('radar_high_baseline_verified') or 0)}</b>\n"
             if int(state.get('radar_high_baseline_pending') or 0) or int(state.get('radar_high_baseline_verified') or 0) else ""
         )
-        + f"🎯 С demand-safe views для Radar: <b>{int(state.get('radar_candidates') or 0)}</b> · "
+        + f"🎯 Demand-safe: <b>{int(state.get('radar_candidates') or 0)}</b> · "
+        f"ниже Early: <b>{int(state.get('radar_demand_gate_rejected') or 0)}</b> · "
+        f"к отбору: <b>{int(state.get('radar_qualified_candidates') or 0)}</b> · "
         f"detail-check: <b>{int(state.get('radar_detail_checked') or 0)}</b>\n"
+        + f"🟡 Early: <b>{int(state.get('radar_early_admitted') or 0)}</b> · "
+        f"📈 Strong: <b>{int(state.get('radar_strong_admitted') or 0)}</b> · 🔥 Hot: <b>{int(state.get('radar_hot_admitted') or 0)}</b>\n"
         f"🛡 Organic прошло: <b>{int(state.get('radar_organic_passed') or 0)}</b> · "
         f"TOP/Promo: <b>{int(state.get('radar_promoted_blocked') or 0)}</b> · "
         f"снижение: <b>{int(state.get('radar_reduced_blocked') or 0)}</b> · "
@@ -5059,6 +5078,11 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         "radar_unknown_blocked": int(state.get("radar_unknown_blocked") or 0),
         "radar_unknown_reasons": dict(state.get("radar_unknown_reasons") or {}),
         "radar_db_blocked": int(state.get("radar_db_blocked") or 0),
+        "radar_demand_gate_rejected": int(state.get("radar_demand_gate_rejected") or 0),
+        "radar_qualified_candidates": int(state.get("radar_qualified_candidates") or 0),
+        "radar_early_admitted": int(state.get("radar_early_admitted") or 0),
+        "radar_strong_admitted": int(state.get("radar_strong_admitted") or 0),
+        "radar_hot_admitted": int(state.get("radar_hot_admitted") or 0),
         "radar_already_present": int(state.get("radar_already_present") or 0),
         "radar_saved": int(state.get("radar_saved") or 0),
         "failed_categories": failed_categories,
@@ -5131,6 +5155,7 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
             f"✅ delta verified <b>{int(summary.get('radar_high_baseline_verified') or 0)}</b>"
             if int(summary.get('radar_high_baseline_pending') or 0) or int(summary.get('radar_high_baseline_verified') or 0) else ""
         )
+        + f"\n🎯 48H отбор: ниже Early <b>{int(summary.get('radar_demand_gate_rejected') or 0)}</b> · 🟡 Early <b>{int(summary.get('radar_early_admitted') or 0)}</b> · 📈 Strong <b>{int(summary.get('radar_strong_admitted') or 0)}</b> · 🔥 Hot <b>{int(summary.get('radar_hot_admitted') or 0)}</b>"
         + f"\n🛡 Organic: <b>{int(summary['radar_organic_passed'])}</b> · TOP/Promo <b>{int(summary['radar_promoted_blocked'])}</b> · снижение <b>{int(summary['radar_reduced_blocked'])}</b> · unknown <b>{int(summary['radar_unknown_blocked'])}</b>"
         + (f"\n↳ unknown: {_radar_unknown_reason_text(summary.get('radar_unknown_reasons'))}" if int(summary.get('radar_unknown_blocked') or 0) else "")
         + f"\n📡 Новых Radar-сигналов: <b>+{int(summary['radar_saved'])}</b>"
@@ -5138,7 +5163,7 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         + f"\n⏱ Время: <b>{_radar_autoscan_human_duration(duration)}</b>"
         + (
             "\n\n🧠 Fresh Layer готов. Следом автоматически запустится <b>48H Context Layer</b>: "
-            "15 страниц за вчера; вчерашние totals напрямую в Radar не публикуются."
+            "15 страниц за вчера; подтверждённые сильные объявления входят в тот же единый 48H Radar."
             if start_context_after_fresh else "\n\nAutoScan остановлен."
         )
         + (
@@ -5393,13 +5418,12 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                             if str(state.get("mode") or "") == "retry"
                             else ""
                         ) or str(state.get("round_id") or "round")
-                        context_only = str(state.get("layer") or "fresh") == "context"
                         local_radar_stats = await record_autoscan_hot_detailed(
                             source_round_id, cat.key, local_result.matched_ids or [],
-                            emit_signals=not context_only,
+                            emit_signals=True,
                         )
                         local_radar_saved = int(local_radar_stats.saved or 0)
-                        expected_slots = min(RADAR_SCAN_TOP_LIMIT, int(local_radar_stats.eligible_with_views or 0))
+                        expected_slots = min(RADAR_SCAN_TOP_LIMIT, int(local_radar_stats.qualified_candidates or 0))
                         if int(local_radar_stats.unknown_blocked or 0) > 0:
                             local_failure_kind = "radar_gate_unknown"
                             reason_text = _radar_unknown_reason_text(dict(local_radar_stats.unknown_reasons or ()))
@@ -5507,6 +5531,11 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                     unknown_reasons[key] = int(unknown_reasons.get(key) or 0) + int(count or 0)
                 state["radar_unknown_reasons"] = unknown_reasons
                 state["radar_db_blocked"] = int(state.get("radar_db_blocked") or 0) + int(radar_stats.db_blocked or 0)
+                state["radar_demand_gate_rejected"] = int(state.get("radar_demand_gate_rejected") or 0) + int(radar_stats.demand_gate_rejected or 0)
+                state["radar_qualified_candidates"] = int(state.get("radar_qualified_candidates") or 0) + int(radar_stats.qualified_candidates or 0)
+                state["radar_early_admitted"] = int(state.get("radar_early_admitted") or 0) + int(radar_stats.early_admitted or 0)
+                state["radar_strong_admitted"] = int(state.get("radar_strong_admitted") or 0) + int(radar_stats.strong_admitted or 0)
+                state["radar_hot_admitted"] = int(state.get("radar_hot_admitted") or 0) + int(radar_stats.hot_admitted or 0)
                 state["radar_already_present"] = int(state.get("radar_already_present") or 0) + int(radar_stats.already_present or 0)
 
             if result is not None and result.date_complete and not failure_kind:
@@ -14660,7 +14689,7 @@ async def _radar_list_payload(
     elif category_key:
         if mode == "category_best":
             lines += [
-                "🔥 Сортировка: <b>сначала лучшие по DT Score</b>.",
+                "🔥 Сортировка: <b>сначала самые сильные подтверждённые сигналы</b>.",
                 f"💶 Цена: <b>{html.escape(price_filter_label(price_filter))}</b>.",
                 "В списке остаются <b>все товары, прошедшие отбор Radar</b> и подходящие под фильтр цены.",
                 "",
@@ -14752,6 +14781,8 @@ async def _radar_product_payload(
         "",
         f"{status_icon} Статус: <b>{html.escape(status)}</b>",
         f"⭐ DT Score: <b>{int(product.current_score or 0)}/100</b>",
+        f"📊 Radar Rank: <b>{float(getattr(product, 'radar_rank', 0.0) or 0.0):.1f}/100</b>",
+        f"🎯 Demand Gate: <b>{int(getattr(product, 'demand_views', 0) or 0)}/{int(getattr(product, 'demand_gate', 0) or 0)}</b> demand-safe views",
         f"🏆 Peak Score: <b>{int(product.peak_score or 0)}/100</b>",
         f"🧠 Сигнал: <b>{html.escape(type_label)}</b> · уверенность <b>{int(product.confidence or 0)}%</b>",
         f"🗂 Категория: <b>{html.escape(cat_name)}</b>",
@@ -16907,6 +16938,9 @@ async def main() -> None:
     velocity_repair = await prepare_verified_organic_velocity_once()
     if any(int(v or 0) for v in velocity_repair.values()):
         log.warning("v4.15.7 Verified Organic Velocity startup repair: %s", velocity_repair)
+    unified_repair = await prepare_unified_48h_ranking_once()
+    if any(int(v or 0) for v in unified_repair.values()):
+        log.warning("v4.20.0 Unified 48H Radar startup repair: %s", unified_repair)
     if organic_cleanup.get("dirty_listings", 0):
         log.warning(
             "v4.15.3 Strict Organic Radar Gate cleanup: %s",

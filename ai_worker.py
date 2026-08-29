@@ -560,14 +560,20 @@ class AIWorker:
                     # checkpoints certify the post-baseline delta.
                     continue
                 effective_views = int(metric.views)
-                if metric.kind == "observed_delta":
-                    age_minutes = metric.age_minutes
-                    exact_clock = age_minutes is not None
-                else:
-                    age_minutes, exact_clock = listing_age_minutes(listing.posted_text, snap.captured_at)
+                # Unified 48H keeps cohort age and delta-velocity time separate.
+                # The cohort always follows the listing's real posted age; only
+                # verified delta views/hour uses time since DT's organic baseline.
+                age_minutes, exact_clock = listing_age_minutes(listing.posted_text, snap.captured_at)
                 if not exact_clock or age_minutes is None:
                     continue
                 if age_minutes < 5.0 or age_minutes > AI_MAX_AGE_HOURS * 60.0:
+                    continue
+                velocity_window_minutes = (
+                    float(metric.age_minutes)
+                    if metric.kind == "observed_delta" and metric.age_minutes is not None
+                    else float(age_minutes)
+                )
+                if velocity_window_minutes <= 0.0:
                     continue
                 category_key = str(listing.category_key or "unknown")
                 category_by_id[listing.external_id] = category_key
@@ -582,6 +588,7 @@ class AIWorker:
                     age_minutes=float(age_minutes),
                     title=str(listing.title or ""),
                     family_key=opportunity_family_key(str(listing.title or ""), category_key),
+                    velocity_window_minutes=velocity_window_minutes,
                 ))
 
             market_stats = await self._market_stats(features)

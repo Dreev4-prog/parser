@@ -110,3 +110,62 @@ class StrictAgeCohortTests(unittest.TestCase):
         old = FeatureRow("o", "cat", None, None, None, 120, 900, 30.0 * 60.0)
         rows = _age_matched_rows(young, [young, same_band, old])
         self.assertEqual({x.external_id for x in rows}, {"y", "y2"})
+
+class AgeCohortBoundaryTests(unittest.TestCase):
+    def test_exact_boundary_does_not_leak_into_next_band(self):
+        rows = [row("three_exact", 180), row("three_plus", 181), row("six_exact", 360)]
+        ids_for_three_plus = {x.external_id for x in _age_matched_rows(rows[1], rows)}
+        self.assertNotIn("three_exact", ids_for_three_plus)
+        self.assertEqual(ids_for_three_plus, {"three_plus", "six_exact"})
+
+
+class Unified48HClockSeparationTests(unittest.TestCase):
+    def test_verified_delta_uses_listing_age_for_cohort_but_observation_window_for_velocity(self):
+        delta_row = FeatureRow(
+            external_id="delta29h",
+            category_key="cat",
+            identity_key=None,
+            identity_label=None,
+            identity_confidence=None,
+            price_eur=100,
+            views=120,
+            age_minutes=29.0 * 60.0,
+            velocity_window_minutes=60.0,
+        )
+        peer = FeatureRow(
+            external_id="peer30h",
+            category_key="cat",
+            identity_key=None,
+            identity_label=None,
+            identity_confidence=None,
+            price_eur=100,
+            views=600,
+            age_minutes=30.0 * 60.0,
+        )
+        young = FeatureRow(
+            external_id="young1h",
+            category_key="cat",
+            identity_key=None,
+            identity_label=None,
+            identity_confidence=None,
+            price_eur=100,
+            views=120,
+            age_minutes=60.0,
+        )
+        matched = _age_matched_rows(delta_row, [delta_row, peer, young])
+        self.assertEqual({x.external_id for x in matched}, {"delta29h", "peer30h"})
+        self.assertAlmostEqual(delta_row.views_per_hour, 120.0)
+        self.assertAlmostEqual(peer.views_per_hour, 20.0)
+
+    def test_normal_trusted_total_still_uses_listing_age_as_velocity_window(self):
+        trusted = FeatureRow(
+            external_id="trusted",
+            category_key="cat",
+            identity_key=None,
+            identity_label=None,
+            identity_confidence=None,
+            price_eur=100,
+            views=120,
+            age_minutes=120.0,
+        )
+        self.assertAlmostEqual(trusted.views_per_hour, 60.0)
