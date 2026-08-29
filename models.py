@@ -479,6 +479,11 @@ class RadarObservation(Base):
     peak_vph: Mapped[float] = mapped_column(Float, default=0.0, index=True)
     status: Mapped[str] = mapped_column(String(24), default="baseline", index=True)
     next_check_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    # v4.21.1: cross-replica claim. Only one Parser replica may refresh one
+    # Radar observation at a time. The lease is deliberately short and expires
+    # automatically after a crashed/deployed worker disappears.
+    lease_owner: Mapped[str] = mapped_column(String(120), default="", index=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)

@@ -510,6 +510,21 @@ async def init_db() -> None:
                 ))
             else:
                 await conn.execute(text(f"ALTER TABLE ai_early_winner_candidates ADD COLUMN {column_name} {sql_type}"))
+        # v4.21.1 Radar 3.0 cross-replica observation leases. This prevents two
+        # Parser replicas from refreshing/writing the same RadarObservation batch
+        # at the same time (and removes a source of PostgreSQL lock cycles).
+        radar_observation_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "radar_observations"))
+        for column_name, sql_type in {
+            "lease_owner": "VARCHAR(120) DEFAULT ''",
+            "lease_until": "TIMESTAMP",
+        }.items():
+            if not radar_observation_columns or column_name in radar_observation_columns:
+                continue
+            if _IS_POSTGRES:
+                await conn.execute(text(f"ALTER TABLE radar_observations ADD COLUMN IF NOT EXISTS {column_name} {sql_type}"))
+            else:
+                await conn.execute(text(f"ALTER TABLE radar_observations ADD COLUMN {column_name} {sql_type}"))
+
         if _IS_POSTGRES and ai_candidate_columns:
             await conn.execute(text(
                 "CREATE INDEX IF NOT EXISTS ix_ai_ew_candidate_cohort_key "

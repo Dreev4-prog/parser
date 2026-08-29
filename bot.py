@@ -129,7 +129,7 @@ from radar import (
     get_radar_product, is_radar_favorite, list_radar_products, radar_categories, radar_stats,
     purge_nonorganic_analytics, record_autoscan_hot_detailed, record_scan_hot,
     record_verified_velocity_signals, refresh_radar_scores, verify_listing_organic_now,
-    prepare_radar_v3_once, radar_v3_due_external_ids, radar_v3_record_refreshed, radar_v3_expire_stale_products,
+    prepare_radar_v3_once, radar_v3_due_external_ids, radar_v3_claim_due_external_ids, radar_v3_release_claims, radar_v3_record_refreshed, radar_v3_expire_stale_products,
     search_radar_products, toggle_radar_favorite,
 )
 from page_manager import (
@@ -4359,7 +4359,12 @@ async def radar_maintenance_scheduler() -> None:
 
 
 async def radar_v3_observation_scheduler() -> None:
-    """Background exact remeasurement for DT-owned Radar 3.0 baselines."""
+    """Background exact remeasurement for DT-owned Radar 3.0 baselines.
+
+    v4.21.1 claims rows before network work, so multiple Parser replicas cannot
+    refresh/write the same RadarObservation batch concurrently.
+    """
+    owner = f"parser:{os.getenv('RAILWAY_REPLICA_ID', os.getenv('HOSTNAME', 'local'))}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
     await asyncio.sleep(30)
     while True:
         try:
@@ -4368,7 +4373,7 @@ async def radar_v3_observation_scheduler() -> None:
             if running or queued or int(getattr(traffic_snapshot, "scan_jobs_active", 0) or 0) > 0 or int(getattr(traffic_snapshot, "background_pauses", 0) or 0) > 0:
                 await asyncio.sleep(60)
                 continue
-            ids = await radar_v3_due_external_ids(limit=1000)
+            ids = await radar_v3_claim_due_external_ids(owner, limit=1000)
             if not ids:
                 expired = await radar_v3_expire_stale_products()
                 if expired:
@@ -4383,7 +4388,10 @@ async def radar_v3_observation_scheduler() -> None:
             async with background_view_refresh_lock:
                 requested, updated, failed = await refresh_view_counts(rows, None, force=True, max_age_seconds=0, traffic_priority="background")
             saved = await radar_v3_record_refreshed([str(x.external_id) for x in rows])
-            log.info("DT Radar 3.0 observation batch due=%s requested=%s updated=%s failed=%s signals=%s", len(ids), requested, updated, failed, saved)
+            # Successful observations release their own lease while being recorded;
+            # failed/unchanged rows are released here for a clean retry next poll.
+            released = await radar_v3_release_claims(owner, ids)
+            log.info("DT Radar 3.0 observation batch due=%s requested=%s updated=%s failed=%s signals=%s released_claims=%s", len(ids), requested, updated, failed, saved, released)
             await asyncio.sleep(10)
         except asyncio.CancelledError:
             raise
@@ -10778,9 +10786,9 @@ async def _admin_workers_text() -> str:
         REMOTE_VIEW_MANAGER.status(),
         AI_MANAGER.status(),
     )
-    ai_label = "🟢 online" if ai_status.get("alive") else ("🔴 offline" if ai_status.get("enabled") else "▫️ выключен")
-    if ai_status.get("alive") and ai_status.get("paused_for_scans"):
-        ai_label += " · ждёт завершения сканов"
+    # v4.21.1: legacy AI scoring is retired. The optional service may still
+    # heartbeat for deployment compatibility, but it performs no DB analysis.
+    ai_label = "⛔ legacy pipeline отключён · Radar 3.0 в Main Bot"
     total_active = (
         int(date_status.get("active_total", 0) or 0)
         + int(page_status.get("active_total", 0) or 0)
@@ -11049,91 +11057,67 @@ def _moscow_today_start_utc_naive() -> datetime:
 
 
 async def _admin_ai_dashboard_text() -> str:
-    worker = await AI_MANAGER.status()
-    today_start = _moscow_today_start_utc_naive()
+    """Radar 3.0 observation dashboard.
+
+    The old AI Early Winner/evidence-adaptive pipeline is intentionally retired;
+    this admin page now reports only DT-owned post-baseline evidence.
+    """
+    now = datetime.utcnow()
     async with SessionLocal() as session:
-        runs = (await session.execute(select(AIEarlyWinnerRun).where(
-            AIEarlyWinnerRun.created_at >= today_start
-        ))).scalars().all()
-        candidates = (await session.execute(select(AIEarlyWinnerCandidate).where(
-            AIEarlyWinnerCandidate.created_at >= today_start,
-            AIEarlyWinnerCandidate.is_control.is_(False),
-        ))).scalars().all()
-        controls = int((await session.execute(select(func.count(AIEarlyWinnerCandidate.id)).where(
-            AIEarlyWinnerCandidate.created_at >= today_start,
-            AIEarlyWinnerCandidate.is_control.is_(True),
+        total = int((await session.execute(select(func.count(RadarObservation.id)))).scalar_one() or 0)
+        baseline = int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.checkpoint_count == 0,
         ))).scalar_one() or 0)
-        pending_obs = int((await session.execute(select(func.count(AIEarlyWinnerObservation.id)).where(
-            AIEarlyWinnerObservation.status.in_(["pending", "running"])
+        due = int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.next_check_at.is_not(None),
+            RadarObservation.next_check_at <= now,
+            RadarObservation.status.in_(["baseline", "observed", "confirmed"]),
         ))).scalar_one() or 0)
-        unread_signals = int((await session.execute(
-            select(func.count(func.distinct(AIEarlyWinnerEvent.candidate_id))).where(
-                AIEarlyWinnerEvent.notified_at.is_(None),
-                AIEarlyWinnerEvent.event_type.in_(AI_BADGE_EVENT_TYPES),
-            )
-        )).scalar_one() or 0)
+        observed = int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.positive_checkpoints >= 1,
+        ))).scalar_one() or 0)
+        persistent = int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.consecutive_positive >= 2,
+        ))).scalar_one() or 0)
+        quiet = int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.status == "quiet",
+        ))).scalar_one() or 0)
+        leased = int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.lease_until.is_not(None),
+            RadarObservation.lease_until >= now,
+        ))).scalar_one() or 0)
+        early = int((await session.execute(select(func.count(RadarProduct.id)).where(
+            RadarProduct.latest_source == "radar3_observed", RadarProduct.demand_status == "stable",
+        ))).scalar_one() or 0)
+        strong = int((await session.execute(select(func.count(RadarProduct.id)).where(
+            RadarProduct.latest_source == "radar3_observed", RadarProduct.demand_status == "rising",
+        ))).scalar_one() or 0)
+        hot = int((await session.execute(select(func.count(RadarProduct.id)).where(
+            RadarProduct.latest_source == "radar3_observed", RadarProduct.demand_status == "hot",
+        ))).scalar_one() or 0)
 
-    scanned = sum(int(x.listing_count or 0) for x in runs if x.status == "done")
-    eligible = sum(int(x.eligible_count or 0) for x in runs if x.status == "done")
-    watch = sum(1 for x in candidates if x.outcome == "pending" and x.stage == "watch")
-    rising = sum(1 for x in candidates if x.outcome == "pending" and x.stage == "rising")
-    hidden_gems = sum(1 for x in candidates if x.outcome == "pending" and x.opportunity_type == "hidden_gem")
-    emerging = sum(1 for x in candidates if x.outcome == "pending" and x.opportunity_type == "emerging")
-    hot_products = sum(1 for x in candidates if x.outcome == "pending" and x.opportunity_type == "hot_product")
-    sparks = sum(1 for x in candidates if x.outcome == "pending" and x.opportunity_type == "spark")
-    saturated = sum(1 for x in candidates if x.outcome == "pending" and x.opportunity_type == "saturated")
-    ai_candidates_total = len(candidates)
-    run_errors = sum(1 for x in runs if x.status == "error")
-    winners = sum(1 for x in candidates if x.outcome == "pending" and x.stage == "early_winner")
-    confirmed = sum(1 for x in candidates if x.outcome == "confirmed")
-    rejected = sum(1 for x in candidates if x.outcome == "rejected")
-    resolved = confirmed + rejected
-    accuracy = (confirmed / resolved * 100.0) if resolved else None
-
-    if worker.get("alive"):
-        worker_text = (
-            f"🟢 в сети · v{html.escape(str(worker.get('version') or '—'))} · "
-            f"модель {html.escape(str(worker.get('model_version') or '—'))}"
-        )
-        if worker.get("paused_for_scans"):
-            worker_text += " · ⏸ ждёт завершения пользовательских сканов"
-    elif worker.get("enabled"):
-        worker_text = "🔴 не в сети · сигнал от AI Worker не найден"
-    else:
-        worker_text = "▫️ REDIS_URL недоступен в основном боте"
-
-    lines = [
-        "<b>🧠 DT AI LAB · ПОИСК ВОЗМОЖНОСТЕЙ</b>",
+    return "\n".join([
+        "<b>🧠 DT RADAR 3.0 · OBSERVED DEMAND</b>",
         "",
-        f"AI Worker: <b>{worker_text}</b>",
-        "Режим: <b>🔒 Теневой · только админка</b>",
-        "Пользовательский парсер и его Автозамеры не меняются.",
-        f"🔔 Новых сильных сигналов: <b>{unread_signals}</b>",
+        "Движок: <b>🟢 Main Bot + View Worker</b>",
+        "Старая AI-модель: <b>⛔ отключена</b>",
+        "Первичный счётчик: <b>baseline · 0 баллов</b>",
+        "Оценка: <b>только прирост, который DT увидел после baseline</b>",
         "",
-        "<b>📊 Воронка сегодня</b>",
-        f"Сканов обработано: <b>{sum(1 for x in runs if x.status == 'done')}</b>",
-        f"Объявлений в сканах: <b>{scanned}</b>",
-        f"Подходят для раннего анализа: <b>{eligible}</b>",
-        f"AI-сигналов найдено: <b>{ai_candidates_total}</b>",
-        f"💎 Скрытая находка: <b>{hidden_gems}</b>",
-        f"🚀 Набирает обороты: <b>{emerging}</b>",
-        f"🔥 Горячий товар: <b>{hot_products}</b>",
-        f"⚡ Первичный сигнал: <b>{sparks}</b> · ⚫ Перенасыщен: <b>{saturated}</b>",
-        f"Уровни оценки · 🟡 Наблюдение {watch} · ⚡ Рост {rising} · 🔥 90+ {winners}",
-        f"✅ Подтверждены: <b>{confirmed}</b>",
-        f"❌ Не подтвердились: <b>{rejected}</b>",
-        f"🧪 Контрольная группа: <b>{controls}</b>",
-        f"⏱ Ожидают +1/+3/+6: <b>{pending_obs}</b>",
-    ]
-    if run_errors:
-        lines.append(f"⚠️ Ошибок AI-анализа сегодня: <b>{run_errors}</b>")
-    if accuracy is None:
-        lines.extend(["", "📈 Точность: <b>пока накапливаем подтверждения</b>"])
-    else:
-        lines.extend(["", f"📈 Доля подтверждений среди завершённых наблюдений: <b>{accuracy:.1f}%</b> ({confirmed}/{resolved})"])
-    if worker.get("last_error"):
-        lines.append(f"⚠️ Последняя ошибка: <code>{html.escape(str(worker.get('last_error')))[:260]}</code>")
-    return "\n".join(lines)
+        "<b>📡 Наблюдения</b>",
+        f"Всего baseline-наблюдений: <b>{total}</b>",
+        f"Ждут первого повторного замера: <b>{baseline}</b>",
+        f"Готовы к замеру сейчас: <b>{due}</b>",
+        f"Сейчас взяты одной репликой в работу: <b>{leased}</b>",
+        f"Получили реальный прирост: <b>{observed}</b>",
+        f"Рост подтвердился ≥2 раза: <b>{persistent}</b>",
+        f"Без дальнейшего роста / остановлены: <b>{quiet}</b>",
+        "",
+        "<b>🎯 Сигналы Radar 3.0</b>",
+        f"🟡 Early: <b>{early}</b> · 📈 Strong: <b>{strong}</b> · 🔥 Hot: <b>{hot}</b>",
+        "",
+        "<i>+1/+3/+6 Early Winner больше не работает и не пишет в Listing/ViewHistory. Повторные замеры принадлежат только Radar 3.0.</i>",
+    ])
 
 
 async def _ai_candidate_rows(kind: str, limit: int = 15) -> list[tuple[AIEarlyWinnerCandidate, Listing, UserScan]]:

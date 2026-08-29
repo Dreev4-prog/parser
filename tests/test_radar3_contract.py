@@ -52,6 +52,26 @@ class Radar3ObservedDemandContractTests(unittest.TestCase):
         self.assertIn('refresh_view_counts(rows, None, force=True, max_age_seconds=0, traffic_priority="background")', BOT)
         self.assertIn('radar_v3_record_refreshed', BOT)
 
+    def test_legacy_ai_pipeline_is_hard_disabled(self):
+        ai = (ROOT / 'ai_worker.py').read_text(encoding='utf-8')
+        self.assertIn('AI_ENABLED = False', ai)
+        self.assertIn('RADAR3_ENGINE_LABEL = "radar3-observed-demand-main-bot"', ai)
+        self.assertIn('if not AI_ENABLED:', ai)
+        self.assertIn('no writes that can deadlock with Radar 3.0', ai)
+
+    def test_cross_replica_claim_uses_skip_locked_and_lease(self):
+        self.assertIn('radar_v3_claim_due_external_ids', RADAR)
+        self.assertIn('.with_for_update(skip_locked=True)', RADAR)
+        self.assertIn('RadarObservation.lease_until', RADAR)
+        self.assertIn('row.lease_owner = owner', RADAR)
+        self.assertIn('radar_v3_release_claims', RADAR)
+        self.assertIn('radar_v3_claim_due_external_ids(owner, limit=1000)', BOT)
+
+    def test_admin_ai_page_reports_radar3_not_old_plus_1_3_6(self):
+        self.assertIn('DT RADAR 3.0 · OBSERVED DEMAND', BOT)
+        self.assertIn('Старая AI-модель: <b>⛔ отключена</b>', BOT)
+        self.assertIn('+1/+3/+6 Early Winner больше не работает', BOT)
+
 
 if __name__ == '__main__':
     unittest.main()

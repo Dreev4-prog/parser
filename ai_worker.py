@@ -54,7 +54,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("dtparser-ai-worker")
 
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
-AI_ENABLED = os.getenv("AI_EARLY_WINNER_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+# v4.21.1 Radar 3.0 owns all demand observation. The legacy Early Winner worker
+# must not create its own +1/+3/+6 checkpoints or write Listing/ViewHistory in
+# parallel, even if an old Railway variable still says AI_EARLY_WINNER_ENABLED=1.
+# Keeping the process alive only preserves deployment/heartbeat compatibility.
+AI_ENABLED = False
+RADAR3_ENGINE_LABEL = "radar3-observed-demand-main-bot"
 AI_POLL_SECONDS = max(3.0, min(60.0, float(os.getenv("AI_POLL_SECONDS", "8"))))
 AI_INITIAL_BACKFILL_MINUTES = max(0, min(240, int(os.getenv("AI_INITIAL_BACKFILL_MINUTES", "30"))))
 AI_MAX_AGE_HOURS = max(3.0, min(48.0, float(os.getenv("AI_EARLY_MAX_AGE_HOURS", "24"))))
@@ -106,9 +111,15 @@ class AIWorker:
         self.shadow_started_at = datetime.utcnow()
 
     async def setup(self) -> None:
-        # Main Bot and AI Worker can deploy at the same time on Railway. Both may
-        # legitimately be the first process to create the new additive AI tables,
-        # so retry startup briefly if PostgreSQL DDL is momentarily racing.
+        # Radar 3.0 deliberately retires the legacy AI DB pipeline. In disabled
+        # compatibility mode this service touches Redis only: no migrations, no
+        # stale +1/+3/+6 recovery, and no writes that can deadlock with Radar 3.0.
+        if not AI_ENABLED:
+            await self.redis.ping()
+            self.shadow_started_at = datetime.utcnow()
+            log.warning("Legacy AI Early Winner disabled; Radar 3.0 observation is owned by Main Bot + View Worker")
+            return
+        # Historical code remains below for rollback/reference only.
         last_db_error: Exception | None = None
         for attempt in range(1, 4):
             try:
@@ -179,7 +190,7 @@ class AIWorker:
         payload = {
             "ts": time.time(),
             "version": APP_VERSION,
-            "model_version": MODEL_VERSION,
+            "model_version": RADAR3_ENGINE_LABEL,
             "consumer": self.consumer,
             "uptime_seconds": int(now_mono - self.started_at),
             "analyzed_runs": self.analyzed_runs,
@@ -1003,7 +1014,7 @@ class AIWorker:
 
     async def loop(self) -> None:
         if not AI_ENABLED:
-            log.warning("AI_EARLY_WINNER_ENABLED=0; worker idle")
+            log.warning("Legacy AI pipeline retired in v4.21.1; compatibility worker idle")
         while True:
             try:
                 await self.heartbeat()

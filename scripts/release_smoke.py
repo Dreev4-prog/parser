@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.21.0", "VERSION=4.21.0")
+    check((ROOT / "VERSION").read_text().strip() == "4.21.1", "VERSION=4.21.1")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -55,6 +55,11 @@ def main() -> int:
     check('priority == "background" and kind in {"view", "browser"}' in traffic, "background browser obeys foreground pause")
     check('else "normal"' in radar and 'background_during_scans' not in radar[radar.find('detail_priority = ('):radar.find('detail_lane =', radar.find('detail_priority = ('))], "foreground Radar detail gate never self-classifies as background")
     check('traffic_priority="background"' in bot and 'radar_v3_record_refreshed' in bot, "Radar 3.0 remeasurement stays background")
+    ai = (ROOT / 'ai_worker.py').read_text(encoding='utf-8')
+    models = (ROOT / 'models.py').read_text(encoding='utf-8')
+    check('AI_ENABLED = False' in ai and 'radar3-observed-demand-main-bot' in ai, "legacy AI Early Winner hard-disabled")
+    check('.with_for_update(skip_locked=True)' in radar and 'radar_v3_claim_due_external_ids' in radar, "cross-replica Radar claims use SKIP LOCKED")
+    check('lease_owner' in models and 'lease_until' in models, "Radar observation lease fields present")
     check('autoscan_view_priority = "scan_inline"' in bot, "AutoScan exact views stay foreground")
     page = (ROOT / 'page_manager.py').read_text(encoding='utf-8')
     stable = (ROOT / 'stable_engine.py').read_text(encoding='utf-8')
@@ -78,7 +83,7 @@ def main() -> int:
     check('_category_feed_identity_matches(requested_url, final_url)' in parser_source, "category redirects preserve requested feed identity")
     check('for item in targets:' in bot and 'vr = results.get(url)' in bot, "partial exact-view maps cannot preserve stale counters")
     check(not list(ROOT.glob('DEPLOY_V4_*.md')), "historical deploy files removed from root")
-    print("\nDT Parser 4.21.0 Radar 3.0 release smoke: PASS")
+    print("\nDT Parser 4.21.1 Radar 3.0 release smoke: PASS")
     return 0
 
 

@@ -34,3 +34,12 @@ The initial counter never participates in this score.
 - two independent persistent listings -> Product Hot
 - stale Radar products are moved to historical after six hours without a new observed signal
 - quiet/expired observations can be re-armed by a later Radar circle after a cooldown, using a new baseline
+
+
+## v4.21.1 — single observation owner / deadlock fix
+
+- The legacy `AI Early Winner` / `dt-demand-score-v2.1-evidence-adaptive` pipeline is retired and cannot be re-enabled by an old Railway `AI_EARLY_WINNER_ENABLED=1` variable.
+- Radar 3.0 is the only component allowed to create demand observations; exact remeasurement is owned by Main Bot + View Worker.
+- `RadarObservation` now has an expiring cross-replica lease (`lease_owner`, `lease_until`). Due rows are atomically claimed with PostgreSQL `FOR UPDATE SKIP LOCKED`, preventing two Parser replicas from refreshing/writing the same observation batch.
+- Failed/unchanged refreshes release their claim for a clean retry; successful measurements release the lease while scheduling the next checkpoint.
+- The former AI Lab summary now reports Radar 3.0 baseline/observed/persistent counts instead of stale +1/+3/+6 Early Winner state.

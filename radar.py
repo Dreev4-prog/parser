@@ -9,7 +9,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import case, delete, func, select, text, update
+from sqlalchemy import case, delete, func, or_, select, text, update
 
 from db import SessionLocal
 from early_winner import FeatureRow, listing_age_minutes, opportunity_family_key, score_initial_rows
@@ -1182,6 +1182,7 @@ async def record_autoscan_hot_detailed(
 
 
 async def radar_v3_due_external_ids(limit: int = 1000) -> list[str]:
+    """Read-only diagnostic view of due Radar 3.0 observations."""
     now = datetime.utcnow()
     async with SessionLocal() as session:
         return [str(x) for x in (await session.execute(
@@ -1189,8 +1190,41 @@ async def radar_v3_due_external_ids(limit: int = 1000) -> list[str]:
                 RadarObservation.next_check_at.is_not(None),
                 RadarObservation.next_check_at <= now,
                 RadarObservation.status.in_(["baseline", "observed", "confirmed"]),
+                or_(RadarObservation.lease_until.is_(None), RadarObservation.lease_until < now),
             ).order_by(RadarObservation.next_check_at.asc()).limit(max(1, int(limit)))
         )).scalars().all()]
+
+
+async def radar_v3_claim_due_external_ids(owner: str, limit: int = 1000, lease_minutes: int = 20) -> list[str]:
+    """Atomically claim due observations for one Parser replica.
+
+    PostgreSQL FOR UPDATE SKIP LOCKED makes concurrent replicas choose disjoint
+    rows instead of waiting on each other. The committed lease survives the
+    network refresh and automatically expires if a replica dies mid-batch.
+    """
+    owner = str(owner or "radar3")[:120]
+    now = datetime.utcnow()
+    lease_until = now + timedelta(minutes=max(5, int(lease_minutes)))
+    async with SessionLocal() as session:
+        stmt = (
+            select(RadarObservation)
+            .where(
+                RadarObservation.next_check_at.is_not(None),
+                RadarObservation.next_check_at <= now,
+                RadarObservation.status.in_(["baseline", "observed", "confirmed"]),
+                or_(RadarObservation.lease_until.is_(None), RadarObservation.lease_until < now),
+            )
+            .order_by(RadarObservation.next_check_at.asc(), RadarObservation.id.asc())
+            .limit(max(1, int(limit)))
+            .with_for_update(skip_locked=True)
+        )
+        rows = list((await session.execute(stmt)).scalars().all())
+        for row in rows:
+            row.lease_owner = owner
+            row.lease_until = lease_until
+            row.updated_at = now
+        await session.commit()
+        return [str(row.external_id) for row in rows]
 
 
 def _percentile_rank(value: float, peers: list[float]) -> float:
@@ -1202,6 +1236,25 @@ def _percentile_rank(value: float, peers: list[float]) -> float:
     below = sum(1 for x in vals if x < value)
     equal = sum(1 for x in vals if x == value)
     return max(0.0, min(1.0, (below + 0.5 * equal) / len(vals)))
+
+
+async def radar_v3_release_claims(owner: str, external_ids: list[str] | tuple[str, ...] | set[str]) -> int:
+    """Release unfinished claims so transient View Worker failures retry promptly."""
+    ids = list(dict.fromkeys(str(x).strip() for x in external_ids if str(x).strip()))
+    if not ids:
+        return 0
+    async with SessionLocal() as session:
+        result = await session.execute(
+            update(RadarObservation)
+            .where(
+                RadarObservation.external_id.in_(ids),
+                RadarObservation.lease_owner == str(owner or "")[:120],
+            )
+            .values(lease_owner="", lease_until=None, updated_at=datetime.utcnow())
+            .execution_options(synchronize_session=False)
+        )
+        await session.commit()
+        return int(result.rowcount or 0)
 
 
 async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | set[str]) -> int:
@@ -1245,6 +1298,10 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
             obs.current_vph = float(vph)
             obs.peak_vph = max(float(obs.peak_vph or 0.0), float(vph))
             obs.updated_at = now
+            # Measurement completed: release the cross-replica claim before the
+            # next checkpoint is scheduled.
+            obs.lease_owner = ""
+            obs.lease_until = None
             if interval_delta <= 0 and int(obs.checkpoint_count) >= 1:
                 obs.status = "quiet"
                 obs.next_check_at = None
