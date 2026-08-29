@@ -30,6 +30,7 @@ from early_winner import (
     select_candidates,
     update_dynamic_score,
 )
+from organic_velocity import demand_safe_metric
 from models import (
     AIEarlyWinnerCandidate,
     AIEarlyWinnerEvent,
@@ -296,6 +297,7 @@ class AIWorker:
                     ViewHistory.recorded_at >= start_at,
                     Listing.is_promoted.is_(False),
                     Listing.is_price_reduced.is_(False),
+                    Listing.organic_history_status.in_(["trusted", "trusted_new", "observed"]),
                 ]
                 if end_at is not None:
                     conditions.extend([Listing.first_seen_at < end_at, ViewHistory.recorded_at < end_at + timedelta(days=2)])
@@ -551,20 +553,16 @@ class AIWorker:
                 snapshot_by_id[listing.external_id] = snap
                 if snap.initial_view_count is None:
                     continue
-                history_status = str(getattr(listing, "organic_history_status", "unknown") or "unknown")
-                effective_views = int(snap.initial_view_count)
-                if history_status in {"unknown", "baseline"}:
-                    # Pre-DT history is unknown and only one clean counter exists.
-                    # Wait for a second observation instead of treating the inherited
-                    # total as organic velocity.
+                metric = demand_safe_metric(listing, int(snap.initial_view_count), snap.captured_at)
+                if metric.views is None:
+                    # v4.15.7: a first-seen 400+ counter is baseline-only.  It
+                    # cannot enter DT Demand Score until two later clean exact
+                    # checkpoints certify the post-baseline delta.
                     continue
-                if history_status == "observed" and getattr(listing, "organic_baseline_views", None) is not None:
-                    baseline_at = getattr(listing, "organic_baseline_at", None)
-                    if baseline_at is None or snap.captured_at <= baseline_at:
-                        continue
-                    effective_views = max(0, int(snap.initial_view_count) - int(listing.organic_baseline_views or 0))
-                    age_minutes = max(0.0, (snap.captured_at - baseline_at).total_seconds() / 60.0)
-                    exact_clock = True
+                effective_views = int(metric.views)
+                if metric.kind == "observed_delta":
+                    age_minutes = metric.age_minutes
+                    exact_clock = age_minutes is not None
                 else:
                     age_minutes, exact_clock = listing_age_minutes(listing.posted_text, snap.captured_at)
                 if not exact_clock or age_minutes is None:

@@ -12,8 +12,12 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import case, delete, func, select, text, update
 
 from db import SessionLocal
-from early_winner import opportunity_family_key
+from early_winner import FeatureRow, listing_age_minutes, opportunity_family_key, score_initial_rows
 from filters import price_bounds
+from organic_velocity import (
+    ORGANIC_HIGH_BASELINE_VIEWS, ORGANIC_HIGH_REQUIRED_CHECKPOINTS,
+    demand_safe_metric, high_baseline_pending, is_high_baseline,
+)
 from parser import KleinanzeigenParser
 from traffic import TRAFFIC
 from models import (
@@ -38,6 +42,7 @@ log = logging.getLogger("dtparser-radar")
 RADAR_BACKFILL_SETTING = "dt_radar_v1_backfill_complete"
 RADAR_BUMP_SWEEP_SETTING = "dt_radar_v4156_bump_sweep_complete"
 RADAR_BUMP_QUARANTINE_SETTING = "dt_radar_v4156_bump_quarantine_applied"
+RADAR_VELOCITY_PREP_SETTING = "dt_radar_v4157_verified_velocity_prepared"
 RADAR_SCAN_TOP_LIMIT = 12
 RADAR_PAGE_SIZE = 8
 # v4.15.5: after parser-level HTTP + browser recovery, wait once and retry only
@@ -294,9 +299,34 @@ async def _live_detail_organic_gate(
     return True, "organic", datetime.utcnow()
 
 
+async def verify_listing_organic_now(
+    external_id: str, *, traffic_priority: str = "background"
+) -> tuple[bool, str, datetime | None]:
+    """Public wrapper used by v4.15.7 checkpoint verification."""
+    external_id = str(external_id or "").strip()
+    if not external_id:
+        return False, "missing_external_id", None
+    async with SessionLocal() as session:
+        listing = (await session.execute(
+            select(Listing).where(
+                Listing.external_id == external_id,
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
+                ~_registry_dirty_exists(Listing.external_id),
+            ).limit(1)
+        )).scalar_one_or_none()
+        if listing is not None:
+            session.expunge(listing)
+    if listing is None:
+        return False, "listing_not_clean", None
+    return await _live_detail_organic_gate(listing, force_priority=traffic_priority)
+
+
 @dataclass(frozen=True)
 class RadarAdmissionStats:
     eligible_with_views: int = 0
+    high_baseline_pending: int = 0
+    high_baseline_verified: int = 0
     reserve_considered: int = 0
     detail_checked: int = 0
     organic_passed: int = 0
@@ -359,23 +389,9 @@ def _clamp_score(value: int | float) -> int:
 def _organic_view_metric(
     listing: Listing, raw_views: int | None, measured_at: datetime | None = None
 ) -> tuple[int | None, str]:
-    """Return the demand-safe view quantity for ranking/scoring.
-
-    Fresh same-day listings that passed the strict bump gate may use their total.
-    Listings with unknown pre-DT history are withheld after the first baseline. Once
-    a second clean observation exists, only growth after DT's baseline is used.
-    """
-    if raw_views is None:
-        return None, "missing_views"
-    raw = max(0, int(raw_views))
-    status = str(getattr(listing, "organic_history_status", "unknown") or "unknown")
-    baseline = getattr(listing, "organic_baseline_views", None)
-    baseline_at = getattr(listing, "organic_baseline_at", None)
-    if status in {"unknown", "baseline"}:
-        return None, "history_baseline_pending"
-    if status == "observed" and baseline is not None:
-        return max(0, raw - int(baseline)), "observed_delta"
-    return raw, "trusted_total"
+    """Return the v4.15.7 demand-safe view quantity for ranking/scoring."""
+    metric = demand_safe_metric(listing, raw_views, measured_at)
+    return metric.views, metric.kind
 
 
 def radar_product_key(listing: Listing, cohort_key: str | None = None) -> str:
@@ -841,10 +857,16 @@ async def record_autoscan_hot_detailed(
             )
         )).scalars().all())
     ranked_rows: list[tuple[Listing, int, str]] = []
+    high_pending_count = 0
+    high_verified_count = 0
     for listing in rows:
         metric, metric_kind = _organic_view_metric(
             listing, listing.view_count, listing.views_checked_at or listing.last_seen_at
         )
+        if high_baseline_pending(listing):
+            high_pending_count += 1
+        elif is_high_baseline(listing) and metric is not None:
+            high_verified_count += 1
         if metric is None:
             continue
         ranked_rows.append((listing, int(metric), metric_kind))
@@ -855,7 +877,11 @@ async def record_autoscan_hot_detailed(
     target = max(1, int(limit))
     reserve = ranked_rows
     if not reserve:
-        return RadarAdmissionStats(eligible_with_views=0)
+        return RadarAdmissionStats(
+            eligible_with_views=0,
+            high_baseline_pending=high_pending_count,
+            high_baseline_verified=high_verified_count,
+        )
 
     clean_round = str(round_id or "round").replace(":", "-")[:48]
     considered = checked = organic = promoted = reduced = unknown = db_blocked = admitted = already_present = saved = 0
@@ -925,6 +951,8 @@ async def record_autoscan_hot_detailed(
 
     stats = RadarAdmissionStats(
         eligible_with_views=len(ranked_rows),
+        high_baseline_pending=high_pending_count,
+        high_baseline_verified=high_verified_count,
         reserve_considered=considered,
         detail_checked=checked,
         organic_passed=organic,
@@ -938,8 +966,8 @@ async def record_autoscan_hot_detailed(
         saved=saved,
     )
     log.info(
-        "DT Radar autoscan funnel round=%s category=%s eligible_views=%s considered=%s checked=%s organic=%s promoted=%s reduced=%s unknown=%s db_blocked=%s admitted=%s existing=%s new=%s target=%s",
-        clean_round, category_key, stats.eligible_with_views, stats.reserve_considered,
+        "DT Radar autoscan funnel round=%s category=%s eligible_views=%s high_pending=%s high_verified=%s considered=%s checked=%s organic=%s promoted=%s reduced=%s unknown=%s db_blocked=%s admitted=%s existing=%s new=%s target=%s",
+        clean_round, category_key, stats.eligible_with_views, stats.high_baseline_pending, stats.high_baseline_verified, stats.reserve_considered,
         stats.detail_checked, stats.organic_passed, stats.promoted_blocked,
         stats.reduced_blocked, stats.unknown_blocked, stats.db_blocked, stats.admitted,
         stats.already_present, stats.saved, target,
@@ -965,6 +993,128 @@ async def record_autoscan_hot(
     )).saved)
 
 
+async def record_verified_velocity_signals(external_ids: list[str] | tuple[str, ...] | set[str]) -> int:
+    """Admit newly certified 400+ baselines only from their observed delta.
+
+    This is intentionally not a shortcut back to the inherited total.  After two
+    clean checkpoints, build a category/age-relative DT Demand Score cohort from
+    demand-safe metrics and emit a Radar signal only when the verified velocity is
+    actually strong (score >=72).
+    """
+    ids = list(dict.fromkeys(str(x).strip() for x in external_ids if str(x).strip()))
+    if not ids:
+        return 0
+    now = datetime.utcnow()
+    async with SessionLocal() as session:
+        targets = list((await session.execute(
+            select(Listing).where(
+                Listing.external_id.in_(ids),
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
+                Listing.organic_baseline_views >= int(ORGANIC_HIGH_BASELINE_VIEWS),
+                Listing.organic_verified_checkpoints >= int(ORGANIC_HIGH_REQUIRED_CHECKPOINTS),
+                Listing.organic_history_status == "observed",
+                Listing.view_count.is_not(None),
+                ~_registry_dirty_exists(Listing.external_id),
+            )
+        )).scalars().all())
+    if not targets:
+        return 0
+
+    target_by_category: dict[str, set[str]] = {}
+    for row in targets:
+        target_by_category.setdefault(str(row.category_key or "unknown"), set()).add(str(row.external_id))
+
+    saved = 0
+    for category_key, target_ids in target_by_category.items():
+        async with SessionLocal() as session:
+            peers = list((await session.execute(
+                select(Listing).where(
+                    Listing.category_key == category_key,
+                    Listing.last_seen_at >= now - timedelta(days=2),
+                    Listing.is_promoted.is_(False),
+                    Listing.is_price_reduced.is_(False),
+                    Listing.view_count.is_not(None),
+                    ~_registry_dirty_exists(Listing.external_id),
+                ).order_by(Listing.last_seen_at.desc()).limit(2000)
+            )).scalars().all())
+
+        features: list[FeatureRow] = []
+        listing_by_id: dict[str, Listing] = {}
+        for listing in peers:
+            measured_at = listing.views_checked_at or listing.last_seen_at or now
+            metric = demand_safe_metric(listing, listing.view_count, measured_at)
+            if metric.views is None:
+                continue
+            if metric.kind == "observed_delta":
+                age_minutes = metric.age_minutes
+                exact_clock = age_minutes is not None
+            else:
+                age_minutes, exact_clock = listing_age_minutes(listing.posted_text, measured_at)
+            if not exact_clock or age_minutes is None or age_minutes < 5.0 or age_minutes > 24.0 * 60.0:
+                continue
+            ext = str(listing.external_id)
+            listing_by_id[ext] = listing
+            features.append(FeatureRow(
+                external_id=ext,
+                category_key=category_key,
+                identity_key=listing.identity_key,
+                identity_label=listing.identity_label,
+                identity_confidence=listing.identity_confidence,
+                price_eur=listing.price_eur,
+                views=int(metric.views),
+                age_minutes=float(age_minutes),
+                title=str(listing.title or ""),
+                family_key=opportunity_family_key(str(listing.title or ""), category_key),
+            ))
+        if not features:
+            continue
+        score_map = {score.external_id: score for score in score_initial_rows(features, {})}
+        for external_id in target_ids:
+            score = score_map.get(external_id)
+            listing = listing_by_id.get(external_id)
+            if score is None or listing is None or int(score.score or 0) < 72:
+                continue
+            metric = demand_safe_metric(listing, listing.view_count, listing.views_checked_at or listing.last_seen_at)
+            if metric.views is None or metric.kind != "observed_delta":
+                continue
+            allowed, reason, verified_at = await _live_detail_organic_gate(listing)
+            if not allowed:
+                log.info(
+                    "Verified velocity Radar admission blocked external_id=%s reason=%s",
+                    external_id, reason,
+                )
+                continue
+            baseline_at = getattr(listing, "organic_baseline_at", None)
+            baseline_token = int(baseline_at.timestamp()) if baseline_at is not None else 0
+            result = await _upsert_signal(
+                source_key=f"verified-velocity:{external_id}:{baseline_token}",
+                source="verified_velocity",
+                listing=listing,
+                product_key=radar_product_key(listing, score.cohort_key),
+                score=int(score.score),
+                confidence=max(65, int(score.confidence or 0)),
+                stage=str(score.stage or "rising"),
+                opportunity_type=str(score.opportunity_type or "spark"),
+                view_count=int(listing.view_count or 0),
+                views_per_hour=float(score.views_per_hour or 0.0),
+                reasons=[
+                    f"Verified Organic Velocity: +{int(metric.views)} после baseline {int(listing.organic_baseline_views or 0)}",
+                    f"2 clean checkpoints · {float(score.views_per_hour or 0.0):.1f} views/h",
+                    *[str(x) for x in tuple(score.reasons or ())[:3]],
+                ],
+                recorded_at=listing.views_checked_at or now,
+                live_detail_verified_at=verified_at,
+            )
+            if result is not None:
+                saved += 1
+                log.info(
+                    "Verified Organic Velocity entered Radar external_id=%s score=%s delta=%s vph=%.2f",
+                    external_id, score.score, metric.views, score.views_per_hour,
+                )
+    return saved
+
+
 async def record_ai_candidate(candidate_id: int, *, source_key: str | None = None, source: str = "ai") -> int | None:
     """Merge the latest AI state into Radar. Control candidates never enter Radar."""
     async with SessionLocal() as session:
@@ -979,6 +1129,13 @@ async def record_ai_candidate(candidate_id: int, *, source_key: str | None = Non
             ).limit(1)
         )).scalar_one_or_none()
         if listing is None:
+            return None
+        if high_baseline_pending(listing):
+            log.info(
+                "DT Radar withheld AI candidate=%s external_id=%s reason=high_baseline_pending baseline=%s checkpoints=%s",
+                candidate_id, listing.external_id, getattr(listing, "organic_baseline_views", None),
+                int(getattr(listing, "organic_verified_checkpoints", 0) or 0),
+            )
             return None
         try:
             reasons = json.loads(candidate.latest_reasons_json or candidate.reasons_json or "[]")
@@ -1830,6 +1987,110 @@ async def purge_nonorganic_analytics(
             stats["dirty_listings"], stats["ai_candidates"], stats["radar_snapshots"],
             stats["radar_links"], stats["lifecycle_watches"],
             stats["radar_products_removed"], stats["radar_products_rebuilt"],
+        )
+    return stats
+
+
+async def prepare_verified_organic_velocity_once() -> dict[str, int]:
+    """Remove pre-v4.15.7 400+ inherited totals from analytical influence.
+
+    v4.15.6 allowed a same-day listing to use its total immediately.  v4.15.7
+    changes that contract: if DT first saw 400+ views, the total becomes an
+    untrusted baseline and two *new* clean checkpoints are required.  This startup
+    repair is intentionally conservative and does not label those ads promoted.
+    """
+    stats = {
+        "listings_reset": 0, "ai_candidates": 0, "lifecycle_watches": 0,
+        "radar_products_quarantined": 0,
+    }
+    async with SessionLocal() as session:
+        done = await session.get(AppSetting, RADAR_VELOCITY_PREP_SETTING)
+        if done is not None and str(done.value or "").strip() == "1":
+            return stats
+
+        rows = list((await session.execute(
+            select(Listing).where(
+                Listing.organic_baseline_views.is_not(None),
+                Listing.organic_baseline_views >= int(ORGANIC_HIGH_BASELINE_VIEWS),
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
+                ~_registry_dirty_exists(Listing.external_id),
+            )
+        )).scalars().all())
+        ids = sorted({str(row.external_id) for row in rows if str(row.external_id or "")})
+        for row in rows:
+            row.organic_history_status = "high_baseline"
+            row.organic_verified_checkpoints = 0
+            row.organic_last_checkpoint_at = row.organic_baseline_at
+            row.organic_last_checkpoint_views = row.organic_baseline_views
+        stats["listings_reset"] = len(ids)
+
+        if ids:
+            candidate_rows = (await session.execute(
+                select(AIEarlyWinnerCandidate.id, AIEarlyWinnerCandidate.run_id).where(
+                    AIEarlyWinnerCandidate.external_id.in_(ids)
+                )
+            )).all()
+            candidate_ids = sorted({int(row[0]) for row in candidate_rows})
+            run_ids = sorted({int(row[1]) for row in candidate_rows})
+            if candidate_ids:
+                await session.execute(delete(AIEarlyWinnerObservation).where(
+                    AIEarlyWinnerObservation.candidate_id.in_(candidate_ids)
+                ))
+                await session.execute(delete(AIEarlyWinnerEvent).where(
+                    AIEarlyWinnerEvent.candidate_id.in_(candidate_ids)
+                ))
+                deleted = await session.execute(delete(AIEarlyWinnerCandidate).where(
+                    AIEarlyWinnerCandidate.id.in_(candidate_ids)
+                ))
+                stats["ai_candidates"] = int(deleted.rowcount or 0)
+
+            affected_product_ids = set((await session.execute(
+                select(RadarSnapshot.product_id).where(RadarSnapshot.external_id.in_(ids))
+            )).scalars().all())
+            affected_product_ids.update((await session.execute(
+                select(RadarProductListing.product_id).where(RadarProductListing.external_id.in_(ids))
+            )).scalars().all())
+            affected_product_ids.update((await session.execute(
+                select(RadarLifecycleWatch.product_id).where(RadarLifecycleWatch.external_id.in_(ids))
+            )).scalars().all())
+            if affected_product_ids:
+                result = await session.execute(
+                    update(RadarProduct)
+                    .where(RadarProduct.id.in_(sorted(int(x) for x in affected_product_ids if x is not None)))
+                    .values(organic_verified_at=None)
+                )
+                stats["radar_products_quarantined"] = int(result.rowcount or 0)
+            deleted_watches = await session.execute(delete(RadarLifecycleWatch).where(
+                RadarLifecycleWatch.external_id.in_(ids)
+            ))
+            stats["lifecycle_watches"] = int(deleted_watches.rowcount or 0)
+
+            # Keep AI run counters truthful after removing candidates whose old
+            # initial scores were based on inherited 400+ totals.
+            for run_id in run_ids:
+                run = await session.get(AIEarlyWinnerRun, int(run_id))
+                if run is None:
+                    continue
+                remaining = list((await session.execute(
+                    select(AIEarlyWinnerCandidate.is_control).where(
+                        AIEarlyWinnerCandidate.run_id == int(run_id)
+                    )
+                )).scalars().all())
+                run.candidate_count = sum(1 for x in remaining if not bool(x))
+                run.control_count = sum(1 for x in remaining if bool(x))
+
+        if done is None:
+            session.add(AppSetting(key=RADAR_VELOCITY_PREP_SETTING, value="1"))
+        else:
+            done.value = "1"
+        await session.commit()
+
+    if any(stats.values()):
+        log.warning(
+            "v4.15.7 Verified Organic Velocity repair: listings=%s ai=%s lifecycle=%s radar_quarantined=%s threshold=%s",
+            stats["listings_reset"], stats["ai_candidates"], stats["lifecycle_watches"],
+            stats["radar_products_quarantined"], ORGANIC_HIGH_BASELINE_VIEWS,
         )
     return stats
 

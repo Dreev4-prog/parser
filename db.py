@@ -306,6 +306,14 @@ async def init_db() -> None:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN organic_baseline_at TIMESTAMP"))
         if columns and "organic_history_status" not in columns:
             await conn.execute(text("ALTER TABLE listings ADD COLUMN organic_history_status VARCHAR(24) DEFAULT 'unknown'"))
+        # v4.15.7 Verified Organic Velocity. Initial 400+ counters are baseline-only
+        # until two later clean exact checkpoints prove the observed delta.
+        if columns and "organic_verified_checkpoints" not in columns:
+            await conn.execute(text("ALTER TABLE listings ADD COLUMN organic_verified_checkpoints INTEGER DEFAULT 0"))
+        if columns and "organic_last_checkpoint_at" not in columns:
+            await conn.execute(text("ALTER TABLE listings ADD COLUMN organic_last_checkpoint_at TIMESTAMP"))
+        if columns and "organic_last_checkpoint_views" not in columns:
+            await conn.execute(text("ALTER TABLE listings ADD COLUMN organic_last_checkpoint_views INTEGER"))
         integrity_columns = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "listing_integrity"))
         if integrity_columns and "promotion_reason" not in integrity_columns:
             await conn.execute(text("ALTER TABLE listing_integrity ADD COLUMN promotion_reason VARCHAR(80) DEFAULT ''"))
@@ -314,6 +322,8 @@ async def init_db() -> None:
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_listings_first_posted_date_msk ON listings (first_posted_date_msk)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_listings_organic_baseline_at ON listings (organic_baseline_at)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_listings_organic_history_status ON listings (organic_history_status)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_listings_organic_verified_checkpoints ON listings (organic_verified_checkpoints)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_listings_organic_last_checkpoint_at ON listings (organic_last_checkpoint_at)"))
 
         # v4.15.4 Strict Organic Pipeline: legacy Radar families remain
         # quarantined until a new live detail-page organic verdict certifies them.

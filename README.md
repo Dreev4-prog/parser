@@ -1,3 +1,13 @@
+# DT PARSER 4.15.7 — Verified Organic Velocity
+
+**Base:** 4.15.6 Bump Resurrection Integrity.
+
+First-observed counters of **400+ views** are now baseline-only: the inherited total contributes zero to Radar ranking and DT Demand Score until DT obtains two later clean exact checkpoints at least 30 minutes apart. After certification only the post-baseline delta can vote. Parser automatically collects those checkpoints at background priority, and genuinely strong verified deltas may re-enter Radar through the unchanged evidence-adaptive DT Demand Score. The first v4.15.7 startup removes old AI/Lifecycle influence from clean 400+ baselines and quarantines affected Radar families so pre-v4.15.7 high-total scores cannot remain visible. High views alone never mark an ad promoted. DT Demand Score weights remain 40/20/15/15/10.
+
+See `DEPLOY_V4_15_7_VERIFIED_ORGANIC_VELOCITY.md`.
+
+---
+
 # DT PARSER 4.15.6 — Bump Resurrection Integrity
 
 **Base:** 4.15.5 AutoScan Recovery Hardening.

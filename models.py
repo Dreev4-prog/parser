@@ -44,6 +44,11 @@ class Listing(Base):
     organic_baseline_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
     organic_baseline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     organic_history_status: Mapped[str] = mapped_column(String(24), default="unknown", index=True)
+    # v4.15.7 Verified Organic Velocity.  Initial counters >=400 never vote in
+    # demand scoring until DT has two later clean exact measurements.
+    organic_verified_checkpoints: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    organic_last_checkpoint_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    organic_last_checkpoint_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # v3.0 deterministic product identity. These columns are intentionally
     # denormalized on the listing so analytics do not have to re-parse titles.

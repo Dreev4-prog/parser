@@ -81,6 +81,11 @@ from models import (
     SubscriptionPayment, SubscriptionPlan, UserScan, UserSettings, ViewHistory,
 )
 from product_identity import TYPE_DISPLAY, ProductIdentity, recognize_product
+from organic_velocity import (
+    ORGANIC_HIGH_BASELINE_VIEWS, ORGANIC_HIGH_BATCH_SIZE,
+    ORGANIC_HIGH_CHECKPOINT_MINUTES, ORGANIC_HIGH_POLL_SECONDS,
+    ORGANIC_HIGH_REQUIRED_CHECKPOINTS, apply_organic_measurement,
+)
 from traffic import TRAFFIC
 from i18n import LANG_EN, LANG_RU, get_user_language, language_name, set_user_language, translate_text
 from distributed import (
@@ -120,9 +125,10 @@ from view_manager import REMOTE_VIEW_MANAGER, REMOTE_VIEW_WORKER_ENABLED
 from ai_manager import AI_MANAGER
 from radar import (
     RADAR_PAGE_SIZE, RADAR_SCAN_TOP_LIMIT, backfill_radar_once, bump_resurrection_integrity_sweep_once,
-    prepare_bump_resurrection_sweep_once, get_fast_sold_info, get_fast_sold_infos,
+    prepare_bump_resurrection_sweep_once, prepare_verified_organic_velocity_once, get_fast_sold_info, get_fast_sold_infos,
     get_radar_product, is_radar_favorite, list_radar_products, radar_categories, radar_stats,
-    purge_nonorganic_analytics, record_autoscan_hot_detailed, record_scan_hot, refresh_radar_scores,
+    purge_nonorganic_analytics, record_autoscan_hot_detailed, record_scan_hot,
+    record_verified_velocity_signals, refresh_radar_scores, verify_listing_organic_now,
     search_radar_products, toggle_radar_favorite,
 )
 from page_manager import (
@@ -2706,28 +2712,21 @@ def _resurfaced_listing_reason(row: Listing, incoming_day) -> str:
     return ""
 
 
-def _apply_organic_view_baseline(row: Listing, views: int, measured_at: datetime) -> None:
-    """Persist the first DT-observed counter and mark later clean growth as observed.
+def _apply_organic_view_baseline(row: Listing, views: int, measured_at: datetime) -> str:
+    """Apply v4.15.7 view-provenance rules to one clean exact measurement.
 
-    Raw totals remain untouched. This does not classify high-view ads as promoted; it
-    only records the boundary between unknown pre-DT history and directly observed growth.
+    Initial counters >=400 are never trusted as demand. They become a baseline and
+    need two later clean checkpoints; only the post-baseline delta may then vote.
     """
-    if bool(getattr(row, "is_promoted", False)) or bool(getattr(row, "is_price_reduced", False)):
-        return
-    status = str(getattr(row, "organic_history_status", "unknown") or "unknown")
-    if getattr(row, "organic_baseline_at", None) is None:
-        row.organic_baseline_views = max(0, int(views))
-        row.organic_baseline_at = measured_at
-        # A listing first observed on the same displayed publication day can use
-        # its fresh total after the strict bump gate. Older/ambiguous history must
-        # establish a second DT-observed point before its pre-DT total is trusted.
-        row.organic_history_status = "trusted" if status in {"trusted", "trusted_new"} else "baseline"
-        return
-    baseline_views = getattr(row, "organic_baseline_views", None)
-    baseline_at = getattr(row, "organic_baseline_at", None)
-    if baseline_views is not None and baseline_at is not None and measured_at > baseline_at and int(views) >= int(baseline_views):
-        if status not in {"trusted", "trusted_new"}:
-            row.organic_history_status = "observed"
+    transition = apply_organic_measurement(row, int(views), measured_at)
+    if transition in {"high_baseline_started", "high_checkpoint_1", "high_verified"}:
+        log.info(
+            "Verified Organic Velocity external_id=%s transition=%s baseline=%s views=%s checkpoints=%s",
+            getattr(row, "external_id", ""), transition,
+            getattr(row, "organic_baseline_views", None), int(views),
+            int(getattr(row, "organic_verified_checkpoints", 0) or 0),
+        )
+    return transition
 
 
 async def backfill_product_identities() -> int:
@@ -4163,6 +4162,110 @@ async def scan_archive_scheduler() -> None:
             await asyncio.sleep(SCAN_ARCHIVE_SWEEP_SECONDS)
 
 
+async def _due_high_baseline_rows(limit: int = ORGANIC_HIGH_BATCH_SIZE) -> list[Listing]:
+    """Return 400+ baseline listings whose next clean velocity checkpoint is due."""
+    cutoff = datetime.utcnow() - timedelta(minutes=ORGANIC_HIGH_CHECKPOINT_MINUTES)
+    async with SessionLocal() as session:
+        rows = list((await session.execute(
+            select(Listing)
+            .where(
+                Listing.is_active.is_(True),
+                Listing.last_seen_at >= datetime.utcnow() - timedelta(hours=24),
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
+                Listing.organic_baseline_views.is_not(None),
+                Listing.organic_baseline_views >= int(ORGANIC_HIGH_BASELINE_VIEWS),
+                Listing.organic_verified_checkpoints < int(ORGANIC_HIGH_REQUIRED_CHECKPOINTS),
+                Listing.organic_history_status.in_(["high_baseline", "high_check_1"]),
+                func.coalesce(Listing.organic_last_checkpoint_at, Listing.organic_baseline_at) <= cutoff,
+                func.coalesce(Listing.views_checked_at, Listing.organic_baseline_at) <= cutoff,
+            )
+            .order_by(func.coalesce(Listing.organic_last_checkpoint_at, Listing.organic_baseline_at).asc())
+            .limit(max(1, int(limit)))
+        )).scalars().all())
+        for row in rows:
+            session.expunge(row)
+        return rows
+
+
+async def organic_velocity_scheduler() -> None:
+    """Collect two low-priority exact checkpoints for first-seen 400+ counters.
+
+    These checks are independent from AI candidacy: a suspiciously large initial
+    total cannot create an AI/Radar score first and only be checked afterwards.
+    User scans keep priority; the scheduler simply waits while foreground work exists.
+    """
+    await asyncio.sleep(20)
+    while True:
+        try:
+            running, queued = await _radar_foreground_counts()
+            if running or queued:
+                await asyncio.sleep(ORGANIC_HIGH_POLL_SECONDS)
+                continue
+            rows = await _due_high_baseline_rows()
+            if not rows:
+                await asyncio.sleep(ORGANIC_HIGH_POLL_SECONDS)
+                continue
+            clean_rows: list[Listing] = []
+            detail_unknown = 0
+            detail_blocked = 0
+            for row in rows:
+                allowed, reason, _verified_at = await verify_listing_organic_now(
+                    str(row.external_id), traffic_priority="background"
+                )
+                if allowed:
+                    clean_rows.append(row)
+                elif "promoted" in str(reason) or "reduced" in str(reason):
+                    detail_blocked += 1
+                else:
+                    detail_unknown += 1
+            if not clean_rows:
+                log.info(
+                    "Verified Organic Velocity checkpoint gate: due=%s clean=0 blocked=%s unknown=%s",
+                    len(rows), detail_blocked, detail_unknown,
+                )
+                await asyncio.sleep(ORGANIC_HIGH_POLL_SECONDS)
+                continue
+            ids = [str(row.external_id) for row in clean_rows]
+            before: dict[str, int] = {
+                str(row.external_id): int(getattr(row, "organic_verified_checkpoints", 0) or 0)
+                for row in clean_rows
+            }
+            async with background_view_refresh_lock:
+                requested, updated, failed = await refresh_view_counts(
+                    clean_rows, None, force=True, max_age_seconds=0, traffic_priority="background"
+                )
+            async with SessionLocal() as session:
+                refreshed = list((await session.execute(
+                    select(Listing).where(Listing.external_id.in_(ids))
+                )).scalars().all())
+            checkpointed = 0
+            newly_verified_ids: list[str] = []
+            for row in refreshed:
+                current = int(getattr(row, "organic_verified_checkpoints", 0) or 0)
+                previous = int(before.get(str(row.external_id), 0))
+                if current > previous:
+                    checkpointed += 1
+                if previous < int(ORGANIC_HIGH_REQUIRED_CHECKPOINTS) <= current and str(getattr(row, "organic_history_status", "") or "") == "observed":
+                    newly_verified_ids.append(str(row.external_id))
+            radar_saved = 0
+            if newly_verified_ids:
+                try:
+                    radar_saved = await record_verified_velocity_signals(newly_verified_ids)
+                except Exception:
+                    log.exception("Verified Organic Velocity Radar merge failed ids=%s", len(newly_verified_ids))
+            log.info(
+                "Verified Organic Velocity batch due=%s detail_clean=%s detail_blocked=%s detail_unknown=%s requested=%s updated=%s failed=%s checkpointed=%s newly_verified=%s radar_saved=%s threshold=%s",
+                len(rows), len(clean_rows), detail_blocked, detail_unknown, requested, updated, failed, checkpointed, len(newly_verified_ids), radar_saved, ORGANIC_HIGH_BASELINE_VIEWS,
+            )
+            await asyncio.sleep(ORGANIC_HIGH_POLL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Verified Organic Velocity scheduler error")
+            await asyncio.sleep(ORGANIC_HIGH_POLL_SECONDS)
+
+
 async def radar_maintenance_scheduler() -> None:
     """Backfill historical strong products once, then cool live scores hourly."""
     try:
@@ -4245,6 +4348,8 @@ def _radar_autoscan_default_state() -> dict:
         "views_verified": 0,
         "views_failed": 0,
         "radar_candidates": 0,
+        "radar_high_baseline_pending": 0,
+        "radar_high_baseline_verified": 0,
         "radar_detail_checked": 0,
         "radar_organic_passed": 0,
         "radar_promoted_blocked": 0,
@@ -4423,6 +4528,8 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
         "views_verified": 0,
         "views_failed": 0,
         "radar_candidates": 0,
+        "radar_high_baseline_pending": 0,
+        "radar_high_baseline_verified": 0,
         "radar_detail_checked": 0,
         "radar_organic_passed": 0,
         "radar_promoted_blocked": 0,
@@ -4494,6 +4601,8 @@ def _radar_autoscan_retry_round(state: dict) -> dict | None:
         "views_verified": 0,
         "views_failed": 0,
         "radar_candidates": 0,
+        "radar_high_baseline_pending": 0,
+        "radar_high_baseline_verified": 0,
         "radar_detail_checked": 0,
         "radar_organic_passed": 0,
         "radar_promoted_blocked": 0,
@@ -4625,7 +4734,12 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         f"снижение <b>{int(state.get('search_reduced_filtered') or 0)}</b>\n"
         f"👁 Точные просмотры: <b>{int(state.get('views_verified') or 0)}/{int(state.get('views_requested') or 0)}</b>"
         + (f" · ⚠️ неизвестно: <b>{int(state.get('views_failed') or 0)}</b>" if int(state.get('views_failed') or 0) else "") + "\n"
-        f"🎯 С точными views для Radar: <b>{int(state.get('radar_candidates') or 0)}</b> · "
+        + (
+            f"🟡 Initial ≥{ORGANIC_HIGH_BASELINE_VIEWS}: <b>{int(state.get('radar_high_baseline_pending') or 0)}</b> ждут 2 замера · "
+            f"✅ delta verified: <b>{int(state.get('radar_high_baseline_verified') or 0)}</b>\n"
+            if int(state.get('radar_high_baseline_pending') or 0) or int(state.get('radar_high_baseline_verified') or 0) else ""
+        )
+        + f"🎯 С demand-safe views для Radar: <b>{int(state.get('radar_candidates') or 0)}</b> · "
         f"detail-check: <b>{int(state.get('radar_detail_checked') or 0)}</b>\n"
         f"🛡 Organic прошло: <b>{int(state.get('radar_organic_passed') or 0)}</b> · "
         f"TOP/Promo: <b>{int(state.get('radar_promoted_blocked') or 0)}</b> · "
@@ -4764,6 +4878,8 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         "views_verified": int(state.get("views_verified") or 0),
         "views_failed": int(state.get("views_failed") or 0),
         "radar_candidates": int(state.get("radar_candidates") or 0),
+        "radar_high_baseline_pending": int(state.get("radar_high_baseline_pending") or 0),
+        "radar_high_baseline_verified": int(state.get("radar_high_baseline_verified") or 0),
         "radar_detail_checked": int(state.get("radar_detail_checked") or 0),
         "radar_organic_passed": int(state.get("radar_organic_passed") or 0),
         "radar_promoted_blocked": int(state.get("radar_promoted_blocked") or 0),
@@ -4824,6 +4940,11 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         + f"\n🧾 Чистых объявлений даты: <b>{int(summary['listings_seen'])}</b> · новых <b>{int(summary['new_listings'])}</b>"
         + f"\n🚫 Сразу исключено: TOP/Promo <b>{int(summary['search_promoted_filtered'])}</b> · снижение <b>{int(summary['search_reduced_filtered'])}</b>"
         + f"\n👁 Точные просмотры: <b>{int(summary['views_verified'])}/{int(summary['views_requested'])}</b>"
+        + (
+            f"\n🟡 Initial ≥{ORGANIC_HIGH_BASELINE_VIEWS}: <b>{int(summary.get('radar_high_baseline_pending') or 0)}</b> ждут 2 замера · "
+            f"✅ delta verified <b>{int(summary.get('radar_high_baseline_verified') or 0)}</b>"
+            if int(summary.get('radar_high_baseline_pending') or 0) or int(summary.get('radar_high_baseline_verified') or 0) else ""
+        )
         + f"\n🛡 Organic: <b>{int(summary['radar_organic_passed'])}</b> · TOP/Promo <b>{int(summary['radar_promoted_blocked'])}</b> · снижение <b>{int(summary['radar_reduced_blocked'])}</b> · unknown <b>{int(summary['radar_unknown_blocked'])}</b>"
         + (f"\n↳ unknown: {_radar_unknown_reason_text(summary.get('radar_unknown_reasons'))}" if int(summary.get('radar_unknown_blocked') or 0) else "")
         + f"\n📡 Новых Radar-сигналов: <b>+{int(summary['radar_saved'])}</b>"
@@ -5022,6 +5143,8 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                 state["radar_saved"] = int(state.get("radar_saved") or 0) + max(0, int(radar_saved or 0))
             if radar_stats is not None:
                 state["radar_candidates"] = int(state.get("radar_candidates") or 0) + int(radar_stats.eligible_with_views or 0)
+                state["radar_high_baseline_pending"] = int(state.get("radar_high_baseline_pending") or 0) + int(radar_stats.high_baseline_pending or 0)
+                state["radar_high_baseline_verified"] = int(state.get("radar_high_baseline_verified") or 0) + int(radar_stats.high_baseline_verified or 0)
                 state["radar_detail_checked"] = int(state.get("radar_detail_checked") or 0) + int(radar_stats.detail_checked or 0)
                 state["radar_organic_passed"] = int(state.get("radar_organic_passed") or 0) + int(radar_stats.organic_passed or 0)
                 state["radar_promoted_blocked"] = int(state.get("radar_promoted_blocked") or 0) + int(radar_stats.promoted_blocked or 0)
@@ -16396,6 +16519,9 @@ async def main() -> None:
     organic_cleanup = await purge_nonorganic_analytics(
         infer_historical_price_drops=True
     )
+    velocity_repair = await prepare_verified_organic_velocity_once()
+    if any(int(v or 0) for v in velocity_repair.values()):
+        log.warning("v4.15.7 Verified Organic Velocity startup repair: %s", velocity_repair)
     if organic_cleanup.get("dirty_listings", 0):
         log.warning(
             "v4.15.3 Strict Organic Radar Gate cleanup: %s",
@@ -16508,6 +16634,7 @@ async def main() -> None:
     )
     archive_task = asyncio.create_task(scan_archive_scheduler(), name="scan-archive-scheduler")
     radar_task = asyncio.create_task(radar_maintenance_scheduler(), name="dt-radar-maintenance")
+    organic_velocity_task = asyncio.create_task(organic_velocity_scheduler(), name="verified-organic-velocity")
     radar_autoscan_task = asyncio.create_task(radar_autoscan_scheduler(bot), name="dt-radar-autoscan")
     radar_daily_digest_task = asyncio.create_task(radar_daily_digest_scheduler(bot), name="dt-radar-daily-digest")
     observation_tasks = [] if DISTRIBUTED_WORKERS else [
@@ -16525,13 +16652,14 @@ async def main() -> None:
         subscription_task.cancel()
         archive_task.cancel()
         radar_task.cancel()
+        organic_velocity_task.cancel()
         radar_autoscan_task.cancel()
         radar_daily_digest_task.cancel()
         for task in observation_tasks:
             task.cancel()
         for task in worker_tasks:
             task.cancel()
-        shutdown_tasks = [payment_task, subscription_task, archive_task, radar_task, radar_autoscan_task, radar_daily_digest_task, *observation_tasks, *worker_tasks]
+        shutdown_tasks = [payment_task, subscription_task, archive_task, radar_task, organic_velocity_task, radar_autoscan_task, radar_daily_digest_task, *observation_tasks, *worker_tasks]
         if distributed_queue_ticker_task is not None:
             shutdown_tasks.insert(0, distributed_queue_ticker_task)
         if ticker_task is not None:
