@@ -5,10 +5,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Awaitable, Callable
 
-from parser import CategoryPageInfo, ParsedListing
+from parser import CategoryPageInfo, ParsedListing, _allowed_url, _strict_external_id
 
 try:
     from redis.asyncio import Redis  # type: ignore
@@ -41,13 +42,20 @@ REDIS_URL = os.getenv("REDIS_URL", "").strip()
 REMOTE_PAGE_WORKER_ENABLED = _env_bool("REMOTE_PAGE_WORKER_ENABLED", bool(REDIS_URL))
 PAGE_REDIS_PREFIX = os.getenv("PAGE_REDIS_PREFIX", "dtparser:pageworker").strip() or "dtparser:pageworker"
 # v4.15.2 changes the page payload/filter semantics. Keep the 180-second cache
-# schema-scoped so a freshly deployed parser cannot consume a pre-v4.15.2 page
+# schema-scoped so a freshly deployed parser cannot consume an older parser page
 # that still contains TOP or crossed-price cards.
-PAGE_CACHE_SCHEMA = "v4156-bump-resurrection"
+PAGE_CACHE_SCHEMA = "v4200-core2-audit3"
 # v4.8.3: cache is stable, queue/pending/worker state is release-scoped.
-PAGE_RUNTIME_PREFIX = os.getenv(
-    "PAGE_RUNTIME_PREFIX", f"{PAGE_REDIS_PREFIX}:runtime:v483"
-).strip() or f"{PAGE_REDIS_PREFIX}:runtime:v483"
+_PAGE_RUNTIME_MARKER = "v4200-core2-audit3"
+_PAGE_RUNTIME_DEFAULT = f"{PAGE_REDIS_PREFIX}:runtime:{_PAGE_RUNTIME_MARKER}"
+_PAGE_RUNTIME_OVERRIDE = os.getenv("PAGE_RUNTIME_PREFIX", "").strip()
+if _PAGE_RUNTIME_OVERRIDE and _PAGE_RUNTIME_MARKER not in _PAGE_RUNTIME_OVERRIDE:
+    log.warning(
+        "Ignoring incompatible PAGE_RUNTIME_PREFIX=%s; release requires %s",
+        _PAGE_RUNTIME_OVERRIDE, _PAGE_RUNTIME_MARKER,
+    )
+    _PAGE_RUNTIME_OVERRIDE = ""
+PAGE_RUNTIME_PREFIX = _PAGE_RUNTIME_OVERRIDE or _PAGE_RUNTIME_DEFAULT
 PAGE_STREAM = f"{PAGE_RUNTIME_PREFIX}:jobs"
 PAGE_GROUP = f"{PAGE_RUNTIME_PREFIX}:workers"
 PAGE_HEARTBEAT_KEY = f"{PAGE_RUNTIME_PREFIX}:heartbeat"
@@ -150,19 +158,38 @@ def deserialize_page_info(raw: str | bytes | None) -> CategoryPageInfo | None:
         data = json.loads(raw)
         if not isinstance(data, dict):
             return None
+        final_url = str(data.get("final_url") or "")
+        # Remote/stable page payloads are acceleration only, never a trust boundary.
+        # A stale/corrupt/rolling-deploy payload must not be able to pair one ad id
+        # with another listing URL and silently poison chronology/Radar.
+        if final_url and not _allowed_url(final_url):
+            return None
+
+        raw_items = data.get("items") or []
+        if not isinstance(raw_items, list):
+            return None
         items: list[ParsedListing] = []
-        for row in data.get("items") or []:
+        for row in raw_items:
             if not isinstance(row, dict):
-                continue
-            external_id = str(row.get("external_id") or "")
-            url = str(row.get("url") or "")
-            if not external_id or not url:
-                continue
+                return None
+            external_id = str(row.get("external_id") or "").strip()
+            url = str(row.get("url") or "").strip()
+            canonical_id = _strict_external_id(url)
+            if (
+                not external_id.isdigit()
+                or len(external_id) < 6
+                or not _allowed_url(url)
+                or canonical_id != external_id
+            ):
+                return None
+            price_eur = row.get("price_eur")
+            if isinstance(price_eur, bool):
+                return None
             items.append(ParsedListing(
                 external_id=external_id,
                 title=str(row.get("title") or ""),
                 price_text=row.get("price_text"),
-                price_eur=(int(row["price_eur"]) if row.get("price_eur") is not None else None),
+                price_eur=(int(price_eur) if price_eur is not None else None),
                 url=url,
                 posted_text=row.get("posted_text"),
                 is_price_reduced=bool(row.get("is_price_reduced", False)),
@@ -171,8 +198,14 @@ def deserialize_page_info(raw: str | bytes | None) -> CategoryPageInfo | None:
         for shard in data.get("location_shards") or []:
             if not isinstance(shard, (list, tuple)) or not shard:
                 continue
-            shard_url = str(shard[0] or "")
-            if not shard_url:
+            shard_url = str(shard[0] or "").strip()
+            # Location shards later become real network fetch targets. Never let a
+            # cached worker payload inject a foreign/arbitrary URL into that path.
+            if (
+                not shard_url
+                or not _allowed_url(shard_url)
+                or not re.search(r"/c\d+l\d+(?:$|[/?#])", shard_url)
+            ):
                 continue
             count = None
             if len(shard) > 1 and shard[1] is not None:
@@ -183,7 +216,7 @@ def deserialize_page_info(raw: str | bytes | None) -> CategoryPageInfo | None:
             shards.append((shard_url, count))
         return CategoryPageInfo(
             requested_page=max(1, int(data.get("requested_page") or 1)),
-            final_url=str(data.get("final_url") or ""),
+            final_url=final_url,
             items=items,
             result_start=(int(data["result_start"]) if data.get("result_start") is not None else None),
             result_end=(int(data["result_end"]) if data.get("result_end") is not None else None),
@@ -195,9 +228,15 @@ def deserialize_page_info(raw: str | bytes | None) -> CategoryPageInfo | None:
             fingerprint=str(data.get("fingerprint") or ""),
             raw_candidates=int(data.get("raw_candidates") or 0),
             promoted_filtered=int(data.get("promoted_filtered") or 0),
-            promoted_ids=[str(x) for x in (data.get("promoted_ids") or []) if str(x)],
+            promoted_ids=[
+                str(x).strip() for x in (data.get("promoted_ids") or [])
+                if str(x).strip().isdigit() and len(str(x).strip()) >= 6
+            ],
             price_reduced_filtered=int(data.get("price_reduced_filtered") or 0),
-            price_reduced_ids=[str(x) for x in (data.get("price_reduced_ids") or []) if str(x)],
+            price_reduced_ids=[
+                str(x).strip() for x in (data.get("price_reduced_ids") or [])
+                if str(x).strip().isdigit() and len(str(x).strip()) >= 6
+            ],
             duplicate_cards=int(data.get("duplicate_cards") or 0),
             missing_date_count=int(data.get("missing_date_count") or 0),
             missing_price_count=int(data.get("missing_price_count") or 0),

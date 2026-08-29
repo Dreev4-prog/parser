@@ -45,6 +45,7 @@ os.environ["TRAFFIC_RECOVERY_QUIET_SECONDS"] = "10"
 from app_version import APP_VERSION
 from parser import KleinanzeigenParser, TemporaryAccessError, shutdown_shared_browser_runtime
 from page_manager import (
+    PAGE_CACHE_SCHEMA,
     PAGE_CACHE_TTL_SECONDS,
     PAGE_ERROR_TTL_SECONDS,
     PAGE_GROUP,
@@ -124,7 +125,7 @@ class PageWorkerProcess:
         TRAFFIC.report_refusal = tracked_refusal  # type: ignore[method-assign]
 
     def cache_key(self, cache_id: str) -> str:
-        return f"{PAGE_REDIS_PREFIX}:cache:{cache_id}"
+        return f"{PAGE_REDIS_PREFIX}:cache:{PAGE_CACHE_SCHEMA}:{cache_id}"
 
     def pending_key(self, cache_id: str) -> str:
         return f"{PAGE_RUNTIME_PREFIX}:pending:{cache_id}"
@@ -349,10 +350,11 @@ class PageWorkerProcess:
         ]
         await self.heartbeat()
         log.info(
-            "DT PARSER Page Worker online | id=%s | replica=%s | concurrency=%s | cache=%ss",
+            "DT PARSER Page Worker online | id=%s | replica=%s | concurrency=%s | cache_schema=%s | cache=%ss",
             self.base_id,
             os.getenv("RAILWAY_REPLICA_ID", "local"),
             PAGE_WORKER_CONCURRENCY,
+            PAGE_CACHE_SCHEMA,
             PAGE_CACHE_TTL_SECONDS,
         )
         try:

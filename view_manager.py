@@ -5,11 +5,13 @@ import json
 import logging
 import math
 import os
+import re
 import socket
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
+from urllib.parse import parse_qs, urlparse
 
 try:
     from redis.asyncio import Redis  # type: ignore
@@ -17,6 +19,47 @@ except Exception:  # pragma: no cover
     Redis = None  # type: ignore
 
 log = logging.getLogger("dtparser-view-manager")
+
+
+def _strict_listing_id(url: str) -> str | None:
+    try:
+        parsed = urlparse(str(url or ""))
+    except Exception:
+        return None
+    if parsed.scheme != "https" or not ((parsed.hostname or "").lower() == "kleinanzeigen.de" or (parsed.hostname or "").lower().endswith(".kleinanzeigen.de")):
+        return None
+    if "/s-anzeige/" not in (parsed.path or ""):
+        return None
+    match = re.search(r"/(\d{6,})-\d+-\d+(?:/|$)", parsed.path or "")
+    return match.group(1) if match else None
+
+
+def _remote_exact_result_identity_ok(requested_url: str, source: str, final_url: str | None) -> bool:
+    """Defensively bind a remote exact counter to the requested ad id.
+
+    The View Worker already performs this verification in parser.py.  Rechecking
+    the serialized contract at the manager boundary prevents a stale/corrupt Redis
+    payload or rolling-deploy mismatch from turning a number for another ad into a
+    valid Radar counter.
+    """
+    expected = _strict_listing_id(requested_url)
+    if expected is None or not final_url:
+        return False
+    src = str(source or "")
+    try:
+        parsed = urlparse(str(final_url))
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not (host == "kleinanzeigen.de" or host.endswith(".kleinanzeigen.de")):
+        return False
+    if src.startswith("verified-official:"):
+        if not (parsed.path or "").endswith("/s-vac-inc-get.json"):
+            return False
+        values = parse_qs(parsed.query, keep_blank_values=True).get("adId", [])
+        return len(values) == 1 and str(values[0]).strip() == expected
+    # Verified browser/network results must finish on the exact listing page.
+    return _strict_listing_id(str(final_url)) == expected
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -42,9 +85,16 @@ REMOTE_VIEW_WORKER_ENABLED = _env_bool("REMOTE_VIEW_WORKER_ENABLED", bool(REDIS_
 VIEW_REDIS_PREFIX = os.getenv("VIEW_REDIS_PREFIX", "dtparser:viewcounter").strip() or "dtparser:viewcounter"
 # v4.8.3: every release gets a fresh ephemeral view runtime. Old streams/jobs
 # can expire naturally without being reclaimed by a newly deployed worker fleet.
-VIEW_RUNTIME_PREFIX = os.getenv(
-    "VIEW_RUNTIME_PREFIX", f"{VIEW_REDIS_PREFIX}:runtime:v4101"
-).strip() or f"{VIEW_REDIS_PREFIX}:runtime:v4101"
+_VIEW_RUNTIME_MARKER = "v4200-core2-audit3"
+_VIEW_RUNTIME_DEFAULT = f"{VIEW_REDIS_PREFIX}:runtime:{_VIEW_RUNTIME_MARKER}"
+_VIEW_RUNTIME_OVERRIDE = os.getenv("VIEW_RUNTIME_PREFIX", "").strip()
+if _VIEW_RUNTIME_OVERRIDE and _VIEW_RUNTIME_MARKER not in _VIEW_RUNTIME_OVERRIDE:
+    log.warning(
+        "Ignoring incompatible VIEW_RUNTIME_PREFIX=%s; release requires %s",
+        _VIEW_RUNTIME_OVERRIDE, _VIEW_RUNTIME_MARKER,
+    )
+    _VIEW_RUNTIME_OVERRIDE = ""
+VIEW_RUNTIME_PREFIX = _VIEW_RUNTIME_OVERRIDE or _VIEW_RUNTIME_DEFAULT
 VIEW_STREAM = f"{VIEW_RUNTIME_PREFIX}:jobs"
 VIEW_GROUP = f"{VIEW_RUNTIME_PREFIX}:workers"
 VIEW_HEARTBEAT_KEY = f"{VIEW_RUNTIME_PREFIX}:heartbeat"
@@ -328,14 +378,30 @@ class RemoteViewManager:
                         )
                         return None
                     out: dict[str, RemoteViewResult] = {}
+                    requested = set(urls)
                     for url, item in (data.get("results") or {}).items():
-                        if not isinstance(item, dict):
+                        url = str(url)
+                        if url not in requested or not isinstance(item, dict):
                             continue
                         value = item.get("views")
-                        out[str(url)] = RemoteViewResult(
-                            int(value) if isinstance(value, int) or (isinstance(value, str) and value.isdigit()) else None,
-                            str(item.get("source") or "remote:unknown"),
-                            item.get("raw_text"), item.get("final_url"), item.get("page_title"), item.get("error"),
+                        parsed_value = (
+                            int(value)
+                            if not isinstance(value, bool)
+                            and (isinstance(value, int) or (isinstance(value, str) and value.isdigit()))
+                            else None
+                        )
+                        source = str(item.get("source") or "remote:unknown")
+                        final_url = item.get("final_url")
+                        error = item.get("error")
+                        if parsed_value is not None and not _remote_exact_result_identity_ok(url, source, final_url):
+                            log.warning(
+                                "Remote view result identity rejected job=%s requested=%s source=%s final=%s",
+                                job_id[:10], url, source, final_url,
+                            )
+                            parsed_value = None
+                            error = "remote exact-result identity mismatch"
+                        out[url] = RemoteViewResult(
+                            parsed_value, source, item.get("raw_text"), final_url, item.get("page_title"), error,
                         )
                     if progress_cb is not None:
                         maybe = progress_cb(len(urls), len(urls))

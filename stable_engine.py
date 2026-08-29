@@ -11,7 +11,8 @@ from sqlalchemy.exc import IntegrityError
 
 from db import SessionLocal
 from models import StableCategoryJob, StableDateIndex, StablePageCheckpoint
-from parser import CategoryPageInfo, ParsedListing
+from parser import CategoryPageInfo
+from page_manager import deserialize_page_info
 
 
 STABLE_PAGE_CHECKPOINT_TTL_SECONDS = max(
@@ -20,9 +21,9 @@ STABLE_PAGE_CHECKPOINT_TTL_SECONDS = max(
 STABLE_DATE_INDEX_TTL_SECONDS = max(
     60, int(os.getenv("STABLE_DATE_INDEX_TTL_SECONDS", "900"))
 )
-# v4.15.2 changes page-card integrity semantics. Reject pre-release checkpoint
-# payloads for their short TTL instead of replaying a cached TOP/reduced card.
-STABLE_PAGE_PAYLOAD_SCHEMA = "v4156-bump-resurrection"
+# v4.20.0 audited promotion semantics: reject every older parsed card payload,
+# including cards that could have been falsely classified from product URL words.
+STABLE_PAGE_PAYLOAD_SCHEMA = "v4200-core2-audit3"
 
 
 def feed_key(url: str) -> str:
@@ -79,11 +80,13 @@ def _deserialize_page_info(raw: str) -> CategoryPageInfo:
     payload = json.loads(raw)
     if str(payload.pop("schema", "")) != STABLE_PAGE_PAYLOAD_SCHEMA:
         raise ValueError("stale stable-page payload schema")
-    items = [ParsedListing(**item) for item in payload.pop("items", [])]
-    shards = payload.get("location_shards")
-    if shards is not None:
-        payload["location_shards"] = [tuple(x) for x in shards]
-    return CategoryPageInfo(items=items, **payload)
+    # Reuse the same fail-closed contract as Redis Page Worker payloads.  Durable
+    # checkpoints are a cache, not authority: identity/host mismatch triggers a
+    # fresh page fetch instead of replaying poisoned parsed data.
+    info = deserialize_page_info(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    if info is None:
+        raise ValueError("invalid stable-page payload identity")
+    return info
 
 
 async def load_page_checkpoint(

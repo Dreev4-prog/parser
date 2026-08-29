@@ -167,8 +167,18 @@ _trial_credit_guard = asyncio.Lock()
 # backoff after partial/system failures. Non-product/service categories remain available
 # to the normal parser; they are excluded only from the automatic Radar seeding round.
 RADAR_AUTOSCAN_SETTING_KEY = "dt_radar_autoscan_v1"
-RADAR_AUTOSCAN_POLICY_VERSION = 2
+RADAR_AUTOSCAN_POLICY_VERSION = 3
 RADAR_AUTOSCAN_DEPTH = 15
+RADAR_CONTEXT_DEPTH = 15
+RADAR_CONTEXT_ENABLED = True
+
+
+def _radar_layer_depth(state: dict | None = None) -> int:
+    """Return the configured page depth for the active Radar layer."""
+    layer = str((state or {}).get("layer") or "fresh")
+    return RADAR_CONTEXT_DEPTH if layer == "context" else RADAR_AUTOSCAN_DEPTH
+
+
 RADAR_AUTOSCAN_USER_ID = -411000001
 RADAR_AUTOSCAN_DEFAULT_TIME = "05:00"
 RADAR_AUTOSCAN_POLL_SECONDS = 10
@@ -3669,15 +3679,18 @@ async def enrich_page_view_counts(
                 Listing.is_price_reduced.is_(False),
             ))
             db_rows = {row.external_id: row for row in db_result.scalars().all()}
-            for url, vr in results.items():
+            for item in targets:
+                url = item.url
                 external_id = url_to_id.get(url)
                 row = db_rows.get(external_id) if external_id else None
                 if row is None:
                     continue
-                if vr.views is None:
+                vr = results.get(url)
+                if vr is None or vr.views is None:
                     failed += 1
-                    # Fail closed: a stale number from an earlier measurement must
-                    # never survive a failed current verification and pass 50+/100+.
+                    # Fail closed: an omitted result is the same as an explicit
+                    # unknown. A stale number from an earlier measurement must
+                    # never survive a failed current verification and pass filters.
                     row.view_count = None
                     row.views_checked_at = now
                     continue
@@ -3750,7 +3763,11 @@ async def enrich_autoscan_view_counts(
                 live.category_name, min(total, int(done)), total,
             )
 
-    autoscan_view_priority = "normal" if int(getattr(TRAFFIC, "background_during_scans", 0)) <= 0 else "background"
+    # Exact counters are part of the foreground AutoScan category itself, not
+    # maintenance traffic. Marking them "background" throttled the category to
+    # TRAFFIC_BACKGROUND_VIEWS_DURING_SCANS (often one slot) and could make a
+    # healthy scan look stalled while the background pause was active.
+    autoscan_view_priority = "scan_inline"
     autoscan_view_concurrency = max(1, min(RADAR_AUTOSCAN_SAFE_VIEW_CONCURRENCY, VIEW_COUNT_CONCURRENCY))
     log.info(
         "Radar AutoScan views start category=%s total=%s priority=%s concurrency=%s",
@@ -3983,15 +4000,18 @@ async def refresh_view_counts(
                 Listing.is_price_reduced.is_(False),
             ))
             db_rows = {row.external_id: row for row in result.scalars().all()}
-            for url, vr in results.items():
+            for item in targets:
+                url = item.url
                 external_id = url_to_id.get(url)
                 row = db_rows.get(external_id) if external_id else None
                 if row is None:
                     continue
-                if vr.views is None:
+                vr = results.get(url)
+                if vr is None or vr.views is None:
                     failed += 1
-                    # Fail closed: a stale number from an earlier measurement must
-                    # never survive a failed current verification and pass 50+/100+.
+                    # Fail closed: an omitted result is the same as an explicit
+                    # unknown. A stale number from an earlier measurement must
+                    # never survive a failed current verification and pass filters.
                     row.view_count = None
                     row.views_checked_at = now
                     continue
@@ -4014,7 +4034,7 @@ async def refresh_view_counts(
         if vr and vr.views is not None:
             row.view_count = int(vr.views)
             row.views_checked_at = now
-        elif vr is not None:
+        else:
             row.view_count = None
             row.views_checked_at = now
 
@@ -4294,7 +4314,9 @@ async def organic_velocity_scheduler() -> None:
             radar_saved = 0
             if newly_verified_ids:
                 try:
-                    radar_saved = await record_verified_velocity_signals(newly_verified_ids)
+                    radar_saved = await record_verified_velocity_signals(
+                        newly_verified_ids, traffic_priority="background"
+                    )
                 except Exception:
                     log.exception("Verified Organic Velocity Radar merge failed ids=%s", len(newly_verified_ids))
             log.info(
@@ -4437,6 +4459,9 @@ def _radar_autoscan_default_state() -> dict:
         "updated_at": _radar_autoscan_now_iso(),
         "last_completed_date": "",
         "last_daily_date": "",
+        "last_context_date": "",
+        "context_for_date": "",
+        "layer": "fresh",
         "last_summary": {},
         "history": [],
     }
@@ -4454,6 +4479,9 @@ def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
     state["skip_daily_if_completed_today"] = bool(state.get("skip_daily_if_completed_today", True))
     state["stop_requested"] = bool(state.get("stop_requested"))
     state["waiting_for_users"] = bool(state.get("waiting_for_users"))
+    state["last_context_date"] = str(state.get("last_context_date") or "")[:10]
+    state["context_for_date"] = str(state.get("context_for_date") or "")[:10]
+    state["layer"] = "context" if str(state.get("layer") or "fresh") == "context" else "fresh"
     state["current_stage"] = str(state.get("current_stage") or "")[:80]
     state["current_stage_started_at"] = str(state.get("current_stage_started_at") or "")[:64]
     state["last_watchdog_category"] = str(state.get("last_watchdog_category") or "")[:160]
@@ -4491,6 +4519,7 @@ def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
             "name": str(item.get("name") or CATEGORIES[key].name)[:160],
             "reason": str(item.get("reason") or "partial")[:300],
             "verified_pages": max(0, int(item.get("verified_pages") or 0)),
+            "depth": max(1, int(item.get("depth") or RADAR_AUTOSCAN_DEPTH)),
             "kind": kind,
         })
     state["failed_categories"] = failures[:500]
@@ -4500,7 +4529,7 @@ def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
 
     # Existing in-progress v4.11.4 rounds keep their exact old key order so a Railway
     # deploy cannot corrupt current_index/counters midway through a persisted round.
-    # Every new/retry round uses policy v2 and only product-oriented categories.
+    # Every new/retry round uses the current policy and only product-oriented categories.
     stored_policy = max(0, int(raw_state.get("policy_version") or 0))
     legacy_active = stored_policy < RADAR_AUTOSCAN_POLICY_VERSION and str(state.get("status") or "idle") in {"running", "paused"} and bool(raw_state.get("category_keys"))
     if legacy_active:
@@ -4568,6 +4597,7 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
         "skip_daily_if_completed_today": bool(state.get("skip_daily_if_completed_today", True)),
         "last_completed_date": str(state.get("last_completed_date") or ""),
         "last_daily_date": str(state.get("last_daily_date") or ""),
+        "last_context_date": str(state.get("last_context_date") or ""),
         "last_summary": dict(state.get("last_summary") or {}),
         "history": list(state.get("history") or [])[:RADAR_AUTOSCAN_HISTORY_LIMIT],
     }
@@ -4580,6 +4610,8 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
         "waiting_for_users": False,
         "round_id": f"{now.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:5]}",
         "mode": "daily" if mode == "daily" else "manual",
+        "layer": "fresh",
+        "context_for_date": "",
         "target_date": now.date().isoformat(),
         "category_keys": keys,
         "current_index": 0,
@@ -4623,6 +4655,57 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
     return new_state
 
 
+def _radar_autoscan_new_context_round(state: dict, for_date=None) -> dict:
+    """Build the once-daily 24-48h Context Layer over yesterday.
+
+    Context uses the same exact page/view/integrity pipeline as Fresh Layer, but
+    its strongest rows are verification-only: inherited yesterday totals do not
+    become public Radar signals. The observations enrich ViewHistory and the
+    Persistence/Repeatability/price-history evidence used by DT Demand Score.
+    """
+    keys = [cat.key for cat in _radar_autoscan_categories()]
+    now = datetime.now(MOSCOW)
+    context_day = for_date or now.date()
+    if isinstance(context_day, str):
+        try:
+            context_day = datetime.strptime(context_day[:10], "%Y-%m-%d").date()
+        except Exception:
+            context_day = now.date()
+    target_day = context_day - timedelta(days=1)
+    keep = {
+        "daily_enabled": bool(state.get("daily_enabled")),
+        "daily_time": str(state.get("daily_time") or RADAR_AUTOSCAN_DEFAULT_TIME),
+        "skip_daily_if_completed_today": bool(state.get("skip_daily_if_completed_today", True)),
+        "last_completed_date": str(state.get("last_completed_date") or ""),
+        "last_daily_date": str(state.get("last_daily_date") or ""),
+        "last_context_date": str(state.get("last_context_date") or ""),
+        "last_summary": dict(state.get("last_summary") or {}),
+        "history": list(state.get("history") or [])[:RADAR_AUTOSCAN_HISTORY_LIMIT],
+    }
+    new_state = _radar_autoscan_default_state()
+    new_state.update(keep)
+    new_state.update({
+        "policy_version": RADAR_AUTOSCAN_POLICY_VERSION,
+        "status": "running",
+        "stop_requested": False,
+        "waiting_for_users": False,
+        "round_id": f"context-{now.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:5]}",
+        "mode": "context",
+        "layer": "context",
+        "context_for_date": context_day.isoformat(),
+        "target_date": target_day.isoformat(),
+        "category_keys": keys,
+        "current_index": 0,
+        "current_category_key": "",
+        "current_category_name": "Запуск 48H Context Layer…",
+        "current_stage": "starting",
+        "current_stage_started_at": now.replace(microsecond=0).isoformat(),
+        "total": len(keys),
+        "started_at": now.replace(microsecond=0).isoformat(),
+    })
+    return new_state
+
+
 def _radar_autoscan_retry_round(state: dict) -> dict | None:
     """Create one low-priority round containing only failures from the last report."""
     last = dict(state.get("last_summary") or {})
@@ -4641,6 +4724,7 @@ def _radar_autoscan_retry_round(state: dict) -> dict | None:
         "skip_daily_if_completed_today": bool(state.get("skip_daily_if_completed_today", True)),
         "last_completed_date": str(state.get("last_completed_date") or ""),
         "last_daily_date": str(state.get("last_daily_date") or ""),
+        "last_context_date": str(state.get("last_context_date") or ""),
         "last_summary": last,
         "history": list(state.get("history") or [])[:RADAR_AUTOSCAN_HISTORY_LIMIT],
     }
@@ -4655,6 +4739,8 @@ def _radar_autoscan_retry_round(state: dict) -> dict | None:
         "waiting_for_users": False,
         "round_id": f"retry-{now.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:5]}",
         "mode": "retry",
+        "layer": str(last.get("layer") or ("context" if last.get("mode") == "context" else "fresh")),
+        "context_for_date": str(last.get("context_for_date") or ""),
         "target_date": str(last.get("target_date") or now.date().isoformat()),
         "category_keys": keys,
         "current_index": 0,
@@ -4738,7 +4824,8 @@ def _radar_unknown_reason_text(reasons: dict | None, *, limit: int = 5) -> str:
     return " · ".join(f"{html.escape(key)} {value}" for key, value in rows)
 
 
-def _human_duration(seconds: int) -> str:
+def _radar_autoscan_human_duration(seconds: int) -> str:
+    """Exact AutoScan duration including hours; kept separate from queue ETA formatting."""
     seconds = max(0, int(seconds or 0))
     hours, rem = divmod(seconds, 3600)
     minutes, secs = divmod(rem, 60)
@@ -4782,7 +4869,7 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         status_text = "🔴 не запущен"
     current = str(state.get("current_category_name") or "—")
     live_stage_line = _radar_autoscan_live_stage_line(state) if status == "running" else ""
-    mode_label = "Ежедневный" if state.get("mode") == "daily" else ("Повтор ошибок" if state.get("mode") == "retry" else ("Ручной" if state.get("mode") == "manual" else "—"))
+    mode_label = ("Ежедневный · Fresh Layer" if state.get("mode") == "daily" else ("48H Context · вчера" if state.get("mode") == "context" else ("Повтор ошибок" if state.get("mode") == "retry" else ("Ручной · Fresh Layer" if state.get("mode") == "manual" else "—"))))
     last = dict(state.get("last_summary") or {})
     if last:
         coverage_total = int(last.get("coverage_total") or last.get("total") or 0)
@@ -4798,7 +4885,8 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         "<b>📡 DT Radar AutoScan</b>\n\n"
         f"Статус: <b>{status_text}</b>\n"
         f"Режим круга: <b>{mode_label}</b>\n"
-        f"Глубина: <b>{RADAR_AUTOSCAN_DEPTH} страниц на категорию</b>\n"
+        f"Глубина: <b>{_radar_layer_depth(state)} страниц на категорию</b>\n"
+        f"Слой: <b>{'сегодня · Fresh' if str(state.get('layer') or 'fresh') == 'fresh' else 'вчера · 24–48H Context'}</b>\n"
         f"Категории: <b>{len(_radar_autoscan_categories())}</b> товарных категорий\n"
         f"Прогресс: <b>{processed}/{total} · {pct}%</b>\n"
         f"Сейчас: <b>{html.escape(current)}</b>\n"
@@ -4832,7 +4920,8 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         f"Ежедневный круг: <b>{'✅ ВКЛ' if state.get('daily_enabled') else '⏸ ВЫКЛ'}</b>\n"
         f"Время: <b>{html.escape(str(state.get('daily_time') or RADAR_AUTOSCAN_DEFAULT_TIME))} МСК</b>\n"
         f"Следующий запуск: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>\n"
-        f"Если полный ручной круг уже прошёл сегодня: <b>{'пропустить автокруг' if state.get('skip_daily_if_completed_today', True) else 'всё равно запустить'}</b>\n\n"
+        f"Если полный ручной круг уже прошёл сегодня: <b>{'пропустить Fresh, но Context всё равно собрать' if state.get('skip_daily_if_completed_today', True) else 'всё равно запустить Fresh'}</b>\n"
+        f"48H Context: <b>{'✅ собран сегодня' if state.get('last_context_date') == datetime.now(MOSCOW).date().isoformat() else '⏳ ещё не собран сегодня'}</b>\n\n"
         f"Последний круг: <b>{last_line}</b>\n"
         + (
             f"📊 Покрытие последнего: <b>{int(last.get('category_coverage_pct') or 0)}% категорий</b> · "
@@ -4876,7 +4965,7 @@ async def _radar_autoscan_errors_text(page: int = 0, per_page: int = 15) -> tupl
         lines += [
             "",
             f"<b>{icon} {idx}. {html.escape(str(item.get('name') or item.get('key') or '—'))}</b>",
-            f"📄 {int(item.get('verified_pages') or 0)}/{RADAR_AUTOSCAN_DEPTH} · {label} · {html.escape(reason)}",
+            f"📄 {int(item.get('verified_pages') or 0)}/{int(item.get('depth') or RADAR_AUTOSCAN_DEPTH)} · {label} · {html.escape(reason)}",
         ]
     lines += ["", f"Страница <b>{page + 1}/{pages}</b> · проблемных категорий <b>{total}</b>"]
     return "\n".join(lines), state, page, pages
@@ -4890,7 +4979,7 @@ async def _radar_autoscan_history_text() -> str:
         lines += ["", "Кругов пока не было."]
         return "\n".join(lines)
     for item in history:
-        mode = "авто" if item.get("mode") == "daily" else ("повтор" if item.get("mode") == "retry" else "ручной")
+        mode = ("fresh" if item.get("mode") == "daily" else ("48H context" if item.get("mode") == "context" else ("повтор" if item.get("mode") == "retry" else "ручной")))
         lines += [
             "",
             f"<b>#{html.escape(str(item.get('round_id') or '—'))}</b> · {mode}",
@@ -4898,7 +4987,7 @@ async def _radar_autoscan_history_text() -> str:
             f"📊 {int(item.get('category_coverage_pct') or 0)}% кат. · {int(item.get('page_coverage_pct') or 0)}% стр. от max",
             f"📄 {int(item.get('pages_verified') or 0)} стр. · 🧾 {int(item.get('listings_seen') or 0)} объявлений",
             f"👁 {int(item.get('views_verified') or 0)}/{int(item.get('views_requested') or 0)} exact · 🛡 {int(item.get('radar_organic_passed') or 0)} organic",
-            f"📡 Radar +{int(item.get('radar_saved') or 0)} · ⏱ {_human_duration(int(item.get('duration_seconds') or 0))}",
+            f"📡 Radar +{int(item.get('radar_saved') or 0)} · ⏱ {_radar_autoscan_human_duration(int(item.get('duration_seconds') or 0))}",
             f"🕒 {html.escape(str(item.get('finished_at_text') or '—'))}",
         ]
     return "\n".join(lines)
@@ -4931,12 +5020,14 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         coverage_pages_verified = max(0, parent_pages - replaced_partial_pages + int(state.get("pages_verified") or 0))
     else:
         coverage_pages_verified = int(state.get("pages_verified") or 0)
-    page_coverage_pct = int(round((coverage_pages_verified / max(1, coverage_total * RADAR_AUTOSCAN_DEPTH)) * 100))
+    page_coverage_pct = int(round((coverage_pages_verified / max(1, coverage_total * _radar_layer_depth(state))) * 100))
     page_coverage_pct = max(0, min(100, page_coverage_pct))
     failed_categories = list(state.get("failed_categories") or [])
     summary = {
         "round_id": str(state.get("round_id") or ""),
         "mode": mode,
+        "layer": str(state.get("layer") or ("context" if mode == "context" else "fresh")),
+        "context_for_date": str(state.get("context_for_date") or ""),
         "target_date": str(state.get("target_date") or ""),
         "total": run_total,
         "processed": int(state.get("processed") or 0),
@@ -4979,20 +5070,34 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
     state["history"] = [summary] + list(state.get("history") or [])
     state["history"] = state["history"][:RADAR_AUTOSCAN_HISTORY_LIMIT]
     state["last_summary"] = summary
-    if coverage_successful >= coverage_total and failed == 0:
+    if coverage_successful >= coverage_total and failed == 0 and mode in {"manual", "daily"}:
         state["last_completed_date"] = now.date().isoformat()
     if mode == "daily":
         state["last_daily_date"] = now.date().isoformat()
+    if mode == "context":
+        state["last_context_date"] = str(state.get("context_for_date") or now.date().isoformat())
     state["status"] = "idle"
     state["stop_requested"] = False
     state["waiting_for_users"] = False
     state["current_category_key"] = ""
     state["current_category_name"] = ""
     state = await save_radar_autoscan_state(state)
+    start_context_after_fresh = bool(
+        RADAR_CONTEXT_ENABLED
+        and mode in {"manual", "daily"}
+        and str(state.get("last_context_date") or "") != now.date().isoformat()
+    )
     icon = "✅" if failed == 0 else "⚠️"
     if mode == "retry":
         headline = f"📡 <b>DT Radar — повтор ошибок завершён {icon}</b>"
         scope_line = f"Повторено: <b>{run_successful}/{run_total}</b> успешно"
+        if needs_review:
+            scope_line += f" · ⚠️ допроверка <b>{needs_review}</b>"
+        if system_errors:
+            scope_line += f" · ❌ системных <b>{system_errors}</b>"
+    elif mode == "context":
+        headline = f"🧠 <b>DT Radar — 48H Context Layer завершён {icon}</b>"
+        scope_line = f"Вчерашний рынок: <b>{run_successful}/{run_total}</b> категорий подтверждено"
         if needs_review:
             scope_line += f" · ⚠️ допроверка <b>{needs_review}</b>"
         if system_errors:
@@ -5015,7 +5120,7 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         headline + "\n\n"
         + scope_line
         + f"\n📊 Покрытие категорий: <b>{coverage_successful}/{coverage_total} · {category_coverage_pct}%</b>"
-        + f"\n📊 Страниц от максимума: <b>{page_coverage_pct}%</b> · <b>{coverage_pages_verified}/{coverage_total * RADAR_AUTOSCAN_DEPTH}</b>"
+        + f"\n📊 Страниц от максимума: <b>{page_coverage_pct}%</b> · <b>{coverage_pages_verified}/{coverage_total * _radar_layer_depth(state)}</b>"
         + (f"\n⏭ Нетоварных пропущено: <b>{skipped_nonproduct}</b>" if skipped_nonproduct else "")
         + f"\n📄 Подтверждено страниц в этом запуске: <b>{int(summary['pages_verified'])}</b>"
         + f"\n🧾 Чистых объявлений даты: <b>{int(summary['listings_seen'])}</b> · новых <b>{int(summary['new_listings'])}</b>"
@@ -5030,11 +5135,29 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         + (f"\n↳ unknown: {_radar_unknown_reason_text(summary.get('radar_unknown_reasons'))}" if int(summary.get('radar_unknown_blocked') or 0) else "")
         + f"\n📡 Новых Radar-сигналов: <b>+{int(summary['radar_saved'])}</b>"
         + (f" · уже были <b>{int(summary.get('radar_already_present') or 0)}</b>" if int(summary.get("radar_already_present") or 0) else "")
-        + f"\n⏱ Время: <b>{_human_duration(duration)}</b>"
-        + "\n\nAutoScan остановлен."
-        + (f" Следующий ежедневный запуск: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>." if state.get("daily_enabled") else ""),
+        + f"\n⏱ Время: <b>{_radar_autoscan_human_duration(duration)}</b>"
+        + (
+            "\n\n🧠 Fresh Layer готов. Следом автоматически запустится <b>48H Context Layer</b>: "
+            "15 страниц за вчера; вчерашние totals напрямую в Radar не публикуются."
+            if start_context_after_fresh else "\n\nAutoScan остановлен."
+        )
+        + (
+            f" Следующий ежедневный запуск: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>."
+            if state.get("daily_enabled") and not start_context_after_fresh else ""
+        ),
         reply_markup=notify_keyboard,
     )
+    if start_context_after_fresh:
+        # v4.20.0 audit fix: every completed Fresh round (manual or daily) gets
+        # one yesterday Context layer per Moscow day, even when the daily toggle
+        # is disabled. This matches the product contract: 15 today + 15 yesterday.
+        async with _radar_autoscan_guard:
+            current = await load_radar_autoscan_state()
+            if current.get("status") == "idle" and str(current.get("last_context_date") or "") != now.date().isoformat():
+                current = _radar_autoscan_new_context_round(current, now.date())
+                await save_radar_autoscan_state(current)
+                _radar_autoscan_stop_event.clear()
+                _radar_autoscan_wakeup.set()
     return state
 
 
@@ -5098,12 +5221,13 @@ def _radar_autoscan_live_stage_line(state: dict) -> str:
         stage = str(state.get("current_stage") or "")
         return f"⚙️ Этап: <b>{html.escape(stage)}</b>" if stage else ""
     try:
-        live = category_live_progress.get(_progress_key(key, target, RADAR_AUTOSCAN_DEPTH))
+        depth = _radar_layer_depth(state)
+        live = category_live_progress.get(_progress_key(key, target, depth))
     except Exception:
         live = None
     if live is None:
         stage = str(state.get("current_stage") or "")
-        labels = {"starting": "запуск", "scan": "поиск даты / страницы", "organic_gate": "Organic detail-check"}
+        labels = {"starting": "запуск", "scan": "поиск даты / страницы", "organic_gate": "Organic detail-check", "context_gate": "48H Context organic-check"}
         return f"⚙️ Этап: <b>{html.escape(labels.get(stage, stage))}</b>" if stage else ""
     phase = str(getattr(live, "phase", "") or "")
     if phase == "views":
@@ -5111,8 +5235,8 @@ def _radar_autoscan_live_stage_line(state: dict) -> str:
         ready = min(total_views, max(0, int(getattr(live, "views_ready", 0) or 0)))
         return f"👁 Этап: <b>точные просмотры {ready}/{total_views}</b>"
     if phase in {"collecting", "regional_date"}:
-        pages = max(0, min(RADAR_AUTOSCAN_DEPTH, int(getattr(live, "collection_index", 0) or 0)))
-        return f"📄 Этап: <b>страницы {pages}/{RADAR_AUTOSCAN_DEPTH}</b> · объявлений <b>{int(getattr(live, 'today_seen', 0) or 0)}</b>"
+        pages = max(0, min(depth, int(getattr(live, "collection_index", 0) or 0)))
+        return f"📄 Этап: <b>страницы {pages}/{depth}</b> · объявлений <b>{int(getattr(live, 'today_seen', 0) or 0)}</b>"
     requests = max(0, int(getattr(live, "network_requests", 0) or 0))
     page = max(0, int(getattr(live, "page", 0) or 0))
     transport = str(getattr(live, "transport_stage", "") or "")
@@ -5133,6 +5257,7 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
         return
     keys = list(state.get("category_keys") or [])
     total = len(keys)
+    round_depth = _radar_layer_depth(state)
     state["total"] = total
     if not state.get("target_date"):
         state["target_date"] = datetime.now(MOSCOW).date().isoformat()
@@ -5196,7 +5321,7 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                 state["failed"] = int(state.get("failed") or 0) + 1
                 state.setdefault("failed_categories", []).append({
                     "key": str(key), "name": str(key), "reason": "категория недоступна",
-                    "verified_pages": 0, "kind": "system",
+                    "verified_pages": 0, "depth": round_depth, "kind": "system",
                 })
                 state = await save_radar_autoscan_state(state)
                 issue_streak += 1
@@ -5230,7 +5355,7 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
             state = await save_radar_autoscan_state(state)
             log.info(
                 "DT Radar AutoScan category start round=%s index=%s/%s category=%s depth=%s target=%s parser_reused=True",
-                state.get("round_id"), idx + 1, total, cat.name, RADAR_AUTOSCAN_DEPTH, state.get("target_date"),
+                state.get("round_id"), idx + 1, total, cat.name, round_depth, state.get("target_date"),
             )
 
             result = None
@@ -5245,7 +5370,7 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
             try:
                 async def _category_pipeline():
                     local_result = await scan_one_category(
-                        parser, cat, RADAR_AUTOSCAN_USER_ID, RADAR_AUTOSCAN_DEPTH, str(state.get("target_date"))
+                        parser, cat, RADAR_AUTOSCAN_USER_ID, round_depth, str(state.get("target_date"))
                     )
                     local_radar_saved = 0
                     local_radar_stats = None
@@ -5260,7 +5385,7 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                     elif local_result.date_complete:
                         live_state = await load_radar_autoscan_state()
                         if live_state.get("status") == "running":
-                            live_state["current_stage"] = "organic_gate"
+                            live_state["current_stage"] = ("context_gate" if str(state.get("layer") or "fresh") == "context" else "organic_gate")
                             live_state["current_stage_started_at"] = _radar_autoscan_now_iso()
                             await save_radar_autoscan_state(live_state)
                         source_round_id = (
@@ -5268,8 +5393,10 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                             if str(state.get("mode") or "") == "retry"
                             else ""
                         ) or str(state.get("round_id") or "round")
+                        context_only = str(state.get("layer") or "fresh") == "context"
                         local_radar_stats = await record_autoscan_hot_detailed(
-                            source_round_id, cat.key, local_result.matched_ids or []
+                            source_round_id, cat.key, local_result.matched_ids or [],
+                            emit_signals=not context_only,
                         )
                         local_radar_saved = int(local_radar_stats.saved or 0)
                         expected_slots = min(RADAR_SCAN_TOP_LIMIT, int(local_radar_stats.eligible_with_views or 0))
@@ -5355,7 +5482,7 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
             state["processed"] = int(state.get("processed") or 0) + 1
             if result is not None:
                 state["pages_verified"] = int(state.get("pages_verified") or 0) + min(
-                    RADAR_AUTOSCAN_DEPTH, max(0, int(result.verified_pages or 0))
+                    round_depth, max(0, int(result.verified_pages or 0))
                 )
                 state["listings_seen"] = int(state.get("listings_seen") or 0) + max(0, int(result.today_seen or 0))
                 state["new_listings"] = int(state.get("new_listings") or 0) + max(0, int(result.new_count or 0))
@@ -5397,9 +5524,10 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                     "name": cat.name,
                     "reason": error_text or "нужно повторно подтвердить категорию",
                     "verified_pages": min(
-                        RADAR_AUTOSCAN_DEPTH,
+                        round_depth,
                         max(0, int(result.verified_pages or 0)) if result is not None else 0,
                     ),
+                    "depth": round_depth,
                     "kind": failure_kind,
                 })
                 issue_streak += 1
@@ -5532,33 +5660,49 @@ async def radar_autoscan_scheduler(bot: Bot) -> None:
 
             now = datetime.now(MOSCOW)
             today = now.date().isoformat()
-            if state.get("daily_enabled") and state.get("status") == "idle" and state.get("last_daily_date") != today:
+            if state.get("daily_enabled") and state.get("status") == "idle":
                 try:
                     hh, mm = [int(x) for x in str(state.get("daily_time") or RADAR_AUTOSCAN_DEFAULT_TIME).split(":", 1)]
                 except Exception:
                     hh, mm = 5, 0
                 due = now >= now.replace(hour=hh, minute=mm, second=0, microsecond=0)
                 if due:
-                    if state.get("skip_daily_if_completed_today", True) and state.get("last_completed_date") == today:
-                        state["last_daily_date"] = today
-                        state = await save_radar_autoscan_state(state)
-                        await _notify_radar_autoscan_admins(
-                            bot,
-                            "📡 <b>DT Radar — ежедневный круг пропущен</b>\n\n"
-                            "Сегодня уже был полностью завершён ручной круг. Следующий автозапуск — завтра.",
-                        )
-                    else:
+                    if state.get("last_daily_date") != today:
+                        if state.get("skip_daily_if_completed_today", True) and state.get("last_completed_date") == today:
+                            state["last_daily_date"] = today
+                            state = await save_radar_autoscan_state(state)
+                            await _notify_radar_autoscan_admins(
+                                bot,
+                                "📡 <b>DT Radar — Fresh Layer уже готов</b>\n\n"
+                                "Сегодня был полностью завершён ручной круг. Fresh повторять не буду; 48H Context за вчера всё равно будет собран.",
+                            )
+                        else:
+                            async with _radar_autoscan_guard:
+                                current = await load_radar_autoscan_state()
+                                if current.get("status") == "idle":
+                                    current = _radar_autoscan_new_round(current, "daily")
+                                    await save_radar_autoscan_state(current)
+                                    _radar_autoscan_stop_event.clear()
+                                    await _notify_radar_autoscan_admins(
+                                        bot,
+                                        f"📡 <b>DT Radar — Fresh Layer запущен</b>\n\n"
+                                        f"Сегодня: {len(current.get('category_keys') or [])} товарных категорий × {RADAR_AUTOSCAN_DEPTH} страниц. "
+                                        "После него один раз запустится отдельный 48H Context за вчера. Пользовательские сканы имеют приоритет.",
+                                    )
+                                    continue
+                    state = await load_radar_autoscan_state()
+                    if RADAR_CONTEXT_ENABLED and state.get("status") == "idle" and state.get("last_context_date") != today:
                         async with _radar_autoscan_guard:
                             current = await load_radar_autoscan_state()
-                            if current.get("status") == "idle":
-                                current = _radar_autoscan_new_round(current, "daily")
+                            if current.get("status") == "idle" and current.get("last_context_date") != today:
+                                current = _radar_autoscan_new_context_round(current, now.date())
                                 await save_radar_autoscan_state(current)
                                 _radar_autoscan_stop_event.clear()
                                 await _notify_radar_autoscan_admins(
                                     bot,
-                                    f"📡 <b>DT Radar — ежедневный круг запущен</b>\n\n"
-                                    f"{len(current.get('category_keys') or [])} товарных категорий × {RADAR_AUTOSCAN_DEPTH} страниц. "
-                                    "Пользовательские сканы имеют приоритет.",
+                                    f"🧠 <b>DT Radar — 48H Context Layer запущен</b>\n\n"
+                                    f"Вчера: {len(current.get('category_keys') or [])} товарных категорий × {RADAR_CONTEXT_DEPTH} страниц. "
+                                    "Слой собирает market history и не публикует вчерашние totals напрямую в Radar.",
                                 )
                                 continue
 
@@ -16864,7 +17008,7 @@ async def main() -> None:
         GUARANTEED_LOCAL_PARSER_LANES,
     )
     log.warning(
-        "v4.15.8 AutoScan Deadlock & Hard Stop online | category_watchdog=%ss | view_recovery_watchdog=%ss | background_pause=round | detail_lanes=foreground+background",
+        "v4.20.0 DT Radar Core 2.0 online | category_watchdog=%ss | view_recovery_watchdog=%ss | background_pause=round | detail_lanes=foreground+background",
         int(RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS), int(RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS),
     )
     ticker_task = None if DISTRIBUTED_WORKERS else asyncio.create_task(

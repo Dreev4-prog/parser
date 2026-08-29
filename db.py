@@ -42,6 +42,8 @@ if not _IS_SQLITE and not _IS_POSTGRES:
     raise RuntimeError("Unsupported DATABASE_URL. Use PostgreSQL (postgresql://...) or local SQLite for development.")
 
 USING_PERSISTENT_DATABASE = _IS_POSTGRES
+# Serialize additive schema migrations across Parser/AI/Lifecycle services during Railway rolling deploys.
+DB_MIGRATION_ADVISORY_LOCK_KEY = 420020260829
 DATABASE_BACKEND = "PostgreSQL" if _IS_POSTGRES else "SQLite (local development)"
 
 if _IS_SQLITE:
@@ -123,6 +125,14 @@ async def wait_for_database() -> None:
 async def init_db() -> None:
     await wait_for_database()
     async with engine.begin() as conn:
+        if _IS_POSTGRES:
+            # Parser, AI Worker and Lifecycle Worker can start at the same time.
+            # A transaction-scoped advisory lock prevents check-then-ALTER races
+            # across services while keeping local SQLite tests unchanged.
+            await conn.execute(
+                text("SELECT pg_advisory_xact_lock(CAST(:lock_key AS BIGINT))"),
+                {"lock_key": DB_MIGRATION_ADVISORY_LOCK_KEY},
+            )
         # v4.11.7: this table is created explicitly with IF NOT EXISTS before the
         # metadata pass. Railway starts parser/date/page/view services close together;
         # the explicit PostgreSQL DDL avoids a create_all check/create race on the new

@@ -39,10 +39,18 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 REMOTE_DATE_WORKER_ENABLED = _env_bool("REMOTE_DATE_WORKER_ENABLED", bool(REDIS_URL))
 DATE_REDIS_PREFIX = os.getenv("DATE_REDIS_PREFIX", "dtparser:dateworker").strip() or "dtparser:dateworker"
+DATE_CACHE_SCHEMA = "v4200-core2-audit3"
 # v4.8.3: cache/predictor survive releases, ephemeral jobs/pending/heartbeat do not.
-DATE_RUNTIME_PREFIX = os.getenv(
-    "DATE_RUNTIME_PREFIX", f"{DATE_REDIS_PREFIX}:runtime:v483"
-).strip() or f"{DATE_REDIS_PREFIX}:runtime:v483"
+_DATE_RUNTIME_MARKER = "v4200-core2-audit3"
+_DATE_RUNTIME_DEFAULT = f"{DATE_REDIS_PREFIX}:runtime:{_DATE_RUNTIME_MARKER}"
+_DATE_RUNTIME_OVERRIDE = os.getenv("DATE_RUNTIME_PREFIX", "").strip()
+if _DATE_RUNTIME_OVERRIDE and _DATE_RUNTIME_MARKER not in _DATE_RUNTIME_OVERRIDE:
+    log.warning(
+        "Ignoring incompatible DATE_RUNTIME_PREFIX=%s; release requires %s",
+        _DATE_RUNTIME_OVERRIDE, _DATE_RUNTIME_MARKER,
+    )
+    _DATE_RUNTIME_OVERRIDE = ""
+DATE_RUNTIME_PREFIX = _DATE_RUNTIME_OVERRIDE or _DATE_RUNTIME_DEFAULT
 DATE_STREAM = f"{DATE_RUNTIME_PREFIX}:jobs"
 DATE_GROUP = f"{DATE_RUNTIME_PREFIX}:workers"
 DATE_HEARTBEAT_KEY = f"{DATE_RUNTIME_PREFIX}:heartbeat"
@@ -152,15 +160,32 @@ def _deserialize_probe(raw: str | bytes | None) -> DateProbeResult | None:
         relation = str(data.get("relation") or "")
         if relation not in {"target", "newer", "older", "mixed", "empty"}:
             return None
+        page = int(data.get("page") or 0)
+        max_page = int(data["max_page"]) if data.get("max_page") is not None else None
+        actual_page = int(data["actual_page"]) if data.get("actual_page") is not None else None
+        coverage = float(data.get("date_coverage") or 0.0)
+        target_count = int(data.get("target_count") or 0)
+        newer_count = int(data.get("newer_count") or 0)
+        older_count = int(data.get("older_count") or 0)
+        if page < 1 or page > 50:
+            return None
+        if max_page is not None and (max_page < 1 or max_page > 50):
+            return None
+        if actual_page is not None and (actual_page < 1 or actual_page > 50):
+            return None
+        if not (0.0 <= coverage <= 1.0):
+            return None
+        if min(target_count, newer_count, older_count) < 0:
+            return None
         return DateProbeResult(
-            page=max(1, int(data.get("page") or 1)),
+            page=page,
             relation=relation,
-            max_page=(int(data["max_page"]) if data.get("max_page") is not None else None),
-            actual_page=(int(data["actual_page"]) if data.get("actual_page") is not None else None),
-            date_coverage=float(data.get("date_coverage") or 0.0),
-            target_count=int(data.get("target_count") or 0),
-            newer_count=int(data.get("newer_count") or 0),
-            older_count=int(data.get("older_count") or 0),
+            max_page=max_page,
+            actual_page=actual_page,
+            date_coverage=coverage,
+            target_count=target_count,
+            newer_count=newer_count,
+            older_count=older_count,
             newest_day=str(data.get("newest_day") or ""),
             oldest_day=str(data.get("oldest_day") or ""),
             source=str(data.get("source") or "remote"),
@@ -233,7 +258,7 @@ class RemoteDateManager:
         return self._redis
 
     def cache_key(self, cache_id: str) -> str:
-        return f"{DATE_REDIS_PREFIX}:cache:{cache_id}"
+        return f"{DATE_REDIS_PREFIX}:cache:{DATE_CACHE_SCHEMA}:{cache_id}"
 
     def pending_key(self, cache_id: str) -> str:
         return f"{DATE_RUNTIME_PREFIX}:pending:{cache_id}"
@@ -463,8 +488,9 @@ class RemoteDateManager:
         pending_ids: list[str] = []
         for cid, raw in zip(ids, raws):
             item = _deserialize_probe(raw)
-            if item is not None:
-                results[item.page] = item
+            expected_page = records[cid][0]
+            if item is not None and item.page == expected_page:
+                results[expected_page] = item
                 self.cache_hits_total += 1
                 self.last_batch_cached += 1
             else:
@@ -530,8 +556,9 @@ class RemoteDateManager:
                 raw = values[index * 2]
                 error = values[index * 2 + 1]
                 item = _deserialize_probe(raw)
-                if item is not None:
-                    results[item.page] = item
+                expected_page = records[cid][0]
+                if item is not None and item.page == expected_page:
+                    results[expected_page] = item
                     unresolved.discard(cid)
                     continue
                 if error:

@@ -58,6 +58,7 @@ os.environ["TRAFFIC_RECOVERY_QUIET_SECONDS"] = "10"
 from app_version import APP_VERSION
 from parser import KleinanzeigenParser, TemporaryAccessError, profile_page_dates, shutdown_shared_browser_runtime
 from date_manager import (
+    DATE_CACHE_SCHEMA,
     DATE_CACHE_TTL_SECONDS,
     DATE_ERROR_TTL_SECONDS,
     DATE_GROUP,
@@ -184,7 +185,7 @@ class DateWorkerProcess:
         TRAFFIC.report_refusal = tracked_refusal  # type: ignore[method-assign]
 
     def cache_key(self, cache_id: str) -> str:
-        return f"{DATE_REDIS_PREFIX}:cache:{cache_id}"
+        return f"{DATE_REDIS_PREFIX}:cache:{DATE_CACHE_SCHEMA}:{cache_id}"
 
     def pending_key(self, cache_id: str) -> str:
         return f"{DATE_RUNTIME_PREFIX}:pending:{cache_id}"

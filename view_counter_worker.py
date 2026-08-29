@@ -362,15 +362,47 @@ class ViewCounterWorker:
                 continue
         return out
 
+    async def _fail_stream_message_for_local_fallback(self, msg_id: str, job_id: str, reason: str) -> None:
+        """Finish a malformed Redis message so Parser falls back immediately.
+
+        A stream entry without a usable payload must never be merely ACKed: the
+        manager would keep polling its result key until the remote timeout. Publish
+        the same explicit failed marker used for an admitted ActiveJob instead.
+        """
+        pipe = self.redis.pipeline(transaction=False)
+        if job_id:
+            payload = {
+                "job_id": job_id,
+                "failed": True,
+                "error": reason[:500],
+                "completed_at": time.time(),
+            }
+            pipe.set(self.result_key(job_id), json.dumps(payload, ensure_ascii=False), ex=VIEW_RESULT_TTL_SECONDS)
+            pipe.hset(
+                self.progress_key(job_id),
+                mapping={"state": "remote_failed", "updated_at": time.time()},
+            )
+            pipe.expire(self.progress_key(job_id), VIEW_RESULT_TTL_SECONDS)
+            pipe.delete(self.partial_key(job_id))
+        pipe.xack(VIEW_STREAM, VIEW_GROUP, msg_id)
+        pipe.xdel(VIEW_STREAM, msg_id)
+        await pipe.execute()
+        log.error("View stream message handed back to local fallback job=%s reason=%s", job_id[:10], reason)
+
     async def _load_message(self, msg_id: str, fields: dict[str, Any]) -> bool:
         job_id = str((fields or {}).get("job_id") or "")
         if not job_id or job_id in self.active:
             if not job_id:
-                await self.redis.xack(VIEW_STREAM, VIEW_GROUP, msg_id)
+                # There is no manager-visible job id to signal. Remove the corrupt
+                # stream entry completely so it cannot be reclaimed forever.
+                pipe = self.redis.pipeline(transaction=False)
+                pipe.xack(VIEW_STREAM, VIEW_GROUP, msg_id)
+                pipe.xdel(VIEW_STREAM, msg_id)
+                await pipe.execute()
             return False
         raw = await self.redis.get(self.payload_key(job_id))
         if not raw:
-            await self.redis.xack(VIEW_STREAM, VIEW_GROUP, msg_id)
+            await self._fail_stream_message_for_local_fallback(msg_id, job_id, "view payload missing")
             return False
         try:
             payload = json.loads(raw)
@@ -379,7 +411,7 @@ class ViewCounterWorker:
             all_urls = []
             payload = {}
         if not all_urls:
-            await self.redis.xack(VIEW_STREAM, VIEW_GROUP, msg_id)
+            await self._fail_stream_message_for_local_fallback(msg_id, job_id, "view payload invalid or empty")
             return False
 
         partial = await self._load_partial_results(job_id)
@@ -520,12 +552,20 @@ class ViewCounterWorker:
         self.requeues_total += 1
         try:
             raw = await self.redis.get(self.payload_key(job.job_id))
-            payload = json.loads(raw) if raw else {"job_id": job.job_id}
+            if not raw:
+                await self.fail_job_for_local_fallback(job, f"requeue payload missing: {reason}")
+                return
+            payload = json.loads(raw)
+            urls = payload.get("urls") if isinstance(payload, dict) else None
+            if not isinstance(urls, list) or not urls:
+                await self.fail_job_for_local_fallback(job, f"requeue payload invalid: {reason}")
+                return
             payload["requeues"] = job.requeues
             payload["last_requeue_at"] = time.time()
             payload["last_requeue_reason"] = reason[:300]
         except Exception:
-            payload = {"job_id": job.job_id, "requeues": job.requeues}
+            await self.fail_job_for_local_fallback(job, f"requeue payload unreadable: {reason}")
+            return
         pipe = self.redis.pipeline(transaction=False)
         pipe.set(self.payload_key(job.job_id), json.dumps(payload, ensure_ascii=False), ex=VIEW_JOB_TTL_SECONDS)
         pipe.hset(

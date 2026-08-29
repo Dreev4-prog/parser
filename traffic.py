@@ -80,7 +80,7 @@ class AdaptiveTrafficManager:
 
         self._condition = asyncio.Condition()
         self._active = {"scan": 0, "view": 0, "browser": 0}
-        self._background_view_active = 0
+        self._background_view_active = 0  # low-priority view/browser leases
         self._background_pauses = 0
         self._scan_jobs_active = 0
         self._next_allowed = {"scan": 0.0, "view": 0.0, "browser": 0.0}
@@ -228,7 +228,7 @@ class AdaptiveTrafficManager:
     async def lease(self, kind: str, priority: str = "normal"):
         if kind not in {"scan", "view", "browser"}:
             raise ValueError(f"Unknown traffic kind: {kind}")
-        is_background = kind == "view" and priority == "background"
+        is_background = priority == "background" and kind in {"view", "browser"}
         acquired = False
         try:
             while not acquired:

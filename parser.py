@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import unquote, urljoin, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qs, unquote, urljoin, urlparse, urlsplit, urlunsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -375,6 +375,48 @@ def extract_external_id(url: str) -> str:
     return nums[0] if nums else url
 
 
+def _strict_external_id(url: str) -> str | None:
+    """Return a listing id only when it is structurally present in a listing URL."""
+    if not url:
+        return None
+    try:
+        parsed = urlparse(str(url))
+    except Exception:
+        return None
+    if "/s-anzeige/" not in (parsed.path or ""):
+        return None
+    match = re.search(r"/(\d{6,})-\d+-\d+(?:/|$)", parsed.path or "")
+    return match.group(1) if match else None
+
+
+def _listing_identity_matches(url: str, expected_external_id: str | None) -> bool:
+    """Fail closed when a navigation redirects away from the requested listing."""
+    expected = str(expected_external_id or "").strip()
+    if not expected or not expected.isdigit():
+        return False
+    if not _allowed_url(url):
+        return False
+    return _strict_external_id(url) == expected
+
+
+def _view_endpoint_matches_ad_id(url: str, expected_external_id: str | None) -> bool:
+    """Bind a public view-counter response to the exact requested ad id."""
+    expected = str(expected_external_id or "").strip()
+    if not expected or not expected.isdigit():
+        return False
+    try:
+        parsed = urlparse(str(url))
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not (host == "kleinanzeigen.de" or host.endswith(".kleinanzeigen.de")):
+        return False
+    if not (parsed.path or "").endswith("/s-vac-inc-get.json"):
+        return False
+    values = parse_qs(parsed.query, keep_blank_values=True).get("adId", [])
+    return len(values) == 1 and str(values[0]).strip() == expected
+
+
 def _allowed_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
@@ -382,6 +424,27 @@ def _allowed_url(url: str) -> bool:
         return False
     host = (parsed.hostname or "").lower()
     return parsed.scheme == "https" and (host == "kleinanzeigen.de" or host.endswith(".kleinanzeigen.de"))
+
+
+def _category_feed_identity(url: str) -> tuple[str, str | None] | None:
+    """Return (category_code, location_id) for one public category feed URL."""
+    if not _allowed_url(url):
+        return None
+    try:
+        path = unquote(urlparse(str(url)).path or "")
+    except Exception:
+        return None
+    match = re.search(r"/(c\d+)(?:l(\d+))?(?:$|/)", path)
+    if not match:
+        return None
+    return match.group(1), (match.group(2) or None)
+
+
+def _category_feed_identity_matches(requested_url: str, final_url: str) -> bool:
+    """Fail closed when a result-page request redirects to another feed."""
+    expected = _category_feed_identity(requested_url)
+    resolved = _category_feed_identity(final_url)
+    return expected is not None and resolved == expected
 
 
 FILTER_BUSINESS_SELLERS = os.getenv("FILTER_BUSINESS_SELLERS", "1").strip().lower() not in {
@@ -745,13 +808,34 @@ def _promotion_attr_blob(element) -> str:
 
 
 def _is_paid_bump_icon(element) -> bool:
-    """Detect the icon-only Hochschieben marker without matching generic UI arrows."""
+    """Detect the icon-only Hochschieben marker without matching product URLs/titles.
+
+    A listing link such as ``/s-anzeige/push-up-board/...`` is product content, not
+    promotion metadata. Only icon-like elements may prove a bump from a bump token;
+    generic arrow-up tokens still require an explicit promotion wrapper.
+    """
     blob = _promotion_attr_blob(element)
     if not blob:
         return False
-    if PROMOTED_BUMP_ICON_TOKEN_RE.search(blob):
-        return True
     tag_name = str(getattr(element, "name", "") or "").lower()
+    icon_like = tag_name in {"svg", "use", "i", "span", "img"}
+    if icon_like and PROMOTED_BUMP_ICON_TOKEN_RE.search(blob):
+        # span/img are accepted only when their own/nearby metadata identifies a
+        # feature; SVG/use/i are already semantic icon carriers.
+        if tag_name in {"svg", "use", "i"}:
+            return True
+        contexts = [blob]
+        try:
+            parent = element.parent
+            for _ in range(3):
+                if parent is None:
+                    break
+                contexts.append(_promotion_attr_blob(parent))
+                parent = getattr(parent, "parent", None)
+        except Exception:
+            pass
+        if any(PROMOTION_CONTEXT_TOKEN_RE.search(text or "") for text in contexts):
+            return True
     if tag_name not in {"svg", "use", "i", "span"} or not PROMOTED_UP_ARROW_TOKEN_RE.search(blob):
         return False
     # Generic back-to-top/navigation arrows are common. Accept an arrow token only
@@ -838,9 +922,18 @@ def _is_promoted_listing_node(node) -> bool:
                     value = None
                 if value:
                     attrs.append(str(value).strip())
+            # Attribute metadata is useful, but ordinary product/accessibility
+            # labels can legitimately contain words such as "Highlight" or
+            # "Gallery".  Those generic words prove paid visibility only when the
+            # attribute itself carries explicit feature/paid semantics.
             if any(
                 re.search(
-                    r"(?:^|[-_: ])(?:bumpup|bump-up|hochgeschoben|hochschieben|topad|top-ad|highlight|gallery|galerie|promoted|sponsored)(?:$|[-_: ])",
+                    r"(?:^|[-_: ])(?:bumpup|bump-up|hochgeschoben|hochschieben|topad|top-ad|promoted|sponsored)(?:$|[-_: ])",
+                    value,
+                    flags=re.IGNORECASE,
+                )
+                or re.search(
+                    r"(?:^|[-_: ])(?:paid[-_: ]?(?:highlight|gallery|galerie)|feature[-_: ]?(?:highlight|gallery|galerie)|galerie[-_: ]?ad|gallery[-_: ]?ad)(?:$|[-_: ])",
                     value,
                     flags=re.IGNORECASE,
                 )
@@ -968,7 +1061,7 @@ def _parse_category_html_with_stats(html_text: str) -> tuple[list[ParsedListing]
                 if link and link.get("href"):
                     blocked_url = urljoin(BASE_URL, link["href"])
                     if _allowed_url(blocked_url):
-                        blocked_id = extract_external_id(blocked_url)
+                        blocked_id = _strict_external_id(blocked_url)
                         if promoted_node and blocked_id and blocked_id not in promoted_ids:
                             promoted_ids.append(blocked_id)
                         if reduced_node and blocked_id and blocked_id not in price_reduced_ids:
@@ -989,7 +1082,12 @@ def _parse_category_html_with_stats(html_text: str) -> tuple[list[ParsedListing]
             if full_url in seen_urls:
                 duplicate_cards += 1
             continue
-        external_id = extract_external_id(full_url)
+        # Result cards are analytics input, so never fall back to an arbitrary
+        # long number found in a malformed slug.  Only a structurally valid
+        # Kleinanzeigen listing id is admitted.
+        external_id = _strict_external_id(full_url)
+        if external_id is None:
+            continue
         if external_id in seen_ids:
             duplicate_cards += 1
             continue
@@ -1108,6 +1206,7 @@ def category_page_info_from_html(
     *,
     requested_page: int,
     final_url: str,
+    requested_url: str | None = None,
 ) -> CategoryPageInfo:
     """Parse one result page and attach verification/quality diagnostics."""
     items, stats = _parse_category_html_with_stats(html_text)
@@ -1178,6 +1277,12 @@ def category_page_info_from_html(
     elif requested_page == 1:
         final_url_confirms_page = True
         page_verified = True
+
+    if requested_url and not _category_feed_identity_matches(requested_url, final_url):
+        request_matches = False
+        page_verified = False
+        final_url_confirms_page = False
+        warnings.append("final URL category/location identity mismatch")
 
     if not final_url_confirms_page and (offset_mismatch or max_page_violation):
         request_matches = False
@@ -2013,14 +2118,14 @@ class KleinanzeigenParser:
 
         if self.scan_transport == "browser":
             text, final_url = await self._fetch_scan_browser_document(url)
-            info = category_page_info_from_html(text, requested_page=requested_page, final_url=final_url)
+            info = category_page_info_from_html(text, requested_page=requested_page, final_url=final_url, requested_url=url)
         elif self.scan_transport == "hybrid":
             text, final_url = await self._fetch_scan_hybrid_document(url)
-            info = category_page_info_from_html(text, requested_page=requested_page, final_url=final_url)
+            info = category_page_info_from_html(text, requested_page=requested_page, final_url=final_url, requested_url=url)
         else:
             response = await self._fetch_response(url)
             info = category_page_info_from_html(
-                response.text, requested_page=requested_page, final_url=str(response.url)
+                response.text, requested_page=requested_page, final_url=str(response.url), requested_url=url
             )
 
         # Checkpoint only trustworthy pages. Weak/suspicious pages are intentionally
@@ -2116,6 +2221,8 @@ class KleinanzeigenParser:
                     return
                 if not PASSIVE_VIEW_ENDPOINT_RE.search(response.url):
                     return
+                if not _view_endpoint_matches_ad_id(response.url, ad_id):
+                    return
                 text = await response.text()
                 value, shape = _extract_passive_view_payload(text[:350_000], ad_id=ad_id)
                 if value is not None and not future.done():
@@ -2124,7 +2231,7 @@ class KleinanzeigenParser:
                 pass
 
         def on_response(response):
-            if PASSIVE_VIEW_ENDPOINT_RE.search(response.url):
+            if PASSIVE_VIEW_ENDPOINT_RE.search(response.url) and _view_endpoint_matches_ad_id(response.url, ad_id):
                 try:
                     tasks.append(asyncio.create_task(capture(response)))
                 except Exception:
@@ -2153,11 +2260,12 @@ class KleinanzeigenParser:
 
     @classmethod
     def _view_value_from_extra_text(cls, text: str | None) -> tuple[int | None, str | None]:
-        """Fallback for A/B markup where the eye counter lost its old id.
+        """Fail-closed parser for the public date/time + eye-counter block.
 
-        The extra-info block normally contains only the publication date/time and
-        the public view count. Remove date/time tokens first, then use the last
-        remaining standalone integer as the counter.
+        Remove publication date/time tokens first. The remaining text is trusted
+        only when it contains exactly one standalone integer. Older code selected
+        the *last* integer, which could silently turn a postal code/other metadata
+        into a believable but wrong view count when an A/B template added fields.
         """
         if not text:
             return None, None
@@ -2168,9 +2276,9 @@ class KleinanzeigenParser:
         cleaned = re.sub(r"\b\d{1,2}:\d{2}\b", " ", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         nums = re.findall(r"(?<!\d)(\d{1,9})(?!\d)", cleaned)
-        if not nums:
+        if len(nums) != 1:
             return None, raw
-        value = int(nums[-1])
+        value = int(nums[0])
         if value > 999_999_999:
             return None, raw
         return value, raw
@@ -2324,7 +2432,9 @@ class KleinanzeigenParser:
                 context = await self._ensure_view_browser()
                 page = await context.new_page()
                 await self._install_lightweight_route(page)
-                ad_id = extract_external_id(url)
+                ad_id = _strict_external_id(url)
+                if ad_id is None:
+                    return ViewCountResult(None, None, "verified:invalid-identity", url, None, "missing listing external_id")
                 passive_future, passive_tasks = self._attach_passive_view_capture(page, ad_id)
 
                 async with TRAFFIC.lease("browser", traffic_priority):
@@ -2337,6 +2447,9 @@ class KleinanzeigenParser:
 
                 final_url = page.url
                 title = await page.title()
+                if not _listing_identity_matches(final_url, ad_id):
+                    last_error = f"wrong_identity expected={ad_id} final={final_url}"
+                    continue
                 try:
                     await page.wait_for_selector(
                         "#viewad-cntr-num, [data-testid='view-count'], #viewad-extra-info",
@@ -2468,7 +2581,7 @@ class KleinanzeigenParser:
         task is removed as soon as it finishes, so later 3/6/12h measurements always
         perform a fresh read.
         """
-        ad_id = extract_external_id(url)
+        ad_id = _strict_external_id(url)
         key = str(ad_id or url)
         task = _DIRECT_VIEW_INFLIGHT.get(key)
         shared = task is not None and not task.done()
@@ -2487,7 +2600,9 @@ class KleinanzeigenParser:
         return result, shared
 
     async def _direct_view_http(self, url: str, *, traffic_priority: str = "normal") -> ViewCountResult:
-        ad_id = extract_external_id(url)
+        ad_id = _strict_external_id(url)
+        if ad_id is None:
+            return ViewCountResult(None, None, "direct-http:invalid-identity", url, None, "missing listing external_id")
         endpoint = self._direct_view_url(ad_id)
         try:
             async with TRAFFIC.lease("view", traffic_priority):
@@ -2495,6 +2610,12 @@ class KleinanzeigenParser:
                     endpoint,
                     headers=self._direct_view_headers(url),
                     timeout=12.0,
+                )
+            final_endpoint = str(response.url)
+            if not _view_endpoint_matches_ad_id(final_endpoint, ad_id):
+                return ViewCountResult(
+                    None, None, "direct-http:wrong-identity", final_endpoint, None,
+                    error=f"Counter endpoint identity mismatch for adId={ad_id}",
                 )
             if response.status_code in {403, 429}:
                 await TRAFFIC.report_refusal(response.status_code, "view")
@@ -2536,7 +2657,9 @@ class KleinanzeigenParser:
             pass
 
     async def _direct_view_context_request(self, url: str, *, traffic_priority: str = "normal") -> ViewCountResult:
-        ad_id = extract_external_id(url)
+        ad_id = _strict_external_id(url)
+        if ad_id is None:
+            return ViewCountResult(None, None, "direct-context:invalid-identity", url, None, "missing listing external_id")
         endpoint = self._direct_view_url(ad_id)
         try:
             # In hybrid mode the standalone APIRequestContext already owns the
@@ -2572,6 +2695,16 @@ class KleinanzeigenParser:
                         timeout=12_000,
                         fail_on_status_code=False,
                     )
+            final_endpoint = str(getattr(response, "url", endpoint) or endpoint)
+            if not _view_endpoint_matches_ad_id(final_endpoint, ad_id):
+                try:
+                    await response.dispose()
+                except Exception:
+                    pass
+                return ViewCountResult(
+                    None, None, f"{source_prefix}:wrong-identity", final_endpoint, None,
+                    error=f"Counter endpoint identity mismatch for adId={ad_id}",
+                )
             if response.status in {403, 429}:
                 await TRAFFIC.report_refusal(response.status, "view")
             elif response.status == 200:
@@ -2670,7 +2803,9 @@ class KleinanzeigenParser:
             context = await self._ensure_view_browser()
             page = await context.new_page()
             await self._install_lightweight_route(page)
-            ad_id = extract_external_id(url)
+            ad_id = _strict_external_id(url)
+            if ad_id is None:
+                return ViewCountResult(None, None, "browser:invalid-identity", url, None, "missing listing external_id")
             passive_future, passive_tasks = self._attach_passive_view_capture(page, ad_id)
 
             async with TRAFFIC.lease("browser", traffic_priority):
@@ -2682,6 +2817,11 @@ class KleinanzeigenParser:
                     await TRAFFIC.report_success("browser")
             final_url = page.url
             page_title = await page.title()
+            if not _listing_identity_matches(final_url, ad_id):
+                return ViewCountResult(
+                    None, None, "browser:wrong-identity", final_url, page_title,
+                    error=f"Listing identity mismatch for external_id={ad_id}",
+                )
 
             # Fast path in v2.6.9: wait briefly for the public counter endpoint that
             # Kleinanzeigen itself requests while rendering this page. We do NOT call
@@ -2738,6 +2878,9 @@ class KleinanzeigenParser:
         if not _allowed_url(url) or "/s-anzeige/" not in url:
             return ViewNetworkProbe(None, "invalid-url", None, None, [], error="Нужна публичная ссылка Kleinanzeigen")
 
+        expected_ad_id = _strict_external_id(url)
+        if expected_ad_id is None:
+            return ViewNetworkProbe(None, "invalid-identity", None, None, [], error="Не найден external_id объявления")
         page = None
         capture_tasks: list[asyncio.Task] = []
         captured: list[dict] = []
@@ -2761,9 +2904,9 @@ class KleinanzeigenParser:
                         text = text[:350_000]
                     parsed_views = None
                     parsed_shape = None
-                    if PASSIVE_VIEW_ENDPOINT_RE.search(response.url):
+                    if PASSIVE_VIEW_ENDPOINT_RE.search(response.url) and _view_endpoint_matches_ad_id(response.url, expected_ad_id):
                         parsed_views, parsed_shape = _extract_passive_view_payload(
-                            text, ad_id=extract_external_id(url)
+                            text, ad_id=expected_ad_id
                         )
                     captured.append({
                         "url": response.url,
@@ -2787,6 +2930,8 @@ class KleinanzeigenParser:
             await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
             final_url = page.url
             page_title = await page.title()
+            if not _listing_identity_matches(final_url, expected_ad_id):
+                return ViewNetworkProbe(None, "wrong-identity", final_url, page_title, [], error=f"expected={expected_ad_id}")
             try:
                 await page.wait_for_selector("#viewad-title", state="attached", timeout=8_000)
             except Exception:
@@ -3108,7 +3253,7 @@ class KleinanzeigenParser:
         if self._hybrid_html_is_challenge(html_text):
             return DetailIntegrityResult(False, reason="challenge", final_url=final_url, status_code=status)
 
-        final_id = extract_external_id(final_url)
+        final_id = _strict_external_id(final_url)
         identity_ok = bool(expected and final_id == expected)
         if expected and not identity_ok:
             return DetailIntegrityResult(False, reason="wrong_identity", final_url=final_url, status_code=status)
@@ -3133,7 +3278,7 @@ class KleinanzeigenParser:
                 promotion_reason = icon_reason
             explicit_feature_attr = re.compile(
                 r"(?:^|[-_: ])(?:topad|top-ad|bumpup|bump-up|hochgeschoben|hochschieben|"
-                r"paid-highlight|feature-highlight|paid-gallery|feature-gallery|galerie-ad|"
+                r"paid-highlight|feature-highlight|paid-gallery|feature-gallery|paid-galerie|feature-galerie|galerie-ad|"
                 r"promoted|sponsored)(?:$|[-_: ])", re.IGNORECASE
             )
             for element in detail_root.find_all(True):
@@ -3141,7 +3286,15 @@ class KleinanzeigenParser:
                 classes = _class_set(element)
                 attrs = " ".join(str(element.get(name) or "") for name in ("id", "data-testid", "aria-label", "title"))
                 class_text = " ".join(classes)
-                if explicit_feature_attr.search(class_text) or explicit_feature_attr.search(attrs):
+                # Reuse the same explicit feature-class contract as search cards.
+                # This closes detail-page false negatives for templates such as
+                # featurelabel-highlight / featuretag-gallery.
+                if (
+                    classes & PROMOTED_BADGE_CLASSES
+                    or any(PROMOTED_FEATURE_CLASS_RE.match(cls) for cls in classes)
+                    or explicit_feature_attr.search(class_text)
+                    or explicit_feature_attr.search(attrs)
+                ):
                     promoted = True
                     promotion_reason = promotion_reason or "promoted_dom_marker"
                     break
@@ -3157,17 +3310,25 @@ class KleinanzeigenParser:
                     break
             if not promoted:
                 sample = html_text[:1_500_000]
-                if re.search(r'(?i)"(?:isTopAd|topAd|isBumped|bumpUp|isPromoted|sponsored)"\s*:\s*true', sample):
+                if re.search(
+                    r'(?i)"(?:isTopAd|topAd|isBumped|bumpUp|isPromoted|sponsored|isHighlighted|isHighlight|isGalleryAd|galleryAd|isGalerieAd|galerieAd)"\s*:\s*true',
+                    sample,
+                ):
                     promoted = True
                     promotion_reason = "promoted_metadata"
-        except Exception:
-            promoted = False
+        except Exception as exc:
+            log.warning("Detail Organic promotion parse failed external_id=%s error=%s", expected, exc.__class__.__name__)
+            return DetailIntegrityResult(
+                False, reason="integrity_parse_error", final_url=final_url, status_code=status
+            )
 
-        reduced = False
         try:
             reduced = _is_price_reduced_listing_node(detail_root)
-        except Exception:
-            reduced = False
+        except Exception as exc:
+            log.warning("Detail Organic price-integrity parse failed external_id=%s error=%s", expected, exc.__class__.__name__)
+            return DetailIntegrityResult(
+                False, reason="integrity_parse_error", final_url=final_url, status_code=status
+            )
 
         if promoted:
             return DetailIntegrityResult(
@@ -3187,7 +3348,7 @@ class KleinanzeigenParser:
         page = await context.new_page()
         await self._install_lightweight_route(page)
         try:
-            async with TRAFFIC.lease("view", traffic_priority):
+            async with TRAFFIC.lease("browser", traffic_priority):
                 response = await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
             if response is None:
                 return "", str(page.url or url), 0
@@ -3219,7 +3380,9 @@ class KleinanzeigenParser:
         if not _allowed_url(url) or "/s-anzeige/" not in url:
             return DetailIntegrityResult(False, reason="invalid_url", final_url=url)
 
-        expected = str(expected_external_id or extract_external_id(url) or "").strip()
+        expected = str(expected_external_id or _strict_external_id(url) or "").strip()
+        if not expected or not expected.isdigit():
+            return DetailIntegrityResult(False, reason="invalid_identity", final_url=url)
         last = DetailIntegrityResult(False, reason="detail_unknown", final_url=url)
         retryable_prefixes = ("transport:", "http_403", "http_429", "http_5", "weak_document", "challenge", "wrong_identity", "wrong_redirect")
 
@@ -3300,13 +3463,17 @@ class KleinanzeigenParser:
             return False
         if response.status_code in {403, 429} or response.status_code >= 500:
             return None
+        # For a 2xx/3xx document, establish identity *before* interpreting page
+        # text. A redirect to a category/different ad can contain generic
+        # "Anzeige nicht mehr verfügbar" copy; treating that as False would create
+        # a fake Fast Sold event for the originally watched listing.
+        external_id = _strict_external_id(url)
+        final_url = str(response.url)
+        if external_id is None or not _listing_identity_matches(final_url, external_id):
+            return None
         text = BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True).lower()
         if any(phrase in text for phrase in UNAVAILABLE_PHRASES):
             return False
-        # A live detail page normally still contains its ad ID or a detail heading.
-        external_id = extract_external_id(url)
-        if external_id and external_id in response.text:
-            return True
-        if "/s-anzeige/" in str(response.url):
+        if external_id in response.text or "/s-anzeige/" in final_url:
             return True
         return None

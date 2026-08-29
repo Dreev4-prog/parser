@@ -265,10 +265,16 @@ async def _live_detail_organic_gate(
             external_id, promoted=True, reduced=False, promotion_reason=resurrection_reason
         )
         return False, f"detail_promoted:{resurrection_reason}", None
+    # Foreground Radar admission (user scan / AutoScan) must never infer
+    # background priority from the traffic policy. During an AutoScan round the
+    # background lane is intentionally paused; inferring ``background`` here
+    # would make the foreground category wait on its own pause. Maintenance
+    # callers that are genuinely low-priority pass force_priority="background"
+    # explicitly (sweep / Verified Organic Velocity).
     detail_priority = (
         str(force_priority)
         if force_priority in {"normal", "background"}
-        else ("normal" if int(getattr(TRAFFIC, "background_during_scans", 0)) <= 0 else "background")
+        else "normal"
     )
     detail_lane = "background" if detail_priority == "background" else "normal"
     async with _detail_gate_locks[detail_lane]:
@@ -839,13 +845,16 @@ async def record_autoscan_hot_detailed(
     matched_ids: list[str] | tuple[str, ...] | set[str],
     *,
     limit: int = RADAR_SCAN_TOP_LIMIT,
+    emit_signals: bool = True,
 ) -> RadarAdmissionStats:
     """Fill TOP-N with verified organic ads, using a bounded ranked reserve.
 
     v4.15.4 fixes the old ``rows[:12]`` dead end. Exact-view candidates are
     considered in rank order and proven paid/reduced rows are skipped until
-    ``limit`` live-detail-verified organic signals are saved or the ranked list
-    ends. An UNKNOWN detail verdict stops the category fail-closed because that
+    ``limit`` live-detail-verified organic rows are admitted or the ranked list
+    ends. With ``emit_signals=False`` the v4.20.0 Context Layer performs the same
+    hidden-promotion cleanup without emitting public Radar snapshots. An UNKNOWN
+    detail verdict stops the category fail-closed because that
     candidate may belong ahead of every lower-ranked ad.
     """
     ids = [str(x).strip() for x in matched_ids if str(x).strip()]
@@ -923,14 +932,18 @@ async def record_autoscan_hot_detailed(
         views = max(0, int(listing.view_count or 0))
         view_bonus = min(8, int(round(math.log10(max(1, demand_views) + 1) * 2.5)))
         score = _clamp_score(58 + percentile * 20 + view_bonus)
+        if not emit_signals:
+            # 48H Context is evidence, not a second public feed. Exact counters and
+            # ViewHistory remain available for persistence/repeatability, but an
+            # inherited yesterday total cannot create a Radar snapshot.
+            admitted += 1
+            continue
         source_key = f"autoscan:{clean_round}:{listing.external_id}"
         async with SessionLocal() as session:
             was_existing = bool((await session.execute(
                 select(RadarSnapshot.id).where(RadarSnapshot.source_key == source_key).limit(1)
             )).scalar_one_or_none())
         result = await _upsert_signal(
-            # Retry rounds reuse the parent round id, so already committed higher
-            # ranks are idempotent while a brand-new manual/daily round stays fresh.
             source_key=source_key,
             source="radar_autoscan",
             listing=listing,
@@ -1000,7 +1013,9 @@ async def record_autoscan_hot(
     )).saved)
 
 
-async def record_verified_velocity_signals(external_ids: list[str] | tuple[str, ...] | set[str]) -> int:
+async def record_verified_velocity_signals(
+    external_ids: list[str] | tuple[str, ...] | set[str], *, traffic_priority: str = "normal"
+) -> int:
     """Admit newly certified 400+ baselines only from their observed delta.
 
     This is intentionally not a shortcut back to the inherited total.  After two
@@ -1058,7 +1073,7 @@ async def record_verified_velocity_signals(external_ids: list[str] | tuple[str, 
                 exact_clock = age_minutes is not None
             else:
                 age_minutes, exact_clock = listing_age_minutes(listing.posted_text, measured_at)
-            if not exact_clock or age_minutes is None or age_minutes < 5.0 or age_minutes > 24.0 * 60.0:
+            if not exact_clock or age_minutes is None or age_minutes < 5.0 or age_minutes > 48.0 * 60.0:
                 continue
             ext = str(listing.external_id)
             listing_by_id[ext] = listing
@@ -1085,7 +1100,9 @@ async def record_verified_velocity_signals(external_ids: list[str] | tuple[str, 
             metric = demand_safe_metric(listing, listing.view_count, listing.views_checked_at or listing.last_seen_at)
             if metric.views is None or metric.kind != "observed_delta":
                 continue
-            allowed, reason, verified_at = await _live_detail_organic_gate(listing)
+            allowed, reason, verified_at = await _live_detail_organic_gate(
+                listing, force_priority=("background" if traffic_priority == "background" else "normal")
+            )
             if not allowed:
                 log.info(
                     "Verified velocity Radar admission blocked external_id=%s reason=%s",
@@ -2147,7 +2164,7 @@ async def bump_resurrection_integrity_sweep_once() -> dict[str, int]:
         traffic_snapshot = await TRAFFIC.snapshot()
         if int(getattr(traffic_snapshot, "scan_jobs_active", 0) or 0) > 0 or int(getattr(traffic_snapshot, "background_pauses", 0) or 0) > 0:
             interrupted = True
-            log.info("v4.15.8 Radar sweep paused for foreground scan checked=%s", stats["checked"])
+            log.info("v4.20.0 Radar sweep paused for foreground scan checked=%s", stats["checked"])
             break
         stats["products"] += 1
         async with SessionLocal() as session:
@@ -2166,7 +2183,7 @@ async def bump_resurrection_integrity_sweep_once() -> dict[str, int]:
             if int(getattr(traffic_snapshot, "scan_jobs_active", 0) or 0) > 0 or int(getattr(traffic_snapshot, "background_pauses", 0) or 0) > 0:
                 interrupted = True
                 product_clean = False
-                log.info("v4.15.8 Radar sweep yielded inside family product=%s checked=%s", product_id, stats["checked"])
+                log.info("v4.20.0 Radar sweep yielded inside family product=%s checked=%s", product_id, stats["checked"])
                 break
             stats["checked"] += 1
             allowed, reason, _verified_at = await _live_detail_organic_gate(

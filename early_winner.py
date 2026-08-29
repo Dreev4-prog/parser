@@ -380,22 +380,25 @@ def _age_matched_rows(row: FeatureRow, category_rows: list[FeatureRow]) -> list[
 
     Views/hour is already age-normalised, but very young listings are noisier than
     listings that have had several hours to accumulate traffic.  Demand Score 2.1
-    therefore prefers listings from a similar age band and falls back to the whole
-    category only when the band is too small.
+    therefore compares only within the explicit age cohort. A sparse cohort stays
+    sparse rather than borrowing 24-48h rows for a 0-3h listing and contaminating
+    Relative View Velocity.
     """
     age = max(5.0, float(row.age_minutes))
-    if age <= 30:
-        low, high = 5.0, 45.0
-    elif age <= 90:
-        low, high = 20.0, 150.0
-    elif age <= 240:
-        low, high = 60.0, 360.0
-    elif age <= 720:
-        low, high = 180.0, 960.0
+    # v4.20.0 48H Market Context. These are the explicit cohorts shown in
+    # product logic/admin docs: 0-3h / 3-6h / 6-12h / 12-24h / 24-48h.
+    if age <= 3.0 * 60.0:
+        low, high = 5.0, 3.0 * 60.0
+    elif age <= 6.0 * 60.0:
+        low, high = 3.0 * 60.0, 6.0 * 60.0
+    elif age <= 12.0 * 60.0:
+        low, high = 6.0 * 60.0, 12.0 * 60.0
+    elif age <= 24.0 * 60.0:
+        low, high = 12.0 * 60.0, 24.0 * 60.0
     else:
-        low, high = 480.0, 24.0 * 60.0
+        low, high = 24.0 * 60.0, 48.0 * 60.0
     matched = [x for x in category_rows if low <= float(x.age_minutes) <= high]
-    return matched if len(matched) >= 5 else category_rows
+    return matched
 
 
 def _relative_rate_factor(rate: float, median: float, p85: float) -> float:
@@ -553,8 +556,11 @@ def score_initial_rows(
             age_balanced_rates = list(age_ungrouped)
             for rates in age_groups.values():
                 age_balanced_rates.append(percentile_value(rates, 0.50))
-            if len(age_balanced_rates) < 2:
-                age_balanced_rates = list(balanced_category_rates)
+            # Never borrow a different age cohort just to manufacture sample size.
+            # If this cohort has only one independent rate, Relative Velocity stays
+            # diagnostically neutral/thin and Evidence Adaptive removes its 40% vote.
+            if not age_balanced_rates:
+                age_balanced_rates = [row.views_per_hour]
 
             category_velocity_pct = percentile_rank(row.views_per_hour, age_balanced_rates)
             views_pct = percentile_rank(float(row.views), view_values)
