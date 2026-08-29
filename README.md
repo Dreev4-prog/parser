@@ -1,3 +1,15 @@
+# DT PARSER 4.15.8 — AutoScan Deadlock & Hard Stop
+
+**Base:** 4.15.7 Verified Organic Velocity.
+
+v4.15.8 fixes the real AutoScan freeze found after the Organic/Bump cleanup rollout. Foreground Radar admission and background integrity/checkpoint verification now use isolated detail locks/parsers, and AutoScan explicitly pauses new low-priority background traffic for the entire round. The admin Stop is now a true hard stop that cancels the in-flight category and keeps its index for Resume. A full-category 8-minute watchdog covers Date/Page, exact views and Organic Detail Gate; AutoScan exact View Worker recovery is separately bounded to 4 minutes. The admin card shows live stage/progress inside the current category, so `0/84` no longer looks dead while work is moving.
+
+No Organic Demand or scoring semantics change: first-seen `>=400` remains baseline-only until two clean checkpoints, and DT Demand Score stays **40/20/15/15/10**. No manual SQL migration and no new required Railway variable.
+
+See `DEPLOY_V4_15_8_AUTOSCAN_DEADLOCK_HARD_STOP.md`.
+
+---
+
 # DT PARSER 4.15.7 — Verified Organic Velocity
 
 **Base:** 4.15.6 Bump Resurrection Integrity.

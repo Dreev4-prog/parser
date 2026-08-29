@@ -60,15 +60,21 @@ RADAR_LIFECYCLE_MAX_MINUTES = max(RADAR_LIFECYCLE_CHECK_MINUTES)
 RADAR_FAST_SOLD_MAX_SECONDS = RADAR_LIFECYCLE_MAX_MINUTES * 60
 
 _radar_lock = asyncio.Lock()
-_detail_gate_lock = asyncio.Lock()
-_detail_gate_parser: KleinanzeigenParser | None = None
+# v4.15.8: foreground Radar admission and background integrity/checkpoint work
+# must never share a lock+parser pair. In v4.15.7 a background task could hold
+# the old global lock, then wait for a background traffic lease after AutoScan
+# became active, while AutoScan waited for that same lock: a true lock inversion.
+_detail_gate_locks = {"normal": asyncio.Lock(), "background": asyncio.Lock()}
+_detail_gate_parsers: dict[str, KleinanzeigenParser] = {}
 
 
-async def _detail_gate_client() -> KleinanzeigenParser:
-    global _detail_gate_parser
-    if _detail_gate_parser is None:
-        _detail_gate_parser = KleinanzeigenParser()
-    return _detail_gate_parser
+async def _detail_gate_client(priority: str = "normal") -> KleinanzeigenParser:
+    lane = "background" if str(priority) == "background" else "normal"
+    parser = _detail_gate_parsers.get(lane)
+    if parser is None:
+        parser = KleinanzeigenParser()
+        _detail_gate_parsers[lane] = parser
+    return parser
 
 
 def _visible_product_association_exists(product_id_expr):
@@ -264,8 +270,9 @@ async def _live_detail_organic_gate(
         if force_priority in {"normal", "background"}
         else ("normal" if int(getattr(TRAFFIC, "background_during_scans", 0)) <= 0 else "background")
     )
-    async with _detail_gate_lock:
-        parser = await _detail_gate_client()
+    detail_lane = "background" if detail_priority == "background" else "normal"
+    async with _detail_gate_locks[detail_lane]:
+        parser = await _detail_gate_client(detail_lane)
         verdict = await parser.inspect_detail_integrity(
             url, expected_external_id=external_id, traffic_priority=detail_priority
         )
@@ -2128,6 +2135,7 @@ async def bump_resurrection_integrity_sweep_once() -> dict[str, int]:
         return {"products": 0, "checked": 0, "clean": 0, "dirty": 0, "unknown": 0, "sweep_verified": 0}
 
     stats = {"products": 0, "checked": 0, "clean": 0, "dirty": 0, "unknown": 0, "sweep_verified": 0}
+    interrupted = False
     async with SessionLocal() as session:
         product_ids = list((await session.execute(
             select(RadarProduct.id)
@@ -2136,6 +2144,11 @@ async def bump_resurrection_integrity_sweep_once() -> dict[str, int]:
         )).scalars().all())
 
     for product_id in product_ids:
+        traffic_snapshot = await TRAFFIC.snapshot()
+        if int(getattr(traffic_snapshot, "scan_jobs_active", 0) or 0) > 0 or int(getattr(traffic_snapshot, "background_pauses", 0) or 0) > 0:
+            interrupted = True
+            log.info("v4.15.8 Radar sweep paused for foreground scan checked=%s", stats["checked"])
+            break
         stats["products"] += 1
         async with SessionLocal() as session:
             pairs = (await session.execute(
@@ -2149,6 +2162,12 @@ async def bump_resurrection_integrity_sweep_once() -> dict[str, int]:
         product_clean = True
         any_clean = False
         for listing, _assoc in pairs:
+            traffic_snapshot = await TRAFFIC.snapshot()
+            if int(getattr(traffic_snapshot, "scan_jobs_active", 0) or 0) > 0 or int(getattr(traffic_snapshot, "background_pauses", 0) or 0) > 0:
+                interrupted = True
+                product_clean = False
+                log.info("v4.15.8 Radar sweep yielded inside family product=%s checked=%s", product_id, stats["checked"])
+                break
             stats["checked"] += 1
             allowed, reason, _verified_at = await _live_detail_organic_gate(
                 listing, force_priority="background"
@@ -2187,7 +2206,7 @@ async def bump_resurrection_integrity_sweep_once() -> dict[str, int]:
         if stats["checked"] and stats["checked"] % 25 == 0:
             await asyncio.sleep(0.25)
 
-    if stats["unknown"] == 0:
+    if not interrupted and stats["unknown"] == 0:
         async with SessionLocal() as session:
             setting = await session.get(AppSetting, RADAR_BUMP_SWEEP_SETTING)
             now = datetime.utcnow()

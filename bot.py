@@ -198,6 +198,14 @@ RADAR_AUTOSCAN_SUCCESS_GAP_SECONDS = 0.25
 # category page. Use a small normal-priority lane only for this AutoScan view phase.
 RADAR_AUTOSCAN_SAFE_VIEW_CONCURRENCY = 4
 RADAR_AUTOSCAN_LAUNCH_WATCHDOG_SECONDS = 20
+# v4.15.8: one category can no longer hold the whole 84-category round forever.
+# The normal user scan watchdog remains unchanged; AutoScan gets its own tighter
+# bound because a timed-out category is safely moved to the retry list.
+RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS = max(120.0, min(1200.0, float(os.getenv("RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS", "480"))))
+# Dedicated View Worker jobs have a historical 30-minute manager timeout. AutoScan
+# cannot wait that long inside one category; preserve direct successes and fail the
+# unresolved tail closed so the category becomes a retry candidate.
+RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS = max(60.0, min(420.0, float(os.getenv("RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS", "240"))))
 
 # v4.12.0 Daily Radar Growth Loop. One factual daily digest turns the live Radar
 # database into a recurring acquisition/retention surface. The digest is enabled by
@@ -222,6 +230,18 @@ _radar_autoscan_guard = asyncio.Lock()
 _radar_autoscan_run_guard = asyncio.Lock()
 _radar_autoscan_wakeup = asyncio.Event()
 _radar_autoscan_kick_task: asyncio.Task | None = None
+# Process-local interrupt used for a real hard stop. Persistent state remains the
+# source of truth across Railway restarts, while this event aborts the in-flight
+# category/cooldown immediately in the current process.
+_radar_autoscan_stop_event = asyncio.Event()
+
+
+class RadarAutoScanStopped(Exception):
+    pass
+
+
+class RadarAutoScanCategoryTimeout(Exception):
+    pass
 
 
 # v4.6.5: per-user RU/EN presentation layer.  The parser/business logic remains
@@ -3781,13 +3801,26 @@ async def enrich_autoscan_view_counts(
                     (live.category_name if live is not None else "autoscan"), len(unresolved),
                 )
         if remote_ready:
-            exact_recovery = await fetch_exact_views_v438_compatible(
-                parser,
-                unresolved,
-                concurrency=autoscan_view_concurrency,
-                progress_cb=recovery_progress,
-                traffic_priority=autoscan_view_priority,
-            )
+            try:
+                exact_recovery = await asyncio.wait_for(
+                    fetch_exact_views_v438_compatible(
+                        parser,
+                        unresolved,
+                        concurrency=autoscan_view_concurrency,
+                        progress_cb=recovery_progress,
+                        traffic_priority=autoscan_view_priority,
+                    ),
+                    timeout=RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                # Preserve direct exact counters and leave only the unresolved tail
+                # unknown. The category is then fail-closed and goes to retry.
+                exact_recovery = {}
+                log.warning(
+                    "Radar AutoScan exact recovery watchdog category=%s unresolved=%s timeout=%ss",
+                    (live.category_name if live is not None else "autoscan"), len(unresolved),
+                    int(RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS),
+                )
 
     combined = dict(direct_results)
     for url, result in exact_recovery.items():
@@ -4199,7 +4232,8 @@ async def organic_velocity_scheduler() -> None:
     while True:
         try:
             running, queued = await _radar_foreground_counts()
-            if running or queued:
+            traffic_snapshot = await TRAFFIC.snapshot()
+            if running or queued or int(getattr(traffic_snapshot, "scan_jobs_active", 0) or 0) > 0 or int(getattr(traffic_snapshot, "background_pauses", 0) or 0) > 0:
                 await asyncio.sleep(ORGANIC_HIGH_POLL_SECONDS)
                 continue
             rows = await _due_high_baseline_rows()
@@ -4209,7 +4243,13 @@ async def organic_velocity_scheduler() -> None:
             clean_rows: list[Listing] = []
             detail_unknown = 0
             detail_blocked = 0
+            foreground_yielded = False
             for row in rows:
+                traffic_snapshot = await TRAFFIC.snapshot()
+                if int(getattr(traffic_snapshot, "scan_jobs_active", 0) or 0) > 0 or int(getattr(traffic_snapshot, "background_pauses", 0) or 0) > 0:
+                    foreground_yielded = True
+                    log.info("Verified Organic Velocity yielded to foreground scan after=%s/%s", len(clean_rows), len(rows))
+                    break
                 allowed, reason, _verified_at = await verify_listing_organic_now(
                     str(row.external_id), traffic_priority="background"
                 )
@@ -4219,6 +4259,9 @@ async def organic_velocity_scheduler() -> None:
                     detail_blocked += 1
                 else:
                     detail_unknown += 1
+            if foreground_yielded:
+                await asyncio.sleep(ORGANIC_HIGH_POLL_SECONDS)
+                continue
             if not clean_rows:
                 log.info(
                     "Verified Organic Velocity checkpoint gate: due=%s clean=0 blocked=%s unknown=%s",
@@ -4267,14 +4310,33 @@ async def organic_velocity_scheduler() -> None:
 
 
 async def radar_maintenance_scheduler() -> None:
-    """Backfill historical strong products once, then cool live scores hourly."""
+    """Backfill historical strong products once, then cool live scores hourly.
+
+    v4.15.8: this scheduler is genuinely background. It waits for both user
+    foreground scans and the explicit AutoScan round pause before any historical
+    sweep/backfill can start. This removes the last startup race with category 1.
+    """
+    async def foreground_busy() -> bool:
+        running, queued = await _radar_foreground_counts()
+        snap = await TRAFFIC.snapshot()
+        return bool(
+            running or queued
+            or int(getattr(snap, "scan_jobs_active", 0) or 0) > 0
+            or int(getattr(snap, "background_pauses", 0) or 0) > 0
+        )
+
     try:
-        # Let Telegram polling come online first. Radar migration is DB-only and
-        # idempotent, so a large historical base never delays bot availability.
+        # Let Telegram polling come online first, then wait until foreground is
+        # genuinely idle. Backfill may invoke Radar admission/detail checks, so it
+        # must not race the first AutoScan category either.
         await asyncio.sleep(8)
+        while await foreground_busy():
+            await asyncio.sleep(10)
         sweep_stats = await bump_resurrection_integrity_sweep_once()
         if any(int(v or 0) for v in sweep_stats.values()):
             log.warning("v4.15.6 initial bump-resurrection sweep: %s", sweep_stats)
+        while await foreground_busy():
+            await asyncio.sleep(10)
         ai_saved, scan_saved = await backfill_radar_once()
         if ai_saved or scan_saved:
             log.warning("DT Radar historical base imported | ai=%s scan_signals=%s", ai_saved, scan_saved)
@@ -4285,7 +4347,13 @@ async def radar_maintenance_scheduler() -> None:
 
     while True:
         try:
+            if await foreground_busy():
+                await asyncio.sleep(60)
+                continue
             await bump_resurrection_integrity_sweep_once()
+            if await foreground_busy():
+                await asyncio.sleep(60)
+                continue
             changed = await refresh_radar_scores()
             if changed:
                 log.info("DT Radar score maintenance changed=%s", changed)
@@ -4331,6 +4399,9 @@ def _radar_autoscan_default_state() -> dict:
         "current_index": 0,
         "current_category_key": "",
         "current_category_name": "",
+        "current_stage": "",
+        "current_stage_started_at": "",
+        "last_watchdog_category": "",
         "total": len(categories),
         "processed": 0,
         "successful": 0,
@@ -4383,6 +4454,9 @@ def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
     state["skip_daily_if_completed_today"] = bool(state.get("skip_daily_if_completed_today", True))
     state["stop_requested"] = bool(state.get("stop_requested"))
     state["waiting_for_users"] = bool(state.get("waiting_for_users"))
+    state["current_stage"] = str(state.get("current_stage") or "")[:80]
+    state["current_stage_started_at"] = str(state.get("current_stage_started_at") or "")[:64]
+    state["last_watchdog_category"] = str(state.get("last_watchdog_category") or "")[:160]
     state["history"] = list(state.get("history") or [])[:RADAR_AUTOSCAN_HISTORY_LIMIT]
     raw_unknown_reasons = state.get("radar_unknown_reasons") or {}
     state["radar_unknown_reasons"] = {
@@ -4511,6 +4585,8 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
         "current_index": 0,
         "current_category_key": "",
         "current_category_name": "Запуск первой категории…",
+        "current_stage": "starting",
+        "current_stage_started_at": now.replace(microsecond=0).isoformat(),
         "total": len(keys),
         "processed": 0,
         "successful": 0,
@@ -4583,7 +4659,9 @@ def _radar_autoscan_retry_round(state: dict) -> dict | None:
         "category_keys": keys,
         "current_index": 0,
         "current_category_key": "",
-        "current_category_name": "",
+        "current_category_name": "Запуск первой категории…",
+        "current_stage": "starting",
+        "current_stage_started_at": now.replace(microsecond=0).isoformat(),
         "total": len(keys),
         "processed": 0,
         "successful": 0,
@@ -4703,6 +4781,7 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
     else:
         status_text = "🔴 не запущен"
     current = str(state.get("current_category_name") or "—")
+    live_stage_line = _radar_autoscan_live_stage_line(state) if status == "running" else ""
     mode_label = "Ежедневный" if state.get("mode") == "daily" else ("Повтор ошибок" if state.get("mode") == "retry" else ("Ручной" if state.get("mode") == "manual" else "—"))
     last = dict(state.get("last_summary") or {})
     if last:
@@ -4722,7 +4801,9 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         f"Глубина: <b>{RADAR_AUTOSCAN_DEPTH} страниц на категорию</b>\n"
         f"Категории: <b>{len(_radar_autoscan_categories())}</b> товарных категорий\n"
         f"Прогресс: <b>{processed}/{total} · {pct}%</b>\n"
-        f"Сейчас: <b>{html.escape(current)}</b>\n\n"
+        f"Сейчас: <b>{html.escape(current)}</b>\n"
+        + (live_stage_line + "\n" if live_stage_line else "")
+        + f"⏱ Watchdog категории: <b>{int(RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS // 60)} мин.</b>\n\n"
         f"✅ Успешно: <b>{int(state.get('successful') or 0)}</b> · "
         f"⚠️ допроверка: <b>{int(state.get('needs_review') or 0)}</b> · "
         f"❌ системных: <b>{int(state.get('system_errors') or 0)}</b>\n"
@@ -4957,6 +5038,88 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
     return state
 
 
+async def _radar_autoscan_interruptible_sleep(seconds: float) -> bool:
+    """Sleep without making Stop wait for a category cooldown/poll interval.
+
+    Returns True when the stop event interrupted the wait.
+    """
+    seconds = max(0.0, float(seconds or 0.0))
+    if _radar_autoscan_stop_event.is_set():
+        return True
+    if seconds <= 0:
+        await asyncio.sleep(0)
+        return _radar_autoscan_stop_event.is_set()
+    try:
+        await asyncio.wait_for(_radar_autoscan_stop_event.wait(), timeout=seconds)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+async def _radar_autoscan_run_category_controlled(coro, *, category_name: str):
+    """Run one category with hard-stop and watchdog semantics.
+
+    The child task is owned exclusively by AutoScan, so cancellation is safe: on
+    Stop the current category is NOT advanced and Resume retries it from scratch.
+    On watchdog the category is recorded as partial and the round continues.
+    """
+    task = asyncio.create_task(coro, name=f"dt-radar-autoscan-category-{str(category_name)[:40]}")
+    stop_waiter = asyncio.create_task(_radar_autoscan_stop_event.wait(), name="dt-radar-autoscan-hard-stop")
+    try:
+        done, _pending = await asyncio.wait(
+            {task, stop_waiter},
+            timeout=RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stop_waiter in done and _radar_autoscan_stop_event.is_set():
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise RadarAutoScanStopped()
+        if task in done:
+            return await task
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise RadarAutoScanCategoryTimeout(
+            f"category watchdog {int(RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS)}s"
+        )
+    finally:
+        if not stop_waiter.done():
+            stop_waiter.cancel()
+        await asyncio.gather(stop_waiter, return_exceptions=True)
+
+
+def _radar_autoscan_live_stage_line(state: dict) -> str:
+    """Human-readable current category heartbeat for the admin panel."""
+    key = str(state.get("current_category_key") or "")
+    target = str(state.get("target_date") or "")
+    if not key or not target:
+        stage = str(state.get("current_stage") or "")
+        return f"⚙️ Этап: <b>{html.escape(stage)}</b>" if stage else ""
+    try:
+        live = category_live_progress.get(_progress_key(key, target, RADAR_AUTOSCAN_DEPTH))
+    except Exception:
+        live = None
+    if live is None:
+        stage = str(state.get("current_stage") or "")
+        labels = {"starting": "запуск", "scan": "поиск даты / страницы", "organic_gate": "Organic detail-check"}
+        return f"⚙️ Этап: <b>{html.escape(labels.get(stage, stage))}</b>" if stage else ""
+    phase = str(getattr(live, "phase", "") or "")
+    if phase == "views":
+        total_views = max(0, int(getattr(live, "today_seen", 0) or 0))
+        ready = min(total_views, max(0, int(getattr(live, "views_ready", 0) or 0)))
+        return f"👁 Этап: <b>точные просмотры {ready}/{total_views}</b>"
+    if phase in {"collecting", "regional_date"}:
+        pages = max(0, min(RADAR_AUTOSCAN_DEPTH, int(getattr(live, "collection_index", 0) or 0)))
+        return f"📄 Этап: <b>страницы {pages}/{RADAR_AUTOSCAN_DEPTH}</b> · объявлений <b>{int(getattr(live, 'today_seen', 0) or 0)}</b>"
+    requests = max(0, int(getattr(live, "network_requests", 0) or 0))
+    page = max(0, int(getattr(live, "page", 0) or 0))
+    transport = str(getattr(live, "transport_stage", "") or "")
+    extra = f" · {html.escape(transport)}" if transport else ""
+    return f"🔎 Этап: <b>поиск даты</b> · запросов <b>{requests}</b> · стр. <b>{page or '—'}</b>{extra}"
+
+
 async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
     """Run/resume one persistent low-priority round until complete or paused.
 
@@ -4975,9 +5138,15 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
         state["target_date"] = datetime.now(MOSCOW).date().isoformat()
         state = await save_radar_autoscan_state(state)
 
+    # Pause low-priority Radar sweep / 400+ checkpoints for the whole round.
+    # An already-leased background request may finish, but no new background
+    # detail/view request can start until AutoScan exits/pauses.
     parser = KleinanzeigenParser()
+    background_paused = False
     issue_streak = 0
     try:
+        await TRAFFIC.background_pause_started()
+        background_paused = True
         while int(state.get("current_index") or 0) < total:
             # Reload on every category boundary so admin Stop/Resume changes are observed.
             state = await load_radar_autoscan_state()
@@ -4987,7 +5156,9 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                 state["status"] = "paused"
                 state["stop_requested"] = False
                 state["waiting_for_users"] = False
+                state["current_stage"] = "paused"
                 state = await save_radar_autoscan_state(state)
+                _radar_autoscan_stop_event.set()
                 await _notify_radar_autoscan_admins(
                     bot,
                     f"⏸ <b>DT Radar AutoScan остановлен</b>\n\n"
@@ -5006,7 +5177,8 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                     state["current_category_name"] = "Ожидание пользовательских сканов"
                     state = await save_radar_autoscan_state(state)
                     log.info("DT Radar AutoScan yielding to users running=%s queued=%s", running, queued)
-                await asyncio.sleep(5)
+                if await _radar_autoscan_interruptible_sleep(5):
+                    return
                 continue
             if state.get("waiting_for_users"):
                 state["waiting_for_users"] = False
@@ -5028,7 +5200,9 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                 })
                 state = await save_radar_autoscan_state(state)
                 issue_streak += 1
-                await asyncio.sleep(min(RADAR_AUTOSCAN_MAX_BACKOFF_SECONDS, RADAR_AUTOSCAN_SYSTEM_BACKOFF_BASE_SECONDS * (2 ** min(2, issue_streak - 1))))
+                invalid_backoff = min(RADAR_AUTOSCAN_MAX_BACKOFF_SECONDS, RADAR_AUTOSCAN_SYSTEM_BACKOFF_BASE_SECONDS * (2 ** min(2, issue_streak - 1)))
+                if await _radar_autoscan_interruptible_sleep(invalid_backoff):
+                    return
                 continue
 
             # A persisted v4.11.4 round may still contain all 141 categories. Do not
@@ -5051,6 +5225,8 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
 
             state["current_category_key"] = cat.key
             state["current_category_name"] = cat.name
+            state["current_stage"] = "scan"
+            state["current_stage_started_at"] = _radar_autoscan_now_iso()
             state = await save_radar_autoscan_state(state)
             log.info(
                 "DT Radar AutoScan category start round=%s index=%s/%s category=%s depth=%s target=%s parser_reused=True",
@@ -5067,37 +5243,83 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
             parser.prepare_category_scan()
             parser_token = JOB_PARSER.set(parser)
             try:
-                result = await scan_one_category(
-                    parser, cat, RADAR_AUTOSCAN_USER_ID, RADAR_AUTOSCAN_DEPTH, str(state.get("target_date"))
-                )
-                if result.date_complete and not result.radar_views_complete:
-                    failure_kind = "radar_views"
-                    error_text = (
-                        f"Radar views неполные: {int(result.views_verified or 0)}/"
-                        f"{int(result.views_requested or 0)} точных счётчиков"
+                async def _category_pipeline():
+                    local_result = await scan_one_category(
+                        parser, cat, RADAR_AUTOSCAN_USER_ID, RADAR_AUTOSCAN_DEPTH, str(state.get("target_date"))
                     )
-                elif result.date_complete:
-                    source_round_id = (
-                        str(state.get("retry_parent_round_id") or "").strip()
-                        if str(state.get("mode") or "") == "retry"
-                        else ""
-                    ) or str(state.get("round_id") or "round")
-                    radar_stats = await record_autoscan_hot_detailed(
-                        source_round_id, cat.key, result.matched_ids or []
-                    )
-                    radar_saved = int(radar_stats.saved or 0)
-                    expected_slots = min(RADAR_SCAN_TOP_LIMIT, int(radar_stats.eligible_with_views or 0))
-                    if int(radar_stats.unknown_blocked or 0) > 0:
-                        failure_kind = "radar_gate_unknown"
-                        reason_text = _radar_unknown_reason_text(dict(radar_stats.unknown_reasons or ()))
-                        error_text = (
-                            f"Organic detail gate не подтвердил {int(radar_stats.unknown_blocked or 0)} "
-                            f"вышестоящих кандидатов; подтверждено Radar {int(radar_stats.admitted or 0)}/{expected_slots}"
-                            + (f"; причины: {reason_text}" if reason_text else "")
+                    local_radar_saved = 0
+                    local_radar_stats = None
+                    local_failure_kind = ""
+                    local_error_text = ""
+                    if local_result.date_complete and not local_result.radar_views_complete:
+                        local_failure_kind = "radar_views"
+                        local_error_text = (
+                            f"Radar views неполные: {int(local_result.views_verified or 0)}/"
+                            f"{int(local_result.views_requested or 0)} точных счётчиков"
                         )
-                else:
-                    failure_kind = "partial"
-                    error_text = result.reason or "нужно повторно подтвердить категорию"
+                    elif local_result.date_complete:
+                        live_state = await load_radar_autoscan_state()
+                        if live_state.get("status") == "running":
+                            live_state["current_stage"] = "organic_gate"
+                            live_state["current_stage_started_at"] = _radar_autoscan_now_iso()
+                            await save_radar_autoscan_state(live_state)
+                        source_round_id = (
+                            str(state.get("retry_parent_round_id") or "").strip()
+                            if str(state.get("mode") or "") == "retry"
+                            else ""
+                        ) or str(state.get("round_id") or "round")
+                        local_radar_stats = await record_autoscan_hot_detailed(
+                            source_round_id, cat.key, local_result.matched_ids or []
+                        )
+                        local_radar_saved = int(local_radar_stats.saved or 0)
+                        expected_slots = min(RADAR_SCAN_TOP_LIMIT, int(local_radar_stats.eligible_with_views or 0))
+                        if int(local_radar_stats.unknown_blocked or 0) > 0:
+                            local_failure_kind = "radar_gate_unknown"
+                            reason_text = _radar_unknown_reason_text(dict(local_radar_stats.unknown_reasons or ()))
+                            local_error_text = (
+                                f"Organic detail gate не подтвердил {int(local_radar_stats.unknown_blocked or 0)} "
+                                f"вышестоящих кандидатов; подтверждено Radar {int(local_radar_stats.admitted or 0)}/{expected_slots}"
+                                + (f"; причины: {reason_text}" if reason_text else "")
+                            )
+                    else:
+                        local_failure_kind = "partial"
+                        local_error_text = local_result.reason or "нужно повторно подтвердить категорию"
+                    return local_result, local_radar_saved, local_radar_stats, local_failure_kind, local_error_text
+
+                result, radar_saved, radar_stats, failure_kind, error_text = await _radar_autoscan_run_category_controlled(
+                    _category_pipeline(), category_name=cat.name
+                )
+            except RadarAutoScanStopped:
+                log.warning(
+                    "DT Radar AutoScan hard stop category=%s round=%s index=%s/%s",
+                    cat.name, state.get("round_id"), idx + 1, total,
+                )
+                try:
+                    await asyncio.wait_for(parser.reset_scan_browser_context(), timeout=10.0)
+                except Exception:
+                    log.debug("DT Radar AutoScan hard-stop context reset failed", exc_info=True)
+                stopped_state = await load_radar_autoscan_state()
+                stopped_state["status"] = "paused"
+                stopped_state["stop_requested"] = False
+                stopped_state["waiting_for_users"] = False
+                stopped_state["current_stage"] = "paused"
+                await save_radar_autoscan_state(stopped_state)
+                await _notify_radar_autoscan_admins(
+                    bot,
+                    f"⏸ <b>DT Radar AutoScan остановлен сразу</b>\n\n"
+                    f"Категория <b>{html.escape(cat.name)}</b> будет начата заново после продолжения. "
+                    f"Сохранено: <b>{int(stopped_state.get('processed') or 0)}/{total}</b>.",
+                )
+                return
+            except RadarAutoScanCategoryTimeout as exc:
+                failure_kind = "partial"
+                error_text = f"watchdog категории: {int(RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS)} сек"
+                recycle_parser = True
+                state["last_watchdog_category"] = cat.name
+                log.error(
+                    "DT Radar AutoScan category watchdog timeout round=%s category=%s seconds=%s",
+                    state.get("round_id"), cat.name, int(RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS),
+                )
             except asyncio.CancelledError:
                 raise
             except TemporaryAccessError as exc:
@@ -5126,7 +5348,9 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                 await TRAFFIC.scan_job_finished()
 
             state = await load_radar_autoscan_state()
-            # A Stop pressed during the category is honored after this bookkeeping.
+            # A Stop pressed during the category is honored by the child waiter above.
+            if error_text.startswith("watchdog категории"):
+                state["last_watchdog_category"] = cat.name
             state["current_index"] = idx + 1
             state["processed"] = int(state.get("processed") or 0) + 1
             if result is not None:
@@ -5187,6 +5411,8 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
             )
             state["current_category_key"] = ""
             state["current_category_name"] = ""
+            state["current_stage"] = ""
+            state["current_stage_started_at"] = ""
             state = await save_radar_autoscan_state(state)
 
             if result is not None and not result.date_complete and not recycle_parser:
@@ -5199,7 +5425,7 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
 
             if recycle_parser:
                 try:
-                    await parser.close()
+                    await asyncio.wait_for(parser.close(), timeout=15.0)
                 except Exception:
                     log.debug("DT Radar AutoScan parser close during recycle failed", exc_info=True)
                 parser = KleinanzeigenParser()
@@ -5212,18 +5438,22 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                     "DT Radar AutoScan cooldown kind=%s streak=%s seconds=%.1f category=%s",
                     failure_kind, issue_streak, cooldown, cat.name,
                 )
-                await asyncio.sleep(cooldown)
+                if await _radar_autoscan_interruptible_sleep(cooldown):
+                    return
             else:
-                await asyncio.sleep(RADAR_AUTOSCAN_SUCCESS_GAP_SECONDS)
+                if await _radar_autoscan_interruptible_sleep(RADAR_AUTOSCAN_SUCCESS_GAP_SECONDS):
+                    return
 
         state = await load_radar_autoscan_state()
         if state.get("status") == "running" and int(state.get("current_index") or 0) >= total:
             await _radar_autoscan_finish_round(bot, state)
     finally:
         try:
-            await parser.close()
+            await asyncio.wait_for(parser.close(), timeout=15.0)
         except Exception:
             log.debug("DT Radar AutoScan persistent parser close failed", exc_info=True)
+        if background_paused:
+            await TRAFFIC.background_pause_finished()
 
 
 async def _run_radar_autoscan_round(bot: Bot) -> None:
@@ -5323,6 +5553,7 @@ async def radar_autoscan_scheduler(bot: Bot) -> None:
                             if current.get("status") == "idle":
                                 current = _radar_autoscan_new_round(current, "daily")
                                 await save_radar_autoscan_state(current)
+                                _radar_autoscan_stop_event.clear()
                                 await _notify_radar_autoscan_admins(
                                     bot,
                                     f"📡 <b>DT Radar — ежедневный круг запущен</b>\n\n"
@@ -9767,7 +9998,7 @@ def admin_radar_autoscan_keyboard(state: dict) -> InlineKeyboardMarkup:
     skip_today = bool(state.get("skip_daily_if_completed_today", True))
     rows: list[list[InlineKeyboardButton]] = []
     if status == "running":
-        rows.append([InlineKeyboardButton(text="⏹ Остановить после категории", callback_data="adminradarauto:stop")])
+        rows.append([InlineKeyboardButton(text="⏹ Остановить сейчас", callback_data="adminradarauto:stop")])
     elif status == "paused":
         rows.append([InlineKeyboardButton(text="▶️ Продолжить круг", callback_data="adminradarauto:resume"),
                      InlineKeyboardButton(text="🔄 Новый круг", callback_data="adminradarauto:start")])
@@ -11577,6 +11808,7 @@ async def admin_radar_autoscan_start_handler(callback: CallbackQuery) -> None:
             return
         state = _radar_autoscan_new_round(state, "manual")
         state = await save_radar_autoscan_state(state)
+    _radar_autoscan_stop_event.clear()
     _radar_autoscan_wakeup.set()
     _kick_radar_autoscan(callback.bot, "manual-start")
     _schedule_radar_autoscan_launch_watchdog(callback.bot, str(state.get("round_id") or ""))
@@ -11618,6 +11850,7 @@ async def admin_radar_autoscan_retry_handler(callback: CallbackQuery) -> None:
             await callback.answer("Нет сохранённого списка ошибок для повтора", show_alert=True)
             return
         state = await save_radar_autoscan_state(retry_state)
+    _radar_autoscan_stop_event.clear()
     _radar_autoscan_wakeup.set()
     _kick_radar_autoscan(callback.bot, "retry")
     _schedule_radar_autoscan_launch_watchdog(callback.bot, str(state.get("round_id") or ""))
@@ -11636,10 +11869,16 @@ async def admin_radar_autoscan_stop_handler(callback: CallbackQuery) -> None:
         if state.get("status") != "running":
             await callback.answer("Сейчас круг не идёт", show_alert=True)
             return
-        state["stop_requested"] = True
+        # Persist paused immediately so a Railway restart cannot resurrect the
+        # round, then signal the process-local waiter to cancel the current child.
+        state["status"] = "paused"
+        state["stop_requested"] = False
+        state["waiting_for_users"] = False
+        state["current_stage"] = "stopping"
         state = await save_radar_autoscan_state(state)
+    _radar_autoscan_stop_event.set()
     _radar_autoscan_wakeup.set()
-    await callback.answer("Остановлю после текущей категории")
+    await callback.answer("Останавливаю текущую категорию сейчас")
     text, state = await _radar_autoscan_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
@@ -11657,7 +11896,9 @@ async def admin_radar_autoscan_resume_handler(callback: CallbackQuery) -> None:
         state["status"] = "running"
         state["stop_requested"] = False
         state["waiting_for_users"] = False
+        state["current_stage"] = "starting"
         state = await save_radar_autoscan_state(state)
+    _radar_autoscan_stop_event.clear()
     _radar_autoscan_wakeup.set()
     _kick_radar_autoscan(callback.bot, "resume")
     _schedule_radar_autoscan_launch_watchdog(callback.bot, str(state.get("round_id") or ""))
@@ -16621,6 +16862,10 @@ async def main() -> None:
         "v4.14.0 Fast Sold Lifecycle + Referral Promo + Daily Radar FSM Hotfix online | parser_lanes=%s | fifth_plus=FIFO | "
         "trial_and_paid_same_queue=True | railway_lane_overrides_ignored=True",
         GUARANTEED_LOCAL_PARSER_LANES,
+    )
+    log.warning(
+        "v4.15.8 AutoScan Deadlock & Hard Stop online | category_watchdog=%ss | view_recovery_watchdog=%ss | background_pause=round | detail_lanes=foreground+background",
+        int(RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS), int(RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS),
     )
     ticker_task = None if DISTRIBUTED_WORKERS else asyncio.create_task(
         progress_ticker(bot), name="user-progress-ticker"

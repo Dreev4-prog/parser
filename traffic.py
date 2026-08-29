@@ -36,6 +36,7 @@ class TrafficSnapshot:
     view_active: int
     browser_active: int
     background_view_active: int
+    background_pauses: int
     scan_limit: int
     view_limit: int
     browser_limit: int
@@ -80,6 +81,7 @@ class AdaptiveTrafficManager:
         self._condition = asyncio.Condition()
         self._active = {"scan": 0, "view": 0, "browser": 0}
         self._background_view_active = 0
+        self._background_pauses = 0
         self._scan_jobs_active = 0
         self._next_allowed = {"scan": 0.0, "view": 0.0, "browser": 0.0}
         self._cooldown_until = 0.0
@@ -143,6 +145,22 @@ class AdaptiveTrafficManager:
             self._scan_jobs_active = max(0, self._scan_jobs_active - 1)
             self._condition.notify_all()
 
+    async def background_pause_started(self) -> None:
+        """Pause low-priority background view/detail traffic for a foreground round.
+
+        Existing leased requests are allowed to finish, but no new background lease
+        can start until the matching pause is released. This is used by Radar
+        AutoScan so maintenance/checkpoint tasks cannot race its first category.
+        """
+        async with self._condition:
+            self._background_pauses += 1
+            self._condition.notify_all()
+
+    async def background_pause_finished(self) -> None:
+        async with self._condition:
+            self._background_pauses = max(0, self._background_pauses - 1)
+            self._condition.notify_all()
+
     async def report_success(self, kind: str) -> None:
         now = time.monotonic()
         async with self._condition:
@@ -194,6 +212,7 @@ class AdaptiveTrafficManager:
                 view_active=self._active["view"],
                 browser_active=self._active["browser"],
                 background_view_active=self._background_view_active,
+                background_pauses=self._background_pauses,
                 scan_limit=scan_limit,
                 view_limit=view_limit,
                 browser_limit=browser_limit,
@@ -228,8 +247,11 @@ class AdaptiveTrafficManager:
                     cooldown_wait = max(0.0, self._cooldown_until - now)
                     spacing_wait = max(0.0, self._next_allowed[kind] - now)
                     background_ok = True
-                    if is_background and self._scan_jobs_active > 0:
-                        background_ok = self._background_view_active < self.background_during_scans
+                    if is_background:
+                        if self._background_pauses > 0:
+                            background_ok = False
+                        elif self._scan_jobs_active > 0:
+                            background_ok = self._background_view_active < self.background_during_scans
 
                     # Reserve part of the global pool for interactive category-page
                     # work while any scan job is alive. This prevents a large view
