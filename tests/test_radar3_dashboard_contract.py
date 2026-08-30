@@ -23,4 +23,5 @@ def test_dashboard_groups_live_growth_by_category():
     assert 'func.sum(RadarObservation.total_delta)' in block
     assert '.group_by(RadarObservation.category_key)' in block
     assert 'RadarProduct.category_key' in block
-    assert 'RadarProduct.demand_status' in block
+    assert 'RadarProduct.status' in block
+    assert 'RadarProduct.demand_status' not in block

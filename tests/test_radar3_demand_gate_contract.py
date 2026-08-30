@@ -26,7 +26,7 @@ def test_60_per_hour_is_strong_on_first_scored_interval():
 
 
 def test_reset_marker_forces_clean_radar_after_upgrade():
-    assert 'dt_radar_v3_observed_demand_reset_v3_radar31_context_score' in RADAR
+    assert 'dt_radar_v3_observed_demand_reset_v4_radar31_audit_fix' in RADAR
     reset = RADAR.split("async def prepare_radar_v3_once", 1)[1].split("async def record_autoscan_hot", 1)[0]
     for table in ("RadarFavorite", "RadarLifecycleWatch", "RadarSnapshot", "RadarProductListing", "RadarProduct", "RadarObservation"):
         assert f"delete({table})" in reset

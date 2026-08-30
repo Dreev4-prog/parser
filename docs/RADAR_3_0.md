@@ -1,4 +1,4 @@
-## v4.21.7 — Radar 3.1 Context Score
+## v4.21.8 — Radar 3.1 Full Audit Fix
 
 Radar keeps the absolute 15/30/60 views/hour gate, then scores only qualified observations using 50% category percentile, 25% persistence, 15% acceleration, and 10% repeatability. Confidence is separate. Candidate/Early/Strong are rechecked after 60/45/30 minutes. Hot can be reached by two consecutive >=60/h intervals on one listing, or by Strong/persistent evidence confirmed by a second independently scored listing in the same product family.
 

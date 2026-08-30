@@ -69,4 +69,4 @@ def test_dashboard_exposes_funnel_acceleration_confidence_and_category_context()
 
 
 def test_new_reset_marker_prevents_old_score_mix():
-    assert 'dt_radar_v3_observed_demand_reset_v3_radar31_context_score' in RADAR
+    assert 'dt_radar_v3_observed_demand_reset_v4_radar31_audit_fix' in RADAR

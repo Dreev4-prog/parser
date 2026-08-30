@@ -48,7 +48,7 @@ RADAR_BUMP_SWEEP_SETTING = "dt_radar_v4156_bump_sweep_complete"
 RADAR_BUMP_QUARANTINE_SETTING = "dt_radar_v4156_bump_quarantine_applied"
 RADAR_VELOCITY_PREP_SETTING = "dt_radar_v4157_verified_velocity_prepared"
 RADAR_UNIFIED_48H_REPAIR_SETTING = "dt_radar_v4200_unified_48h_repair_v2"
-RADAR_V3_RESET_SETTING = "dt_radar_v3_observed_demand_reset_v3_radar31_context_score"
+RADAR_V3_RESET_SETTING = "dt_radar_v3_observed_demand_reset_v4_radar31_audit_fix"
 RADAR_V3_FIRST_CHECK_MINUTES = 60
 RADAR_V3_NEXT_CHECK_MINUTES = 60
 RADAR_V3_EARLY_CHECK_MINUTES = 45
@@ -591,6 +591,11 @@ def _snapshot_live_evidence(snapshot: RadarSnapshot, now: datetime):
         elapsed_minutes = max(0.0, (now - recorded_at).total_seconds() / 60.0)
     effective_age = max(0.0, float(getattr(snapshot, "demand_age_minutes", 0.0) or 0.0)) + elapsed_minutes
     if str(getattr(snapshot, "source", "") or "") == "radar3_observed":
+        # Radar 3.1 evidence is live, not a 48-hour trophy. Once the DT-owned
+        # observation window is stale, an old Hot/Strong snapshot must not
+        # resurrect a product when a later weaker checkpoint arrives.
+        if elapsed_minutes > float(RADAR_V3_MAX_OBSERVATION_HOURS * 60):
+            return RadarRankEvidence("historical", 0.0, 0, 1.0, 0.0, False)
         status = str(getattr(snapshot, "demand_status", "stable") or "stable")
         return RadarRankEvidence(status, float(getattr(snapshot, "radar_rank", 0.0) or 0.0), 0, 1.0, 0.0, True)
     return classify_radar_signal(
@@ -1161,7 +1166,17 @@ async def record_autoscan_hot_detailed(
                     existing.consecutive_positive = 0
                     existing.total_delta = 0
                     existing.current_vph = 0.0
+                    existing.previous_vph = 0.0
                     existing.peak_vph = 0.0
+                    existing.velocity_percentile = 0.0
+                    existing.acceleration_ratio = 0.0
+                    existing.confidence = 0
+                    existing.scored_checkpoints = 0
+                    existing.consecutive_scored = 0
+                    existing.strong_checkpoints = 0
+                    existing.consecutive_strong = 0
+                    existing.lease_owner = ""
+                    existing.lease_until = None
                     existing.status = "baseline"
                     existing.next_check_at = measured_at + timedelta(minutes=RADAR_V3_FIRST_CHECK_MINUTES)
                     existing.expires_at = measured_at + timedelta(hours=RADAR_V3_MAX_OBSERVATION_HOURS)
@@ -1228,10 +1243,40 @@ async def record_user_scan_radar3_baselines(scan_id: int) -> int:
             )).scalars().all()}
         for snap, listing in rows:
             ext = str(listing.external_id)
-            if ext in existing_map:
-                continue
             measured_at = snap.captured_at or now
             raw = max(0, int(snap.initial_view_count or 0))
+            existing = existing_map.get(ext)
+            if isinstance(existing, RadarObservation):
+                old_enough = (now - (existing.updated_at or existing.last_measured_at or now)).total_seconds() >= 3 * 3600
+                if str(existing.status or "") in {"quiet", "expired"} and old_enough:
+                    existing.baseline_views = raw
+                    existing.baseline_at = measured_at
+                    existing.last_views = raw
+                    existing.last_measured_at = measured_at
+                    existing.checkpoint_count = 0
+                    existing.positive_checkpoints = 0
+                    existing.consecutive_positive = 0
+                    existing.total_delta = 0
+                    existing.current_vph = 0.0
+                    existing.previous_vph = 0.0
+                    existing.peak_vph = 0.0
+                    existing.velocity_percentile = 0.0
+                    existing.acceleration_ratio = 0.0
+                    existing.confidence = 0
+                    existing.scored_checkpoints = 0
+                    existing.consecutive_scored = 0
+                    existing.strong_checkpoints = 0
+                    existing.consecutive_strong = 0
+                    existing.lease_owner = ""
+                    existing.lease_until = None
+                    existing.status = "baseline"
+                    existing.next_check_at = measured_at + timedelta(minutes=RADAR_V3_FIRST_CHECK_MINUTES)
+                    existing.expires_at = measured_at + timedelta(hours=RADAR_V3_MAX_OBSERVATION_HOURS)
+                    existing.updated_at = now
+                    seeded += 1
+                continue
+            if ext in existing_map:
+                continue
             session.add(RadarObservation(
                 external_id=ext, category_key=str(listing.category_key or "unknown"),
                 product_key=radar_product_key(listing),
@@ -1431,12 +1476,16 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
                 RadarObservation.category_key == str(obs.category_key),
                 RadarObservation.checkpoint_count >= 1,
                 RadarObservation.current_vph >= RADAR_V3_CANDIDATE_VPH,
+                RadarObservation.status.in_(["candidate", "observed", "confirmed"]),
+                or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now),
                 RadarObservation.updated_at >= now - timedelta(hours=6),
             ))).scalars().all()]
             family = list((await session.execute(select(RadarObservation).where(
                 RadarObservation.product_key == str(obs.product_key),
                 RadarObservation.current_vph >= RADAR_V3_CANDIDATE_VPH,
                 RadarObservation.positive_checkpoints >= 1,
+                RadarObservation.status.in_(["candidate", "observed", "confirmed"]),
+                or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now),
                 RadarObservation.updated_at >= now - timedelta(hours=6),
             ))).scalars().all())
 
@@ -1532,13 +1581,16 @@ async def radar_v3_expire_observations() -> int:
     now = datetime.utcnow()
     async with SessionLocal() as session:
         result = await session.execute(
-            update(RadarObservation).where(
+            update(RadarObservation)
+            .where(
                 RadarObservation.status.in_(["baseline", "candidate", "observed", "confirmed"]),
                 RadarObservation.expires_at.is_not(None),
                 RadarObservation.expires_at <= now,
-            ).values(
+            )
+            .values(
                 status="expired", next_check_at=None, lease_owner="", lease_until=None, updated_at=now
-            ).execution_options(synchronize_session=False)
+            )
+            .execution_options(synchronize_session=False)
         )
         await session.commit()
         return int(result.rowcount or 0)

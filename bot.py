@@ -1256,8 +1256,7 @@ def radar_best_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="🔥 Горячие", callback_data="radarlist:hot:0"),
          InlineKeyboardButton(text="🚀 Набирают", callback_data="radarlist:rising:0")],
-        [InlineKeyboardButton(text="🧠 AI Picks", callback_data="radarlist:ai:0"),
-         InlineKeyboardButton(text="⚡ Быстро исчезли" + ("" if full else " · 🔒"), callback_data=fast_cb)],
+        [InlineKeyboardButton(text="⚡ Быстро исчезли" + ("" if full else " · 🔒"), callback_data=fast_cb)],
     ]
     if full:
         rows.append([InlineKeyboardButton(text="🏆 Рекорды Radar", callback_data="radarlist:alltime:0")])
@@ -4851,57 +4850,65 @@ def _radar_autoscan_next_run_text(state: dict) -> str:
 
 
 async def _radar3_dashboard_snapshot() -> dict:
-    """Compact Radar 3.1 control-plane snapshot with evidence funnel/context metrics."""
+    """Compact Radar 3.1 control-plane snapshot with bounded DB round-trips."""
     now = datetime.utcnow()
+    active_statuses = ["baseline", "candidate", "observed", "confirmed"]
     async with SessionLocal() as session:
-        active = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.status.in_(["baseline", "candidate", "observed", "confirmed"]),
-            RadarObservation.expires_at > now,
-        ))).scalar_one() or 0)
-        baseline = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.checkpoint_count == 0, RadarObservation.expires_at > now,
-        ))).scalar_one() or 0)
-        due = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.next_check_at.is_not(None), RadarObservation.next_check_at <= now,
-            RadarObservation.expires_at > now,
-            RadarObservation.status.in_(["baseline", "candidate", "observed", "confirmed"]),
-        ))).scalar_one() or 0)
-        any_growth = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.total_delta > 0, RadarObservation.expires_at > now,
-        ))).scalar_one() or 0)
-        candidate = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.current_vph >= 15.0, RadarObservation.current_vph < 30.0, RadarObservation.expires_at > now,
-        ))).scalar_one() or 0)
-        observed = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.current_vph >= 30.0, RadarObservation.expires_at > now,
-        ))).scalar_one() or 0)
-        strong_intervals = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.current_vph >= 60.0, RadarObservation.expires_at > now,
-        ))).scalar_one() or 0)
-        persistent = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.consecutive_scored >= 2, RadarObservation.expires_at > now,
-        ))).scalar_one() or 0)
-        accelerating = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.current_vph >= 30.0, RadarObservation.acceleration_ratio >= 0.20, RadarObservation.expires_at > now,
-        ))).scalar_one() or 0)
-        high_confidence = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.confidence >= 70, RadarObservation.expires_at > now,
-        ))).scalar_one() or 0)
-        quiet = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.status == "quiet",
-        ))).scalar_one() or 0)
-        total_delta = int((await session.execute(select(func.coalesce(func.sum(RadarObservation.total_delta), 0)).where(
-            RadarObservation.positive_checkpoints >= 1, RadarObservation.expires_at > now,
-        ))).scalar_one() or 0)
-        early = int((await session.execute(select(func.count(RadarProduct.id)).where(
-            RadarProduct.latest_source == "radar3_observed", RadarProduct.demand_status == "stable",
-        ))).scalar_one() or 0)
-        strong = int((await session.execute(select(func.count(RadarProduct.id)).where(
-            RadarProduct.latest_source == "radar3_observed", RadarProduct.demand_status == "rising",
-        ))).scalar_one() or 0)
-        hot = int((await session.execute(select(func.count(RadarProduct.id)).where(
-            RadarProduct.latest_source == "radar3_observed", RadarProduct.demand_status == "hot",
-        ))).scalar_one() or 0)
+        # One aggregate scan replaces the former ~12 sequential COUNT queries.
+        # This matters once Radar carries tens of thousands of observations.
+        obs = (await session.execute(select(
+            func.count(RadarObservation.id).filter(
+                RadarObservation.status.in_(active_statuses), RadarObservation.expires_at > now
+            ),
+            func.count(RadarObservation.id).filter(
+                RadarObservation.checkpoint_count == 0, RadarObservation.expires_at > now
+            ),
+            func.count(RadarObservation.id).filter(
+                RadarObservation.next_check_at.is_not(None), RadarObservation.next_check_at <= now,
+                RadarObservation.expires_at > now, RadarObservation.status.in_(active_statuses)
+            ),
+            func.count(RadarObservation.id).filter(
+                RadarObservation.total_delta > 0, RadarObservation.expires_at > now
+            ),
+            func.count(RadarObservation.id).filter(
+                RadarObservation.current_vph >= 15.0, RadarObservation.current_vph < 30.0, RadarObservation.expires_at > now
+            ),
+            func.count(RadarObservation.id).filter(
+                RadarObservation.current_vph >= 30.0, RadarObservation.expires_at > now
+            ),
+            func.count(RadarObservation.id).filter(
+                RadarObservation.current_vph >= 60.0, RadarObservation.expires_at > now
+            ),
+            func.count(RadarObservation.id).filter(
+                RadarObservation.consecutive_scored >= 2, RadarObservation.expires_at > now
+            ),
+            func.count(RadarObservation.id).filter(
+                RadarObservation.current_vph >= 30.0, RadarObservation.acceleration_ratio >= 0.20, RadarObservation.expires_at > now
+            ),
+            func.count(RadarObservation.id).filter(
+                RadarObservation.confidence >= 70, RadarObservation.expires_at > now
+            ),
+            func.count(RadarObservation.id).filter(RadarObservation.status == "quiet"),
+            func.coalesce(func.sum(RadarObservation.total_delta).filter(
+                RadarObservation.positive_checkpoints >= 1, RadarObservation.expires_at > now
+            ), 0),
+        ))).one()
+        (active, baseline, due, any_growth, candidate, observed, strong_intervals,
+         persistent, accelerating, high_confidence, quiet, total_delta) = [int(x or 0) for x in obs]
+
+        products = (await session.execute(select(
+            func.count(RadarProduct.id).filter(
+                RadarProduct.latest_source == "radar3_observed", RadarProduct.status == "stable"
+            ),
+            func.count(RadarProduct.id).filter(
+                RadarProduct.latest_source == "radar3_observed", RadarProduct.status == "rising"
+            ),
+            func.count(RadarProduct.id).filter(
+                RadarProduct.latest_source == "radar3_observed", RadarProduct.status == "hot"
+            ),
+        ))).one()
+        early, strong, hot = [int(x or 0) for x in products]
+
         category_rows = list((await session.execute(
             select(
                 RadarObservation.category_key,
@@ -4917,9 +4924,12 @@ async def _radar3_dashboard_snapshot() -> dict:
             .limit(12)
         )).all())
         signal_rows = list((await session.execute(
-            select(RadarProduct.category_key, RadarProduct.demand_status, func.count(RadarProduct.id))
-            .where(RadarProduct.latest_source == "radar3_observed")
-            .group_by(RadarProduct.category_key, RadarProduct.demand_status)
+            select(RadarProduct.category_key, RadarProduct.status, func.count(RadarProduct.id))
+            .where(
+                RadarProduct.latest_source == "radar3_observed",
+                RadarProduct.status.in_(["stable", "rising", "hot"]),
+            )
+            .group_by(RadarProduct.category_key, RadarProduct.status)
         )).all())
 
     signal_map: dict[str, dict[str, int]] = {}
@@ -5026,6 +5036,32 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         + f"Следующий ежедневный: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>"
     )
     return text, state
+
+
+def _radar_autoscan_loading_text() -> str:
+    return (
+        "<b>📡 DT Radar 3.1 · CONTEXT DEMAND</b>\n\n"
+        "Панель открыта ✅\n"
+        "Статистика Radar загружается… ⏳"
+    )
+
+
+async def _radar_autoscan_safe_text(timeout_seconds: float = 5.0) -> tuple[str, dict]:
+    """Open Radar even when PostgreSQL is busy or one diagnostic query fails."""
+    try:
+        return await asyncio.wait_for(_radar_autoscan_text(), timeout=max(1.0, float(timeout_seconds)))
+    except Exception as exc:
+        log.exception("DT Radar 3.1 control panel failed")
+        state = _radar_autoscan_default_state()
+        reason = html.escape(type(exc).__name__)
+        text = (
+            "<b>📡 DT Radar 3.1 · CONTEXT DEMAND</b>\n\n"
+            "Панель открыта ✅\n"
+            "Radar 3.1 продолжает работать в фоне.\n\n"
+            "⚠️ Статистика временно недоступна.\n"
+            f"Диагностика: <code>{reason}</code>"
+        )
+        return text, state
 
 
 async def _radar_autoscan_errors_text(page: int = 0, per_page: int = 15) -> tuple[str, dict, int, int]:
@@ -11446,7 +11482,6 @@ async def _admin_radar_funnel_text(page: int = 0) -> tuple[str, list[dict], int,
             products = visitor.get("preview_products") or {}
             hot = min(FREE_RADAR_PREVIEW_LIMIT, len(products.get("hot", set())))
             rising = min(FREE_RADAR_PREVIEW_LIMIT, len(products.get("rising", set())))
-            ai = min(FREE_RADAR_PREVIEW_LIMIT, len(products.get("ai", set())))
             locked = visitor.get("locked_features") or set()
             locked_text = ", ".join(feature_labels.get(x, x) for x in sorted(locked))
             trial_used = int(visitor.get("trial_scans_used", 0) or 0)
@@ -11456,7 +11491,7 @@ async def _admin_radar_funnel_text(page: int = 0) -> tuple[str, list[dict], int,
                 "",
                 f"👤 <b>{html.escape(label)}</b> · <code>{uid}</code>",
                 f"🕐 {_utc_to_msk_text(last_at)} МСК · Radar ×{int(visitor.get('radar_opens', 0) or 0)} · Лучшие ×{int(visitor.get('best_opens', 0) or 0)}",
-                f"🔥 {hot}/{FREE_RADAR_PREVIEW_LIMIT} · 🚀 {rising}/{FREE_RADAR_PREVIEW_LIMIT} · 🧠 {ai}/{FREE_RADAR_PREVIEW_LIMIT}",
+                f"🔥 {hot}/{FREE_RADAR_PREVIEW_LIMIT} · 🚀 {rising}/{FREE_RADAR_PREVIEW_LIMIT}",
                 f"💎 Полный доступ: <b>{'нажал' if int(visitor.get('upgrade_clicks', 0) or 0) > 0 else '—'}</b> · "
                 f"🎁 сканы {trial_used}/{FREE_TRIAL_SCAN_LIMIT} · 💳 после Radar: <b>{'купил' if converted_after_radar else '—'}</b>",
             ])
@@ -11553,8 +11588,16 @@ async def admin_radar_autoscan_handler(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    text, state = await _radar_autoscan_text()
+    # Acknowledge Telegram before any PostgreSQL work. The old order made a busy
+    # dashboard look like a dead button because callback.answer() happened last.
     await callback.answer()
+    await _edit_or_answer(
+        callback.message, _radar_autoscan_loading_text(),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")
+        ]]),
+    )
+    text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11579,7 +11622,8 @@ async def admin_radar_autoscan_start_handler(callback: CallbackQuery) -> None:
         await callback.answer(f"Круг запущен · ждёт пользовательские сканы: {running + queued}")
     else:
         await callback.answer("Круг запущен · первая категория стартует сейчас")
-    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11617,7 +11661,8 @@ async def admin_radar_autoscan_retry_handler(callback: CallbackQuery) -> None:
     _kick_radar_autoscan(callback.bot, "retry")
     _schedule_radar_autoscan_launch_watchdog(callback.bot, str(state.get("round_id") or ""))
     await callback.answer(f"Повторяю проблемные категории: {len(state.get('category_keys') or [])}")
-    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11641,7 +11686,8 @@ async def admin_radar_autoscan_stop_handler(callback: CallbackQuery) -> None:
     _radar_autoscan_stop_event.set()
     _radar_autoscan_wakeup.set()
     await callback.answer("Останавливаю текущую категорию сейчас")
-    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11665,7 +11711,8 @@ async def admin_radar_autoscan_resume_handler(callback: CallbackQuery) -> None:
     _kick_radar_autoscan(callback.bot, "resume")
     _schedule_radar_autoscan_launch_watchdog(callback.bot, str(state.get("round_id") or ""))
     await callback.answer("Круг продолжен")
-    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11680,7 +11727,8 @@ async def admin_radar_autoscan_daily_handler(callback: CallbackQuery) -> None:
         state = await save_radar_autoscan_state(state)
     _radar_autoscan_wakeup.set()
     await callback.answer("Ежедневный круг включён" if state.get("daily_enabled") else "Ежедневный круг выключен")
-    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11695,7 +11743,8 @@ async def admin_radar_autoscan_skipday_handler(callback: CallbackQuery) -> None:
         state = await save_radar_autoscan_state(state)
     _radar_autoscan_wakeup.set()
     await callback.answer("Настройка сохранена")
-    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11729,7 +11778,8 @@ async def admin_radar_autoscan_settime_handler(callback: CallbackQuery) -> None:
         state = await save_radar_autoscan_state(state)
     _radar_autoscan_wakeup.set()
     await callback.answer(f"Время: {value} МСК")
-    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11781,7 +11831,8 @@ async def admin_ai_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer("Открываю DT Radar 3.0")
-    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11791,7 +11842,8 @@ async def admin_ai_section_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer("Раздел удалён · DT Radar 3.0")
-    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11801,7 +11853,8 @@ async def admin_ai_candidate_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer("Старая AI-карточка удалена · DT Radar 3.0")
-    text, state = await _radar_autoscan_text()
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -12121,8 +12174,7 @@ def radar_daily_digest_text(metrics: dict[str, int], *, paid: bool) -> str:
         "",
         f"🔥 Горячих сейчас: <b>{_digest_n(metrics.get('hot', 0))}</b>",
         f"🚀 Набирают: <b>{_digest_n(metrics.get('rising', 0))}</b>",
-        f"🧠 AI Picks: <b>{_digest_n(metrics.get('ai_picks', 0))}</b>",
-        f"📦 В базе Radar: <b>{_digest_n(metrics.get('radar_total', 0))}</b> товаров",
+                f"📦 В базе Radar: <b>{_digest_n(metrics.get('radar_total', 0))}</b> товаров",
     ]
     if int(metrics.get("best_score_today") or 0) > 0:
         lines.append(f"🏆 Лучший DT Score сегодня: <b>{int(metrics['best_score_today'])}/100</b>")
@@ -12284,7 +12336,7 @@ async def admin_daily_radar_handler(callback: CallbackQuery, state: FSMContext) 
         f"🔎 Проверено: <b>{_digest_n(metrics.get('listings_seen', 0))}</b>\n"
         f"📡 Сигналов сегодня: <b>+{_digest_n(metrics.get('signals_today', 0))}</b>\n"
         f"🔥 Горячих: <b>{_digest_n(metrics.get('hot', 0))}</b> · 🚀 Набирают: <b>{_digest_n(metrics.get('rising', 0))}</b>\n"
-        f"🧠 AI Picks: <b>{_digest_n(metrics.get('ai_picks', 0))}</b> · 📦 база: <b>{_digest_n(metrics.get('radar_total', 0))}</b>"
+        f"📦 В базе Radar: <b>{_digest_n(metrics.get('radar_total', 0))}</b>"
         + freshness
     )
     await _edit_or_answer(callback.message, text, reply_markup=admin_daily_radar_keyboard(digest_state))
@@ -14193,7 +14245,7 @@ async def _radar_home_text(user_id: int | None = None) -> str:
     return (
         "📡 <b>DT Radar</b>\n\n"
         "Найди сильные товары без лишней сложности. Выбери, что хочешь сделать:\n\n"
-        "🔥 <b>Лучшие сейчас</b> — горячие, набирающие, AI Picks и быстро исчезнувшие\n"
+        "🔥 <b>Лучшие сейчас</b> — горячие, набирающие и быстро исчезнувшие\n"
         "🔎 <b>Поиск</b> — если уже знаешь название товара\n"
         "🗂 <b>Категории</b> — если хочешь посмотреть по разделам\n"
         "⭐ <b>Мой Radar</b> — сохранённые товары\n\n"
@@ -14219,7 +14271,7 @@ async def _radar_list_payload(
     titles = {
         "hot": "🔥 Горячие сейчас",
         "rising": "🚀 Набирают обороты",
-        "ai": "🧠 AI Picks",
+        "ai": "🚀 Набирают обороты",
         "fastsold": "⚡ Быстро исчезли",
         "alltime": "🏆 Рекорды Radar",
         "favorites": "⭐ Мой Radar",
@@ -14485,7 +14537,7 @@ async def radar_locked(callback: CallbackQuery) -> None:
         f"Эта функция доступна в полном DT Radar. Бесплатно можно посмотреть первые <b>{FREE_RADAR_PREVIEW_LIMIT}</b> "
         "реальных находок в каждом режиме «Лучшие сейчас».\n\n"
         f"📦 В Radar уже: <b>{stats.total}</b> товаров\n"
-        f"🔥 Горячих: <b>{stats.hot}</b> · 🚀 Набирают: <b>{stats.rising}</b> · 🧠 AI Picks: <b>{stats.ai_picks}</b>\n"
+        f"🔥 Горячих: <b>{stats.hot}</b> · 🚀 Набирают: <b>{stats.rising}</b>\n"
         f"⚡ Быстро исчезли: <b>{stats.fast_sold}</b>\n\n"
         "💎 Полный доступ открывает все результаты, поиск, категории, сохранения и историю Radar."
     )
@@ -14543,7 +14595,7 @@ async def radar_best_handler(callback: CallbackQuery) -> None:
             "Выбери, какие сильные товары хочешь посмотреть:\n\n"
             f"🔥 Горячие: <b>{stats.hot}</b>\n"
             f"🚀 Набирают: <b>{stats.rising}</b>\n"
-            f"🧠 AI Picks: <b>{stats.ai_picks}</b>\n"
+            
             f"⚡ Быстро исчезли: <b>{stats.fast_sold}</b>\n\n"
             "⚡ «Быстро исчезли» — объявления, которые Radar видел активными и затем подтвердил недоступными в первые 3 часа.\n\n"
             "🏆 Рекорды Radar оставлены ниже как дополнительная история."
@@ -14555,7 +14607,7 @@ async def radar_best_handler(callback: CallbackQuery) -> None:
             f"🎁 <b>Бесплатно покажем первые {FREE_RADAR_PREVIEW_LIMIT} находок</b> в выбранном режиме.\n\n"
             f"🔥 Горячие: <b>{stats.hot}</b>\n"
             f"🚀 Набирают: <b>{stats.rising}</b>\n"
-            f"🧠 AI Picks: <b>{stats.ai_picks}</b>\n"
+            
             f"⚡ Быстро исчезли: <b>{stats.fast_sold}</b> · 🔒\n\n"
             "Выбери режим и посмотри реальные результаты Radar."
         )
@@ -14705,6 +14757,9 @@ async def radar_price_back(callback: CallbackQuery, state: FSMContext) -> None:
 async def radar_list_handler(callback: CallbackQuery, state: FSMContext) -> None:
     parts = callback.data.split(":")
     mode = parts[1] if len(parts) > 1 else "hot"
+    if mode == "ai":
+        # Compatibility for old inline messages after legacy AI Picks retirement.
+        mode = "rising"
     try:
         page = max(0, int(parts[2])) if len(parts) > 2 else 0
     except Exception:
@@ -14719,7 +14774,7 @@ async def radar_list_handler(callback: CallbackQuery, state: FSMContext) -> None
                 stats = await radar_stats()
                 text = (
                     "🔒 <b>Полный DT Radar</b>\n\n"
-                    f"Бесплатно доступны первые <b>{FREE_RADAR_PREVIEW_LIMIT}</b> находок в Горячих, Набирают и AI Picks.\n"
+                    f"Бесплатно доступны первые <b>{FREE_RADAR_PREVIEW_LIMIT}</b> находок в Горячих и Набирают.\n"
                     f"В полной базе уже <b>{stats.total}</b> товаров.\n\n"
                     "💎 Подписка открывает все результаты, поиск, категории и Мой Radar."
                 )
@@ -14746,6 +14801,8 @@ async def radar_preview_item_handler(callback: CallbackQuery) -> None:
         await callback.answer("Товар не найден", show_alert=True)
         return
     mode = parts[1]
+    if mode == "ai":
+        mode = "rising"
     try:
         product_id = int(parts[2])
     except Exception:

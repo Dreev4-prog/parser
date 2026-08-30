@@ -533,6 +533,23 @@ async def init_db() -> None:
             else:
                 await conn.execute(text(f"ALTER TABLE radar_observations ADD COLUMN {column_name} {sql_type}"))
 
+        if _IS_POSTGRES:
+            # v4.21.8: these columns were added to an existing table after
+            # metadata.create_all. SQLAlchemy does not create model indexes for
+            # columns introduced by ALTER TABLE, so create the live Radar indexes
+            # explicitly. This keeps the control panel and category context reads
+            # fast as observations grow into the tens of thousands.
+            for index_sql in (
+                "CREATE INDEX IF NOT EXISTS ix_radar_observations_velocity_percentile ON radar_observations (velocity_percentile)",
+                "CREATE INDEX IF NOT EXISTS ix_radar_observations_confidence ON radar_observations (confidence)",
+                "CREATE INDEX IF NOT EXISTS ix_radar_observations_scored_checkpoints ON radar_observations (scored_checkpoints)",
+                "CREATE INDEX IF NOT EXISTS ix_radar_observations_consecutive_scored ON radar_observations (consecutive_scored)",
+                "CREATE INDEX IF NOT EXISTS ix_radar_observations_strong_checkpoints ON radar_observations (strong_checkpoints)",
+                "CREATE INDEX IF NOT EXISTS ix_radar_observations_consecutive_strong ON radar_observations (consecutive_strong)",
+                "CREATE INDEX IF NOT EXISTS ix_radar_observations_acceleration_ratio ON radar_observations (acceleration_ratio)",
+            ):
+                await conn.execute(text(index_sql))
+
         if _IS_POSTGRES and ai_candidate_columns:
             await conn.execute(text(
                 "CREATE INDEX IF NOT EXISTS ix_ai_ew_candidate_cohort_key "
