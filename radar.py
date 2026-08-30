@@ -48,9 +48,11 @@ RADAR_BUMP_SWEEP_SETTING = "dt_radar_v4156_bump_sweep_complete"
 RADAR_BUMP_QUARANTINE_SETTING = "dt_radar_v4156_bump_quarantine_applied"
 RADAR_VELOCITY_PREP_SETTING = "dt_radar_v4157_verified_velocity_prepared"
 RADAR_UNIFIED_48H_REPAIR_SETTING = "dt_radar_v4200_unified_48h_repair_v2"
-RADAR_V3_RESET_SETTING = "dt_radar_v3_observed_demand_reset_v2_gate_15_30_60"
+RADAR_V3_RESET_SETTING = "dt_radar_v3_observed_demand_reset_v3_radar31_context_score"
 RADAR_V3_FIRST_CHECK_MINUTES = 60
 RADAR_V3_NEXT_CHECK_MINUTES = 60
+RADAR_V3_EARLY_CHECK_MINUTES = 45
+RADAR_V3_STRONG_CHECK_MINUTES = 30
 RADAR_V3_MAX_OBSERVATION_HOURS = 6
 RADAR_V3_CANDIDATE_VPH = 15.0
 RADAR_V3_SCORE_VPH = 30.0
@@ -1327,22 +1329,26 @@ async def radar_v3_release_claims(owner: str, external_ids: list[str] | tuple[st
 
 
 async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | set[str]) -> int:
-    """Convert exact refreshed counters into Radar 3.0 evidence.
+    """Convert exact refreshed counters into Radar 3.1 observed-demand evidence.
 
-    Demand Gate v2 (normalized to views/hour so delayed checkpoints stay fair):
-      <15/h  -> noise/weak, no public DT Score and observation closes;
-      15-29/h -> Candidate, no public DT Score, keep watching;
-      30-59/h -> scored Early signal;
-      >=60/h  -> strong first signal immediately.
+    Absolute Demand Gate stays authoritative:
+      <15/h   -> Noise/Weak, no Score and observation closes;
+      15-29/h -> Candidate, no Score, recheck in 60m;
+      30-59/h -> scored Early evidence, recheck in 45m;
+      >=60/h  -> Strong first signal, recheck in 30m.
 
-    Persistence and independent listings can strengthen the signal further. The
-    absolute pre-DT counter is baseline-only and never contributes to Score.
+    Above the 30/h Score Gate, DT Score measures context rather than raw movement:
+      50% category velocity percentile, 25% persistence, 15% acceleration,
+      10% repeatability across independent listings of the same product family.
+    Confidence is separate from Score. Hot has two valid paths: two consecutive
+    >=60/h intervals on one listing, or strong/persistent evidence confirmed by a
+    second independently scored listing in the same product family.
     """
     ids = list(dict.fromkeys(str(x).strip() for x in external_ids if str(x).strip()))
     if not ids:
         return 0
     now = datetime.utcnow()
-    prepared: list[tuple[Listing, RadarObservation, int, float, int]] = []
+    prepared: list[tuple[Listing, RadarObservation, int, float, int, float]] = []
     async with SessionLocal() as session:
         pairs = (await session.execute(
             select(Listing, RadarObservation).join(RadarObservation, RadarObservation.external_id == Listing.external_id).where(
@@ -1353,8 +1359,6 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
         )).all()
         for listing, obs in pairs:
             measured_at = listing.views_checked_at or now
-            # Observation TTL is authoritative. A delayed checkpoint must never
-            # turn many hours of accumulated growth into a supposedly fresh signal.
             if obs.expires_at and measured_at > obs.expires_at:
                 obs.status = "expired"
                 obs.next_check_at = None
@@ -1368,50 +1372,64 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
             interval_delta = max(0, current - int(obs.last_views or 0))
             hours = max(1/60, (measured_at - obs.last_measured_at).total_seconds()/3600.0)
             vph = interval_delta / hours
+            previous_vph = float(obs.current_vph or 0.0)
+            acceleration_ratio = 0.0
+            if previous_vph >= RADAR_V3_CANDIDATE_VPH:
+                acceleration_ratio = (float(vph) - previous_vph) / max(1.0, previous_vph)
+
             obs.checkpoint_count = int(obs.checkpoint_count or 0) + 1
             if vph >= RADAR_V3_CANDIDATE_VPH:
                 obs.positive_checkpoints = int(obs.positive_checkpoints or 0) + 1
                 obs.consecutive_positive = int(obs.consecutive_positive or 0) + 1
             else:
                 obs.consecutive_positive = 0
+            if vph >= RADAR_V3_SCORE_VPH:
+                obs.scored_checkpoints = int(obs.scored_checkpoints or 0) + 1
+                obs.consecutive_scored = int(obs.consecutive_scored or 0) + 1
+            else:
+                obs.consecutive_scored = 0
+            if vph >= RADAR_V3_STRONG_VPH:
+                obs.strong_checkpoints = int(obs.strong_checkpoints or 0) + 1
+                obs.consecutive_strong = int(obs.consecutive_strong or 0) + 1
+            else:
+                obs.consecutive_strong = 0
+
             obs.last_views = current
             obs.last_measured_at = measured_at
             obs.total_delta = max(0, current - int(obs.baseline_views or 0))
+            obs.previous_vph = previous_vph
             obs.current_vph = float(vph)
+            obs.acceleration_ratio = float(acceleration_ratio)
             obs.peak_vph = max(float(obs.peak_vph or 0.0), float(vph))
             obs.updated_at = now
             obs.lease_owner = ""
             obs.lease_until = None
 
-            # Hard evidence funnel. Sub-15/h movement is noise/weak demand and is
-            # deliberately not rechecked; 15-29/h remains a Candidate but cannot
-            # publish a product or a DT Score. Only >=30/h can reach public Radar.
             if vph < RADAR_V3_CANDIDATE_VPH:
                 obs.status = "quiet"
                 obs.next_check_at = None
             elif vph < RADAR_V3_SCORE_VPH:
                 obs.status = "candidate"
                 obs.next_check_at = measured_at + timedelta(minutes=RADAR_V3_NEXT_CHECK_MINUTES)
-            elif vph >= RADAR_V3_STRONG_VPH or int(obs.consecutive_positive or 0) >= 2:
+            elif vph >= RADAR_V3_STRONG_VPH or int(obs.consecutive_scored or 0) >= 2:
                 obs.status = "confirmed"
-                obs.next_check_at = measured_at + timedelta(minutes=RADAR_V3_NEXT_CHECK_MINUTES)
+                obs.next_check_at = measured_at + timedelta(minutes=RADAR_V3_STRONG_CHECK_MINUTES)
             else:
                 obs.status = "observed"
-                obs.next_check_at = measured_at + timedelta(minutes=RADAR_V3_NEXT_CHECK_MINUTES)
+                obs.next_check_at = measured_at + timedelta(minutes=RADAR_V3_EARLY_CHECK_MINUTES)
             if obs.expires_at and obs.next_check_at and obs.next_check_at > obs.expires_at:
                 obs.next_check_at = None
-            prepared.append((listing, obs, interval_delta, vph, current))
+            prepared.append((listing, obs, interval_delta, vph, current, previous_vph))
         await session.commit()
 
     emitted = 0
-    for listing, obs, interval_delta, vph, current in prepared:
-        # Candidate is intentionally visible only in diagnostics. No RadarProduct,
-        # RadarSnapshot or DT Score is created below the 30 views/hour gate.
+    for listing, obs, interval_delta, vph, current, previous_vph in prepared:
         if vph < RADAR_V3_SCORE_VPH:
             continue
         async with SessionLocal() as session:
             peers = [float(x or 0.0) for x in (await session.execute(select(RadarObservation.current_vph).where(
-                RadarObservation.category_key == str(obs.category_key), RadarObservation.checkpoint_count >= 1,
+                RadarObservation.category_key == str(obs.category_key),
+                RadarObservation.checkpoint_count >= 1,
                 RadarObservation.current_vph >= RADAR_V3_CANDIDATE_VPH,
                 RadarObservation.updated_at >= now - timedelta(hours=6),
             ))).scalars().all()]
@@ -1421,18 +1439,68 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
                 RadarObservation.positive_checkpoints >= 1,
                 RadarObservation.updated_at >= now - timedelta(hours=6),
             ))).scalars().all())
-        family_positive = len({str(x.external_id) for x in family})
-        family_persistent = len({str(x.external_id) for x in family if int(x.consecutive_positive or 0) >= 2})
-        velocity_points = round(60 * _percentile_rank(float(vph), peers))
-        persistence_points = 25 if int(obs.consecutive_positive or 0) >= 3 else (15 if int(obs.consecutive_positive or 0) >= 2 else 5)
-        repeat_points = 15 if family_positive >= 3 else (8 if family_positive >= 2 else 0)
-        score = max(1, min(100, int(velocity_points + persistence_points + repeat_points)))
-        if family_persistent >= 2:
+
+        category_percentile = _percentile_rank(float(vph), peers)
+        peer_count = len(peers)
+        family_candidate = len({str(x.external_id) for x in family})
+        family_scored = len({str(x.external_id) for x in family if float(x.current_vph or 0.0) >= RADAR_V3_SCORE_VPH})
+        family_strong = len({str(x.external_id) for x in family if float(x.current_vph or 0.0) >= RADAR_V3_STRONG_VPH})
+
+        velocity_points = round(50 * category_percentile)
+        consecutive_scored = int(obs.consecutive_scored or 0)
+        persistence_points = 25 if consecutive_scored >= 3 else (15 if consecutive_scored >= 2 else 0)
+        accel = float(obs.acceleration_ratio or 0.0)
+        if previous_vph < RADAR_V3_CANDIDATE_VPH:
+            acceleration_points = 0
+        elif accel >= 0.50:
+            acceleration_points = 15
+        elif accel >= 0.20:
+            acceleration_points = 12
+        elif accel >= 0.0:
+            acceleration_points = 8
+        elif accel >= -0.15:
+            acceleration_points = 4
+        else:
+            acceleration_points = 0
+        repeat_points = 10 if family_scored >= 2 else (5 if family_candidate >= 2 else 0)
+        score = max(1, min(100, int(velocity_points + persistence_points + acceleration_points + repeat_points)))
+        # One interval may reveal a strong lead, but it cannot pretend to have
+        # persistence/acceleration evidence that DT has not observed yet.
+        if int(obs.scored_checkpoints or 0) <= 1:
+            score = min(score, 50)
+
+        confidence = 30
+        confidence += min(20, peer_count)
+        confidence += 20 if int(obs.scored_checkpoints or 0) >= 2 else 0
+        confidence += 10 if int(obs.strong_checkpoints or 0) >= 1 else 0
+        confidence += 10 if family_scored >= 2 else 0
+        confidence += 5 if family_strong >= 2 else 0
+        confidence = max(0, min(95, int(confidence)))
+
+        # Hot path A: one listing sustains >=60/h twice.
+        solo_hot = int(obs.consecutive_strong or 0) >= 2
+        # Hot path B: a strong/persistent listing is independently confirmed by
+        # another family listing that also crossed the 30/h Score Gate.
+        family_hot = family_scored >= 2 and (float(vph) >= RADAR_V3_STRONG_VPH or consecutive_scored >= 2)
+        if solo_hot or family_hot:
             demand_status, stage = "hot", "product_hot"
-        elif float(vph) >= RADAR_V3_STRONG_VPH or int(obs.consecutive_positive or 0) >= 2 or family_positive >= 2:
+        elif float(vph) >= RADAR_V3_STRONG_VPH or consecutive_scored >= 2:
             demand_status, stage = "rising", "confirmed"
         else:
             demand_status, stage = "stable", "observed"
+
+        # Persist context metrics even before signal write so the dashboard can
+        # explain how Radar reached the decision.
+        async with SessionLocal() as session:
+            await session.execute(
+                update(RadarObservation).where(RadarObservation.external_id == str(obs.external_id)).values(
+                    velocity_percentile=float(category_percentile),
+                    confidence=int(confidence),
+                    updated_at=now,
+                )
+            )
+            await session.commit()
+
         allowed, detail_reason, verified_at = await _live_detail_organic_gate(listing, force_priority="radar_checkpoint")
         if not allowed:
             continue
@@ -1440,14 +1508,15 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
         result = await _upsert_signal(
             source_key=f"radar3:{obs.external_id}:{int(obs.last_measured_at.timestamp())}",
             source="radar3_observed", listing=listing, product_key=str(obs.product_key),
-            score=score, confidence=min(95, 35 + int(obs.positive_checkpoints or 0)*20 + min(20, family_positive*5)),
+            score=score, confidence=confidence,
             stage=stage, opportunity_type="observed_demand", view_count=current, views_per_hour=float(vph),
             reasons=[
-                f"Radar 3.0 Demand Gate: {float(vph):.1f}/h (Candidate >=15, Score >=30, Strong >=60)",
-                f"DT observed +{int(obs.total_delta)} views in {elapsed_hours:.1f}h after baseline",
-                f"Current interval: +{int(interval_delta)} · {float(vph):.1f}/h · consecutive demand checkpoints={int(obs.consecutive_positive or 0)}",
-                f"Independent family listings above Candidate gate: {family_positive} · persistent: {family_persistent}",
-                "Initial counter is baseline-only and contributed 0 points",
+                f"Radar 3.1: {float(vph):.1f}/h · category P{int(round(category_percentile*100))} among {peer_count} live peers",
+                f"Score = velocity {velocity_points}/50 + persistence {persistence_points}/25 + acceleration {acceleration_points}/15 + repeatability {repeat_points}/10",
+                f"Confidence {confidence}% · scored checkpoints={int(obs.scored_checkpoints or 0)} · strong checkpoints={int(obs.strong_checkpoints or 0)}",
+                f"Acceleration {accel*100:+.0f}% vs previous {previous_vph:.1f}/h · current interval +{int(interval_delta)}",
+                f"Family confirmations: Candidate {family_candidate} · Score Gate {family_scored} · Strong {family_strong}",
+                f"DT observed +{int(obs.total_delta)} views in {elapsed_hours:.1f}h after baseline; Initial counter is baseline-only and contributed 0 points",
             ],
             recorded_at=obs.last_measured_at, live_detail_verified_at=verified_at,
             demand_views=int(obs.total_delta), demand_age_minutes=float(elapsed_hours*60), radar_rank=float(score),

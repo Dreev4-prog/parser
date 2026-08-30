@@ -4851,7 +4851,7 @@ def _radar_autoscan_next_run_text(state: dict) -> str:
 
 
 async def _radar3_dashboard_snapshot() -> dict:
-    """Compact Radar 3.0 control-plane snapshot for the single admin dashboard."""
+    """Compact Radar 3.1 control-plane snapshot with evidence funnel/context metrics."""
     now = datetime.utcnow()
     async with SessionLocal() as session:
         active = int((await session.execute(select(func.count(RadarObservation.id)).where(
@@ -4866,14 +4866,26 @@ async def _radar3_dashboard_snapshot() -> dict:
             RadarObservation.expires_at > now,
             RadarObservation.status.in_(["baseline", "candidate", "observed", "confirmed"]),
         ))).scalar_one() or 0)
+        any_growth = int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.total_delta > 0, RadarObservation.expires_at > now,
+        ))).scalar_one() or 0)
         candidate = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.status == "candidate", RadarObservation.expires_at > now,
+            RadarObservation.current_vph >= 15.0, RadarObservation.current_vph < 30.0, RadarObservation.expires_at > now,
         ))).scalar_one() or 0)
         observed = int((await session.execute(select(func.count(RadarObservation.id)).where(
             RadarObservation.current_vph >= 30.0, RadarObservation.expires_at > now,
         ))).scalar_one() or 0)
+        strong_intervals = int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.current_vph >= 60.0, RadarObservation.expires_at > now,
+        ))).scalar_one() or 0)
         persistent = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.consecutive_positive >= 2, RadarObservation.expires_at > now,
+            RadarObservation.consecutive_scored >= 2, RadarObservation.expires_at > now,
+        ))).scalar_one() or 0)
+        accelerating = int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.current_vph >= 30.0, RadarObservation.acceleration_ratio >= 0.20, RadarObservation.expires_at > now,
+        ))).scalar_one() or 0)
+        high_confidence = int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.confidence >= 70, RadarObservation.expires_at > now,
         ))).scalar_one() or 0)
         quiet = int((await session.execute(select(func.count(RadarObservation.id)).where(
             RadarObservation.status == "quiet",
@@ -4895,10 +4907,13 @@ async def _radar3_dashboard_snapshot() -> dict:
                 RadarObservation.category_key,
                 func.count(RadarObservation.id),
                 func.coalesce(func.sum(RadarObservation.total_delta), 0),
+                func.coalesce(func.avg(RadarObservation.current_vph), 0.0),
+                func.coalesce(func.max(RadarObservation.velocity_percentile), 0.0),
+                func.coalesce(func.avg(RadarObservation.confidence), 0.0),
             )
-            .where(RadarObservation.positive_checkpoints >= 1, RadarObservation.expires_at > now)
+            .where(RadarObservation.current_vph >= 15.0, RadarObservation.expires_at > now)
             .group_by(RadarObservation.category_key)
-            .order_by(func.coalesce(func.sum(RadarObservation.total_delta), 0).desc(), func.count(RadarObservation.id).desc())
+            .order_by(func.coalesce(func.max(RadarObservation.velocity_percentile), 0.0).desc(), func.coalesce(func.avg(RadarObservation.current_vph), 0.0).desc())
             .limit(12)
         )).all())
         signal_rows = list((await session.execute(
@@ -4912,7 +4927,7 @@ async def _radar3_dashboard_snapshot() -> dict:
         slot = signal_map.setdefault(str(key or "unknown"), {"stable": 0, "rising": 0, "hot": 0})
         slot[str(status or "")] = int(count or 0)
     category_lines = []
-    for key, count, delta in category_rows:
+    for key, count, delta, avg_vph, max_pct, avg_conf in category_rows:
         key = str(key or "unknown")
         cat = CATEGORIES.get(key)
         name = str(getattr(cat, "name", None) or key)
@@ -4922,10 +4937,15 @@ async def _radar3_dashboard_snapshot() -> dict:
         if int(sig.get("rising", 0)): suffix.append(f"📈{int(sig['rising'])}")
         if int(sig.get("stable", 0)): suffix.append(f"🟡{int(sig['stable'])}")
         signal_text = (" · " + " ".join(suffix)) if suffix else ""
-        category_lines.append(f"• <b>{html.escape(name)}</b>: +{int(delta or 0)} · {int(count or 0)} растут{signal_text}")
+        category_lines.append(
+            f"• <b>{html.escape(name)}</b>: {float(avg_vph or 0):.1f}/ч avg · P{int(round(float(max_pct or 0)*100))} max · "
+            f"conf {int(round(float(avg_conf or 0)))}% · +{int(delta or 0)} · {int(count or 0)} наблюд.{signal_text}"
+        )
     return {
-        "active": active, "baseline": baseline, "due": due, "candidate": candidate, "observed": observed,
-        "persistent": persistent, "quiet": quiet, "total_delta": total_delta,
+        "active": active, "baseline": baseline, "due": due, "any_growth": any_growth,
+        "candidate": candidate, "observed": observed, "strong_intervals": strong_intervals,
+        "persistent": persistent, "accelerating": accelerating, "high_confidence": high_confidence,
+        "quiet": quiet, "total_delta": total_delta,
         "early": early, "strong": strong, "hot": hot, "category_lines": category_lines,
     }
 
@@ -4972,7 +4992,7 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
     category_lines = list(radar3.get("category_lines") or [])
     category_text = "\n".join(category_lines[:8]) if category_lines else "Пока подтверждённых категорий нет"
     text = (
-        "<b>📡 DT Radar 3.0 · OBSERVED DEMAND</b>\n\n"
+        "<b>📡 DT Radar 3.1 · CONTEXT DEMAND</b>\n\n"
         f"Статус AutoScan: <b>{status_text}</b>\n"
         f"Режим: <b>{mode_label}</b>\n"
         + (f"Глубина: <b>{RADAR_AUTOSCAN_DEPTH} страниц только за сегодня на категорию</b>\n" if not is_retry else f"Глубина: <b>{_radar_layer_depth(state)} страниц на категорию</b>\n")
@@ -4985,19 +5005,23 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         + f"🧾 Чистых сегодняшних объявлений: <b>{int(state.get('listings_seen') or 0)}</b> · новых: <b>{int(state.get('new_listings') or 0)}</b>\n"
         + f"👁 Точные просмотры: <b>{int(state.get('views_verified') or 0)}/{int(state.get('views_requested') or 0)}</b>\n"
         + f"📡 Baseline создано в этом круге: <b>{int(state.get('radar_candidates') or 0)}</b>\n\n"
-        + "<b>🔬 Живые замеры Radar 3.0</b>\n"
+        + "<b>🔬 Воронка Radar 3.1</b>\n"
         + f"Всего активных наблюдений: <b>{int(radar3.get('active') or 0)}</b>\n"
         + f"Ждут первого повторного замера: <b>{int(radar3.get('baseline') or 0)}</b>\n"
         + f"Готовы к замеру сейчас: <b>{int(radar3.get('due') or 0)}</b>\n"
-        + f"🟠 Candidate ≥15/ч, без Score: <b>{int(radar3.get('candidate') or 0)}</b>\n"
-        + f"⭐ Прошли Score Gate ≥30/ч: <b>{int(radar3.get('observed') or 0)}</b>\n"
-        + f"Рост подтвердился ≥2 раза: <b>{int(radar3.get('persistent') or 0)}</b>\n"
+        + f"Любой DT-observed прирост: <b>{int(radar3.get('any_growth') or 0)}</b>\n"
+        + f"🟠 Candidate 15–29/ч, без Score: <b>{int(radar3.get('candidate') or 0)}</b>\n"
+        + f"⭐ Score Gate ≥30/ч: <b>{int(radar3.get('observed') or 0)}</b>\n"
+        + f"⚡ Сильный интервал ≥60/ч: <b>{int(radar3.get('strong_intervals') or 0)}</b>\n"
+        + f"🔁 Score подтверждён ≥2 раза: <b>{int(radar3.get('persistent') or 0)}</b>\n"
+        + f"🚀 Ускоряются ≥20%: <b>{int(radar3.get('accelerating') or 0)}</b>\n"
+        + f"🛡 Confidence ≥70%: <b>{int(radar3.get('high_confidence') or 0)}</b>\n"
         + f"Noise / Weak <15/ч, остановлены: <b>{int(radar3.get('quiet') or 0)}</b>\n"
         + f"Суммарный DT-observed прирост: <b>+{int(radar3.get('total_delta') or 0)}</b> просмотров\n"
         + f"🟡 Early: <b>{int(radar3.get('early') or 0)}</b> · 📈 Strong: <b>{int(radar3.get('strong') or 0)}</b> · 🔥 Hot: <b>{int(radar3.get('hot') or 0)}</b>\n\n"
-        + "<b>🗂 Категории с живым приростом</b>\n"
+        + "<b>🗂 Категории с живым спросом</b>\n"
         + category_text + "\n\n"
-        + "<i>Demand Gate: &lt;15/ч — без Score и стоп; 15–29/ч — Candidate без Score; ≥30/ч — появляется DT Score; ≥60/ч — Strong уже на первом контрольном интервале. Первый счётчик всегда только baseline.</i>\n\n"
+        + "<i>DT Score = 50% сила относительно категории + 25% устойчивость + 15% ускорение + 10% повторяемость. Confidence считается отдельно. Demand Gate: &lt;15/ч — стоп; 15–29/ч — Candidate; ≥30/ч — Score/Early; ≥60/ч — Strong. Повторные замеры: Candidate 60 мин · Early 45 мин · Strong 30 мин. Hot: два ≥60/ч подряд ИЛИ Strong/устойчивый сигнал + второе независимое объявление той же семьи. Первый счётчик всегда только baseline.</i>\n\n"
         + f"Последний круг: <b>{last_line}</b>\n"
         + f"Следующий ежедневный: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>"
     )

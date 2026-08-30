@@ -69,7 +69,7 @@ class Radar3ObservedDemandContractTests(unittest.TestCase):
         self.assertIn('radar_v3_claim_due_external_ids(owner, limit=250)', BOT)
 
     def test_admin_radar3_page_replaces_old_ai_lab(self):
-        self.assertIn('DT Radar 3.0 · OBSERVED DEMAND', BOT)
+        self.assertIn('DT Radar 3.1 · CONTEXT DEMAND', BOT)
         admin = BOT.split('def admin_keyboard', 1)[1].split('def admin_back_keyboard', 1)[0]
         self.assertNotIn('DT AI Lab', admin)
         self.assertIn('DT Radar 3.0', admin)

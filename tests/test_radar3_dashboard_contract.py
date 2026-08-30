@@ -7,12 +7,12 @@ def test_radar3_dashboard_has_core_measurements():
     for phrase in (
         'Ждут первого повторного замера',
         'Готовы к замеру сейчас',
-        'Candidate ≥15/ч, без Score',
-        'Прошли Score Gate ≥30/ч',
-        'Рост подтвердился ≥2 раза',
+        'Candidate 15–29/ч, без Score',
+        'Score Gate ≥30/ч',
+        'Score подтверждён ≥2 раза',
         'Суммарный DT-observed прирост',
         'Early:', 'Strong:', 'Hot:',
-        'Категории с живым приростом',
+        'Категории с живым спросом',
     ):
         assert phrase in BOT
 

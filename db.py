@@ -517,6 +517,14 @@ async def init_db() -> None:
         for column_name, sql_type in {
             "lease_owner": "VARCHAR(120) DEFAULT ''",
             "lease_until": "TIMESTAMP",
+            "previous_vph": "FLOAT DEFAULT 0",
+            "velocity_percentile": "FLOAT DEFAULT 0",
+            "acceleration_ratio": "FLOAT DEFAULT 0",
+            "confidence": "INTEGER DEFAULT 0",
+            "scored_checkpoints": "INTEGER DEFAULT 0",
+            "consecutive_scored": "INTEGER DEFAULT 0",
+            "strong_checkpoints": "INTEGER DEFAULT 0",
+            "consecutive_strong": "INTEGER DEFAULT 0",
         }.items():
             if not radar_observation_columns or column_name in radar_observation_columns:
                 continue

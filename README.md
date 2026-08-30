@@ -1,91 +1,37 @@
-# DT Parser 4.21.4 — DT Radar 3.0 Observed Demand
+# DT Parser 4.21.7 — Radar 3.1 Context Score
 
 Production Telegram/Railway parser and DT Radar for Kleinanzeigen.
 
+## Current Radar contract
 
-## Radar 3.0: first counter is never demand
+Radar scans **20 pages for today only** per eligible product category. Completed user scans for today may also seed exact-view baselines. The first Kleinanzeigen counter is always baseline-only and contributes zero demand evidence.
 
-Kleinanzeigen can surface an old listing as if it were fresh while keeping its historical view counter. Radar 3.0 therefore treats the first exact counter only as a baseline. Public signals are created solely from growth DT measures afterwards. See `docs/RADAR_3_0.md`.
+### Absolute Demand Gate
 
-## Unified 48H Radar
+- `<15 views/hour` — Noise/Weak, no Score, observation stops.
+- `15–29 views/hour` — Candidate, no Score, recheck after 60 minutes.
+- `30–59 views/hour` — Score/Early evidence, recheck after 45 minutes.
+- `>=60 views/hour` — Strong first signal, recheck after 30 minutes.
 
-4.20.0 uses one public Radar for **today + yesterday** instead of treating yesterday only as background statistics.
+All rates are calculated only from post-baseline growth observed by DT.
 
-- **Fresh Layer:** up to 15 verified pages/category for today on every normal AutoScan.
-- **Context Layer:** up to 15 verified pages/category for yesterday, at most once per Moscow day after a completed manual/daily Fresh round.
-- Both layers use the same Date/Page chronology, exact views, view-provenance rules and live Organic Gate.
-- A yesterday listing may enter the same Radar, but only from **demand-safe evidence**. An inherited/unknown total never becomes a shortcut into TOP.
-- Relative View Velocity is compared only inside explicit age cohorts: `0–3h`, `3–6h`, `6–12h`, `12–24h`, `24–48h`.
+### DT Score after the 30/h gate
 
-### Demand Gate
+`50% category velocity percentile + 25% persistence + 15% acceleration + 10% repeatability`
 
-DT Score is relative, so Radar adds an absolute demand floor before a listing can be called Hot:
+The first scored checkpoint is capped at 50/100 because persistence and acceleration have not yet been proven. Confidence is a separate 0–95% evidence-maturity metric.
 
-- `0–3h`: 30 demand-safe views
-- `3–6h`: 40
-- `6–12h`: 60
-- `12–24h`: 80
-- `24–48h`: 100
+### Hot
 
-Statuses:
+A product can become Hot by either route:
 
-- `🟡 Early` — interesting early evidence, but not enough proof for Strong/Hot;
-- `📈 Strong` — demand is already confirming;
-- `🔥 Hot` — DT Score + confidence + full age-aware Demand Gate are all satisfied.
+1. one listing sustains `>=60/h` for two consecutive DT checkpoints; or
+2. a Strong/persistent listing is confirmed by a second independent listing in the same product family that also crosses the `>=30/h` Score Gate.
 
-A listing with 15 views can therefore never become Hot simply because a weak category makes its relative percentile look good.
+### Radar dashboard
 
-### Radar Rank
+The single DT Radar admin panel shows the observation funnel, due queue, any growth, Candidate/Score/Strong counts, persistence, acceleration, high-confidence evidence, Early/Strong/Hot, total DT-observed growth, and category context (average velocity, best percentile, average confidence).
 
-Public **DT Demand Score stays unchanged**. Ordering uses a separate internal rank:
+## Reliability
 
-`Radar Rank = 70% DT Score + 20% Evidence Confidence + 10% Evidence Maturity`
-
-Radar Rank does not rewrite DT Score. Stale demand is re-evaluated against the older age gate even without inventing new views, so a listing cannot stay Hot forever on an early frozen counter.
-
-## DT Demand Score
-
-The public score remains:
-
-`40% Relative View Velocity + 20% Acceleration + 15% Persistence + 15% Repeatability + 10% Price Fit`
-
-Unknown factors remain evidence-adaptive: unavailable evidence is removed from the vote instead of injecting a synthetic neutral score.
-
-## View provenance / Organic Integrity
-
-- First exact counter `>=400` is always an untrusted baseline.
-- Two later clean checkpoints, at least 30 minutes apart, are required.
-- Only `current - baseline` may then contribute to demand scoring.
-- Sticky exclusions remain for TOP/Hochschieben/Highlight/Galerie/sponsored/reduced-price/resurfaced external IDs.
-- High views alone never mark an ad promoted.
-
-## Reliability retained
-
-The audited 4.20.0 baseline preserves hard stop, category watchdog, foreground/background deadlock isolation, exact-view identity checks, Page/Date payload trust boundaries and the `v4200-core2-audit3` rolling-deploy/cache contract.
-
-On first startup, old `radar_autoscan` / `scan_hot` snapshots that used the previous synthetic TOP-position score are removed from live ranking. Product ids/favorites/history remain, while current status is rebuilt only from new unified demand-safe evidence.
-
-## Repository layout
-
-Runtime entrypoints intentionally remain in the repository root because Railway services import them directly. Release clutter does not.
-
-- `bot.py`, `parser.py`, `radar.py`, workers/managers — production runtime.
-- `radar_ranking.py` — unified 48H Demand Gate / Radar Rank policy.
-- `assets/` — Telegram/UI assets.
-- `docs/DEPLOYMENT.md` — deployment checklist.
-- `docs/ARCHITECTURE.md` — runtime/data-flow overview.
-- `docs/RELEASE_4_20_0.md` — exact release behavior.
-- `docs/AUDIT_4_20_0.md` — whole-project audit notes.
-- `docs/releases/HISTORY.md` — historical deployment notes consolidated into one archive document.
-- `docs/checksums/HISTORY_SHA256.txt` — historical release hashes consolidated into one archive file.
-- `tests/` — release invariants/smoke tests.
-- `scripts/release_smoke.py` — dependency-free local release validation.
-
-## Validation
-
-```bash
-python scripts/release_smoke.py
-pytest -q
-```
-
-A full live smoke test still requires Railway/PostgreSQL/Redis and the real Kleinanzeigen worker fleet.
+Radar observations have cross-replica PostgreSQL leases (`FOR UPDATE SKIP LOCKED`), a six-hour TTL, an independent expiry loop, and a dedicated throttled `radar_checkpoint` traffic lane. User scans keep foreground priority. Legacy AI admission is retired.
