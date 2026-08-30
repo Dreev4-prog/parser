@@ -48,10 +48,13 @@ RADAR_BUMP_SWEEP_SETTING = "dt_radar_v4156_bump_sweep_complete"
 RADAR_BUMP_QUARANTINE_SETTING = "dt_radar_v4156_bump_quarantine_applied"
 RADAR_VELOCITY_PREP_SETTING = "dt_radar_v4157_verified_velocity_prepared"
 RADAR_UNIFIED_48H_REPAIR_SETTING = "dt_radar_v4200_unified_48h_repair_v2"
-RADAR_V3_RESET_SETTING = "dt_radar_v3_observed_demand_reset_v1"
+RADAR_V3_RESET_SETTING = "dt_radar_v3_observed_demand_reset_v2_gate_15_30_60"
 RADAR_V3_FIRST_CHECK_MINUTES = 60
 RADAR_V3_NEXT_CHECK_MINUTES = 60
 RADAR_V3_MAX_OBSERVATION_HOURS = 6
+RADAR_V3_CANDIDATE_VPH = 15.0
+RADAR_V3_SCORE_VPH = 30.0
+RADAR_V3_STRONG_VPH = 60.0
 RADAR_SCAN_TOP_LIMIT = 12
 RADAR_PAGE_SIZE = 8
 # v4.15.5: after parser-level HTTP + browser recovery, wait once and retry only
@@ -1253,7 +1256,7 @@ async def radar_v3_due_external_ids(limit: int = 1000) -> list[str]:
             select(RadarObservation.external_id).where(
                 RadarObservation.next_check_at.is_not(None),
                 RadarObservation.next_check_at <= now,
-                RadarObservation.status.in_(["baseline", "observed", "confirmed"]),
+                RadarObservation.status.in_(["baseline", "candidate", "observed", "confirmed"]),
                 or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now),
                 or_(RadarObservation.lease_until.is_(None), RadarObservation.lease_until < now),
             ).order_by(RadarObservation.next_check_at.asc()).limit(max(1, int(limit)))
@@ -1276,7 +1279,7 @@ async def radar_v3_claim_due_external_ids(owner: str, limit: int = 1000, lease_m
             .where(
                 RadarObservation.next_check_at.is_not(None),
                 RadarObservation.next_check_at <= now,
-                RadarObservation.status.in_(["baseline", "observed", "confirmed"]),
+                RadarObservation.status.in_(["baseline", "candidate", "observed", "confirmed"]),
                 or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now),
                 or_(RadarObservation.lease_until.is_(None), RadarObservation.lease_until < now),
             )
@@ -1326,10 +1329,14 @@ async def radar_v3_release_claims(owner: str, external_ids: list[str] | tuple[st
 async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | set[str]) -> int:
     """Convert exact refreshed counters into Radar 3.0 evidence.
 
-    Early = one positive DT-observed interval. Strong = two consecutive positive
-    intervals OR two independent listings in the same product family. Hot = at
-    least two independent family listings with persistent DT-observed growth.
-    Absolute pre-DT counters are never used in score or status.
+    Demand Gate v2 (normalized to views/hour so delayed checkpoints stay fair):
+      <15/h  -> noise/weak, no public DT Score and observation closes;
+      15-29/h -> Candidate, no public DT Score, keep watching;
+      30-59/h -> scored Early signal;
+      >=60/h  -> strong first signal immediately.
+
+    Persistence and independent listings can strengthen the signal further. The
+    absolute pre-DT counter is baseline-only and never contributes to Score.
     """
     ids = list(dict.fromkeys(str(x).strip() for x in external_ids if str(x).strip()))
     if not ids:
@@ -1362,7 +1369,7 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
             hours = max(1/60, (measured_at - obs.last_measured_at).total_seconds()/3600.0)
             vph = interval_delta / hours
             obs.checkpoint_count = int(obs.checkpoint_count or 0) + 1
-            if interval_delta > 0:
+            if vph >= RADAR_V3_CANDIDATE_VPH:
                 obs.positive_checkpoints = int(obs.positive_checkpoints or 0) + 1
                 obs.consecutive_positive = int(obs.consecutive_positive or 0) + 1
             else:
@@ -1373,14 +1380,19 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
             obs.current_vph = float(vph)
             obs.peak_vph = max(float(obs.peak_vph or 0.0), float(vph))
             obs.updated_at = now
-            # Measurement completed: release the cross-replica claim before the
-            # next checkpoint is scheduled.
             obs.lease_owner = ""
             obs.lease_until = None
-            if interval_delta <= 0 and int(obs.checkpoint_count) >= 1:
+
+            # Hard evidence funnel. Sub-15/h movement is noise/weak demand and is
+            # deliberately not rechecked; 15-29/h remains a Candidate but cannot
+            # publish a product or a DT Score. Only >=30/h can reach public Radar.
+            if vph < RADAR_V3_CANDIDATE_VPH:
                 obs.status = "quiet"
                 obs.next_check_at = None
-            elif int(obs.consecutive_positive) >= 2:
+            elif vph < RADAR_V3_SCORE_VPH:
+                obs.status = "candidate"
+                obs.next_check_at = measured_at + timedelta(minutes=RADAR_V3_NEXT_CHECK_MINUTES)
+            elif vph >= RADAR_V3_STRONG_VPH or int(obs.consecutive_positive or 0) >= 2:
                 obs.status = "confirmed"
                 obs.next_check_at = measured_at + timedelta(minutes=RADAR_V3_NEXT_CHECK_MINUTES)
             else:
@@ -1393,15 +1405,19 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
 
     emitted = 0
     for listing, obs, interval_delta, vph, current in prepared:
-        if interval_delta <= 0:
+        # Candidate is intentionally visible only in diagnostics. No RadarProduct,
+        # RadarSnapshot or DT Score is created below the 30 views/hour gate.
+        if vph < RADAR_V3_SCORE_VPH:
             continue
         async with SessionLocal() as session:
             peers = [float(x or 0.0) for x in (await session.execute(select(RadarObservation.current_vph).where(
                 RadarObservation.category_key == str(obs.category_key), RadarObservation.checkpoint_count >= 1,
+                RadarObservation.current_vph >= RADAR_V3_CANDIDATE_VPH,
                 RadarObservation.updated_at >= now - timedelta(hours=6),
             ))).scalars().all()]
             family = list((await session.execute(select(RadarObservation).where(
                 RadarObservation.product_key == str(obs.product_key),
+                RadarObservation.current_vph >= RADAR_V3_CANDIDATE_VPH,
                 RadarObservation.positive_checkpoints >= 1,
                 RadarObservation.updated_at >= now - timedelta(hours=6),
             ))).scalars().all())
@@ -1413,7 +1429,7 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
         score = max(1, min(100, int(velocity_points + persistence_points + repeat_points)))
         if family_persistent >= 2:
             demand_status, stage = "hot", "product_hot"
-        elif int(obs.consecutive_positive or 0) >= 2 or family_positive >= 2:
+        elif float(vph) >= RADAR_V3_STRONG_VPH or int(obs.consecutive_positive or 0) >= 2 or family_positive >= 2:
             demand_status, stage = "rising", "confirmed"
         else:
             demand_status, stage = "stable", "observed"
@@ -1427,14 +1443,15 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
             score=score, confidence=min(95, 35 + int(obs.positive_checkpoints or 0)*20 + min(20, family_positive*5)),
             stage=stage, opportunity_type="observed_demand", view_count=current, views_per_hour=float(vph),
             reasons=[
-                f"Radar 3.0: DT observed +{int(obs.total_delta)} views in {elapsed_hours:.1f}h after baseline",
-                f"Current interval: +{int(interval_delta)} · {float(vph):.1f}/h · consecutive positive={int(obs.consecutive_positive or 0)}",
-                f"Independent family listings with observed growth: {family_positive} · persistent: {family_persistent}",
+                f"Radar 3.0 Demand Gate: {float(vph):.1f}/h (Candidate >=15, Score >=30, Strong >=60)",
+                f"DT observed +{int(obs.total_delta)} views in {elapsed_hours:.1f}h after baseline",
+                f"Current interval: +{int(interval_delta)} · {float(vph):.1f}/h · consecutive demand checkpoints={int(obs.consecutive_positive or 0)}",
+                f"Independent family listings above Candidate gate: {family_positive} · persistent: {family_persistent}",
                 "Initial counter is baseline-only and contributed 0 points",
             ],
             recorded_at=obs.last_measured_at, live_detail_verified_at=verified_at,
             demand_views=int(obs.total_delta), demand_age_minutes=float(elapsed_hours*60), radar_rank=float(score),
-            demand_status=demand_status, demand_gate=0,
+            demand_status=demand_status, demand_gate=int(RADAR_V3_SCORE_VPH),
         )
         if result is not None:
             emitted += 1
@@ -1447,7 +1464,7 @@ async def radar_v3_expire_observations() -> int:
     async with SessionLocal() as session:
         result = await session.execute(
             update(RadarObservation).where(
-                RadarObservation.status.in_(["baseline", "observed", "confirmed"]),
+                RadarObservation.status.in_(["baseline", "candidate", "observed", "confirmed"]),
                 RadarObservation.expires_at.is_not(None),
                 RadarObservation.expires_at <= now,
             ).values(

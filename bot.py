@@ -4855,7 +4855,7 @@ async def _radar3_dashboard_snapshot() -> dict:
     now = datetime.utcnow()
     async with SessionLocal() as session:
         active = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.status.in_(["baseline", "observed", "confirmed"]),
+            RadarObservation.status.in_(["baseline", "candidate", "observed", "confirmed"]),
             RadarObservation.expires_at > now,
         ))).scalar_one() or 0)
         baseline = int((await session.execute(select(func.count(RadarObservation.id)).where(
@@ -4864,10 +4864,13 @@ async def _radar3_dashboard_snapshot() -> dict:
         due = int((await session.execute(select(func.count(RadarObservation.id)).where(
             RadarObservation.next_check_at.is_not(None), RadarObservation.next_check_at <= now,
             RadarObservation.expires_at > now,
-            RadarObservation.status.in_(["baseline", "observed", "confirmed"]),
+            RadarObservation.status.in_(["baseline", "candidate", "observed", "confirmed"]),
+        ))).scalar_one() or 0)
+        candidate = int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.status == "candidate", RadarObservation.expires_at > now,
         ))).scalar_one() or 0)
         observed = int((await session.execute(select(func.count(RadarObservation.id)).where(
-            RadarObservation.positive_checkpoints >= 1, RadarObservation.expires_at > now,
+            RadarObservation.current_vph >= 30.0, RadarObservation.expires_at > now,
         ))).scalar_one() or 0)
         persistent = int((await session.execute(select(func.count(RadarObservation.id)).where(
             RadarObservation.consecutive_positive >= 2, RadarObservation.expires_at > now,
@@ -4921,7 +4924,7 @@ async def _radar3_dashboard_snapshot() -> dict:
         signal_text = (" · " + " ".join(suffix)) if suffix else ""
         category_lines.append(f"• <b>{html.escape(name)}</b>: +{int(delta or 0)} · {int(count or 0)} растут{signal_text}")
     return {
-        "active": active, "baseline": baseline, "due": due, "observed": observed,
+        "active": active, "baseline": baseline, "due": due, "candidate": candidate, "observed": observed,
         "persistent": persistent, "quiet": quiet, "total_delta": total_delta,
         "early": early, "strong": strong, "hot": hot, "category_lines": category_lines,
     }
@@ -4986,14 +4989,15 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         + f"Всего активных наблюдений: <b>{int(radar3.get('active') or 0)}</b>\n"
         + f"Ждут первого повторного замера: <b>{int(radar3.get('baseline') or 0)}</b>\n"
         + f"Готовы к замеру сейчас: <b>{int(radar3.get('due') or 0)}</b>\n"
-        + f"Получили реальный прирост: <b>{int(radar3.get('observed') or 0)}</b>\n"
+        + f"🟠 Candidate ≥15/ч, без Score: <b>{int(radar3.get('candidate') or 0)}</b>\n"
+        + f"⭐ Прошли Score Gate ≥30/ч: <b>{int(radar3.get('observed') or 0)}</b>\n"
         + f"Рост подтвердился ≥2 раза: <b>{int(radar3.get('persistent') or 0)}</b>\n"
-        + f"Без роста / остановлены: <b>{int(radar3.get('quiet') or 0)}</b>\n"
+        + f"Noise / Weak <15/ч, остановлены: <b>{int(radar3.get('quiet') or 0)}</b>\n"
         + f"Суммарный DT-observed прирост: <b>+{int(radar3.get('total_delta') or 0)}</b> просмотров\n"
         + f"🟡 Early: <b>{int(radar3.get('early') or 0)}</b> · 📈 Strong: <b>{int(radar3.get('strong') or 0)}</b> · 🔥 Hot: <b>{int(radar3.get('hot') or 0)}</b>\n\n"
         + "<b>🗂 Категории с живым приростом</b>\n"
         + category_text + "\n\n"
-        + "<i>Первый счётчик = только baseline. В оценку входит только прирост, который DT сам увидел после baseline. Сегодняшние пользовательские сканы тоже могут добавлять baseline без дублей по adId.</i>\n\n"
+        + "<i>Demand Gate: &lt;15/ч — без Score и стоп; 15–29/ч — Candidate без Score; ≥30/ч — появляется DT Score; ≥60/ч — Strong уже на первом контрольном интервале. Первый счётчик всегда только baseline.</i>\n\n"
         + f"Последний круг: <b>{last_line}</b>\n"
         + f"Следующий ежедневный: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>"
     )

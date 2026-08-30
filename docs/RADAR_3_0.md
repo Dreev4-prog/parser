@@ -1,3 +1,13 @@
+## v4.21.6 — Demand Gate 15/30/60
+
+Radar Score is unavailable until DT itself observes at least 30 views/hour after baseline.
+- <15/h: Noise/Weak, stop.
+- 15–29/h: Candidate, no Score.
+- 30–59/h: scored Early.
+- >=60/h: Strong immediately.
+
+All thresholds are based on DT-owned post-baseline velocity, never the inherited Kleinanzeigen counter.
+
 # DT Radar 3.0 — Observed Demand
 
 ## v4.21.5 — Live Today

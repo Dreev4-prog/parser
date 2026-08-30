@@ -36,8 +36,11 @@ class Radar3ObservedDemandContractTests(unittest.TestCase):
         start = RADAR.index('async def radar_v3_record_refreshed(')
         end = RADAR.index('async def radar_v3_expire_stale_products(', start)
         src = RADAR[start:end]
-        self.assertIn('family_persistent >= 2', src)
-        self.assertIn('consecutive_positive', src)
+        self.assertIn('RADAR_V3_CANDIDATE_VPH', src)
+        self.assertIn('RADAR_V3_SCORE_VPH', src)
+        self.assertIn('RADAR_V3_STRONG_VPH', src)
+        self.assertIn('if vph < RADAR_V3_SCORE_VPH:', src)
+        self.assertIn('float(vph) >= RADAR_V3_STRONG_VPH', src)
         self.assertIn('Initial counter is baseline-only and contributed 0 points', src)
 
     def test_clean_break_preserves_raw_listing_history_by_contract(self):

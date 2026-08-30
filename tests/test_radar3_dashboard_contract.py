@@ -7,7 +7,8 @@ def test_radar3_dashboard_has_core_measurements():
     for phrase in (
         'Ждут первого повторного замера',
         'Готовы к замеру сейчас',
-        'Получили реальный прирост',
+        'Candidate ≥15/ч, без Score',
+        'Прошли Score Gate ≥30/ч',
         'Рост подтвердился ≥2 раза',
         'Суммарный DT-observed прирост',
         'Early:', 'Strong:', 'Hot:',

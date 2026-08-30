@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.21.5", "VERSION=4.21.5")
+    check((ROOT / "VERSION").read_text().strip() == "4.21.6", "VERSION=4.21.6")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -38,8 +38,10 @@ def main() -> int:
           "first exact counter is baseline-only and cannot publish")
     check('RADAR_V3_FIRST_CHECK_MINUTES = 60' in radar and 'radar_v3_observation_scheduler' in bot,
           "first DT-owned remeasurement scheduled after 60 minutes")
-    check('family_persistent >= 2' in radar and 'consecutive_positive' in radar,
-          "Strong/Hot require observed persistence/repeatability")
+    check('RADAR_V3_CANDIDATE_VPH = 15.0' in radar and 'RADAR_V3_SCORE_VPH = 30.0' in radar and 'RADAR_V3_STRONG_VPH = 60.0' in radar,
+          "Radar 3.0 hard Demand Gate is 15/30/60 views per hour")
+    check('if vph < RADAR_V3_SCORE_VPH:' in radar and 'continue' in radar,
+          "sub-30 demand cannot publish DT Score")
     check('Initial counter is baseline-only and contributed 0 points' in radar,
           "initial counter contributes zero score")
     check('delete(RadarSnapshot)' in radar and 'delete(RadarProduct)' in radar and 'RADAR_V3_RESET_SETTING' in radar,
@@ -85,7 +87,7 @@ def main() -> int:
     check('_category_feed_identity_matches(requested_url, final_url)' in parser_source, "category redirects preserve requested feed identity")
     check('for item in targets:' in bot and 'vr = results.get(url)' in bot, "partial exact-view maps cannot preserve stale counters")
     check(not list(ROOT.glob('DEPLOY_V4_*.md')), "historical deploy files removed from root")
-    print("\nDT Parser 4.21.5 Radar 3.0 Live Today release smoke: PASS")
+    print("\nDT Parser 4.21.6 Radar 3.0 Demand Gate release smoke: PASS")
     return 0
 
 
