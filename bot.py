@@ -4960,11 +4960,41 @@ async def _radar3_dashboard_snapshot() -> dict:
     }
 
 
-async def _radar3_dashboard_safe_snapshot(timeout_seconds: float = 2.5) -> dict:
+_radar3_dashboard_snapshot_task: asyncio.Task | None = None
+
+
+def _consume_detached_radar_task(task: asyncio.Task) -> None:
+    """Consume a late DB task result without blocking Telegram UI handlers."""
     try:
-        return await asyncio.wait_for(_radar3_dashboard_snapshot(), timeout=max(0.5, float(timeout_seconds)))
+        task.result()
+    except asyncio.CancelledError:
+        pass
     except Exception:
-        log.exception("DT Radar 3.0 dashboard snapshot failed")
+        log.exception("Detached DT Radar dashboard task failed")
+
+
+async def _radar3_dashboard_safe_snapshot(timeout_seconds: float = 2.5) -> dict:
+    """Bound dashboard latency without waiting for asyncpg cancellation.
+
+    asyncio.wait_for(coro) cancels the underlying query on timeout and then waits
+    for cancellation to finish. Under PostgreSQL contention that cancellation can
+    itself take much longer than the requested timeout, leaving Telegram stuck on
+    the loading card. Shielding a single shared in-flight snapshot lets the UI
+    return immediately while the query finishes in the background.
+    """
+    global _radar3_dashboard_snapshot_task
+    task = _radar3_dashboard_snapshot_task
+    if task is None or task.done():
+        task = asyncio.create_task(_radar3_dashboard_snapshot(), name="dt-radar-dashboard-snapshot")
+        task.add_done_callback(_consume_detached_radar_task)
+        _radar3_dashboard_snapshot_task = task
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=max(0.5, float(timeout_seconds)))
+    except asyncio.TimeoutError:
+        log.warning("DT Radar 3.1 dashboard snapshot timed out; UI continues with controls")
+        return {"category_lines": ["⚠️ Статистика замеров ещё считается — нажми «Обновить» через несколько секунд"]}
+    except Exception:
+        log.exception("DT Radar 3.1 dashboard snapshot failed")
         return {"category_lines": ["⚠️ Статистика замеров временно недоступна"]}
 
 
@@ -5042,8 +5072,19 @@ def _radar_autoscan_loading_text() -> str:
     return (
         "<b>📡 DT Radar 3.1 · CONTEXT DEMAND</b>\n\n"
         "Панель открыта ✅\n"
+        "⚙️ Управление AutoScan доступно сразу.\n"
         "Статистика Radar загружается… ⏳"
     )
+
+
+def admin_radar_autoscan_loading_keyboard() -> InlineKeyboardMarkup:
+    """Always expose AutoScan controls even if PostgreSQL statistics are slow."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▶️ Запустить AutoScan", callback_data="adminradarauto:start"),
+         InlineKeyboardButton(text="⏹ Остановить", callback_data="adminradarauto:stop")],
+        [InlineKeyboardButton(text="🔄 Обновить статистику", callback_data="adminradarauto")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
+    ])
 
 
 async def _radar_autoscan_safe_text(timeout_seconds: float = 5.0) -> tuple[str, dict]:
@@ -11593,9 +11634,7 @@ async def admin_radar_autoscan_handler(callback: CallbackQuery) -> None:
     await callback.answer()
     await _edit_or_answer(
         callback.message, _radar_autoscan_loading_text(),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")
-        ]]),
+        reply_markup=admin_radar_autoscan_loading_keyboard(),
     )
     text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
@@ -11622,7 +11661,7 @@ async def admin_radar_autoscan_start_handler(callback: CallbackQuery) -> None:
         await callback.answer(f"Круг запущен · ждёт пользовательские сканы: {running + queued}")
     else:
         await callback.answer("Круг запущен · первая категория стартует сейчас")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
     text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
@@ -11661,7 +11700,7 @@ async def admin_radar_autoscan_retry_handler(callback: CallbackQuery) -> None:
     _kick_radar_autoscan(callback.bot, "retry")
     _schedule_radar_autoscan_launch_watchdog(callback.bot, str(state.get("round_id") or ""))
     await callback.answer(f"Повторяю проблемные категории: {len(state.get('category_keys') or [])}")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
     text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
@@ -11686,7 +11725,7 @@ async def admin_radar_autoscan_stop_handler(callback: CallbackQuery) -> None:
     _radar_autoscan_stop_event.set()
     _radar_autoscan_wakeup.set()
     await callback.answer("Останавливаю текущую категорию сейчас")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
     text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
@@ -11711,7 +11750,7 @@ async def admin_radar_autoscan_resume_handler(callback: CallbackQuery) -> None:
     _kick_radar_autoscan(callback.bot, "resume")
     _schedule_radar_autoscan_launch_watchdog(callback.bot, str(state.get("round_id") or ""))
     await callback.answer("Круг продолжен")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
     text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
@@ -11727,7 +11766,7 @@ async def admin_radar_autoscan_daily_handler(callback: CallbackQuery) -> None:
         state = await save_radar_autoscan_state(state)
     _radar_autoscan_wakeup.set()
     await callback.answer("Ежедневный круг включён" if state.get("daily_enabled") else "Ежедневный круг выключен")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
     text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
@@ -11743,7 +11782,7 @@ async def admin_radar_autoscan_skipday_handler(callback: CallbackQuery) -> None:
         state = await save_radar_autoscan_state(state)
     _radar_autoscan_wakeup.set()
     await callback.answer("Настройка сохранена")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
     text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
@@ -11778,7 +11817,7 @@ async def admin_radar_autoscan_settime_handler(callback: CallbackQuery) -> None:
         state = await save_radar_autoscan_state(state)
     _radar_autoscan_wakeup.set()
     await callback.answer(f"Время: {value} МСК")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
     text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
@@ -11831,7 +11870,7 @@ async def admin_ai_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer("Открываю DT Radar 3.0")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
     text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
@@ -11842,7 +11881,7 @@ async def admin_ai_section_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer("Раздел удалён · DT Radar 3.0")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
     text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
@@ -11853,7 +11892,7 @@ async def admin_ai_candidate_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer("Старая AI-карточка удалена · DT Radar 3.0")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text())
+    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
     text, state = await _radar_autoscan_safe_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 

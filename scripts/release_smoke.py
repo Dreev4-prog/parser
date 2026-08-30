@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.21.8", "VERSION=4.21.8")
+    check((ROOT / "VERSION").read_text().strip() == "4.21.9", "VERSION=4.21.9")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -65,6 +65,8 @@ def main() -> int:
     check('radar_v3_expire_observations' in radar and 'RadarObservation.expires_at > now' in radar, "Radar observation TTL enforced before claims")
     check('pg_advisory_xact_lock(hashtext(:key))' in radar, "Radar 3.0 clean reset serialized across Parser replicas")
     check('autoscan_view_priority = "scan_inline"' in bot, "AutoScan exact views stay foreground")
+    check('def admin_radar_autoscan_loading_keyboard()' in bot and '▶️ Запустить AutoScan' in bot and '⏹ Остановить' in bot, "AutoScan controls visible on Radar loading screen")
+    check('asyncio.shield(task)' in bot and 'dashboard snapshot timed out; UI continues with controls' in bot, "Radar dashboard timeout cannot trap UI on loading screen")
     page = (ROOT / 'page_manager.py').read_text(encoding='utf-8')
     stable = (ROOT / 'stable_engine.py').read_text(encoding='utf-8')
     page_worker = (ROOT / 'page_worker.py').read_text(encoding='utf-8')
@@ -87,7 +89,7 @@ def main() -> int:
     check('_category_feed_identity_matches(requested_url, final_url)' in parser_source, "category redirects preserve requested feed identity")
     check('for item in targets:' in bot and 'vr = results.get(url)' in bot, "partial exact-view maps cannot preserve stale counters")
     check(not list(ROOT.glob('DEPLOY_V4_*.md')), "historical deploy files removed from root")
-    print("\nDT Parser 4.21.8 Radar 3.1 Full Audit Fix release smoke: PASS")
+    print("\nDT Parser 4.21.9 Radar AutoScan Control Recovery release smoke: PASS")
     return 0
 
 

@@ -1,4 +1,4 @@
-# DT Parser 4.21.8 — Radar 3.1 Full Audit Fix
+# DT Parser 4.21.9 — Radar 3.1 Full Audit Fix
 
 Production Telegram/Railway parser and DT Radar for Kleinanzeigen.
 
@@ -37,7 +37,7 @@ The single DT Radar admin panel shows the observation funnel, due queue, any gro
 Radar observations have cross-replica PostgreSQL leases (`FOR UPDATE SKIP LOCKED`), a six-hour TTL, an independent expiry loop, and a dedicated throttled `radar_checkpoint` traffic lane. User scans keep foreground priority. Legacy AI admission is retired.
 
 
-## 4.21.8 audit hardening
+## 4.21.9 audit hardening
 
 - Radar admin entry acknowledges Telegram immediately and opens a loading shell before database diagnostics.
 - Fixed the dashboard schema reference from nonexistent `RadarProduct.demand_status` to `RadarProduct.status`.
