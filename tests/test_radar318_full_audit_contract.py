@@ -42,7 +42,8 @@ def test_rearm_clears_all_context_score_state():
 def test_context_peers_and_family_exclude_expired_rows():
     block = RADAR.split('async def radar_v3_record_refreshed', 1)[1].split('async def radar_v3_expire_observations', 1)[0]
     assert block.count('or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now)') >= 2
-    assert block.count('RadarObservation.status.in_(["candidate", "observed", "confirmed"])') >= 2
+    assert 'RadarObservation.status != "expired"' in block
+    assert 'RadarObservation.status.in_(["observed", "confirmed"])' in block
 
 
 def test_stale_radar31_snapshots_cannot_resurrect_hot():

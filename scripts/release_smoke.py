@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.21.10", "VERSION=4.21.10")
+    check((ROOT / "VERSION").read_text().strip() == "4.21.12", "VERSION=4.21.12")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -38,10 +38,23 @@ def main() -> int:
           "first exact counter is baseline-only and cannot publish")
     check('RADAR_V3_FIRST_CHECK_MINUTES = 60' in radar and 'radar_v3_observation_scheduler' in bot,
           "first DT-owned remeasurement scheduled after 60 minutes")
-    check('RADAR_V3_CANDIDATE_VPH = 15.0' in radar and 'RADAR_V3_SCORE_VPH = 30.0' in radar and 'RADAR_V3_STRONG_VPH = 60.0' in radar,
-          "Radar 3.0 hard Demand Gate is 15/30/60 views per hour")
-    check('if vph < RADAR_V3_SCORE_VPH:' in radar and 'continue' in radar,
-          "sub-30 demand cannot publish DT Score")
+    check('RADAR_V3_NOISE_FLOOR_VPH = 3.0' in radar and 'RADAR_V3_CANDIDATE_PERCENTILE = 0.90' in radar and 'RADAR_V3_EARLY_PERCENTILE = 0.95' in radar and 'RADAR_V3_STRONG_PERCENTILE = 0.98' in radar,
+          "Radar 3.2 uses category-adaptive P90/P95/P98 with 3/h noise floor")
+    categories = (ROOT / 'categories.py').read_text(encoding='utf-8')
+    check('RADAR_EXCLUDED_GROUPS = frozenset' in categories and '"auto"' in categories and 'radar_category_allowed' in categories,
+          "one shared Radar category exclusion policy covers Auto and non-priority sections")
+    check('Listing.category_key.in_(allowed_category_keys)' in radar and 'radar_allowed_category_keys' in radar,
+          "user-scan Radar baselines obey the same category exclusion policy")
+    refresh = radar.split('async def radar_v3_record_refreshed', 1)[1].split('async def radar_v3_expire_observations', 1)[0]
+    check('PASS 1' in refresh and 'PASS 2' in refresh and 'category_cohorts' in refresh and 'category_context' in refresh,
+          "Radar 3.2 classification uses a frozen two-pass category cohort")
+    helper = radar.split('def _radar32_thresholds', 1)[1].split('async def radar_v3_release_claims', 1)[0]
+    check('float(x) >= 0.0' in helper and 'float(x) >= RADAR_V3_NOISE_FLOOR_VPH' not in helper,
+          "quiet/zero-growth rows remain in adaptive category quantiles")
+    check('affected_product_keys' in refresh and 'retired_keys' in refresh and 'status="historical", current_score=0' in refresh,
+          "stale Radar cards retire immediately when active scored evidence disappears")
+    check('if str(obs.status or "") not in {"observed", "confirmed"}:' in radar and 'continue' in radar,
+          "only category-qualified Early/Strong observations can publish DT Score")
     check('Initial counter is baseline-only and contributed 0 points' in radar,
           "initial counter contributes zero score")
     check('delete(RadarSnapshot)' in radar and 'delete(RadarProduct)' in radar and 'RADAR_V3_RESET_SETTING' in radar,
@@ -89,7 +102,7 @@ def main() -> int:
     check('_category_feed_identity_matches(requested_url, final_url)' in parser_source, "category redirects preserve requested feed identity")
     check('for item in targets:' in bot and 'vr = results.get(url)' in bot, "partial exact-view maps cannot preserve stale counters")
     check(not list(ROOT.glob('DEPLOY_V4_*.md')), "historical deploy files removed from root")
-    print("\nDT Parser 4.21.10 Radar 3.1 Live Dashboard release smoke: PASS")
+    print("\nDT Parser 4.21.12 Radar 3.2 Frozen Cohort Full Audit Fix release smoke: PASS")
     return 0
 
 

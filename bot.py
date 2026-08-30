@@ -61,7 +61,10 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from app_version import APP_VERSION
-from categories import CATEGORIES, GROUPS, categories_for_group, group_root_key
+from categories import (
+    CATEGORIES, GROUPS, categories_for_group, group_root_key,
+    RADAR_EXCLUDED_GROUPS, RADAR_EXCLUDED_CATEGORY_KEYS, radar_category_allowed,
+)
 from db import DATABASE_BACKEND, SessionLocal, init_db
 from filters import (
     apply_listing_settings,
@@ -166,7 +169,7 @@ _trial_credit_guard = asyncio.Lock()
 # backoff after partial/system failures. Non-product/service categories remain available
 # to the normal parser; they are excluded only from the automatic Radar seeding round.
 RADAR_AUTOSCAN_SETTING_KEY = "dt_radar_autoscan_v1"
-RADAR_AUTOSCAN_POLICY_VERSION = 4
+RADAR_AUTOSCAN_POLICY_VERSION = 6
 RADAR_AUTOSCAN_DEPTH = 20
 # Radar 3.0 observes live demand only on today's market. Yesterday context was retired in v4.21.5.
 RADAR_CONTEXT_DEPTH = 0
@@ -184,20 +187,10 @@ RADAR_AUTOSCAN_DEFAULT_TIME = "05:00"
 RADAR_AUTOSCAN_POLL_SECONDS = 10
 RADAR_AUTOSCAN_HISTORY_LIMIT = 20
 RADAR_AUTOSCAN_TIME_CHOICES = ("03:00", "05:00", "08:00", "12:00", "18:00", "23:00")
-RADAR_AUTOSCAN_EXCLUDED_GROUPS = frozenset({"immobilien", "jobs", "services", "kurse", "hilfe"})
-RADAR_AUTOSCAN_EXCLUDED_CATEGORY_KEYS = frozenset({
-    "auto_reparatur",       # Reparaturen & Dienstleistungen
-    "hg_service",           # Dienstleistungen Haus & Garten
-    "el_service",           # Dienstleistungen Elektronik
-    "ti_betreuung",         # Tierbetreuung & Training
-    "ti_vermisst",          # Vermisste Tiere
-    "fa_alten",             # Altenpflege
-    "fa_babysit",           # Babysitter/-in & Kinderbetreuung
-    "fr_aktiv",             # Freizeitaktivitäten
-    "fr_kuenstler",         # Künstler/-in & Musiker/-in
-    "fr_reise",             # Reise & Eventservices
-    "fr_verloren",          # Verloren & Gefunden
-})
+# Compatibility aliases: policy now lives in categories.py and is shared with
+# user-scan Radar ingestion.
+RADAR_AUTOSCAN_EXCLUDED_GROUPS = RADAR_EXCLUDED_GROUPS
+RADAR_AUTOSCAN_EXCLUDED_CATEGORY_KEYS = RADAR_EXCLUDED_CATEGORY_KEYS
 RADAR_AUTOSCAN_PARTIAL_BACKOFF_BASE_SECONDS = 3.0
 RADAR_AUTOSCAN_SYSTEM_BACKOFF_BASE_SECONDS = 8.0
 RADAR_AUTOSCAN_MAX_BACKOFF_SECONDS = 30.0
@@ -4407,12 +4400,8 @@ async def radar_v3_observation_scheduler() -> None:
 
 
 def _radar_autoscan_category_allowed(cat) -> bool:
-    """Return True only for product-oriented leaves eligible for automatic Radar seeding."""
-    if cat is None or bool(getattr(cat, "is_group", False)):
-        return False
-    if str(getattr(cat, "group", "")) in RADAR_AUTOSCAN_EXCLUDED_GROUPS:
-        return False
-    return str(getattr(cat, "key", "")) not in RADAR_AUTOSCAN_EXCLUDED_CATEGORY_KEYS
+    """Shared Radar eligibility policy; normal user parser categories are untouched."""
+    return bool(cat is not None and radar_category_allowed(str(getattr(cat, "key", ""))))
 
 
 def _radar_autoscan_categories() -> list:
@@ -4850,7 +4839,7 @@ def _radar_autoscan_next_run_text(state: dict) -> str:
 
 
 async def _radar3_dashboard_snapshot() -> dict:
-    """Compact Radar 3.1 control-plane snapshot with bounded DB round-trips."""
+    """Compact Radar 3.2 control-plane snapshot with bounded DB round-trips."""
     now = datetime.utcnow()
     active_statuses = ["baseline", "candidate", "observed", "confirmed"]
     async with SessionLocal() as session:
@@ -4871,26 +4860,29 @@ async def _radar3_dashboard_snapshot() -> dict:
                 RadarObservation.total_delta > 0, RadarObservation.expires_at > now
             ),
             func.count(RadarObservation.id).filter(
-                RadarObservation.current_vph >= 15.0, RadarObservation.current_vph < 30.0, RadarObservation.expires_at > now
+                RadarObservation.status == "candidate", RadarObservation.expires_at > now
             ),
             func.count(RadarObservation.id).filter(
-                RadarObservation.current_vph >= 30.0, RadarObservation.expires_at > now
+                RadarObservation.status.in_(["observed", "confirmed"]), RadarObservation.expires_at > now
             ),
             func.count(RadarObservation.id).filter(
-                RadarObservation.current_vph >= 60.0, RadarObservation.expires_at > now
+                RadarObservation.status == "confirmed", RadarObservation.expires_at > now
             ),
             func.count(RadarObservation.id).filter(
                 RadarObservation.consecutive_scored >= 2, RadarObservation.expires_at > now
             ),
             func.count(RadarObservation.id).filter(
-                RadarObservation.current_vph >= 30.0, RadarObservation.acceleration_ratio >= 0.20, RadarObservation.expires_at > now
+                RadarObservation.status.in_(["observed", "confirmed"]),
+                RadarObservation.acceleration_ratio >= 0.20, RadarObservation.expires_at > now
             ),
             func.count(RadarObservation.id).filter(
                 RadarObservation.confidence >= 70, RadarObservation.expires_at > now
             ),
-            func.count(RadarObservation.id).filter(RadarObservation.status == "quiet"),
+            func.count(RadarObservation.id).filter(
+                RadarObservation.status == "quiet", RadarObservation.expires_at > now
+            ),
             func.coalesce(func.sum(RadarObservation.total_delta).filter(
-                RadarObservation.positive_checkpoints >= 1, RadarObservation.expires_at > now
+                RadarObservation.total_delta > 0, RadarObservation.expires_at > now
             ), 0),
         ))).one()
         (active, baseline, due, any_growth, candidate, observed, strong_intervals,
@@ -4918,7 +4910,7 @@ async def _radar3_dashboard_snapshot() -> dict:
                 func.coalesce(func.max(RadarObservation.velocity_percentile), 0.0),
                 func.coalesce(func.avg(RadarObservation.confidence), 0.0),
             )
-            .where(RadarObservation.current_vph >= 15.0, RadarObservation.expires_at > now)
+            .where(RadarObservation.status.in_(["candidate", "observed", "confirmed"]), RadarObservation.expires_at > now)
             .group_by(RadarObservation.category_key)
             .order_by(func.coalesce(func.max(RadarObservation.velocity_percentile), 0.0).desc(), func.coalesce(func.avg(RadarObservation.current_vph), 0.0).desc())
             .limit(12)
@@ -4991,10 +4983,10 @@ async def _radar3_dashboard_safe_snapshot(timeout_seconds: float = 2.5) -> dict:
     try:
         return await asyncio.wait_for(asyncio.shield(task), timeout=max(0.5, float(timeout_seconds)))
     except asyncio.TimeoutError:
-        log.warning("DT Radar 3.1 dashboard snapshot timed out; UI continues with controls")
+        log.warning("DT Radar 3.2 dashboard snapshot timed out; UI continues with controls")
         return {"category_lines": ["⚠️ Статистика замеров ещё считается — нажми «Обновить» через несколько секунд"]}
     except Exception:
-        log.exception("DT Radar 3.1 dashboard snapshot failed")
+        log.exception("DT Radar 3.2 dashboard snapshot failed")
         return {"category_lines": ["⚠️ Статистика замеров временно недоступна"]}
 
 
@@ -5046,7 +5038,7 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         last_line = f"{coverage_success}/{coverage_total} категорий · Baseline {int(last.get('radar_candidates') or 0)}"
 
     text = (
-        "<b>📡 DT Radar 3.1 · LIVE STATUS</b>\n\n"
+        "<b>📡 DT Radar 3.2 · ADAPTIVE LIVE</b>\n\n"
         f"AutoScan: <b>{status_text}</b>\n"
         f"📂 Категория: <b>{html.escape(current)}</b>\n"
         f"📊 Прогресс категорий: <b>{processed}/{total} · {pct}%</b>"
@@ -5076,21 +5068,21 @@ async def _radar3_analytics_text() -> str:
     category_text = "\n".join(category_lines[:10]) if category_lines else "Пока подтверждённых категорий нет"
     if not any(k in radar3 for k in ("active", "early", "strong", "hot")):
         return (
-            "<b>📊 DT Radar 3.1 · ANALYTICS</b>\n\n"
+            "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\n"
             "⚠️ Глубокая статистика сейчас считается или PostgreSQL занят.\n"
             "Live Status и AutoScan при этом продолжают работать независимо.\n\n"
             + category_text
         )
     return (
-        "<b>📊 DT Radar 3.1 · ANALYTICS</b>\n\n"
-        "<b>🔬 Воронка Radar 3.1</b>\n"
+        "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\n"
+        "<b>🔬 Воронка Radar 3.2</b>\n"
         f"Активных наблюдений: <b>{int(radar3.get('active') or 0)}</b>\n"
         f"Ждут первого повторного замера: <b>{int(radar3.get('baseline') or 0)}</b>\n"
         f"Готовы к замеру сейчас: <b>{int(radar3.get('due') or 0)}</b>\n"
         f"Любой DT-observed прирост: <b>{int(radar3.get('any_growth') or 0)}</b>\n"
-        f"🟠 Candidate 15–29/ч, без Score: <b>{int(radar3.get('candidate') or 0)}</b>\n"
-        f"⭐ Score Gate ≥30/ч: <b>{int(radar3.get('observed') or 0)}</b>\n"
-        f"⚡ ≥60/ч: <b>{int(radar3.get('strong_intervals') or 0)}</b>\n"
+        f"🟠 Candidate · топ-10% категории: <b>{int(radar3.get('candidate') or 0)}</b>\n"
+        f"⭐ Early/Score · топ-5% категории: <b>{int(radar3.get('observed') or 0)}</b>\n"
+        f"⚡ Strong interval · топ-2% категории: <b>{int(radar3.get('strong_intervals') or 0)}</b>\n"
         f"🔁 Score подтверждён ≥2 раза: <b>{int(radar3.get('persistent') or 0)}</b>\n"
         f"🚀 Ускоряются ≥20%: <b>{int(radar3.get('accelerating') or 0)}</b>\n"
         f"🛡 Confidence ≥70%: <b>{int(radar3.get('high_confidence') or 0)}</b>\n"
@@ -5099,14 +5091,15 @@ async def _radar3_analytics_text() -> str:
         f"🟡 Early: <b>{int(radar3.get('early') or 0)}</b> · 📈 Strong: <b>{int(radar3.get('strong') or 0)}</b> · 🔥 Hot: <b>{int(radar3.get('hot') or 0)}</b>\n\n"
         "<b>🗂 Категории с живым спросом</b>\n"
         + category_text + "\n\n"
-        "<i>Demand Gate: &lt;15/ч — стоп; 15–29/ч — Candidate; ≥30/ч — Score/Early; ≥60/ч — Strong. "
-        "DT Score = 50% сила относительно категории + 25% устойчивость + 15% ускорение + 10% повторяемость. Confidence считается отдельно.</i>"
+        "<i>Radar 3.2: &lt;3/ч — шум. Дальше объявление сравнивается только со своей категорией: "
+        "P90 Candidate · P95 Early/Score · P98 Strong · P99 Hot при подтверждении. "
+        "DT Score = 50% позиция в категории + 25% устойчивость + 15% ускорение + 10% повторяемость.</i>"
     )
 
 
 def _radar_autoscan_loading_text() -> str:
     return (
-        "<b>📡 DT Radar 3.1 · CONTEXT DEMAND</b>\n\n"
+        "<b>📡 DT Radar 3.2 · ADAPTIVE LIVE</b>\n\n"
         "Панель открыта ✅\n"
         "⚙️ Управление AutoScan доступно сразу.\n"
         "Статистика Radar загружается… ⏳"
@@ -5129,13 +5122,13 @@ async def _radar_autoscan_safe_text(timeout_seconds: float = 5.0) -> tuple[str, 
     try:
         return await asyncio.wait_for(_radar_autoscan_text(), timeout=max(1.0, float(timeout_seconds)))
     except Exception as exc:
-        log.exception("DT Radar 3.1 control panel failed")
+        log.exception("DT Radar 3.2 control panel failed")
         state = _radar_autoscan_default_state()
         reason = html.escape(type(exc).__name__)
         text = (
-            "<b>📡 DT Radar 3.1 · CONTEXT DEMAND</b>\n\n"
+            "<b>📡 DT Radar 3.2 · ADAPTIVE LIVE</b>\n\n"
             "Панель открыта ✅\n"
-            "Radar 3.1 продолжает работать в фоне.\n\n"
+            "Radar 3.2 продолжает работать в фоне.\n\n"
             "⚠️ Статистика временно недоступна.\n"
             f"Диагностика: <code>{reason}</code>"
         )
@@ -11677,7 +11670,7 @@ async def admin_radar_autoscan_handler(callback: CallbackQuery) -> None:
         log.exception("DT Radar live status failed")
         await _edit_or_answer(
             callback.message,
-            "<b>📡 DT Radar 3.1 · LIVE STATUS</b>\n\n⚠️ Live Status временно недоступен. AutoScan продолжает работать в фоне.\n"
+            "<b>📡 DT Radar 3.2 · ADAPTIVE LIVE</b>\n\n⚠️ Live Status временно недоступен. AutoScan продолжает работать в фоне.\n"
             f"Диагностика: <code>{html.escape(type(exc).__name__)}</code>",
             reply_markup=admin_radar_autoscan_loading_keyboard(),
         )
@@ -11691,7 +11684,7 @@ async def admin_radar_analytics_handler(callback: CallbackQuery) -> None:
     await callback.answer()
     await _edit_or_answer(
         callback.message,
-        "<b>📊 DT Radar 3.1 · ANALYTICS</b>\n\nСчитаю глубокую статистику… ⏳\nLive AutoScan от этого не блокируется.",
+        "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\nСчитаю глубокую статистику… ⏳\nLive AutoScan от этого не блокируется.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Live Status", callback_data="adminradarauto")]
         ]),

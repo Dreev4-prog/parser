@@ -36,11 +36,11 @@ class Radar3ObservedDemandContractTests(unittest.TestCase):
         start = RADAR.index('async def radar_v3_record_refreshed(')
         end = RADAR.index('async def radar_v3_expire_stale_products(', start)
         src = RADAR[start:end]
-        self.assertIn('RADAR_V3_CANDIDATE_VPH', src)
-        self.assertIn('RADAR_V3_SCORE_VPH', src)
-        self.assertIn('RADAR_V3_STRONG_VPH', src)
-        self.assertIn('if vph < RADAR_V3_SCORE_VPH:', src)
-        self.assertIn('float(vph) >= RADAR_V3_STRONG_VPH', src)
+        self.assertIn('thresholds["candidate"]', src)
+        self.assertIn('thresholds["early"]', src)
+        self.assertIn('thresholds["strong"]', src)
+        self.assertIn('thresholds["early"]', src)
+        self.assertIn('thresholds["strong"]', src)
         self.assertIn('Initial counter is baseline-only and contributed 0 points', src)
 
     def test_clean_break_preserves_raw_listing_history_by_contract(self):
@@ -69,7 +69,7 @@ class Radar3ObservedDemandContractTests(unittest.TestCase):
         self.assertIn('radar_v3_claim_due_external_ids(owner, limit=250)', BOT)
 
     def test_admin_radar3_page_replaces_old_ai_lab(self):
-        self.assertIn('DT Radar 3.1 · CONTEXT DEMAND', BOT)
+        self.assertIn('DT Radar 3.2 · ADAPTIVE LIVE', BOT)
         admin = BOT.split('def admin_keyboard', 1)[1].split('def admin_back_keyboard', 1)[0]
         self.assertNotIn('DT AI Lab', admin)
         self.assertIn('DT Radar 3.0', admin)

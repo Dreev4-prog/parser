@@ -1,56 +1,23 @@
-# DT Parser 4.21.10 — Radar 3.1 Live Dashboard
+# DT Parser 4.21.12 — Radar 3.2 Frozen Cohort Full Audit Fix
 
-## Что изменено
-- Основной DT Radar теперь открывает лёгкий Live Status без тяжёлых агрегатов PostgreSQL.
-- Live Status показывает AutoScan, текущую категорию, прогресс категорий, 20 страниц только сегодня, этап внутри категории, длительность круга, найденные объявления, точные просмотры, baseline и ошибки.
-- Deep Analytics вынесена в отдельную кнопку `📊 Аналитика Radar`; percentile/Confidence/Acceleration/категорийная воронка больше не блокируют AutoScan UI.
-- Кнопки Start/Stop динамические: при активном круге показывается Stop, при остановленном — Start/Resume.
-- Demand Gate и Radar 3.1 scoring не изменены.
+Production release after full audit of 4.21.11.
 
-Production Telegram/Railway parser and DT Radar for Kleinanzeigen.
+## Radar 3.2
+- AutoScan: 20 pages, today only.
+- Auto/Immobilien/Jobs/Dienstleistungen/Unterricht/Nachbarschaftshilfe are excluded from every Radar ingestion path (AutoScan and user-scan baselines), while the normal parser still supports them.
+- First exact counter is baseline-only and contributes 0 score.
+- First DT checkpoint remains ~60 minutes.
+- <3 views/hour is absolute noise.
+- Mature categories use adaptive P90 Candidate / P95 Early+Score / P98 Strong / P99 Hot interval gates.
+- Small cohorts (<20 measured intervals) use conservative bootstrap gates until enough category evidence exists.
+- Category classification is two-pass with one frozen cohort for the whole refreshed batch; quiet/zero-growth rows remain in the distribution.
+- First scored interval is capped at 50/100.
+- Hot requires persistence or independent product-family confirmation.
+- Products are retired immediately when no active Early/Strong evidence remains.
 
-## Current Radar contract
+## Integrity
+- Radar reset marker v6 clears old Radar observations/products once; raw Listing/ViewHistory is preserved.
+- Cross-replica observation leases, TTL, stale cleanup, organic gates and Radar checkpoint traffic lane remain enabled.
+- Legacy AI worker stays retired/inert.
 
-Radar scans **20 pages for today only** per eligible product category. Completed user scans for today may also seed exact-view baselines. The first Kleinanzeigen counter is always baseline-only and contributes zero demand evidence.
-
-### Absolute Demand Gate
-
-- `<15 views/hour` — Noise/Weak, no Score, observation stops.
-- `15–29 views/hour` — Candidate, no Score, recheck after 60 minutes.
-- `30–59 views/hour` — Score/Early evidence, recheck after 45 minutes.
-- `>=60 views/hour` — Strong first signal, recheck after 30 minutes.
-
-All rates are calculated only from post-baseline growth observed by DT.
-
-### DT Score after the 30/h gate
-
-`50% category velocity percentile + 25% persistence + 15% acceleration + 10% repeatability`
-
-The first scored checkpoint is capped at 50/100 because persistence and acceleration have not yet been proven. Confidence is a separate 0–95% evidence-maturity metric.
-
-### Hot
-
-A product can become Hot by either route:
-
-1. one listing sustains `>=60/h` for two consecutive DT checkpoints; or
-2. a Strong/persistent listing is confirmed by a second independent listing in the same product family that also crosses the `>=30/h` Score Gate.
-
-### Radar dashboard
-
-The single DT Radar admin panel shows the observation funnel, due queue, any growth, Candidate/Score/Strong counts, persistence, acceleration, high-confidence evidence, Early/Strong/Hot, total DT-observed growth, and category context (average velocity, best percentile, average confidence).
-
-## Reliability
-
-Radar observations have cross-replica PostgreSQL leases (`FOR UPDATE SKIP LOCKED`), a six-hour TTL, an independent expiry loop, and a dedicated throttled `radar_checkpoint` traffic lane. User scans keep foreground priority. Legacy AI admission is retired.
-
-
-## 4.21.9 audit hardening
-
-- Radar admin entry acknowledges Telegram immediately and opens a loading shell before database diagnostics.
-- Fixed the dashboard schema reference from nonexistent `RadarProduct.demand_status` to `RadarProduct.status`.
-- Fixed the RadarObservation expiry UPDATE used by the background scheduler.
-- Rearmed observations now clear every Radar 3.1 context/persistence/confidence field.
-- Category/family context excludes expired observations.
-- Radar 3.1 snapshots older than the six-hour live window cannot resurrect stale Hot/Strong products.
-- Added explicit PostgreSQL indexes for Radar 3.1 columns introduced by additive ALTER TABLE migrations.
-- Dashboard aggregate reads use bounded round-trips and the whole control panel has a timeout/fallback.
+See `docs/RELEASE_4_21_12.md` for audit details.
