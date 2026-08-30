@@ -14,11 +14,11 @@ def test_dashboard_uses_real_radar_product_status_column():
     assert 'RadarProduct.status == "hot"' in block
 
 
-def test_radar_panel_acknowledges_before_database_panel_build():
-    block = BOT.split('@dp.callback_query(F.data == "adminradarauto")', 1)[1].split('@dp.callback_query(F.data == "adminradarauto:start")', 1)[0]
-    assert block.index('await callback.answer()') < block.index('_radar_autoscan_safe_text()')
-    assert '_radar_autoscan_loading_text()' in block
-    assert 'asyncio.wait_for(_radar_autoscan_text()' in BOT
+def test_radar_panel_acknowledges_before_lightweight_live_state():
+    block = BOT.split('@dp.callback_query(F.data == "adminradarauto")', 1)[1].split('@dp.callback_query(F.data == "adminradarauto:analytics")', 1)[0]
+    assert block.index('await callback.answer()') < block.index('_radar_autoscan_text()')
+    assert 'asyncio.wait_for(_radar_autoscan_text(), timeout=2.0)' in block
+    assert '_radar3_dashboard_safe_snapshot' not in block
 
 
 def test_expiry_update_is_not_nested_inside_where():

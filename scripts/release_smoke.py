@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.21.9", "VERSION=4.21.9")
+    check((ROOT / "VERSION").read_text().strip() == "4.21.10", "VERSION=4.21.10")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -89,7 +89,7 @@ def main() -> int:
     check('_category_feed_identity_matches(requested_url, final_url)' in parser_source, "category redirects preserve requested feed identity")
     check('for item in targets:' in bot and 'vr = results.get(url)' in bot, "partial exact-view maps cannot preserve stale counters")
     check(not list(ROOT.glob('DEPLOY_V4_*.md')), "historical deploy files removed from root")
-    print("\nDT Parser 4.21.9 Radar AutoScan Control Recovery release smoke: PASS")
+    print("\nDT Parser 4.21.10 Radar 3.1 Live Dashboard release smoke: PASS")
     return 0
 
 

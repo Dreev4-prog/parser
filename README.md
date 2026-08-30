@@ -1,4 +1,11 @@
-# DT Parser 4.21.9 — Radar 3.1 Full Audit Fix
+# DT Parser 4.21.10 — Radar 3.1 Live Dashboard
+
+## Что изменено
+- Основной DT Radar теперь открывает лёгкий Live Status без тяжёлых агрегатов PostgreSQL.
+- Live Status показывает AutoScan, текущую категорию, прогресс категорий, 20 страниц только сегодня, этап внутри категории, длительность круга, найденные объявления, точные просмотры, baseline и ошибки.
+- Deep Analytics вынесена в отдельную кнопку `📊 Аналитика Radar`; percentile/Confidence/Acceleration/категорийная воронка больше не блокируют AutoScan UI.
+- Кнопки Start/Stop динамические: при активном круге показывается Stop, при остановленном — Start/Resume.
+- Demand Gate и Radar 3.1 scoring не изменены.
 
 Production Telegram/Railway parser and DT Radar for Kleinanzeigen.
 

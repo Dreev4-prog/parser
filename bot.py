@@ -4999,73 +4999,109 @@ async def _radar3_dashboard_safe_snapshot(timeout_seconds: float = 2.5) -> dict:
 
 
 async def _radar_autoscan_text() -> tuple[str, dict]:
+    """Fast live control panel. Never waits for Radar analytics queries."""
     state = await load_radar_autoscan_state()
     total = max(1, int(state.get("total") or len(_radar_autoscan_categories()) or 1))
     processed = min(total, int(state.get("processed") or 0))
     pct = int(round(processed / total * 100))
     status = str(state.get("status") or "idle")
     if status == "running":
-        status_text = "🟡 ждёт освобождения пользовательских сканов" if state.get("waiting_for_users") else "🟢 идёт круг"
+        status_text = "🟡 ждёт пользовательские сканы" if state.get("waiting_for_users") else "🟢 работает"
     elif status == "paused":
-        status_text = "⏸ круг остановлен"
+        status_text = "⏸ остановлен"
     else:
         status_text = "🔴 не запущен"
+
     current = str(state.get("current_category_name") or "—")
     live_stage_line = _radar_autoscan_live_stage_line(state) if status == "running" else ""
-    mode = str(state.get("mode") or "")
-    is_retry = mode == "retry"
-    mode_label = "Повтор ошибок" if is_retry else "Radar 3.0 · Live Today"
-    stage_label = "допроверка проблемных категорий" if is_retry else "Сегодня · 20 страниц"
+    depth = _radar_layer_depth(state)
+    total_pages_target = total * depth
+    pages_verified = int(state.get("pages_verified") or 0)
+    listings_seen = int(state.get("listings_seen") or 0)
+    new_listings = int(state.get("new_listings") or 0)
+    views_requested = int(state.get("views_requested") or 0)
+    views_verified = int(state.get("views_verified") or 0)
+    baselines = int(state.get("radar_candidates") or 0)
+    successful = int(state.get("successful") or 0)
+    needs_review = int(state.get("needs_review") or 0)
+    system_errors = int(state.get("system_errors") or 0)
+
+    elapsed_text = "—"
+    started_at = str(state.get("started_at") or "")
+    if started_at and status in {"running", "paused"}:
+        try:
+            started = datetime.fromisoformat(started_at)
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=MOSCOW)
+            elapsed_text = _radar_autoscan_human_duration(int((datetime.now(MOSCOW) - started.astimezone(MOSCOW)).total_seconds()))
+        except Exception:
+            pass
+
+    current_number = min(total, processed + 1) if status == "running" else processed
     last = dict(state.get("last_summary") or {})
+    last_line = "—"
     if last:
         coverage_total = int(last.get("coverage_total") or last.get("total") or 0)
         coverage_success = int(last.get("coverage_successful") or last.get("successful") or 0)
-        last_line = (
-            f"#{html.escape(str(last.get('round_id') or '—'))} · "
-            f"{coverage_success}/{coverage_total} покрыто · "
-            f"Baseline {int(last.get('radar_candidates') or 0)}"
-        )
-    else:
-        last_line = "—"
+        last_line = f"{coverage_success}/{coverage_total} категорий · Baseline {int(last.get('radar_candidates') or 0)}"
 
-    radar3 = await _radar3_dashboard_safe_snapshot()
-    category_lines = list(radar3.get("category_lines") or [])
-    category_text = "\n".join(category_lines[:8]) if category_lines else "Пока подтверждённых категорий нет"
     text = (
-        "<b>📡 DT Radar 3.1 · CONTEXT DEMAND</b>\n\n"
-        f"Статус AutoScan: <b>{status_text}</b>\n"
-        f"Режим: <b>{mode_label}</b>\n"
-        + (f"Глубина: <b>{RADAR_AUTOSCAN_DEPTH} страниц только за сегодня на категорию</b>\n" if not is_retry else f"Глубина: <b>{_radar_layer_depth(state)} страниц на категорию</b>\n")
-        + f"Текущий этап: <b>{stage_label}</b>\n"
-        + f"Категории AutoScan: <b>{len(_radar_autoscan_categories())}</b>\n"
-        + f"Прогресс: <b>{processed}/{total} · {pct}%</b>\n"
-        + f"Сейчас: <b>{html.escape(current)}</b>\n"
+        "<b>📡 DT Radar 3.1 · LIVE STATUS</b>\n\n"
+        f"AutoScan: <b>{status_text}</b>\n"
+        f"📂 Категория: <b>{html.escape(current)}</b>\n"
+        f"📊 Прогресс категорий: <b>{processed}/{total} · {pct}%</b>"
+        + (f" · сейчас {current_number}/{total}" if status == "running" else "") + "\n"
+        f"📄 Глубина: <b>{depth} страниц только за сегодня на категорию</b>\n"
         + (live_stage_line + "\n" if live_stage_line else "")
-        + f"📄 Подтверждено страниц: <b>{int(state.get('pages_verified') or 0)}</b>\n"
-        + f"🧾 Чистых сегодняшних объявлений: <b>{int(state.get('listings_seen') or 0)}</b> · новых: <b>{int(state.get('new_listings') or 0)}</b>\n"
-        + f"👁 Точные просмотры: <b>{int(state.get('views_verified') or 0)}/{int(state.get('views_requested') or 0)}</b>\n"
-        + f"📡 Baseline создано в этом круге: <b>{int(state.get('radar_candidates') or 0)}</b>\n\n"
-        + "<b>🔬 Воронка Radar 3.1</b>\n"
-        + f"Всего активных наблюдений: <b>{int(radar3.get('active') or 0)}</b>\n"
-        + f"Ждут первого повторного замера: <b>{int(radar3.get('baseline') or 0)}</b>\n"
-        + f"Готовы к замеру сейчас: <b>{int(radar3.get('due') or 0)}</b>\n"
-        + f"Любой DT-observed прирост: <b>{int(radar3.get('any_growth') or 0)}</b>\n"
-        + f"🟠 Candidate 15–29/ч, без Score: <b>{int(radar3.get('candidate') or 0)}</b>\n"
-        + f"⭐ Score Gate ≥30/ч: <b>{int(radar3.get('observed') or 0)}</b>\n"
-        + f"⚡ Сильный интервал ≥60/ч: <b>{int(radar3.get('strong_intervals') or 0)}</b>\n"
-        + f"🔁 Score подтверждён ≥2 раза: <b>{int(radar3.get('persistent') or 0)}</b>\n"
-        + f"🚀 Ускоряются ≥20%: <b>{int(radar3.get('accelerating') or 0)}</b>\n"
-        + f"🛡 Confidence ≥70%: <b>{int(radar3.get('high_confidence') or 0)}</b>\n"
-        + f"Noise / Weak <15/ч, остановлены: <b>{int(radar3.get('quiet') or 0)}</b>\n"
-        + f"Суммарный DT-observed прирост: <b>+{int(radar3.get('total_delta') or 0)}</b> просмотров\n"
-        + f"🟡 Early: <b>{int(radar3.get('early') or 0)}</b> · 📈 Strong: <b>{int(radar3.get('strong') or 0)}</b> · 🔥 Hot: <b>{int(radar3.get('hot') or 0)}</b>\n\n"
-        + "<b>🗂 Категории с живым спросом</b>\n"
-        + category_text + "\n\n"
-        + "<i>DT Score = 50% сила относительно категории + 25% устойчивость + 15% ускорение + 10% повторяемость. Confidence считается отдельно. Demand Gate: &lt;15/ч — стоп; 15–29/ч — Candidate; ≥30/ч — Score/Early; ≥60/ч — Strong. Повторные замеры: Candidate 60 мин · Early 45 мин · Strong 30 мин. Hot: два ≥60/ч подряд ИЛИ Strong/устойчивый сигнал + второе независимое объявление той же семьи. Первый счётчик всегда только baseline.</i>\n\n"
-        + f"Последний круг: <b>{last_line}</b>\n"
+        + f"⏱ Время круга: <b>{elapsed_text}</b>\n\n"
+        + "<b>🔎 Текущий круг</b>\n"
+        + f"📄 Подтверждено страниц: <b>{pages_verified}/{total_pages_target}</b>\n"
+        + f"🧾 Обнаружено чистых объявлений: <b>{listings_seen}</b> · новых <b>{new_listings}</b>\n"
+        + f"👁 Точные просмотры: <b>{views_verified}/{views_requested}</b>\n"
+        + f"🎯 Baseline создано: <b>{baselines}</b>\n"
+        + f"✅ Категорий успешно: <b>{successful}</b> · ⚠️ допроверка <b>{needs_review}</b> · ❌ ошибок <b>{system_errors}</b>\n\n"
+        + "<b>🧪 Radar-наблюдения</b>\n"
+        + "Подробная воронка Candidate / Early / Strong / Hot, Confidence, Acceleration и категории вынесены в <b>📊 Аналитика Radar</b>.\n"
+        + "Так тяжёлая статистика больше не может заблокировать управление AutoScan.\n\n"
+        + f"Последний круг: <b>{html.escape(last_line)}</b>\n"
         + f"Следующий ежедневный: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>"
     )
     return text, state
+
+
+async def _radar3_analytics_text() -> str:
+    """Deep Radar analytics. It is intentionally isolated from the live control panel."""
+    radar3 = await _radar3_dashboard_safe_snapshot(timeout_seconds=3.0)
+    category_lines = list(radar3.get("category_lines") or [])
+    category_text = "\n".join(category_lines[:10]) if category_lines else "Пока подтверждённых категорий нет"
+    if not any(k in radar3 for k in ("active", "early", "strong", "hot")):
+        return (
+            "<b>📊 DT Radar 3.1 · ANALYTICS</b>\n\n"
+            "⚠️ Глубокая статистика сейчас считается или PostgreSQL занят.\n"
+            "Live Status и AutoScan при этом продолжают работать независимо.\n\n"
+            + category_text
+        )
+    return (
+        "<b>📊 DT Radar 3.1 · ANALYTICS</b>\n\n"
+        "<b>🔬 Воронка Radar 3.1</b>\n"
+        f"Активных наблюдений: <b>{int(radar3.get('active') or 0)}</b>\n"
+        f"Ждут первого повторного замера: <b>{int(radar3.get('baseline') or 0)}</b>\n"
+        f"Готовы к замеру сейчас: <b>{int(radar3.get('due') or 0)}</b>\n"
+        f"Любой DT-observed прирост: <b>{int(radar3.get('any_growth') or 0)}</b>\n"
+        f"🟠 Candidate 15–29/ч, без Score: <b>{int(radar3.get('candidate') or 0)}</b>\n"
+        f"⭐ Score Gate ≥30/ч: <b>{int(radar3.get('observed') or 0)}</b>\n"
+        f"⚡ ≥60/ч: <b>{int(radar3.get('strong_intervals') or 0)}</b>\n"
+        f"🔁 Score подтверждён ≥2 раза: <b>{int(radar3.get('persistent') or 0)}</b>\n"
+        f"🚀 Ускоряются ≥20%: <b>{int(radar3.get('accelerating') or 0)}</b>\n"
+        f"🛡 Confidence ≥70%: <b>{int(radar3.get('high_confidence') or 0)}</b>\n"
+        f"⚫ Noise / Weak: <b>{int(radar3.get('quiet') or 0)}</b>\n"
+        f"Суммарный DT-observed прирост: <b>+{int(radar3.get('total_delta') or 0)}</b>\n\n"
+        f"🟡 Early: <b>{int(radar3.get('early') or 0)}</b> · 📈 Strong: <b>{int(radar3.get('strong') or 0)}</b> · 🔥 Hot: <b>{int(radar3.get('hot') or 0)}</b>\n\n"
+        "<b>🗂 Категории с живым спросом</b>\n"
+        + category_text + "\n\n"
+        "<i>Demand Gate: &lt;15/ч — стоп; 15–29/ч — Candidate; ≥30/ч — Score/Early; ≥60/ч — Strong. "
+        "DT Score = 50% сила относительно категории + 25% устойчивость + 15% ускорение + 10% повторяемость. Confidence считается отдельно.</i>"
+    )
 
 
 def _radar_autoscan_loading_text() -> str:
@@ -5078,11 +5114,12 @@ def _radar_autoscan_loading_text() -> str:
 
 
 def admin_radar_autoscan_loading_keyboard() -> InlineKeyboardMarkup:
-    """Always expose AutoScan controls even if PostgreSQL statistics are slow."""
+    """Emergency controls if the lightweight live state itself is temporarily unavailable."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="▶️ Запустить AutoScan", callback_data="adminradarauto:start"),
          InlineKeyboardButton(text="⏹ Остановить", callback_data="adminradarauto:stop")],
-        [InlineKeyboardButton(text="🔄 Обновить статистику", callback_data="adminradarauto")],
+        [InlineKeyboardButton(text="📊 Аналитика Radar", callback_data="adminradarauto:analytics")],
+        [InlineKeyboardButton(text="🔄 Обновить Live", callback_data="adminradarauto")],
         [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
     ])
 
@@ -10319,8 +10356,9 @@ def admin_radar_autoscan_keyboard(state: dict) -> InlineKeyboardMarkup:
         text=f"✅ Пропускать автокруг после ручного: {'ДА' if skip_today else 'НЕТ'}",
         callback_data="adminradarauto:skipday",
     )])
+    rows.append([InlineKeyboardButton(text="📊 Аналитика Radar", callback_data="adminradarauto:analytics")])
     rows.append([InlineKeyboardButton(text="📜 История кругов", callback_data="adminradarauto:history"),
-                 InlineKeyboardButton(text="🔄 Обновить", callback_data="adminradarauto")])
+                 InlineKeyboardButton(text="🔄 Обновить Live", callback_data="adminradarauto")])
     rows.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -11629,15 +11667,43 @@ async def admin_radar_autoscan_handler(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    # Acknowledge Telegram before any PostgreSQL work. The old order made a busy
-    # dashboard look like a dead button because callback.answer() happened last.
+    await callback.answer()
+    # Live Status is deliberately lightweight: one AppSetting read, no Radar analytics.
+    # This screen must never wait for percentile/category aggregation.
+    try:
+        text, state = await asyncio.wait_for(_radar_autoscan_text(), timeout=2.0)
+        await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
+    except Exception as exc:
+        log.exception("DT Radar live status failed")
+        await _edit_or_answer(
+            callback.message,
+            "<b>📡 DT Radar 3.1 · LIVE STATUS</b>\n\n⚠️ Live Status временно недоступен. AutoScan продолжает работать в фоне.\n"
+            f"Диагностика: <code>{html.escape(type(exc).__name__)}</code>",
+            reply_markup=admin_radar_autoscan_loading_keyboard(),
+        )
+
+
+@dp.callback_query(F.data == "adminradarauto:analytics")
+async def admin_radar_analytics_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
     await callback.answer()
     await _edit_or_answer(
-        callback.message, _radar_autoscan_loading_text(),
-        reply_markup=admin_radar_autoscan_loading_keyboard(),
+        callback.message,
+        "<b>📊 DT Radar 3.1 · ANALYTICS</b>\n\nСчитаю глубокую статистику… ⏳\nLive AutoScan от этого не блокируется.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Live Status", callback_data="adminradarauto")]
+        ]),
     )
-    text, state = await _radar_autoscan_safe_text()
-    await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
+    text = await _radar3_analytics_text()
+    await _edit_or_answer(
+        callback.message, text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить аналитику", callback_data="adminradarauto:analytics")],
+            [InlineKeyboardButton(text="⬅️ Live Status", callback_data="adminradarauto")],
+        ]),
+    )
 
 
 @dp.callback_query(F.data == "adminradarauto:start")
@@ -11661,8 +11727,7 @@ async def admin_radar_autoscan_start_handler(callback: CallbackQuery) -> None:
         await callback.answer(f"Круг запущен · ждёт пользовательские сканы: {running + queued}")
     else:
         await callback.answer("Круг запущен · первая категория стартует сейчас")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
-    text, state = await _radar_autoscan_safe_text()
+    text, state = await _radar_autoscan_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11700,8 +11765,7 @@ async def admin_radar_autoscan_retry_handler(callback: CallbackQuery) -> None:
     _kick_radar_autoscan(callback.bot, "retry")
     _schedule_radar_autoscan_launch_watchdog(callback.bot, str(state.get("round_id") or ""))
     await callback.answer(f"Повторяю проблемные категории: {len(state.get('category_keys') or [])}")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
-    text, state = await _radar_autoscan_safe_text()
+    text, state = await _radar_autoscan_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11725,8 +11789,7 @@ async def admin_radar_autoscan_stop_handler(callback: CallbackQuery) -> None:
     _radar_autoscan_stop_event.set()
     _radar_autoscan_wakeup.set()
     await callback.answer("Останавливаю текущую категорию сейчас")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
-    text, state = await _radar_autoscan_safe_text()
+    text, state = await _radar_autoscan_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11750,8 +11813,7 @@ async def admin_radar_autoscan_resume_handler(callback: CallbackQuery) -> None:
     _kick_radar_autoscan(callback.bot, "resume")
     _schedule_radar_autoscan_launch_watchdog(callback.bot, str(state.get("round_id") or ""))
     await callback.answer("Круг продолжен")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
-    text, state = await _radar_autoscan_safe_text()
+    text, state = await _radar_autoscan_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11766,8 +11828,7 @@ async def admin_radar_autoscan_daily_handler(callback: CallbackQuery) -> None:
         state = await save_radar_autoscan_state(state)
     _radar_autoscan_wakeup.set()
     await callback.answer("Ежедневный круг включён" if state.get("daily_enabled") else "Ежедневный круг выключен")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
-    text, state = await _radar_autoscan_safe_text()
+    text, state = await _radar_autoscan_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11782,8 +11843,7 @@ async def admin_radar_autoscan_skipday_handler(callback: CallbackQuery) -> None:
         state = await save_radar_autoscan_state(state)
     _radar_autoscan_wakeup.set()
     await callback.answer("Настройка сохранена")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
-    text, state = await _radar_autoscan_safe_text()
+    text, state = await _radar_autoscan_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11817,8 +11877,7 @@ async def admin_radar_autoscan_settime_handler(callback: CallbackQuery) -> None:
         state = await save_radar_autoscan_state(state)
     _radar_autoscan_wakeup.set()
     await callback.answer(f"Время: {value} МСК")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
-    text, state = await _radar_autoscan_safe_text()
+    text, state = await _radar_autoscan_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11870,8 +11929,7 @@ async def admin_ai_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer("Открываю DT Radar 3.0")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
-    text, state = await _radar_autoscan_safe_text()
+    text, state = await _radar_autoscan_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11881,8 +11939,7 @@ async def admin_ai_section_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer("Раздел удалён · DT Radar 3.0")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
-    text, state = await _radar_autoscan_safe_text()
+    text, state = await _radar_autoscan_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 
@@ -11892,8 +11949,7 @@ async def admin_ai_candidate_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer("Старая AI-карточка удалена · DT Radar 3.0")
-    await _edit_or_answer(callback.message, _radar_autoscan_loading_text(), reply_markup=admin_radar_autoscan_loading_keyboard())
-    text, state = await _radar_autoscan_safe_text()
+    text, state = await _radar_autoscan_text()
     await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
 
 

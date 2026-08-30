@@ -15,7 +15,7 @@ def test_ai_lab_is_not_in_admin_or_workers_menu():
 
 def test_old_ai_callbacks_only_redirect_to_radar3():
     block = BOT.split('@dp.callback_query(F.data == "adminai")', 1)[1].split('@dp.callback_query(F.data == "adminviews")', 1)[0]
-    assert '_radar_autoscan_safe_text()' in block
+    assert '_radar_autoscan_text()' in block
     assert 'admin_radar_autoscan_keyboard' in block
     assert '_admin_ai_dashboard_safe_text' not in block
     assert '_ai_candidate_rows' not in block
