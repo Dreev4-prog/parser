@@ -1013,7 +1013,7 @@ def main_keyboard(
     selected_count: int = 0, *, admin: bool = False, auto_observations: bool | None = None,
     access_active: bool = True, trial_remaining: int = 0, referral_enabled: bool = False,
 ) -> InlineKeyboardMarkup:
-    """Product-style home screen with one clear primary action."""
+    """Product-style home screen with Scan and Radar as equal primary actions."""
     if auto_observations is True:
         auto_label = "⏱ Автозамеры · ✅ ВКЛ"
     elif auto_observations is False:
@@ -1022,10 +1022,10 @@ def main_keyboard(
         auto_label = "⏱ Автозамеры"
     if access_active:
         rows = [
-            [InlineKeyboardButton(text="▶️ Новый скан", callback_data="start_scan")],
+            [InlineKeyboardButton(text="▶️ НОВЫЙ СКАН", callback_data="start_scan")],
+            [InlineKeyboardButton(text="📡 DT RADAR 3.0", callback_data="radar_home")],
             [InlineKeyboardButton(text="🔥 Популярное", callback_data="popular_now"),
-             InlineKeyboardButton(text="📡 DT Radar", callback_data="radar_home")],
-            [InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
+             InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
             [InlineKeyboardButton(text=f"🗂 Категории · {selected_count}/{MAX_SELECTED_CATEGORIES}", callback_data="groups"),
              InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
             [InlineKeyboardButton(text="📥 Очередь", callback_data="queue_status"),
@@ -1035,18 +1035,18 @@ def main_keyboard(
     elif trial_remaining > 0:
         rows = [
             [InlineKeyboardButton(text=f"🎁 Бесплатный скан · осталось {trial_remaining}", callback_data="start_scan")],
+            [InlineKeyboardButton(text="📡 DT RADAR 3.0 · 🎁", callback_data="radar_home")],
             [InlineKeyboardButton(text=f"🗂 Категория · {min(selected_count, FREE_TRIAL_MAX_CATEGORIES)}/{FREE_TRIAL_MAX_CATEGORIES}", callback_data="groups"),
              InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
-            [InlineKeyboardButton(text="📡 DT Radar · 🎁", callback_data="radar_home"),
-             InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
-            [InlineKeyboardButton(text="📥 Очередь", callback_data="queue_status")],
+            [InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans"),
+             InlineKeyboardButton(text="📥 Очередь", callback_data="queue_status")],
             [InlineKeyboardButton(text="💎 Полный доступ", callback_data="subscription")],
         ]
     else:
         rows = [
-            [InlineKeyboardButton(text="🔒 Новый скан", callback_data="start_scan")],
-            [InlineKeyboardButton(text="📡 DT Radar · 🎁", callback_data="radar_home"),
-             InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
+            [InlineKeyboardButton(text="🔒 НОВЫЙ СКАН", callback_data="start_scan")],
+            [InlineKeyboardButton(text="📡 DT RADAR 3.0 · 🎁", callback_data="radar_home")],
+            [InlineKeyboardButton(text="📊 Мои сканы", callback_data="my_scans")],
             [InlineKeyboardButton(text="💎 Продлить подписку", callback_data="subscription")],
         ]
     if referral_enabled:
@@ -13557,25 +13557,15 @@ def home_text(
             "Можно открыть карточку скана, TOP, историю и скачать XLSX.\n\n"
             "🔒 Для нового скана, повторного запуска или обновления просмотров нужна активная подписка."
         )
-    if selected_count:
-        state_line = f"🗂 Категории: <b>{selected_count}/{MAX_SELECTED_CATEGORIES}</b> · выбраны"
-    else:
-        state_line = "🗂 Категории: <b>не выбраны</b>"
-    auto_line = (
-        "⏱ Автозамеры: <b>✅ ВКЛ</b> · 3 / 6 / 12 ч"
-        if auto_observations else
-        "⏱ Автозамеры: <b>⛔ ВЫКЛ</b> · ручное обновление доступно всегда"
-    )
     return (
-        "<b>🔎 Kleinanzeigen Analytics</b>\n\n"
-        "Находи объявления, которые быстрее остальных набирают просмотры.\n\n"
-        "<b>Перед новым сканом:</b>\n"
-        "1️⃣ <b>Категории</b> — что искать\n"
-        "2️⃣ <b>Настройки</b> — что попадёт в результат и TOP\n"
-        "3️⃣ <b>Новый скан</b> — дата, цена и 15/25/50 страниц\n\n"
-        f"{state_line}\n"
-        f"{auto_line}\n"
-        "💡 Автозамеры можно включить или выключить прямо из главного меню."
+        "<b>📡 DT PARSER — MARKET ANALYTICS</b>\n\n"
+        "Сканируй рынок. Находи спрос. <b>Заходи раньше.</b>\n\n"
+        "🔎 <b>Сканирование</b>\n"
+        "Анализируй Kleinanzeigen и находи объявления, которые быстрее остальных набирают просмотры.\n\n"
+        "📡 <b>DT Radar 3.0</b>\n"
+        "Radar анализирует рынок и выцепляет <b>нестандартную товарку с растущим интересом</b>, "
+        "пока её ещё не начали продавать все.\n\n"
+        "<b>Выбери режим 👇</b>"
     )
 
 

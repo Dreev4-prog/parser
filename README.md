@@ -1,4 +1,19 @@
-# DT Parser 4.21.14 — Radar 3.2 Startup Guard Fix
+# DT Parser 4.21.15 — Radar Equal Home UI
+
+## 4.21.15 home redesign
+- `▶️ НОВЫЙ СКАН` and `📡 DT RADAR 3.0` are equal full-width primary actions.
+- `🔥 Популярное` + `📊 Мои сканы` move to the secondary row.
+- The active home caption is now `DT PARSER — MARKET ANALYTICS` and explains both Scan and Radar.
+- The old `Перед новым сканом` checklist is removed from the home screen; setup remains in the dedicated Categories/Settings flow.
+- Callback IDs and all parser/Radar algorithms are unchanged.
+- Based directly on 4.21.14; its non-destructive Radar startup guard remains intact.
+
+See `RELEASE_4_21_15.md`.
+
+---
+
+## Base release: 4.21.14 Radar 3.2 Startup Guard Fix
+
 
 ## Radar scope
 - AutoScan: 20 pages, today only.

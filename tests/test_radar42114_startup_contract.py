@@ -45,5 +45,5 @@ def test_startup_radar_guard_cannot_delete_tables():
     for token in ("delete(RadarProduct)", "delete(RadarObservation)", "delete(RadarSnapshot)", "delete(RadarFavorite)"):
         assert token not in block
 
-def test_version_is_42114():
-    assert (ROOT / "VERSION").read_text().strip() == "4.21.14"
+def test_release_keeps_42114_startup_guard():
+    assert (ROOT / "VERSION").read_text().strip() == "4.21.15"

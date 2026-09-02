@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.21.14", "VERSION=4.21.14")
+    check((ROOT / "VERSION").read_text().strip() == "4.21.15", "VERSION=4.21.15")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -28,6 +28,12 @@ def main() -> int:
     score = (ROOT / "early_winner.py").read_text(encoding="utf-8")
 
     check('RADAR_AUTOSCAN_DEPTH = 20' in bot, "Radar AutoScan depth=20")
+    home_block = bot.split('def main_keyboard(', 1)[1].split('def post_scan_keyboard(', 1)[0]
+    check('[InlineKeyboardButton(text="▶️ НОВЫЙ СКАН", callback_data="start_scan")]' in home_block and '[InlineKeyboardButton(text="📡 DT RADAR 3.0", callback_data="radar_home")]' in home_block,
+          "Scan and Radar are equal full-width home actions")
+    home_text_block = bot.split('def home_text(', 1)[1].split('async def _send_home_message(', 1)[0]
+    check('DT PARSER — MARKET ANALYTICS' in home_text_block and '<b>Перед новым сканом:</b>' not in home_text_block,
+          "home caption is Radar-equal Market Analytics UI")
     check('RADAR_CONTEXT_ENABLED = False' in bot and 'RADAR_CONTEXT_DEPTH = 0' in bot, "yesterday Context retired")
     scheduler = bot.split('async def radar_autoscan_scheduler', 1)[1].split('async def send_smart_export', 1)[0]
     check('_radar_autoscan_new_context_round' not in scheduler, "scheduler cannot launch yesterday Context")
@@ -110,7 +116,7 @@ def main() -> int:
     check('_category_feed_identity_matches(requested_url, final_url)' in parser_source, "category redirects preserve requested feed identity")
     check('for item in targets:' in bot and 'vr = results.get(url)' in bot, "partial exact-view maps cannot preserve stale counters")
     check(not list(ROOT.glob('DEPLOY_V4_*.md')), "historical deploy files removed from root")
-    print("\nDT Parser 4.21.14 Radar 3.2 Live/History Split release smoke: PASS")
+    print("\nDT Parser 4.21.15 Radar Equal Home UI release smoke: PASS")
     return 0
 
 
