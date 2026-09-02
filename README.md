@@ -1,23 +1,26 @@
-# DT Parser 4.21.12 — Radar 3.2 Frozen Cohort Full Audit Fix
+# DT Parser 4.21.13 — Radar 3.2 Two-Pass Clean
 
-Production release after full audit of 4.21.11.
-
-## Radar 3.2
+## Radar scope
 - AutoScan: 20 pages, today only.
-- Auto/Immobilien/Jobs/Dienstleistungen/Unterricht/Nachbarschaftshilfe are excluded from every Radar ingestion path (AutoScan and user-scan baselines), while the normal parser still supports them.
-- First exact counter is baseline-only and contributes 0 score.
-- First DT checkpoint remains ~60 minutes.
-- <3 views/hour is absolute noise.
-- Mature categories use adaptive P90 Candidate / P95 Early+Score / P98 Strong / P99 Hot interval gates.
-- Small cohorts (<20 measured intervals) use conservative bootstrap gates until enough category evidence exists.
-- Category classification is two-pass with one frozen cohort for the whole refreshed batch; quiet/zero-growth rows remain in the distribution.
-- First scored interval is capped at 50/100.
-- Hot requires persistence or independent product-family confirmation.
-- Products are retired immediately when no active Early/Strong evidence remains.
+- Automatic Radar excludes Auto, Immobilien, Jobs, Dienstleistungen, Unterricht & Kurse and Nachbarschaftshilfe.
+- The same exclusion policy is applied to user-scan Radar baselines, so those sections cannot leak back into Radar through manual scans.
+- The normal user parser is unchanged; exclusions apply only to Radar analytics.
 
-## Integrity
-- Radar reset marker v6 clears old Radar observations/products once; raw Listing/ViewHistory is preserved.
-- Cross-replica observation leases, TTL, stale cleanup, organic gates and Radar checkpoint traffic lane remain enabled.
-- Legacy AI worker stays retired/inert.
+## Category-adaptive demand
+- First exact view counter is baseline only and contributes 0 points.
+- <3 views/hour is hard noise.
+- Candidate = P90 of the current leaf category.
+- Early / Score = P95.
+- Strong = P98.
+- Hot interval = P99, with persistence or an independent family confirmation still required for Hot.
+- First scored checkpoint remains capped at 50/100.
 
-See `docs/RELEASE_4_21_12.md` for audit details.
+## 4.21.13 audit fixes
+- Radar evaluation is two-pass: all refreshed velocities are persisted first, then one shared category cohort is built and applied to every row in that batch.
+- New one-time reset marker clears RadarProduct, RadarObservation, RadarSnapshot, RadarFavorite, product links and lifecycle watches. Raw Listing/ViewHistory is preserved for audit.
+- AutoScan policy version is bumped; old progress/history/counters are discarded while the user's daily schedule preference is preserved.
+- Old in-progress rounds cannot resume with excluded categories.
+- Canonical category scope is shared by AutoScan and user-scan seeding to prevent policy drift.
+
+## Validation
+Run `python -m compileall -q .`, `pytest -q`, and `python scripts/release_smoke.py`.

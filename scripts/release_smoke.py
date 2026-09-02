@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.21.12", "VERSION=4.21.12")
+    check((ROOT / "VERSION").read_text().strip() == "4.21.13", "VERSION=4.21.13")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -40,27 +40,34 @@ def main() -> int:
           "first DT-owned remeasurement scheduled after 60 minutes")
     check('RADAR_V3_NOISE_FLOOR_VPH = 3.0' in radar and 'RADAR_V3_CANDIDATE_PERCENTILE = 0.90' in radar and 'RADAR_V3_EARLY_PERCENTILE = 0.95' in radar and 'RADAR_V3_STRONG_PERCENTILE = 0.98' in radar,
           "Radar 3.2 uses category-adaptive P90/P95/P98 with 3/h noise floor")
-    categories = (ROOT / 'categories.py').read_text(encoding='utf-8')
-    check('RADAR_EXCLUDED_GROUPS = frozenset' in categories and '"auto"' in categories and 'radar_category_allowed' in categories,
-          "one shared Radar category exclusion policy covers Auto and non-priority sections")
-    check('Listing.category_key.in_(allowed_category_keys)' in radar and 'radar_allowed_category_keys' in radar,
-          "user-scan Radar baselines obey the same category exclusion policy")
-    refresh = radar.split('async def radar_v3_record_refreshed', 1)[1].split('async def radar_v3_expire_observations', 1)[0]
-    check('PASS 1' in refresh and 'PASS 2' in refresh and 'category_cohorts' in refresh and 'category_context' in refresh,
-          "Radar 3.2 classification uses a frozen two-pass category cohort")
-    helper = radar.split('def _radar32_thresholds', 1)[1].split('async def radar_v3_release_claims', 1)[0]
-    check('float(x) >= 0.0' in helper and 'float(x) >= RADAR_V3_NOISE_FLOOR_VPH' not in helper,
-          "quiet/zero-growth rows remain in adaptive category quantiles")
-    check('affected_product_keys' in refresh and 'retired_keys' in refresh and 'status="historical", current_score=0' in refresh,
-          "stale Radar cards retire immediately when active scored evidence disappears")
-    check('if str(obs.status or "") not in {"observed", "confirmed"}:' in radar and 'continue' in radar,
+    refresh_block = radar.split('async def radar_v3_record_refreshed', 1)[1].split('async def radar_v3_expire_observations', 1)[0]
+    check('PASS 1 — persist raw DT measurements only' in refresh_block and 'PASS 2 — load each category cohort once' in refresh_block and 'thresholds_by_category' in refresh_block,
+          "Radar 3.2 category evaluation is two-pass and order-stable inside each batch")
+    check('RADAR_V3_EXCLUDED_GROUPS' in radar and all(f'"{g}"' in radar.split('RADAR_V3_EXCLUDED_GROUPS',1)[1].split('})',1)[0] for g in ('auto','immobilien','jobs','services','kurse','hilfe')),
+          "non-product groups are excluded by canonical Radar scope")
+    user_seed = radar.split('async def record_user_scan_radar3_baselines',1)[1].split('async def radar_v3_due_external_ids',1)[0]
+    check('radar_v3_category_allowed(str(listing.category_key or ""))' in user_seed and 'radar_v3_category_allowed' in bot.split('def _radar_autoscan_category_allowed',1)[1].split('def _radar_autoscan_categories',1)[0],
+          "AutoScan and user-scan baselines share the same Radar category policy")
+    check('RADAR_AUTOSCAN_POLICY_VERSION = 6' in bot and 'state = _radar_autoscan_default_state()' in bot and 'raw_state = {}' in bot,
+          "policy upgrade discards old AutoScan telemetry/progress")
+    check('if str(obs.status) not in {"observed", "confirmed"}:' in radar and 'continue' in radar,
           "only category-qualified Early/Strong observations can publish DT Score")
     check('Initial counter is baseline-only and contributed 0 points' in radar,
           "initial counter contributes zero score")
-    check('delete(RadarSnapshot)' in radar and 'delete(RadarProduct)' in radar and 'RADAR_V3_RESET_SETTING' in radar,
-          "one-time Radar 3.0 clean break present")
+    check('delete(RadarSnapshot)' in radar and 'delete(RadarProduct)' in radar and 'dt_radar_v3_observed_demand_reset_v6_radar32_two_pass_clean' in radar,
+          "one-time Radar 3.2 clean break present")
     check('Radar 3.0 maintenance: clean break, no legacy historical backfill.' in bot,
           "legacy historical backfill disabled")
+    expire_block = radar.split('async def radar_v3_expire_stale_products', 1)[1].split('async def repair_radar_v3_historical_scores_once', 1)[0]
+    check('current_score=0' not in expire_block and 'else_=RadarProduct.last_signal_score' in expire_block,
+          "6h expiry moves signal to History without destroying confirmed Score")
+    check('RADAR_V3_HISTORY_SCORE_REPAIR_SETTING' in radar and 'repair_radar_v3_historical_scores_once()' in bot,
+          "pre-4.21.13 zeroed historical scores are repaired once")
+    check('conditions.append(RadarProduct.status != "historical")' in radar and 'История · сигнал устарел' in bot,
+          "live catalogue is separated from preserved Radar history")
+    refresh_score_block = radar.split('async def refresh_radar_scores', 1)[1].split('async def radar_stats', 1)[0]
+    check('str(product.latest_source or "") == "radar3_observed"' in refresh_score_block and 'signal_age_hours > RADAR_V3_MAX_OBSERVATION_HOURS' in refresh_score_block,
+          "legacy score refresh cannot resurrect stale Radar 3.2 History")
     check('Radar 3.0: legacy admission path disabled' in radar,
           "legacy scan/AI/verified-velocity publishers disabled")
     check('RadarAutoScanStopped' in bot and '_radar_autoscan_stop_event' in bot,
@@ -102,7 +109,7 @@ def main() -> int:
     check('_category_feed_identity_matches(requested_url, final_url)' in parser_source, "category redirects preserve requested feed identity")
     check('for item in targets:' in bot and 'vr = results.get(url)' in bot, "partial exact-view maps cannot preserve stale counters")
     check(not list(ROOT.glob('DEPLOY_V4_*.md')), "historical deploy files removed from root")
-    print("\nDT Parser 4.21.12 Radar 3.2 Frozen Cohort Full Audit Fix release smoke: PASS")
+    print("\nDT Parser 4.21.13 Radar 3.2 Live/History Split release smoke: PASS")
     return 0
 
 

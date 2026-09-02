@@ -36,11 +36,11 @@ class Radar3ObservedDemandContractTests(unittest.TestCase):
         start = RADAR.index('async def radar_v3_record_refreshed(')
         end = RADAR.index('async def radar_v3_expire_stale_products(', start)
         src = RADAR[start:end]
-        self.assertIn('thresholds["candidate"]', src)
-        self.assertIn('thresholds["early"]', src)
-        self.assertIn('thresholds["strong"]', src)
-        self.assertIn('thresholds["early"]', src)
-        self.assertIn('thresholds["strong"]', src)
+        self.assertIn('RADAR_V3_CANDIDATE_PERCENTILE', src)
+        self.assertIn('RADAR_V3_EARLY_PERCENTILE', src)
+        self.assertIn('RADAR_V3_STRONG_PERCENTILE', src)
+        self.assertIn('pct >= RADAR_V3_EARLY_PERCENTILE', src)
+        self.assertIn('pct >= RADAR_V3_STRONG_PERCENTILE', src)
         self.assertIn('Initial counter is baseline-only and contributed 0 points', src)
 
     def test_clean_break_preserves_raw_listing_history_by_contract(self):

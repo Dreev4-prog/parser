@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import case, delete, func, or_, select, text, update
 
 from db import DATABASE_BACKEND, SessionLocal
-from categories import radar_category_allowed, radar_allowed_category_keys
+from categories import CATEGORIES
 from early_winner import FeatureRow, listing_age_minutes, opportunity_family_key, score_initial_rows
 from filters import price_bounds
 from organic_velocity import (
@@ -49,7 +49,8 @@ RADAR_BUMP_SWEEP_SETTING = "dt_radar_v4156_bump_sweep_complete"
 RADAR_BUMP_QUARANTINE_SETTING = "dt_radar_v4156_bump_quarantine_applied"
 RADAR_VELOCITY_PREP_SETTING = "dt_radar_v4157_verified_velocity_prepared"
 RADAR_UNIFIED_48H_REPAIR_SETTING = "dt_radar_v4200_unified_48h_repair_v2"
-RADAR_V3_RESET_SETTING = "dt_radar_v3_observed_demand_reset_v6_radar32_frozen_cohort"
+RADAR_V3_RESET_SETTING = "dt_radar_v3_observed_demand_reset_v6_radar32_two_pass_clean"
+RADAR_V3_HISTORY_SCORE_REPAIR_SETTING = "dt_radar_v3_history_score_repair_v1"
 RADAR_V3_FIRST_CHECK_MINUTES = 60
 RADAR_V3_NEXT_CHECK_MINUTES = 60
 RADAR_V3_EARLY_CHECK_MINUTES = 45
@@ -63,6 +64,24 @@ RADAR_V3_CANDIDATE_PERCENTILE = 0.90
 RADAR_V3_EARLY_PERCENTILE = 0.95
 RADAR_V3_STRONG_PERCENTILE = 0.98
 RADAR_V3_HOT_PERCENTILE = 0.99
+# Radar is deliberately limited to product-market sections. These groups remain
+# available in the normal parser, but neither AutoScan nor user scans may seed
+# them into Radar observations.
+RADAR_V3_EXCLUDED_GROUPS = frozenset({
+    "auto", "immobilien", "jobs", "services", "kurse", "hilfe",
+})
+RADAR_V3_EXCLUDED_CATEGORY_KEYS = frozenset({
+    "auto_reparatur", "hg_service", "el_service", "ti_betreuung", "ti_vermisst",
+    "fa_alten", "fa_babysit", "fr_aktiv", "fr_kuenstler", "fr_reise", "fr_verloren",
+})
+
+def radar_v3_category_allowed(category_key: str) -> bool:
+    cat = CATEGORIES.get(str(category_key or ""))
+    if cat is None or bool(getattr(cat, "is_group", False)):
+        return False
+    if str(getattr(cat, "group", "")) in RADAR_V3_EXCLUDED_GROUPS:
+        return False
+    return str(getattr(cat, "key", "")) not in RADAR_V3_EXCLUDED_CATEGORY_KEYS
 RADAR_SCAN_TOP_LIMIT = 12
 RADAR_PAGE_SIZE = 8
 # v4.15.5: after parser-level HTTP + browser recovery, wait once and retry only
@@ -597,7 +616,7 @@ def _snapshot_live_evidence(snapshot: RadarSnapshot, now: datetime):
         elapsed_minutes = max(0.0, (now - recorded_at).total_seconds() / 60.0)
     effective_age = max(0.0, float(getattr(snapshot, "demand_age_minutes", 0.0) or 0.0)) + elapsed_minutes
     if str(getattr(snapshot, "source", "") or "") == "radar3_observed":
-        # Radar 3.1 evidence is live, not a 48-hour trophy. Once the DT-owned
+        # Radar 3.2 evidence is live, not a 48-hour trophy. Once the DT-owned
         # observation window is stale, an old Hot/Strong snapshot must not
         # resurrect a product when a later weaker checkpoint arrives.
         if elapsed_minutes > float(RADAR_V3_MAX_OBSERVATION_HOURS * 60):
@@ -1136,7 +1155,7 @@ async def record_autoscan_hot_detailed(
     growth. This makes hidden bumps with inherited counters harmless.
     """
     ids = list(dict.fromkeys(str(x).strip() for x in matched_ids if str(x).strip()))[:5000]
-    if not ids or not radar_category_allowed(str(category_key)):
+    if not ids or not radar_v3_category_allowed(str(category_key)):
         return RadarAdmissionStats()
     now = datetime.utcnow()
     seeded = 0
@@ -1229,9 +1248,6 @@ async def record_user_scan_radar3_baselines(scan_id: int) -> int:
         scan = await session.get(UserScan, int(scan_id))
         if scan is None or str(scan.target_date or "") != today_msk or str(scan.status or "") not in {"done", "partial"}:
             return 0
-        allowed_category_keys = tuple(sorted(radar_allowed_category_keys()))
-        if not allowed_category_keys:
-            return 0
         rows = list((await session.execute(
             select(ScanListing, Listing)
             .join(Listing, Listing.external_id == ScanListing.external_id)
@@ -1239,7 +1255,6 @@ async def record_user_scan_radar3_baselines(scan_id: int) -> int:
                 ScanListing.scan_id == int(scan_id),
                 ScanListing.initial_view_count.is_not(None),
                 Listing.posted_date_msk == today_msk,
-                Listing.category_key.in_(allowed_category_keys),
                 Listing.is_promoted.is_(False),
                 Listing.is_price_reduced.is_(False),
                 ~_registry_dirty_exists(Listing.external_id),
@@ -1252,6 +1267,8 @@ async def record_user_scan_radar3_baselines(scan_id: int) -> int:
                 select(RadarObservation).where(RadarObservation.external_id.in_(ids))
             )).scalars().all()}
         for snap, listing in rows:
+            if not radar_v3_category_allowed(str(listing.category_key or "")):
+                continue
             ext = str(listing.external_id)
             measured_at = snap.captured_at or now
             raw = max(0, int(snap.initial_view_count or 0))
@@ -1369,7 +1386,7 @@ def _radar32_thresholds(peers: list[float]) -> dict[str, float]:
     Until a category has enough observations, thresholds deliberately stay
     conservative so a tiny cohort cannot manufacture a P99 signal.
     """
-    vals = sorted(float(x) for x in peers if float(x) >= 0.0)
+    vals = sorted(float(x) for x in peers if float(x) >= RADAR_V3_NOISE_FLOOR_VPH)
     def q(p: float) -> float:
         if not vals:
             return RADAR_V3_NOISE_FLOOR_VPH
@@ -1412,246 +1429,146 @@ async def radar_v3_release_claims(owner: str, external_ids: list[str] | tuple[st
 
 
 async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | set[str]) -> int:
-    """Radar 3.2 category-adaptive observed demand with a frozen cohort.
+    """Radar 3.2 category-adaptive observed demand, evaluated in two passes.
 
-    The evaluation is deliberately two-pass:
-      1) calculate every refreshed listing's new DT-owned interval velocity;
-      2) freeze one category cohort/threshold set and classify the whole batch.
-
-    This prevents order-dependent scores where the first listing in a View batch
-    sees a different P90/P95/P98/P99 population than the last listing. The cohort
-    includes fresh quiet/zero-growth observations; <3/h is only the hard per-listing
-    noise floor, not a filter on the category distribution.
+    Pass 1 persists every fresh DT-measured velocity in the batch without assigning
+    a market status. Pass 2 builds one shared cohort per category and evaluates all
+    rows in that category against the same P90/P95/P98/P99 thresholds. This removes
+    the order-dependent scoring bug where early rows in a batch saw a smaller cohort.
     """
     ids = list(dict.fromkeys(str(x).strip() for x in external_ids if str(x).strip()))
     if not ids:
         return 0
-
     now = datetime.utcnow()
-    prepared: list[dict] = []
+    prepared: list[tuple[Listing, RadarObservation, int, float, float]] = []
 
+    # PASS 1 — persist raw DT measurements only. Keep the lease until PASS 2 so a
+    # second replica cannot claim/reclassify the same observation mid-flight.
     async with SessionLocal() as session:
         pairs = (await session.execute(
-            select(Listing, RadarObservation)
-            .join(RadarObservation, RadarObservation.external_id == Listing.external_id)
-            .where(
-                Listing.external_id.in_(ids),
-                Listing.view_count.is_not(None),
-                Listing.is_promoted.is_(False),
-                Listing.is_price_reduced.is_(False),
+            select(Listing, RadarObservation).join(
+                RadarObservation, RadarObservation.external_id == Listing.external_id
+            ).where(
+                Listing.external_id.in_(ids), Listing.view_count.is_not(None),
+                Listing.is_promoted.is_(False), Listing.is_price_reduced.is_(False),
                 ~_registry_dirty_exists(Listing.external_id),
             )
         )).all()
-
-        # PASS 1 — compute raw intervals only. No category decision is made here.
         for listing, obs in pairs:
+            if not radar_v3_category_allowed(str(obs.category_key or listing.category_key or "")):
+                obs.status, obs.next_check_at = "excluded", None
+                obs.lease_owner, obs.lease_until = "", None
+                obs.updated_at = now
+                continue
             measured_at = listing.views_checked_at or now
             if obs.expires_at and measured_at > obs.expires_at:
-                obs.status = "expired"
-                obs.next_check_at = None
-                obs.lease_owner = ""
-                obs.lease_until = None
+                obs.status, obs.next_check_at = "expired", None
+                obs.lease_owner, obs.lease_until = "", None
                 obs.updated_at = now
                 continue
             if measured_at <= obs.last_measured_at:
                 continue
-            if not radar_category_allowed(str(obs.category_key or listing.category_key or "")):
-                # Defense in depth: a stale/manual excluded-category observation
-                # can never be promoted back into Radar intelligence.
-                obs.status = "expired"
-                obs.next_check_at = None
-                obs.lease_owner = ""
-                obs.lease_until = None
-                obs.updated_at = now
-                continue
-
             current = max(0, int(listing.view_count or 0))
             interval_delta = max(0, current - int(obs.last_views or 0))
             hours = max(1 / 60, (measured_at - obs.last_measured_at).total_seconds() / 3600.0)
-            vph = float(interval_delta / hours)
+            vph = interval_delta / hours
             previous_vph = float(obs.current_vph or 0.0)
-            acceleration_ratio = (
-                (vph - previous_vph) / max(1.0, previous_vph)
-                if previous_vph >= RADAR_V3_NOISE_FLOOR_VPH else 0.0
-            )
-            prepared.append({
-                "listing": listing,
-                "obs": obs,
-                "measured_at": measured_at,
-                "current": current,
-                "interval_delta": interval_delta,
-                "vph": vph,
-                "previous_vph": previous_vph,
-                "acceleration_ratio": float(acceleration_ratio),
-                "category_key": str(obs.category_key or listing.category_key or "unknown"),
-            })
-
-        if not prepared:
-            await session.commit()
-            return 0
-
-        # Build one immutable category population for this whole refreshed batch.
-        # Exclude the batch's old current_vph values, then add every newly computed
-        # interval exactly once. Quiet rows outside the batch remain in the cohort.
-        refreshed_ids = [str(row["obs"].external_id) for row in prepared]
-        category_keys = sorted({str(row["category_key"]) for row in prepared})
-        historical_rows = (await session.execute(
-            select(RadarObservation.category_key, RadarObservation.current_vph)
-            .where(
-                RadarObservation.category_key.in_(category_keys),
-                ~RadarObservation.external_id.in_(refreshed_ids),
-                RadarObservation.checkpoint_count >= 1,
-                RadarObservation.status != "expired",
-                or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now),
-                RadarObservation.updated_at >= now - timedelta(hours=6),
-            )
-        )).all()
-
-        category_cohorts: dict[str, list[float]] = {key: [] for key in category_keys}
-        for category_key, current_vph in historical_rows:
-            category_cohorts.setdefault(str(category_key), []).append(max(0.0, float(current_vph or 0.0)))
-        for row in prepared:
-            category_cohorts.setdefault(str(row["category_key"]), []).append(max(0.0, float(row["vph"])))
-
-        category_context: dict[str, dict[str, float]] = {}
-        for category_key, cohort in category_cohorts.items():
-            thresholds = _radar32_thresholds(cohort)
-            thresholds["cohort_size"] = len(cohort)
-            category_context[category_key] = thresholds
-
-        # PASS 2 — every row in one category uses the exact same frozen thresholds.
-        for row in prepared:
-            listing = row["listing"]
-            obs = row["obs"]
-            measured_at = row["measured_at"]
-            current = int(row["current"])
-            vph = float(row["vph"])
-            previous_vph = float(row["previous_vph"])
-            acceleration_ratio = float(row["acceleration_ratio"])
-            cohort = category_cohorts[str(row["category_key"])]
-            thresholds = category_context[str(row["category_key"])]
-            category_percentile = _percentile_rank(vph, cohort)
-            mature_cohort = int(thresholds.get("peer_count") or 0) >= RADAR_V3_MIN_CATEGORY_PEERS
-            positive = vph >= RADAR_V3_NOISE_FLOOR_VPH
-
-            # Before 20 real category intervals exist, conservative absolute fallback
-            # thresholds bootstrap the category. Once mature, percentile is authoritative.
-            if mature_cohort:
-                # The quantile value itself is the gate. Do not require mid-rank too:
-                # integer view counters create ties at the cutoff and a second rank
-                # condition could incorrectly reject every listing tied at P90/P95.
-                candidate = positive and vph >= float(thresholds["candidate"])
-                early = positive and vph >= float(thresholds["early"])
-                strong = positive and vph >= float(thresholds["strong"])
-                hot_interval = positive and vph >= float(thresholds["hot"])
-            else:
-                candidate = positive and vph >= float(thresholds["candidate"])
-                early = positive and vph >= float(thresholds["early"])
-                strong = positive and vph >= float(thresholds["strong"])
-                hot_interval = positive and vph >= float(thresholds["hot"])
+            accel = ((vph - previous_vph) / max(1.0, previous_vph)) if previous_vph >= RADAR_V3_NOISE_FLOOR_VPH else 0.0
 
             obs.checkpoint_count = int(obs.checkpoint_count or 0) + 1
-            obs.positive_checkpoints = int(obs.positive_checkpoints or 0) + (1 if positive else 0)
+            obs.positive_checkpoints = int(obs.positive_checkpoints or 0) + (1 if vph >= RADAR_V3_NOISE_FLOOR_VPH else 0)
+            obs.last_views = current
+            obs.last_measured_at = measured_at
+            obs.total_delta = max(0, current - int(obs.baseline_views or 0))
+            obs.previous_vph = previous_vph
+            obs.current_vph = float(vph)
+            obs.acceleration_ratio = float(accel)
+            obs.peak_vph = max(float(obs.peak_vph or 0.0), float(vph))
+            obs.updated_at = now
+            prepared.append((listing, obs, interval_delta, float(vph), previous_vph))
+        await session.commit()
+
+    if not prepared:
+        return 0
+
+    # PASS 2 — load each category cohort once, after every row above is committed.
+    # All refreshed rows of the same category therefore use identical thresholds.
+    category_keys = sorted({str(obs.category_key or listing.category_key or "") for listing, obs, *_ in prepared})
+    cohort_by_category: dict[str, list[float]] = {}
+    thresholds_by_category: dict[str, dict[str, float]] = {}
+    async with SessionLocal() as session:
+        for category_key in category_keys:
+            cohort = [float(x or 0.0) for x in (await session.execute(
+                select(RadarObservation.current_vph).where(
+                    RadarObservation.category_key == category_key,
+                    RadarObservation.checkpoint_count >= 1,
+                    RadarObservation.status.notin_(["expired", "excluded"]),
+                    or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now),
+                    RadarObservation.updated_at >= now - timedelta(hours=6),
+                )
+            )).scalars().all()]
+            cohort_by_category[category_key] = cohort
+            thresholds_by_category[category_key] = _radar32_thresholds(cohort)
+
+    evaluated: list[tuple[Listing, RadarObservation, int, float, float, float, dict[str, float], bool]] = []
+    async with SessionLocal() as session:
+        obs_map = {str(x.external_id): x for x in (await session.execute(
+            select(RadarObservation).where(RadarObservation.external_id.in_([str(obs.external_id) for _, obs, *_ in prepared]))
+        )).scalars().all()}
+        for listing, old_obs, interval_delta, vph, previous_vph in prepared:
+            obs = obs_map.get(str(old_obs.external_id))
+            if obs is None:
+                continue
+            category_key = str(obs.category_key or listing.category_key or "")
+            cohort = cohort_by_category.get(category_key, [float(vph)])
+            thresholds = thresholds_by_category.get(category_key) or _radar32_thresholds(cohort)
+            pct = _percentile_rank(float(vph), cohort)
+            positive = vph >= RADAR_V3_NOISE_FLOOR_VPH
+            candidate = positive and vph >= thresholds["candidate"] and pct >= RADAR_V3_CANDIDATE_PERCENTILE
+            early = positive and vph >= thresholds["early"] and pct >= RADAR_V3_EARLY_PERCENTILE
+            strong = positive and vph >= thresholds["strong"] and pct >= RADAR_V3_STRONG_PERCENTILE
+            hot_interval = positive and vph >= thresholds["hot"] and pct >= RADAR_V3_HOT_PERCENTILE
+
             obs.consecutive_positive = int(obs.consecutive_positive or 0) + 1 if candidate else 0
             obs.scored_checkpoints = int(obs.scored_checkpoints or 0) + (1 if early else 0)
             obs.consecutive_scored = int(obs.consecutive_scored or 0) + 1 if early else 0
             obs.strong_checkpoints = int(obs.strong_checkpoints or 0) + (1 if strong else 0)
             obs.consecutive_strong = int(obs.consecutive_strong or 0) + 1 if strong else 0
-            obs.last_views = current
-            obs.last_measured_at = measured_at
-            obs.total_delta = max(0, current - int(obs.baseline_views or 0))
-            obs.previous_vph = previous_vph
-            obs.current_vph = vph
-            obs.acceleration_ratio = acceleration_ratio
-            obs.peak_vph = max(float(obs.peak_vph or 0.0), vph)
-            obs.velocity_percentile = float(category_percentile)
-            obs.updated_at = now
-            obs.lease_owner = ""
-            obs.lease_until = None
-
+            obs.velocity_percentile = float(pct)
+            obs.lease_owner, obs.lease_until = "", None
             if not candidate:
-                obs.status = "quiet"
-                obs.next_check_at = None
+                obs.status, obs.next_check_at = "quiet", None
             elif strong:
                 obs.status = "confirmed"
-                obs.next_check_at = measured_at + timedelta(minutes=RADAR_V3_STRONG_CHECK_MINUTES)
+                obs.next_check_at = obs.last_measured_at + timedelta(minutes=RADAR_V3_STRONG_CHECK_MINUTES)
             elif early:
                 obs.status = "observed"
-                obs.next_check_at = measured_at + timedelta(minutes=RADAR_V3_EARLY_CHECK_MINUTES)
+                obs.next_check_at = obs.last_measured_at + timedelta(minutes=RADAR_V3_EARLY_CHECK_MINUTES)
             else:
                 obs.status = "candidate"
-                obs.next_check_at = measured_at + timedelta(minutes=RADAR_V3_NEXT_CHECK_MINUTES)
+                obs.next_check_at = obs.last_measured_at + timedelta(minutes=RADAR_V3_NEXT_CHECK_MINUTES)
             if obs.expires_at and obs.next_check_at and obs.next_check_at > obs.expires_at:
                 obs.next_check_at = None
-
-            row.update({
-                "thresholds": dict(thresholds),
-                "category_percentile": float(category_percentile),
-                "hot_interval": bool(hot_interval),
-                "mature_cohort": bool(mature_cohort),
-            })
-
+            obs.updated_at = now
+            evaluated.append((listing, obs, interval_delta, vph, previous_vph, pct, thresholds, hot_interval))
         await session.commit()
 
-    # If a previously visible Radar product no longer has any active Early/Strong
-    # observation after this checkpoint, retire it immediately instead of leaving
-    # a stale Early/Strong/Hot card visible for the remainder of the 6-hour TTL.
-    affected_product_keys = sorted({str(row["obs"].product_key) for row in prepared if str(row["obs"].product_key or "")})
-    if affected_product_keys:
-        async with SessionLocal() as session:
-            active_keys = set((await session.execute(
-                select(RadarObservation.product_key).where(
-                    RadarObservation.product_key.in_(affected_product_keys),
-                    RadarObservation.scored_checkpoints >= 1,
-                    RadarObservation.status.in_(["observed", "confirmed"]),
-                    or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now),
-                    RadarObservation.updated_at >= now - timedelta(hours=6),
-                ).distinct()
-            )).scalars().all())
-            retired_keys = [key for key in affected_product_keys if key not in {str(x) for x in active_keys}]
-            if retired_keys:
-                await session.execute(
-                    update(RadarProduct).where(
-                        RadarProduct.product_key.in_(retired_keys),
-                        RadarProduct.latest_source == "radar3_observed",
-                        RadarProduct.status != "historical",
-                    ).values(
-                        status="historical", current_score=0, radar_rank=0.0, updated_at=now
-                    ).execution_options(synchronize_session=False)
-                )
-                await session.commit()
-
-    # Signal publication is intentionally after the frozen classification commit,
-    # so family confirmation sees one coherent state for the entire refreshed batch.
     emitted = 0
-    for row in prepared:
-        listing = row["listing"]
-        obs = row["obs"]
-        vph = float(row["vph"])
-        previous_vph = float(row["previous_vph"])
-        interval_delta = int(row["interval_delta"])
-        category_percentile = float(row["category_percentile"])
-        thresholds = dict(row["thresholds"])
-        hot_interval = bool(row["hot_interval"])
-
-        if str(obs.status or "") not in {"observed", "confirmed"}:
+    for listing, obs, interval_delta, vph, previous_vph, category_percentile, thresholds, hot_interval in evaluated:
+        if str(obs.status) not in {"observed", "confirmed"}:
             continue
-
         async with SessionLocal() as session:
-            family = list((await session.execute(
-                select(RadarObservation).where(
-                    RadarObservation.product_key == str(obs.product_key),
-                    RadarObservation.external_id != str(obs.external_id),
-                    RadarObservation.scored_checkpoints >= 1,
-                    RadarObservation.status.in_(["observed", "confirmed"]),
-                    or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now),
-                    RadarObservation.updated_at >= now - timedelta(hours=6),
-                )
-            )).scalars().all())
+            family = list((await session.execute(select(RadarObservation).where(
+                RadarObservation.product_key == str(obs.product_key),
+                RadarObservation.external_id != str(obs.external_id),
+                RadarObservation.velocity_percentile >= RADAR_V3_EARLY_PERCENTILE,
+                RadarObservation.scored_checkpoints >= 1,
+                RadarObservation.status.in_(["observed", "confirmed"]),
+                or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now),
+                RadarObservation.updated_at >= now - timedelta(hours=6),
+            ))).scalars().all())
 
         family_scored = len({str(x.external_id) for x in family})
-        family_strong = len({str(x.external_id) for x in family if int(x.strong_checkpoints or 0) >= 1})
-
         velocity_points = round(50 * category_percentile)
         consecutive_scored = int(obs.consecutive_scored or 0)
         persistence_points = 25 if consecutive_scored >= 3 else (15 if consecutive_scored >= 2 else 0)
@@ -1673,23 +1590,17 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
         if int(obs.scored_checkpoints or 0) <= 1:
             score = min(score, 50)
 
-        confidence = 30
-        confidence += min(20, int(thresholds.get("peer_count") or 0))
+        confidence = 30 + min(20, int(thresholds["peer_count"]))
         confidence += 20 if int(obs.scored_checkpoints or 0) >= 2 else 0
         confidence += 10 if int(obs.strong_checkpoints or 0) >= 1 else 0
         confidence += 10 if family_scored >= 1 else 0
-        confidence += 5 if family_strong >= 1 else 0
         confidence = max(0, min(95, int(confidence)))
 
-        # Hot path A: current interval is category P99 (or bootstrap Hot fallback)
-        # and this listing has already demonstrated strong persistence.
+        # Hot path A: one listing stays at category-P99 territory across two
+        # strong checkpoints. Hot path B: persistent P95+ demand is confirmed by
+        # a second independent listing from the same product family.
         solo_hot = bool(hot_interval and int(obs.consecutive_strong or 0) >= 2)
-        # Hot path B: current listing is strong/persistent and an independent ad in
-        # the same product family has also reached category-qualified Early.
-        family_hot = bool(
-            family_scored >= 1
-            and (int(obs.consecutive_strong or 0) >= 1 or int(obs.consecutive_scored or 0) >= 2)
-        )
+        family_hot = bool(family_scored >= 1 and int(obs.consecutive_scored or 0) >= 2)
         if solo_hot or family_hot:
             demand_status, stage = "hot", "product_hot"
         elif int(obs.consecutive_strong or 0) >= 1 or int(obs.consecutive_scored or 0) >= 2:
@@ -1698,50 +1609,34 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
             demand_status, stage = "stable", "observed"
 
         async with SessionLocal() as session:
-            await session.execute(
-                update(RadarObservation)
-                .where(RadarObservation.external_id == str(obs.external_id))
-                .values(confidence=int(confidence), updated_at=now)
-            )
+            await session.execute(update(RadarObservation).where(
+                RadarObservation.external_id == str(obs.external_id)
+            ).values(confidence=int(confidence), updated_at=now))
             await session.commit()
 
-        allowed, detail_reason, verified_at = await _live_detail_organic_gate(
-            listing, force_priority="radar_checkpoint"
-        )
+        allowed, detail_reason, verified_at = await _live_detail_organic_gate(listing, force_priority="radar_checkpoint")
         if not allowed:
             continue
         elapsed_hours = max(1 / 60, (obs.last_measured_at - obs.baseline_at).total_seconds() / 3600.0)
-        cohort_mode = "percentile" if bool(row["mature_cohort"]) else "bootstrap"
         result = await _upsert_signal(
             source_key=f"radar3:{obs.external_id}:{int(obs.last_measured_at.timestamp())}",
-            source="radar3_observed",
-            listing=listing,
-            product_key=str(obs.product_key),
-            score=score,
-            confidence=confidence,
-            stage=stage,
-            opportunity_type="observed_demand",
-            view_count=int(obs.last_views or 0),
-            views_per_hour=vph,
+            source="radar3_observed", listing=listing, product_key=str(obs.product_key),
+            score=score, confidence=confidence, stage=stage, opportunity_type="observed_demand",
+            view_count=int(obs.last_views or 0), views_per_hour=float(vph),
             reasons=[
-                f"Radar 3.2: {vph:.1f}/h · category P{int(round(category_percentile * 100))} · frozen cohort={int(thresholds.get('cohort_size') or 0)} ({cohort_mode})",
-                f"Category gates: Candidate {float(thresholds['candidate']):.1f}/h · Early {float(thresholds['early']):.1f}/h · Strong {float(thresholds['strong']):.1f}/h · Hot {float(thresholds['hot']):.1f}/h",
+                f"Radar 3.2: {float(vph):.1f}/h · category P{int(round(float(category_percentile) * 100))} among {int(thresholds['peer_count'])} peers",
+                f"Live category gates: Candidate {thresholds['candidate']:.1f}/h · Early {thresholds['early']:.1f}/h · Strong {thresholds['strong']:.1f}/h · Hot {thresholds['hot']:.1f}/h",
                 f"Score = velocity {velocity_points}/50 + persistence {persistence_points}/25 + acceleration {acceleration_points}/15 + repeatability {repeat_points}/10",
-                f"Confidence {confidence}% · acceleration {accel * 100:+.0f}% · interval +{interval_delta}",
-                f"Family confirmations: Early {family_scored} · Strong {family_strong}",
+                f"Confidence {confidence}% · acceleration {accel * 100:+.0f}% · interval +{int(interval_delta)}",
                 f"DT observed +{int(obs.total_delta)} views in {elapsed_hours:.1f}h after baseline; Initial counter is baseline-only and contributed 0 points",
             ],
-            recorded_at=obs.last_measured_at,
-            live_detail_verified_at=verified_at,
-            demand_views=int(obs.total_delta),
-            demand_age_minutes=float(elapsed_hours * 60),
-            radar_rank=float(score),
-            demand_status=demand_status,
+            recorded_at=obs.last_measured_at, live_detail_verified_at=verified_at,
+            demand_views=int(obs.total_delta), demand_age_minutes=float(elapsed_hours * 60),
+            radar_rank=float(score), demand_status=demand_status,
             demand_gate=int(round(float(thresholds["early"]))),
         )
         if result is not None:
             emitted += 1
-
     return emitted
 
 
@@ -1766,17 +1661,76 @@ async def radar_v3_expire_observations() -> int:
 
 
 async def radar_v3_expire_stale_products(max_age_hours: int = 6) -> int:
+    """Move stale live signals to History without destroying their evidence score.
+
+    A six-hour TTL means "not live anymore", not "this product scored zero".
+    The last confirmed Score is intentionally preserved for Records/Favorites and
+    auditability, while ``radar_rank=0`` guarantees that stale history cannot rank
+    inside live feeds.
+    """
     cutoff = datetime.utcnow() - timedelta(hours=max(1, int(max_age_hours)))
+    now = datetime.utcnow()
     async with SessionLocal() as session:
         result = await session.execute(
             update(RadarProduct).where(
                 RadarProduct.latest_source == "radar3_observed",
                 RadarProduct.last_signal_at < cutoff,
                 RadarProduct.status != "historical",
-            ).values(status="historical", current_score=0, radar_rank=0.0, updated_at=datetime.utcnow())
+            ).values(
+                status="historical",
+                current_score=case(
+                    (RadarProduct.current_score > 0, RadarProduct.current_score),
+                    else_=RadarProduct.last_signal_score,
+                ),
+                radar_rank=0.0,
+                updated_at=now,
+            )
         )
         await session.commit()
         return int(result.rowcount or 0)
+
+
+async def repair_radar_v3_historical_scores_once() -> int:
+    """Repair historical rows zeroed by the pre-4.21.13 expiry bug.
+
+    v4.21.12 changed stale products to ``historical`` and set ``current_score=0``.
+    ``last_signal_score`` and ``peak_score`` survived, so we can restore the last
+    confirmed value without re-running scans or manufacturing new demand.
+    Serialized across Parser replicas and idempotent via AppSetting.
+    """
+    async with SessionLocal() as session:
+        bind = session.get_bind()
+        if bind is not None and str(bind.dialect.name).startswith("postgres"):
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                {"key": RADAR_V3_HISTORY_SCORE_REPAIR_SETTING},
+            )
+        existing = await session.get(AppSetting, RADAR_V3_HISTORY_SCORE_REPAIR_SETTING)
+        if existing is not None and str(existing.value or "") == "done":
+            return 0
+        result = await session.execute(
+            update(RadarProduct).where(
+                RadarProduct.latest_source == "radar3_observed",
+                RadarProduct.status == "historical",
+                RadarProduct.current_score <= 0,
+            ).values(
+                current_score=case(
+                    (RadarProduct.last_signal_score > 0, RadarProduct.last_signal_score),
+                    else_=RadarProduct.peak_score,
+                ),
+                radar_rank=0.0,
+                updated_at=datetime.utcnow(),
+            )
+        )
+        repaired = int(result.rowcount or 0)
+        if existing is None:
+            session.add(AppSetting(key=RADAR_V3_HISTORY_SCORE_REPAIR_SETTING, value="done"))
+        else:
+            existing.value = "done"
+        await session.commit()
+    if repaired:
+        log.warning("DT Radar history score repair restored=%s stale products", repaired)
+    return repaired
 
 
 async def prepare_radar_v3_once() -> bool:
@@ -1801,7 +1755,7 @@ async def prepare_radar_v3_once() -> bool:
         else:
             existing.value = "done"
         await session.commit()
-    log.warning("DT Radar 3.0 reset complete: old Radar products/signals removed; listing/view history preserved")
+    log.warning("DT Radar 3.2 clean reset complete: products/observations/snapshots/favorites/lifecycle removed; Listing/ViewHistory preserved")
     return True
 
 
@@ -2228,7 +2182,20 @@ async def refresh_radar_scores() -> int:
                     max(0.0, (now - product.last_signal_at).total_seconds() / 3600.0)
                     if product.last_signal_at is not None else 10**6
                 )
-                if signal_age_hours > 48.0:
+                if str(product.latest_source or "") == "radar3_observed":
+                    # Radar 3.2 owns its live/historical lifecycle. Never feed a
+                    # stale observed-demand product back through the legacy 48H
+                    # classifier: that could resurrect History as live merely
+                    # because its preserved Score is high. A fresh checkpoint is
+                    # the only valid path back into Early/Strong/Hot.
+                    new_score = _clamp_score(int(product.last_signal_score or product.current_score or 0))
+                    if str(product.status or "") == "historical" or signal_age_hours > RADAR_V3_MAX_OBSERVATION_HOURS:
+                        new_status = "historical"
+                        new_rank = 0.0
+                    else:
+                        new_status = str(product.status or "stable")
+                        new_rank = float(product.radar_rank or 0.0)
+                elif signal_age_hours > 48.0:
                     new_status = "historical"
                     new_rank = 0.0
                 else:
@@ -2267,7 +2234,7 @@ async def radar_stats() -> RadarStats:
         visible = _visible_product_association_exists(RadarProduct.id)
         visible_product_ids = select(RadarProduct.id).where(visible)
         total = int((await session.execute(
-            select(func.count(RadarProduct.id)).where(visible)
+            select(func.count(RadarProduct.id)).where(visible, RadarProduct.status != "historical")
         )).scalar_one() or 0)
         hot = int((await session.execute(select(func.count(RadarProduct.id)).where(
             visible, RadarProduct.status == "hot"
@@ -2282,7 +2249,7 @@ async def radar_stats() -> RadarStats:
             RadarProduct.confidence >= 55,
         ))).scalar_one() or 0)
         categories = int((await session.execute(select(func.count(func.distinct(RadarProduct.category_key))).where(
-            visible
+            visible, RadarProduct.status != "historical"
         ))).scalar_one() or 0)
         signals = int((await session.execute(select(func.count(RadarSnapshot.id)).where(
             RadarSnapshot.product_id.in_(visible_product_ids),
@@ -2394,10 +2361,15 @@ async def list_radar_products(
             conditions.append(RadarProduct.id.in_(fav_ids))
             order = (RadarProduct.radar_rank.desc(), RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
         elif mode == "category_best" and category_key:
+            conditions.append(RadarProduct.status != "historical")
             order = (RadarProduct.radar_rank.desc(), RadarProduct.current_score.desc(), RadarProduct.first_radar_at.desc(), RadarProduct.last_signal_at.desc())
         elif mode == "category_new" and category_key:
+            conditions.append(RadarProduct.status != "historical")
             order = (RadarProduct.first_radar_at.desc(), RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
         else:
+            # Generic/current catalogue feeds are live-only. Historical products
+            # remain available through Records and explicit Favorites.
+            conditions.append(RadarProduct.status != "historical")
             order = (RadarProduct.radar_rank.desc(), RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
         if conditions:
             query = query.where(*conditions)
@@ -2423,6 +2395,7 @@ async def search_radar_products(
     async with SessionLocal() as session:
         conditions = [
             RadarProduct.title.ilike(pattern),
+            RadarProduct.status != "historical",
             _visible_product_association_exists(RadarProduct.id),
         ]
         price_lo, price_hi = price_bounds(price_filter)
@@ -2479,6 +2452,7 @@ async def radar_categories() -> list[tuple[str, int, int, int]]:
             )
             .where(
                 RadarProduct.category_key != "",
+                RadarProduct.status != "historical",
                 _visible_product_association_exists(RadarProduct.id),
             )
             .group_by(RadarProduct.category_key)

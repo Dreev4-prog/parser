@@ -39,10 +39,12 @@ def test_rearm_clears_all_context_score_state():
         assert token in block
 
 
-def test_context_peers_and_family_exclude_expired_rows():
+def test_context_cohort_and_family_exclude_expired_or_excluded_rows():
     block = RADAR.split('async def radar_v3_record_refreshed', 1)[1].split('async def radar_v3_expire_observations', 1)[0]
     assert block.count('or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now)') >= 2
-    assert 'RadarObservation.status != "expired"' in block
+    # Category cohort intentionally keeps quiet measured rows to avoid survivor bias.
+    assert 'RadarObservation.status.notin_(["expired", "excluded"])' in block
+    # Product-family confirmation remains restricted to live scored evidence.
     assert 'RadarObservation.status.in_(["observed", "confirmed"])' in block
 
 

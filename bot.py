@@ -61,10 +61,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from app_version import APP_VERSION
-from categories import (
-    CATEGORIES, GROUPS, categories_for_group, group_root_key,
-    RADAR_EXCLUDED_GROUPS, RADAR_EXCLUDED_CATEGORY_KEYS, radar_category_allowed,
-)
+from categories import CATEGORIES, GROUPS, categories_for_group, group_root_key
 from db import DATABASE_BACKEND, SessionLocal, init_db
 from filters import (
     apply_listing_settings,
@@ -128,9 +125,9 @@ from radar import (
     RADAR_PAGE_SIZE, RADAR_SCAN_TOP_LIMIT, bump_resurrection_integrity_sweep_once,
     prepare_bump_resurrection_sweep_once, prepare_verified_organic_velocity_once, prepare_unified_48h_ranking_once, get_fast_sold_info, get_fast_sold_infos,
     get_radar_product, is_radar_favorite, list_radar_products, radar_categories, radar_stats,
-    purge_nonorganic_analytics, record_autoscan_hot_detailed, record_user_scan_radar3_baselines,
+    purge_nonorganic_analytics, record_autoscan_hot_detailed, record_user_scan_radar3_baselines, radar_v3_category_allowed,
     record_verified_velocity_signals, refresh_radar_scores, verify_listing_organic_now,
-    prepare_radar_v3_once, radar_v3_due_external_ids, radar_v3_claim_due_external_ids, radar_v3_release_claims, radar_v3_record_refreshed, radar_v3_expire_observations, radar_v3_expire_stale_products,
+    prepare_radar_v3_once, repair_radar_v3_historical_scores_once, radar_v3_due_external_ids, radar_v3_claim_due_external_ids, radar_v3_release_claims, radar_v3_record_refreshed, radar_v3_expire_observations, radar_v3_expire_stale_products,
     search_radar_products, toggle_radar_favorite,
 )
 from page_manager import (
@@ -187,29 +184,6 @@ RADAR_AUTOSCAN_DEFAULT_TIME = "05:00"
 RADAR_AUTOSCAN_POLL_SECONDS = 10
 RADAR_AUTOSCAN_HISTORY_LIMIT = 20
 RADAR_AUTOSCAN_TIME_CHOICES = ("03:00", "05:00", "08:00", "12:00", "18:00", "23:00")
-# Compatibility aliases: policy now lives in categories.py and is shared with
-# user-scan Radar ingestion.
-RADAR_AUTOSCAN_EXCLUDED_GROUPS = RADAR_EXCLUDED_GROUPS
-RADAR_AUTOSCAN_EXCLUDED_CATEGORY_KEYS = RADAR_EXCLUDED_CATEGORY_KEYS
-RADAR_AUTOSCAN_PARTIAL_BACKOFF_BASE_SECONDS = 3.0
-RADAR_AUTOSCAN_SYSTEM_BACKOFF_BASE_SECONDS = 8.0
-RADAR_AUTOSCAN_MAX_BACKOFF_SECONDS = 30.0
-RADAR_AUTOSCAN_SUCCESS_GAP_SECONDS = 0.25
-# v4.11.9: in stable single-service mode TRAFFIC.background_during_scans is forced to 0
-# to protect user-facing scans. AutoScan itself is wrapped in scan_job_started(), so using
-# background priority for its own deferred views creates a self-deadlock after the last
-# category page. Use a small normal-priority lane only for this AutoScan view phase.
-RADAR_AUTOSCAN_SAFE_VIEW_CONCURRENCY = 4
-RADAR_AUTOSCAN_LAUNCH_WATCHDOG_SECONDS = 20
-# v4.15.8: one category can no longer hold the whole 84-category round forever.
-# The normal user scan watchdog remains unchanged; AutoScan gets its own tighter
-# bound because a timed-out category is safely moved to the retry list.
-RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS = max(120.0, min(1200.0, float(os.getenv("RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS", "480"))))
-# Dedicated View Worker jobs have a historical 30-minute manager timeout. AutoScan
-# cannot wait that long inside one category; preserve direct successes and fail the
-# unresolved tail closed so the category becomes a retry candidate.
-RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS = max(60.0, min(420.0, float(os.getenv("RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS", "240"))))
-
 # v4.12.0 Daily Radar Growth Loop. One factual daily digest turns the live Radar
 # database into a recurring acquisition/retention surface. The digest is enabled by
 # default, sends at 20:00 Moscow time, and stores its last send date in AppSetting so
@@ -1158,14 +1132,14 @@ RADAR_STATUS_ICON = {
     "rising": "📈",
     "stable": "🟡",
     "cooling": "💤",
-    "historical": "🗄",
+    "historical": "🕒",
 }
 RADAR_STATUS_LABEL = {
     "hot": "Hot · спрос доказан",
     "rising": "Strong · спрос подтверждается",
     "stable": "Early · ранний сигнал",
     "cooling": "Остывает",
-    "historical": "История",
+    "historical": "История · сигнал устарел",
 }
 RADAR_TYPE_LABEL = {
     "hot_product": "🔥 Hot Product",
@@ -1333,8 +1307,9 @@ def radar_list_keyboard(
         title = " ".join(str(product.title or "Товар").split())
         if len(title) > 32:
             title = title[:31].rstrip() + "…"
+        shown_score = int(product.peak_score or 0) if mode == "alltime" else int(product.current_score or 0)
         rows.append([InlineKeyboardButton(
-            text=f"{icon} {int(product.current_score or 0)} · {title}",
+            text=f"{icon} {shown_score} · {title}",
             callback_data=f"radaritem:{int(product.id)}",
         )])
     nav: list[InlineKeyboardButton] = []
@@ -4336,6 +4311,7 @@ async def radar_maintenance_scheduler() -> None:
     try:
         await asyncio.sleep(8)
         await prepare_radar_v3_once()
+        await repair_radar_v3_historical_scores_once()
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -4400,8 +4376,10 @@ async def radar_v3_observation_scheduler() -> None:
 
 
 def _radar_autoscan_category_allowed(cat) -> bool:
-    """Shared Radar eligibility policy; normal user parser categories are untouched."""
-    return bool(cat is not None and radar_category_allowed(str(getattr(cat, "key", ""))))
+    """Use the canonical Radar 3.2 product-market scope for AutoScan."""
+    if cat is None:
+        return False
+    return radar_v3_category_allowed(str(getattr(cat, "key", "")))
 
 
 def _radar_autoscan_categories() -> list:
@@ -4544,6 +4522,21 @@ def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
     # deploy cannot corrupt current_index/counters midway through a persisted round.
     # Every new/retry round uses the current policy and only product-oriented categories.
     stored_policy = max(0, int(raw_state.get("policy_version") or 0))
+    if stored_policy < RADAR_AUTOSCAN_POLICY_VERSION:
+        # A Radar policy change means old progress/counters/history describe a
+        # different market scope and must not leak into the clean dashboard.
+        # Preserve only the user's daily schedule preferences.
+        daily_enabled = bool(state.get("daily_enabled"))
+        daily_time = str(state.get("daily_time") or RADAR_AUTOSCAN_DEFAULT_TIME)
+        skip_daily = bool(state.get("skip_daily_if_completed_today", True))
+        state = _radar_autoscan_default_state()
+        state["daily_enabled"] = daily_enabled
+        state["daily_time"] = daily_time if daily_time in RADAR_AUTOSCAN_TIME_CHOICES else RADAR_AUTOSCAN_DEFAULT_TIME
+        state["skip_daily_if_completed_today"] = skip_daily
+        raw_state = {}
+        failures = []
+        inferred_review = 0
+        inferred_system = 0
     if stored_policy < RADAR_AUTOSCAN_POLICY_VERSION and str(state.get("status") or "idle") in {"running", "paused"}:
         # v4.21.5 retires yesterday/context entirely. Never resume a persisted
         # 15+15 round after deploy; a new run must use 20 pages for today only.
@@ -4872,17 +4865,14 @@ async def _radar3_dashboard_snapshot() -> dict:
                 RadarObservation.consecutive_scored >= 2, RadarObservation.expires_at > now
             ),
             func.count(RadarObservation.id).filter(
-                RadarObservation.status.in_(["observed", "confirmed"]),
-                RadarObservation.acceleration_ratio >= 0.20, RadarObservation.expires_at > now
+                RadarObservation.current_vph >= 30.0, RadarObservation.acceleration_ratio >= 0.20, RadarObservation.expires_at > now
             ),
             func.count(RadarObservation.id).filter(
                 RadarObservation.confidence >= 70, RadarObservation.expires_at > now
             ),
-            func.count(RadarObservation.id).filter(
-                RadarObservation.status == "quiet", RadarObservation.expires_at > now
-            ),
+            func.count(RadarObservation.id).filter(RadarObservation.status == "quiet"),
             func.coalesce(func.sum(RadarObservation.total_delta).filter(
-                RadarObservation.total_delta > 0, RadarObservation.expires_at > now
+                RadarObservation.positive_checkpoints >= 1, RadarObservation.expires_at > now
             ), 0),
         ))).one()
         (active, baseline, due, any_growth, candidate, observed, strong_intervals,
@@ -4910,7 +4900,10 @@ async def _radar3_dashboard_snapshot() -> dict:
                 func.coalesce(func.max(RadarObservation.velocity_percentile), 0.0),
                 func.coalesce(func.avg(RadarObservation.confidence), 0.0),
             )
-            .where(RadarObservation.status.in_(["candidate", "observed", "confirmed"]), RadarObservation.expires_at > now)
+            .where(
+                RadarObservation.status.in_(["candidate", "observed", "confirmed"]),
+                RadarObservation.expires_at > now,
+            )
             .group_by(RadarObservation.category_key)
             .order_by(func.coalesce(func.max(RadarObservation.velocity_percentile), 0.0).desc(), func.coalesce(func.avg(RadarObservation.current_vph), 0.0).desc())
             .limit(12)
@@ -5075,7 +5068,7 @@ async def _radar3_analytics_text() -> str:
         )
     return (
         "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\n"
-        "<b>🔬 Воронка Radar 3.2</b>\n"
+        "<b>🔬 Воронка Radar 3.2 · по категориям</b>\n"
         f"Активных наблюдений: <b>{int(radar3.get('active') or 0)}</b>\n"
         f"Ждут первого повторного замера: <b>{int(radar3.get('baseline') or 0)}</b>\n"
         f"Готовы к замеру сейчас: <b>{int(radar3.get('due') or 0)}</b>\n"
@@ -5099,7 +5092,7 @@ async def _radar3_analytics_text() -> str:
 
 def _radar_autoscan_loading_text() -> str:
     return (
-        "<b>📡 DT Radar 3.2 · ADAPTIVE LIVE</b>\n\n"
+        "<b>📡 DT Radar 3.2 · CONTEXT DEMAND</b>\n\n"
         "Панель открыта ✅\n"
         "⚙️ Управление AutoScan доступно сразу.\n"
         "Статистика Radar загружается… ⏳"
@@ -5126,7 +5119,7 @@ async def _radar_autoscan_safe_text(timeout_seconds: float = 5.0) -> tuple[str, 
         state = _radar_autoscan_default_state()
         reason = html.escape(type(exc).__name__)
         text = (
-            "<b>📡 DT Radar 3.2 · ADAPTIVE LIVE</b>\n\n"
+            "<b>📡 DT Radar 3.2 · CONTEXT DEMAND</b>\n\n"
             "Панель открыта ✅\n"
             "Radar 3.2 продолжает работать в фоне.\n\n"
             "⚠️ Статистика временно недоступна.\n"
@@ -14364,6 +14357,10 @@ async def _radar_list_payload(
         "alltime": "🏆 Рекорды Radar",
         "favorites": "⭐ Мой Radar",
     }
+    if mode == "alltime" and not category_key and not preview:
+        lines_hint = True
+    else:
+        lines_hint = False
     if category_key:
         cat = CATEGORIES.get(category_key)
         if cat is not None and cat.group in GROUPS:
@@ -14374,6 +14371,12 @@ async def _radar_list_payload(
     else:
         heading = titles.get(mode, "📡 DT Radar")
     lines = [f"<b>{html.escape(heading)}</b>", ""]
+    if lines_hint:
+        lines += [
+            "Здесь хранится история сильных сигналов. Истёкший live-сигнал не обнуляет доказанный Score.",
+            "В кнопке показывается 🏆 Peak Score; live-категории и поиск историю не смешивают.",
+            "",
+        ]
     fast_infos = {}
     if mode == "fastsold" and rows and not preview:
         fast_infos = await get_fast_sold_infos([int(product.id) for product in rows])
@@ -14395,14 +14398,14 @@ async def _radar_list_payload(
             lines += [
                 "🔥 Сортировка: <b>сначала самые сильные подтверждённые сигналы</b>.",
                 f"💶 Цена: <b>{html.escape(price_filter_label(price_filter))}</b>.",
-                "В списке остаются <b>все товары, прошедшие отбор Radar</b> и подходящие под фильтр цены.",
+                "В списке остаются только <b>актуальные live-сигналы</b>; устаревшие товары уходят в 🏆 Рекорды Radar.",
                 "",
             ]
         else:
             lines += [
                 "🆕 Сортировка: <b>сначала новые</b>.",
                 f"💶 Цена: <b>{html.escape(price_filter_label(price_filter))}</b>.",
-                "В списке — <b>все товары, прошедшие отбор Radar</b> и подходящие под фильтр цены.",
+                "В списке — только <b>актуальные live-сигналы</b>; история не засоряет категорию.",
                 "",
             ]
     if not rows:
@@ -14432,12 +14435,17 @@ async def _radar_list_payload(
                         f"📂 {html.escape(cat_name)}"
                     )
                     continue
+            score_line = (
+                f"🕒 Последний Score <b>{int(product.current_score or 0)}</b>/100 · Peak <b>{int(product.peak_score or 0)}</b> · "
+                if str(product.status or "") == "historical"
+                else f"⭐ <b>{int(product.current_score or 0)}</b>/100 · Peak <b>{int(product.peak_score or 0)}</b> · "
+            )
             lines.append(
                 f"{icon} <b>{index}. {html.escape(str(product.title or 'Товар')[:70])}</b>\n"
-                f"⭐ <b>{int(product.current_score or 0)}</b>/100 · Peak <b>{int(product.peak_score or 0)}</b> · "
-                f"📂 {html.escape(cat_name)}\n"
-                f"💶 <b>{html.escape(_radar_product_price_text(product))}</b> · 🕐 <b>{html.escape(freshness)}</b> · "
-                f"🔁 сигналов: <b>{int(product.signal_count or 0)}</b> · объявлений: <b>{int(product.listing_count or 0)}</b>"
+                + score_line
+                + f"📂 {html.escape(cat_name)}\n"
+                + f"💶 <b>{html.escape(_radar_product_price_text(product))}</b> · 🕐 <b>{html.escape(freshness)}</b> · "
+                + f"🔁 сигналов: <b>{int(product.signal_count or 0)}</b> · объявлений: <b>{int(product.listing_count or 0)}</b>"
             )
     if preview:
         hidden = max(0, int(total) - len(rows))
@@ -14484,7 +14492,7 @@ async def _radar_product_payload(
         f"📡 <b>{html.escape(str(product.title or 'Товар'))}</b>",
         "",
         f"{status_icon} Статус: <b>{html.escape(status)}</b>",
-        f"⭐ Observed Score: <b>{int(product.current_score or 0)}/100</b>",
+        (f"🕒 Последний подтверждённый Score: <b>{int(product.current_score or 0)}/100</b> · Peak <b>{int(product.peak_score or 0)}</b>" if str(product.status or "") == "historical" else f"⭐ Observed Score: <b>{int(product.current_score or 0)}/100</b> · Peak <b>{int(product.peak_score or 0)}</b>"),
         f"👁 DT-наблюдаемый прирост: <b>+{int(getattr(product, 'demand_views', 0) or 0)}</b> просмотров",
         f"🧠 Доказательство: <b>{html.escape(type_label)}</b> · уверенность <b>{int(product.confidence or 0)}%</b>",
         f"🗂 Категория: <b>{html.escape(cat_name)}</b>",
@@ -16649,6 +16657,9 @@ async def main() -> None:
         log.warning("v4.20.0 Unified 48H Radar startup repair: %s", unified_repair)
     # Radar 3.0 clean break must complete before Telegram polling/AutoScan can publish anything.
     await prepare_radar_v3_once()
+    history_score_repair = await repair_radar_v3_historical_scores_once()
+    if history_score_repair:
+        log.warning("v4.21.13 Radar history score repair: restored %s stale scores", history_score_repair)
     if organic_cleanup.get("dirty_listings", 0):
         log.warning(
             "v4.15.3 Strict Organic Radar Gate cleanup: %s",

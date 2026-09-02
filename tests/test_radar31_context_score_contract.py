@@ -30,15 +30,13 @@ def test_confidence_is_separate_from_score():
     src = _block()
     assert 'confidence = 30' in src
     assert 'confidence = max(0, min(95' in src
-    assert 'score=score' in src
-    assert 'confidence=confidence' in src
+    assert 'score=score, confidence=confidence' in src
 
 
 def test_hot_has_two_paths():
     src = _block()
     assert 'solo_hot = bool(hot_interval and int(obs.consecutive_strong or 0) >= 2)' in src
-    assert 'family_hot = bool(' in src
-    assert 'family_scored >= 1' in src
+    assert 'family_hot = bool(family_scored >= 1 and int(obs.consecutive_scored or 0) >= 2)' in src
     assert 'if solo_hot or family_hot:' in src
     assert 'demand_status, stage = "hot", "product_hot"' in src
 
@@ -63,7 +61,7 @@ def test_observation_schema_persists_context_evidence():
 
 
 def test_dashboard_exposes_funnel_acceleration_confidence_and_category_context():
-    assert 'Воронка Radar 3.2' in BOT
+    assert 'Воронка Radar 3.2 · по категориям' in BOT
     assert 'Любой DT-observed прирост' in BOT
     assert 'Ускоряются ≥20%' in BOT
     assert 'Confidence ≥70%' in BOT
@@ -71,4 +69,4 @@ def test_dashboard_exposes_funnel_acceleration_confidence_and_category_context()
 
 
 def test_new_reset_marker_prevents_old_score_mix():
-    assert 'dt_radar_v3_observed_demand_reset_v6_radar32_frozen_cohort' in RADAR
+    assert 'dt_radar_v3_observed_demand_reset_v6_radar32_two_pass_clean' in RADAR

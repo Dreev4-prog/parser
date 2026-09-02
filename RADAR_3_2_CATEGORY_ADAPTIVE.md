@@ -1,13 +1,13 @@
-# DT Radar 3.2 — Category Adaptive Demand (4.21.12)
+# DT Radar 3.2 — Category Adaptive / Two-Pass
 
-Radar evaluates live DT-owned post-baseline growth against the listing's own category.
+Radar compares each listing with fresh DT-observed demand in its own leaf category.
 
 - Noise: <3 views/hour.
-- Mature cohort (>=20 fresh measured intervals): P90 Candidate, P95 Early/Score, P98 Strong, P99 Hot interval.
-- Bootstrap cohort (<20): conservative 8/15/30/60 views/hour until enough category data exists.
-- One frozen category cohort is built before classification, preventing order-dependent decisions inside a refreshed batch.
-- Quiet and zero-growth measurements stay in the category distribution to prevent survivor bias.
-- Integer ties at quantile cutoffs qualify by the quantile value itself; percentile is used for ranking/score, not as a second rejection gate.
-- First scored checkpoint is capped at 50/100.
-- Hot: persistent P99/Strong path or strong/persistent demand confirmed by another independently scored listing in the same product family.
-- Auto/Immobilien/Jobs/Dienstleistungen/Unterricht/Nachbarschaftshilfe are excluded from all Radar baseline ingestion.
+- Candidate: category P90.
+- Early / Score: category P95.
+- Strong: category P98.
+- Hot interval: category P99; final Hot requires persistence or independent product-family confirmation.
+- Minimum cohort safeguard: until 20 usable peers exist, conservative fallback gates are used.
+- Two-pass evaluation: a refreshed batch is fully persisted before category thresholds are calculated, so processing order inside the batch cannot change the result.
+- Auto/real-estate/jobs/services/courses/neighborhood-help are excluded from Radar from every baseline source.
+- Release 4.21.13 performs a new one-time Radar reset; raw listing/view history remains intact.

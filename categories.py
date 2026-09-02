@@ -251,38 +251,6 @@ for x in [
 CATEGORIES["hi_hilfe"] = _c("hi_hilfe", "Nachbarschaftshilfe", "https://www.kleinanzeigen.de/s-nachbarschaftshilfe/c401", "hilfe")
 
 
-
-# Radar automatic/intelligence eligibility is shared by AutoScan and user-scan
-# baseline seeding. Keep one source of truth so excluded market sections can
-# never leak back into Radar through a different ingestion path.
-RADAR_EXCLUDED_GROUPS = frozenset({
-    "auto", "immobilien", "jobs", "services", "kurse", "hilfe",
-})
-RADAR_EXCLUDED_CATEGORY_KEYS = frozenset({
-    "auto_reparatur",       # Reparaturen & Dienstleistungen
-    "hg_service",           # Dienstleistungen Haus & Garten
-    "el_service",           # Dienstleistungen Elektronik
-    "ti_betreuung",         # Tierbetreuung & Training
-    "ti_vermisst",          # Vermisste Tiere
-    "fa_alten",             # Altenpflege
-    "fa_babysit",           # Babysitter/-in & Kinderbetreuung
-    "fr_aktiv",             # Freizeitaktivitäten
-    "fr_kuenstler",         # Künstler/-in & Musiker/-in
-    "fr_reise",             # Reise & Eventservices
-    "fr_verloren",          # Verloren & Gefunden
-})
-
-def radar_category_allowed(category_key: str) -> bool:
-    cat = CATEGORIES.get(str(category_key or ""))
-    if cat is None or bool(getattr(cat, "is_group", False)):
-        return False
-    if str(getattr(cat, "group", "")) in RADAR_EXCLUDED_GROUPS:
-        return False
-    return str(getattr(cat, "key", "")) not in RADAR_EXCLUDED_CATEGORY_KEYS
-
-def radar_allowed_category_keys() -> frozenset[str]:
-    return frozenset(str(cat.key) for cat in CATEGORIES.values() if radar_category_allowed(cat.key))
-
 def categories_for_group(group_key: str) -> list[Category]:
     return [c for c in CATEGORIES.values() if c.group == group_key]
 
