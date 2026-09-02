@@ -33,11 +33,11 @@ def test_strong_is_category_relative_not_global_60_vph():
     assert "RADAR_V3_STRONG_VPH" not in RADAR
 
 
-def test_reset_marker_forces_clean_radar_after_upgrade():
+def test_reset_marker_is_preservation_only_after_upgrade():
     assert 'dt_radar_v3_observed_demand_reset_v6_radar32_two_pass_clean' in RADAR
     reset = RADAR.split("async def prepare_radar_v3_once", 1)[1].split("async def record_autoscan_hot", 1)[0]
     for table in ("RadarFavorite", "RadarLifecycleWatch", "RadarSnapshot", "RadarProductListing", "RadarProduct", "RadarObservation"):
-        assert f"delete({table})" in reset
+        assert f"delete({table})" not in reset
 
 
 def test_dashboard_explains_adaptive_gate():

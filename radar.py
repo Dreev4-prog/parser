@@ -1691,7 +1691,7 @@ async def radar_v3_expire_stale_products(max_age_hours: int = 6) -> int:
 
 
 async def repair_radar_v3_historical_scores_once() -> int:
-    """Repair historical rows zeroed by the pre-4.21.13 expiry bug.
+    """Repair historical rows zeroed by the pre-4.21.14 expiry bug.
 
     v4.21.12 changed stale products to ``historical`` and set ``current_score=0``.
     ``last_signal_score`` and ``peak_score`` survived, so we can restore the last
@@ -1734,29 +1734,37 @@ async def repair_radar_v3_historical_scores_once() -> int:
 
 
 async def prepare_radar_v3_once() -> bool:
-    """One-time clean break, serialized across Parser replicas."""
+    """Non-destructive Radar startup guard (v4.21.14+).
+
+    Older releases used this hook for one-time destructive clean breaks. That is
+    too risky in normal deploys: a missing/changed AppSetting must never erase
+    Radar evidence. From v4.21.14 onward this function only restores the marker
+    and preserves every Radar table. Explicit destructive maintenance must be a
+    separate admin/manual operation.
+    """
     async with SessionLocal() as session:
         bind = session.get_bind()
         if bind is not None and str(bind.dialect.name).startswith("postgres"):
-            # Transaction-scoped lock makes rolling deploys safe: only one replica
-            # can test/purge/set the reset marker at a time.
-            await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": RADAR_V3_RESET_SETTING})
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                {"key": RADAR_V3_RESET_SETTING + ":preserve"},
+            )
         existing = await session.get(AppSetting, RADAR_V3_RESET_SETTING)
-        if existing is not None and str(existing.value or "") == "done":
-            return False
-        await session.execute(delete(RadarFavorite))
-        await session.execute(delete(RadarLifecycleWatch))
-        await session.execute(delete(RadarSnapshot))
-        await session.execute(delete(RadarProductListing))
-        await session.execute(delete(RadarProduct))
-        await session.execute(delete(RadarObservation))
         if existing is None:
             session.add(AppSetting(key=RADAR_V3_RESET_SETTING, value="done"))
-        else:
+            await session.commit()
+            log.warning(
+                "DT Radar preservation guard restored missing reset marker; "
+                "no Radar tables were deleted"
+            )
+        elif str(existing.value or "") != "done":
             existing.value = "done"
-        await session.commit()
-    log.warning("DT Radar 3.2 clean reset complete: products/observations/snapshots/favorites/lifecycle removed; Listing/ViewHistory preserved")
-    return True
+            await session.commit()
+            log.warning(
+                "DT Radar preservation guard normalized reset marker; "
+                "no Radar tables were deleted"
+            )
+    return False
 
 
 async def record_autoscan_hot(

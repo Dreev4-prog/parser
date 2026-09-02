@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.21.13", "VERSION=4.21.13")
+    check((ROOT / "VERSION").read_text().strip() == "4.21.14", "VERSION=4.21.14")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -54,15 +54,16 @@ def main() -> int:
           "only category-qualified Early/Strong observations can publish DT Score")
     check('Initial counter is baseline-only and contributed 0 points' in radar,
           "initial counter contributes zero score")
-    check('delete(RadarSnapshot)' in radar and 'delete(RadarProduct)' in radar and 'dt_radar_v3_observed_demand_reset_v6_radar32_two_pass_clean' in radar,
-          "one-time Radar 3.2 clean break present")
-    check('Radar 3.0 maintenance: clean break, no legacy historical backfill.' in bot,
-          "legacy historical backfill disabled")
+    reset_block = radar.split('async def prepare_radar_v3_once() -> bool:', 1)[1].split('async def record_autoscan_hot(', 1)[0]
+    check('delete(RadarSnapshot)' not in reset_block and 'delete(RadarProduct)' not in reset_block and 'delete(RadarObservation)' not in reset_block,
+          "Radar startup guard is non-destructive")
+    check('Radar 3.2 maintenance: preserve evidence; no destructive startup reset/backfill.' in bot,
+          "legacy historical backfill disabled and maintenance is non-destructive")
     expire_block = radar.split('async def radar_v3_expire_stale_products', 1)[1].split('async def repair_radar_v3_historical_scores_once', 1)[0]
     check('current_score=0' not in expire_block and 'else_=RadarProduct.last_signal_score' in expire_block,
           "6h expiry moves signal to History without destroying confirmed Score")
     check('RADAR_V3_HISTORY_SCORE_REPAIR_SETTING' in radar and 'repair_radar_v3_historical_scores_once()' in bot,
-          "pre-4.21.13 zeroed historical scores are repaired once")
+          "pre-4.21.14 zeroed historical scores are repaired once")
     check('conditions.append(RadarProduct.status != "historical")' in radar and 'История · сигнал устарел' in bot,
           "live catalogue is separated from preserved Radar history")
     refresh_score_block = radar.split('async def refresh_radar_scores', 1)[1].split('async def radar_stats', 1)[0]
@@ -83,7 +84,7 @@ def main() -> int:
     check('.with_for_update(skip_locked=True)' in radar and 'radar_v3_claim_due_external_ids' in radar, "cross-replica Radar claims use SKIP LOCKED")
     check('lease_owner' in models and 'lease_until' in models, "Radar observation lease fields present")
     check('radar_v3_expire_observations' in radar and 'RadarObservation.expires_at > now' in radar, "Radar observation TTL enforced before claims")
-    check('pg_advisory_xact_lock(hashtext(:key))' in radar, "Radar 3.0 clean reset serialized across Parser replicas")
+    check('pg_advisory_xact_lock(hashtext(:key))' in radar, "Radar preservation guard serialized across Parser replicas")
     check('autoscan_view_priority = "scan_inline"' in bot, "AutoScan exact views stay foreground")
     check('def admin_radar_autoscan_loading_keyboard()' in bot and '▶️ Запустить AutoScan' in bot and '⏹ Остановить' in bot, "AutoScan controls visible on Radar loading screen")
     check('asyncio.shield(task)' in bot and 'dashboard snapshot timed out; UI continues with controls' in bot, "Radar dashboard timeout cannot trap UI on loading screen")
@@ -109,7 +110,7 @@ def main() -> int:
     check('_category_feed_identity_matches(requested_url, final_url)' in parser_source, "category redirects preserve requested feed identity")
     check('for item in targets:' in bot and 'vr = results.get(url)' in bot, "partial exact-view maps cannot preserve stale counters")
     check(not list(ROOT.glob('DEPLOY_V4_*.md')), "historical deploy files removed from root")
-    print("\nDT Parser 4.21.13 Radar 3.2 Live/History Split release smoke: PASS")
+    print("\nDT Parser 4.21.14 Radar 3.2 Live/History Split release smoke: PASS")
     return 0
 
 

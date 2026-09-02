@@ -184,6 +184,28 @@ RADAR_AUTOSCAN_DEFAULT_TIME = "05:00"
 RADAR_AUTOSCAN_POLL_SECONDS = 10
 RADAR_AUTOSCAN_HISTORY_LIMIT = 20
 RADAR_AUTOSCAN_TIME_CHOICES = ("03:00", "05:00", "08:00", "12:00", "18:00", "23:00")
+# v4.21.14: these watchdog settings were referenced by runtime code but had no
+# module-level definitions in 4.21.12/4.21.14, causing a startup NameError.
+# Keep Railway overrides optional and clamp obviously unsafe values.
+def _radar_env_seconds(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(int(minimum), int(str(os.getenv(name, str(default))).strip()))
+    except (TypeError, ValueError):
+        log.warning("Invalid %s; using default=%ss", name, default)
+        return int(default)
+
+RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS = _radar_env_seconds(
+    "RADAR_AUTOSCAN_CATEGORY_TIMEOUT_SECONDS", 480, 120
+)
+RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS = _radar_env_seconds(
+    "RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS", 240, 60
+)
+RADAR_AUTOSCAN_PARTIAL_BACKOFF_BASE_SECONDS = 3.0
+RADAR_AUTOSCAN_SYSTEM_BACKOFF_BASE_SECONDS = 8.0
+RADAR_AUTOSCAN_MAX_BACKOFF_SECONDS = 30.0
+RADAR_AUTOSCAN_SUCCESS_GAP_SECONDS = 0.25
+RADAR_AUTOSCAN_SAFE_VIEW_CONCURRENCY = 4
+RADAR_AUTOSCAN_LAUNCH_WATCHDOG_SECONDS = 20
 # v4.12.0 Daily Radar Growth Loop. One factual daily digest turns the live Radar
 # database into a recurring acquisition/retention surface. The digest is enabled by
 # default, sends at 20:00 Moscow time, and stores its last send date in AppSetting so
@@ -4303,7 +4325,7 @@ async def organic_velocity_scheduler() -> None:
 
 
 async def radar_maintenance_scheduler() -> None:
-    """Radar 3.0 maintenance: clean break, no legacy historical backfill."""
+    """Radar 3.2 maintenance: preserve evidence; no destructive startup reset/backfill."""
     async def foreground_busy() -> bool:
         running, queued = await _radar_foreground_counts()
         snap = await TRAFFIC.snapshot()
@@ -5128,6 +5150,12 @@ async def _radar_autoscan_safe_text(timeout_seconds: float = 5.0) -> tuple[str, 
         return text, state
 
 
+def _radar_autoscan_failure_list(state: dict) -> list[dict]:
+    """Return structured category failures from the last AutoScan summary."""
+    last = dict(state.get("last_summary") or {})
+    return [item for item in list(last.get("failed_categories") or []) if isinstance(item, dict)]
+
+
 async def _radar_autoscan_errors_text(page: int = 0, per_page: int = 15) -> tuple[str, dict, int, int]:
     state = await load_radar_autoscan_state()
     failures = _radar_autoscan_failure_list(state)
@@ -5335,17 +5363,6 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         ),
         reply_markup=notify_keyboard,
     )
-    if start_context_after_fresh:
-        # v4.20.0 audit fix: every completed Fresh round (manual or daily) gets
-        # one yesterday Context layer per Moscow day, even when the daily toggle
-        # is disabled. This matches the product contract: 15 today + 15 yesterday.
-        async with _radar_autoscan_guard:
-            current = await load_radar_autoscan_state()
-            if current.get("status") == "idle" and str(current.get("last_context_date") or "") != now.date().isoformat():
-                current = _radar_autoscan_new_context_round(current, now.date())
-                await save_radar_autoscan_state(current)
-                _radar_autoscan_stop_event.clear()
-                _radar_autoscan_wakeup.set()
     return state
 
 
@@ -16655,11 +16672,11 @@ async def main() -> None:
     unified_repair = await prepare_unified_48h_ranking_once()
     if any(int(v or 0) for v in unified_repair.values()):
         log.warning("v4.20.0 Unified 48H Radar startup repair: %s", unified_repair)
-    # Radar 3.0 clean break must complete before Telegram polling/AutoScan can publish anything.
+    # Radar startup preservation guard: never destructively clear evidence on deploy.
     await prepare_radar_v3_once()
     history_score_repair = await repair_radar_v3_historical_scores_once()
     if history_score_repair:
-        log.warning("v4.21.13 Radar history score repair: restored %s stale scores", history_score_repair)
+        log.warning("v4.21.14 Radar history score repair: restored %s stale scores", history_score_repair)
     if organic_cleanup.get("dirty_listings", 0):
         log.warning(
             "v4.15.3 Strict Organic Radar Gate cleanup: %s",

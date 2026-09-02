@@ -43,12 +43,14 @@ class Radar3ObservedDemandContractTests(unittest.TestCase):
         self.assertIn('pct >= RADAR_V3_STRONG_PERCENTILE', src)
         self.assertIn('Initial counter is baseline-only and contributed 0 points', src)
 
-    def test_clean_break_preserves_raw_listing_history_by_contract(self):
+    def test_startup_guard_is_non_destructive(self):
         start = RADAR.index('async def prepare_radar_v3_once(')
-        src = RADAR[start:]
-        self.assertIn('delete(RadarSnapshot)', src)
-        self.assertIn('delete(RadarProduct)', src)
+        src = RADAR[start:RADAR.index('async def record_autoscan_hot(', start)]
+        self.assertNotIn('delete(RadarSnapshot)', src)
+        self.assertNotIn('delete(RadarProduct)', src)
+        self.assertNotIn('delete(RadarObservation)', src)
         self.assertNotIn('delete(Listing)', src)
+        self.assertIn('no Radar tables were deleted', src)
 
     def test_scheduler_remeasures_exact_views_after_baseline(self):
         self.assertIn('radar_v3_observation_scheduler', BOT)
