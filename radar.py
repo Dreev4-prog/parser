@@ -51,11 +51,17 @@ RADAR_VELOCITY_PREP_SETTING = "dt_radar_v4157_verified_velocity_prepared"
 RADAR_UNIFIED_48H_REPAIR_SETTING = "dt_radar_v4200_unified_48h_repair_v2"
 RADAR_V3_RESET_SETTING = "dt_radar_v3_observed_demand_reset_v6_radar32_two_pass_clean"
 RADAR_V3_HISTORY_SCORE_REPAIR_SETTING = "dt_radar_v3_history_score_repair_v1"
+RADAR_V3_LIVE_RETENTION_REPAIR_SETTING = "dt_radar_v3_live_retention_24h_repair_v1"
 RADAR_V3_FIRST_CHECK_MINUTES = 60
 RADAR_V3_NEXT_CHECK_MINUTES = 60
 RADAR_V3_EARLY_CHECK_MINUTES = 45
 RADAR_V3_STRONG_CHECK_MINUTES = 30
 RADAR_V3_MAX_OBSERVATION_HOURS = 6
+# v4.21.16: observation remains a six-hour evidence window, but a confirmed
+# product may stay visible in the live catalogue for up to one day.  A later
+# successful AutoScan of the same category can retire products that are no
+# longer present in the freshly verified category set before this hard cap.
+RADAR_V3_LIVE_RETENTION_HOURS = 24
 # Radar 3.2: category-adaptive demand. Absolute thresholds are now only a
 # safety floor; ranking/status is decided relative to the live category cohort.
 RADAR_V3_NOISE_FLOOR_VPH = 3.0
@@ -616,10 +622,10 @@ def _snapshot_live_evidence(snapshot: RadarSnapshot, now: datetime):
         elapsed_minutes = max(0.0, (now - recorded_at).total_seconds() / 60.0)
     effective_age = max(0.0, float(getattr(snapshot, "demand_age_minutes", 0.0) or 0.0)) + elapsed_minutes
     if str(getattr(snapshot, "source", "") or "") == "radar3_observed":
-        # Radar 3.2 evidence is live, not a 48-hour trophy. Once the DT-owned
-        # observation window is stale, an old Hot/Strong snapshot must not
-        # resurrect a product when a later weaker checkpoint arrives.
-        if elapsed_minutes > float(RADAR_V3_MAX_OBSERVATION_HOURS * 60):
+        # Radar 3.2 evidence is live, not a 48-hour trophy. Active remeasurement
+        # still ends after six hours, but the confirmed catalogue result may stay
+        # visible for the separate 24-hour retention window between AutoScan passes.
+        if elapsed_minutes > float(RADAR_V3_LIVE_RETENTION_HOURS * 60):
             return RadarRankEvidence("historical", 0.0, 0, 1.0, 0.0, False)
         status = str(getattr(snapshot, "demand_status", "stable") or "stable")
         return RadarRankEvidence(status, float(getattr(snapshot, "radar_rank", 0.0) or 0.0), 0, 1.0, 0.0, True)
@@ -1660,13 +1666,14 @@ async def radar_v3_expire_observations() -> int:
         return int(result.rowcount or 0)
 
 
-async def radar_v3_expire_stale_products(max_age_hours: int = 6) -> int:
+async def radar_v3_expire_stale_products(max_age_hours: int = RADAR_V3_LIVE_RETENTION_HOURS) -> int:
     """Move stale live signals to History without destroying their evidence score.
 
-    A six-hour TTL means "not live anymore", not "this product scored zero".
-    The last confirmed Score is intentionally preserved for Records/Favorites and
-    auditability, while ``radar_rank=0`` guarantees that stale history cannot rank
-    inside live feeds.
+    Radar 3.2 observes demand for six hours, but a confirmed product can remain in
+    the live catalogue for up to 24 hours so the Radar does not drain between
+    daily AutoScan passes.  A successful AutoScan category rollover may retire a
+    product earlier when that product family is absent from the newly verified
+    category set.  History keeps the last confirmed Score/Peak for auditability.
     """
     cutoff = datetime.utcnow() - timedelta(hours=max(1, int(max_age_hours)))
     now = datetime.utcnow()
@@ -1688,6 +1695,79 @@ async def radar_v3_expire_stale_products(max_age_hours: int = 6) -> int:
         )
         await session.commit()
         return int(result.rowcount or 0)
+
+
+async def radar_v3_rollover_successful_category(
+    category_key: str,
+    matched_ids: list[str] | tuple[str, ...] | set[str],
+) -> int:
+    """Retire stale live families after a *successful* AutoScan category pass.
+
+    The new category pass is treated as the freshness boundary.  Product families
+    represented by a clean listing in the just-verified result set stay live while
+    their new six-hour observation is (re)measured.  Older live families that are
+    no longer present are moved to History immediately instead of lingering until
+    the 24-hour hard cap.  No product/snapshot/history row is deleted and the last
+    confirmed Score is preserved.
+
+    The caller must invoke this only after the category has completed with exact
+    views and without a category failure.  This function is intentionally DB-only
+    and creates no additional Kleinanzeigen traffic.
+    """
+    category_key = str(category_key or "").strip()
+    if not category_key:
+        return 0
+    ids = list(dict.fromkeys(str(x).strip() for x in matched_ids if str(x).strip()))[:5000]
+    now = datetime.utcnow()
+    current_product_keys: set[str] = set()
+    async with SessionLocal() as session:
+        if ids:
+            current_product_keys = {
+                str(value) for value in (await session.execute(
+                    select(RadarObservation.product_key)
+                    .join(Listing, Listing.external_id == RadarObservation.external_id)
+                    .where(
+                        RadarObservation.external_id.in_(ids),
+                        RadarObservation.category_key == category_key,
+                        Listing.category_key == category_key,
+                        Listing.is_promoted.is_(False),
+                        Listing.is_price_reduced.is_(False),
+                        Listing.view_count.is_not(None),
+                        ~_registry_dirty_exists(Listing.external_id),
+                    )
+                )).scalars().all()
+                if str(value or "").strip()
+            }
+
+        conditions = [
+            RadarProduct.category_key == category_key,
+            RadarProduct.latest_source == "radar3_observed",
+            RadarProduct.status != "historical",
+        ]
+        if current_product_keys:
+            conditions.append(RadarProduct.product_key.notin_(sorted(current_product_keys)))
+        result = await session.execute(
+            update(RadarProduct)
+            .where(*conditions)
+            .values(
+                status="historical",
+                current_score=case(
+                    (RadarProduct.current_score > 0, RadarProduct.current_score),
+                    else_=RadarProduct.last_signal_score,
+                ),
+                radar_rank=0.0,
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await session.commit()
+        retired = int(result.rowcount or 0)
+    if retired:
+        log.info(
+            "DT Radar 3.2 category rollover category=%s retained_keys=%s retired=%s",
+            category_key, len(current_product_keys), retired,
+        )
+    return retired
 
 
 async def repair_radar_v3_historical_scores_once() -> int:
@@ -1731,6 +1811,86 @@ async def repair_radar_v3_historical_scores_once() -> int:
     if repaired:
         log.warning("DT Radar history score repair restored=%s stale products", repaired)
     return repaired
+
+
+async def repair_radar_v3_live_retention_once() -> int:
+    """Restore recent products historicalized by the old six-hour live TTL.
+
+    The underlying Radar 3.2 snapshots already preserve the last exact status,
+    score and rank.  On the first 4.21.16 Parser startup we restore only products
+    whose latest DT-owned signal is between 6 and 24 hours old, so the catalogue
+    does not have to wait for an entire new AutoScan cycle to fill again.  Older
+    History remains untouched and this repair is idempotent across replicas.
+    """
+    now = datetime.utcnow()
+    live_cutoff = now - timedelta(hours=RADAR_V3_LIVE_RETENTION_HOURS)
+    old_ttl_cutoff = now - timedelta(hours=RADAR_V3_MAX_OBSERVATION_HOURS)
+    restored = 0
+    async with SessionLocal() as session:
+        bind = session.get_bind()
+        if bind is not None and str(bind.dialect.name).startswith("postgres"):
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                {"key": RADAR_V3_LIVE_RETENTION_REPAIR_SETTING},
+            )
+        existing = await session.get(AppSetting, RADAR_V3_LIVE_RETENTION_REPAIR_SETTING)
+        if existing is not None and str(existing.value or "") == "done":
+            return 0
+
+        products = list((await session.execute(
+            select(RadarProduct).where(
+                RadarProduct.latest_source == "radar3_observed",
+                RadarProduct.status == "historical",
+                RadarProduct.organic_verified_at.is_not(None),
+                RadarProduct.last_signal_at >= live_cutoff,
+                RadarProduct.last_signal_at < old_ttl_cutoff,
+            )
+        )).scalars().all())
+        product_ids = {int(product.id) for product in products}
+        latest_by_product: dict[int, RadarSnapshot] = {}
+        if product_ids:
+            snapshots = list((await session.execute(
+                select(RadarSnapshot).where(
+                    RadarSnapshot.product_id.in_(sorted(product_ids)),
+                    RadarSnapshot.source == "radar3_observed",
+                    RadarSnapshot.recorded_at >= live_cutoff,
+                ).order_by(RadarSnapshot.recorded_at.desc(), RadarSnapshot.id.desc())
+            )).scalars().all())
+            for snapshot in snapshots:
+                latest_by_product.setdefault(int(snapshot.product_id), snapshot)
+
+        for product in products:
+            snapshot = latest_by_product.get(int(product.id))
+            if snapshot is None:
+                continue
+            restored_status = str(snapshot.demand_status or "").strip().lower()
+            if restored_status not in {"stable", "rising", "hot"}:
+                continue
+            product.status = restored_status
+            product.last_signal_at = snapshot.recorded_at
+            product.last_signal_score = int(snapshot.score or product.last_signal_score or 0)
+            product.current_score = int(snapshot.score or product.current_score or product.last_signal_score or 0)
+            product.radar_rank = max(0.0, float(snapshot.radar_rank or snapshot.score or 0.0))
+            product.confidence = int(snapshot.confidence or product.confidence or 0)
+            product.demand_views = int(snapshot.demand_views or 0)
+            product.demand_age_minutes = float(snapshot.demand_age_minutes or 0.0)
+            product.demand_gate = int(snapshot.demand_gate or 0)
+            product.updated_at = now
+            restored += 1
+
+        if existing is None:
+            session.add(AppSetting(
+                key=RADAR_V3_LIVE_RETENTION_REPAIR_SETTING,
+                value="done",
+                updated_at=now,
+            ))
+        else:
+            existing.value = "done"
+            existing.updated_at = now
+        await session.commit()
+    if restored:
+        log.warning("DT Radar 3.2 restored recent 6h->24h live products=%s", restored)
+    return restored
 
 
 async def prepare_radar_v3_once() -> bool:
@@ -2197,7 +2357,7 @@ async def refresh_radar_scores() -> int:
                     # because its preserved Score is high. A fresh checkpoint is
                     # the only valid path back into Early/Strong/Hot.
                     new_score = _clamp_score(int(product.last_signal_score or product.current_score or 0))
-                    if str(product.status or "") == "historical" or signal_age_hours > RADAR_V3_MAX_OBSERVATION_HOURS:
+                    if str(product.status or "") == "historical" or signal_age_hours > RADAR_V3_LIVE_RETENTION_HOURS:
                         new_status = "historical"
                         new_rank = 0.0
                     else:

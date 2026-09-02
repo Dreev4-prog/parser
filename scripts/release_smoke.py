@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.21.15", "VERSION=4.21.15")
+    check((ROOT / "VERSION").read_text().strip() == "4.21.16", "VERSION=4.21.16")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -44,6 +44,8 @@ def main() -> int:
           "first exact counter is baseline-only and cannot publish")
     check('RADAR_V3_FIRST_CHECK_MINUTES = 60' in radar and 'radar_v3_observation_scheduler' in bot,
           "first DT-owned remeasurement scheduled after 60 minutes")
+    check('RADAR_V3_MAX_OBSERVATION_HOURS = 6' in radar and 'RADAR_V3_LIVE_RETENTION_HOURS = 24' in radar,
+          "Radar evidence window stays 6h while live catalogue retention is 24h")
     check('RADAR_V3_NOISE_FLOOR_VPH = 3.0' in radar and 'RADAR_V3_CANDIDATE_PERCENTILE = 0.90' in radar and 'RADAR_V3_EARLY_PERCENTILE = 0.95' in radar and 'RADAR_V3_STRONG_PERCENTILE = 0.98' in radar,
           "Radar 3.2 uses category-adaptive P90/P95/P98 with 3/h noise floor")
     refresh_block = radar.split('async def radar_v3_record_refreshed', 1)[1].split('async def radar_v3_expire_observations', 1)[0]
@@ -67,13 +69,22 @@ def main() -> int:
           "legacy historical backfill disabled and maintenance is non-destructive")
     expire_block = radar.split('async def radar_v3_expire_stale_products', 1)[1].split('async def repair_radar_v3_historical_scores_once', 1)[0]
     check('current_score=0' not in expire_block and 'else_=RadarProduct.last_signal_score' in expire_block,
-          "6h expiry moves signal to History without destroying confirmed Score")
+          "24h live expiry preserves confirmed Score between AutoScan passes")
+    rollover_block = radar.split('async def radar_v3_rollover_successful_category', 1)[1].split('async def repair_radar_v3_historical_scores_once', 1)[0]
+    check('RadarProduct.product_key.notin_' in rollover_block and 'status="historical"' in rollover_block,
+          "successful category pass retires live families absent from the fresh verified set")
+    autoscan_runner = bot.split('async def _run_radar_autoscan_round_inner', 1)[1].split('async def _run_radar_autoscan_round', 1)[0]
+    check('radar_v3_rollover_successful_category' in autoscan_runner and 'result.matched_ids or []' in autoscan_runner,
+          "category freshness rollover is wired into successful AutoScan completion")
     check('RADAR_V3_HISTORY_SCORE_REPAIR_SETTING' in radar and 'repair_radar_v3_historical_scores_once()' in bot,
           "pre-4.21.14 zeroed historical scores are repaired once")
+    live_restore = radar.split('async def repair_radar_v3_live_retention_once', 1)[1].split('async def prepare_radar_v3_once', 1)[0]
+    check('RADAR_V3_LIVE_RETENTION_REPAIR_SETTING' in radar and 'RadarProduct.last_signal_at >= live_cutoff' in live_restore and 'repair_radar_v3_live_retention_once()' in bot,
+          "first 4.21.16 startup restores recent products expired by the old 6h live TTL")
     check('conditions.append(RadarProduct.status != "historical")' in radar and 'История · сигнал устарел' in bot,
           "live catalogue is separated from preserved Radar history")
     refresh_score_block = radar.split('async def refresh_radar_scores', 1)[1].split('async def radar_stats', 1)[0]
-    check('str(product.latest_source or "") == "radar3_observed"' in refresh_score_block and 'signal_age_hours > RADAR_V3_MAX_OBSERVATION_HOURS' in refresh_score_block,
+    check('str(product.latest_source or "") == "radar3_observed"' in refresh_score_block and 'signal_age_hours > RADAR_V3_LIVE_RETENTION_HOURS' in refresh_score_block,
           "legacy score refresh cannot resurrect stale Radar 3.2 History")
     check('Radar 3.0: legacy admission path disabled' in radar,
           "legacy scan/AI/verified-velocity publishers disabled")
@@ -116,7 +127,7 @@ def main() -> int:
     check('_category_feed_identity_matches(requested_url, final_url)' in parser_source, "category redirects preserve requested feed identity")
     check('for item in targets:' in bot and 'vr = results.get(url)' in bot, "partial exact-view maps cannot preserve stale counters")
     check(not list(ROOT.glob('DEPLOY_V4_*.md')), "historical deploy files removed from root")
-    print("\nDT Parser 4.21.15 Radar Equal Home UI release smoke: PASS")
+    print("\nDT Parser 4.21.16 Radar 24H Category Handoff release smoke: PASS")
     return 0
 
 

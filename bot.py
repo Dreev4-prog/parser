@@ -127,7 +127,7 @@ from radar import (
     get_radar_product, is_radar_favorite, list_radar_products, radar_categories, radar_stats,
     purge_nonorganic_analytics, record_autoscan_hot_detailed, record_user_scan_radar3_baselines, radar_v3_category_allowed,
     record_verified_velocity_signals, refresh_radar_scores, verify_listing_organic_now,
-    prepare_radar_v3_once, repair_radar_v3_historical_scores_once, radar_v3_due_external_ids, radar_v3_claim_due_external_ids, radar_v3_release_claims, radar_v3_record_refreshed, radar_v3_expire_observations, radar_v3_expire_stale_products,
+    prepare_radar_v3_once, repair_radar_v3_historical_scores_once, repair_radar_v3_live_retention_once, radar_v3_due_external_ids, radar_v3_claim_due_external_ids, radar_v3_release_claims, radar_v3_record_refreshed, radar_v3_expire_observations, radar_v3_expire_stale_products, radar_v3_rollover_successful_category,
     search_radar_products, toggle_radar_favorite,
 )
 from page_manager import (
@@ -4334,6 +4334,9 @@ async def radar_maintenance_scheduler() -> None:
         await asyncio.sleep(8)
         await prepare_radar_v3_once()
         await repair_radar_v3_historical_scores_once()
+        restored_live = await repair_radar_v3_live_retention_once()
+        if restored_live:
+            log.info("DT Radar 3.2 startup live-retention restore=%s", restored_live)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -5721,6 +5724,23 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
             if result is not None and result.date_complete and not failure_kind:
                 state["successful"] = int(state.get("successful") or 0) + 1
                 issue_streak = 0
+                try:
+                    rollover_retired = await radar_v3_rollover_successful_category(
+                        cat.key, result.matched_ids or []
+                    )
+                    if rollover_retired:
+                        log.info(
+                            "DT Radar AutoScan category freshness rollover round=%s category=%s retired=%s",
+                            state.get("round_id"), cat.name, rollover_retired,
+                        )
+                except Exception:
+                    # Category scanning and evidence collection already succeeded;
+                    # a DB-only catalogue rollover must never downgrade that scan to
+                    # a parser failure. The 24h hard cap remains the safe fallback.
+                    log.exception(
+                        "DT Radar AutoScan category freshness rollover failed round=%s category=%s",
+                        state.get("round_id"), cat.name,
+                    )
             else:
                 state["failed"] = int(state.get("failed") or 0) + 1
                 if failure_kind == "system":

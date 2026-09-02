@@ -61,7 +61,7 @@ def test_records_keep_history_and_use_peak_score():
 def test_preserved_history_cannot_be_resurrected_by_legacy_refresh():
     block = RADAR.split("async def refresh_radar_scores", 1)[1].split("async def radar_stats", 1)[0]
     assert 'str(product.latest_source or "") == "radar3_observed"' in block
-    assert 'signal_age_hours > RADAR_V3_MAX_OBSERVATION_HOURS' in block
+    assert 'signal_age_hours > RADAR_V3_LIVE_RETENTION_HOURS' in block
     assert 'new_status = "historical"' in block
     assert 'new_rank = 0.0' in block
     assert 'legacy 48H' in block

@@ -1,14 +1,15 @@
-# DT Parser 4.21.15 — Radar Equal Home UI
+# DT Parser 4.21.16 — Radar 24H Category Handoff
 
-## 4.21.15 home redesign
-- `▶️ НОВЫЙ СКАН` and `📡 DT RADAR 3.0` are equal full-width primary actions.
-- `🔥 Популярное` + `📊 Мои сканы` move to the secondary row.
-- The active home caption is now `DT PARSER — MARKET ANALYTICS` and explains both Scan and Radar.
-- The old `Перед новым сканом` checklist is removed from the home screen; setup remains in the dedicated Categories/Settings flow.
-- Callback IDs and all parser/Radar algorithms are unchanged.
-- Based directly on 4.21.14; its non-destructive Radar startup guard remains intact.
+## 4.21.16 live-retention redesign
+- Radar still actively measures each DT-owned baseline for **6 hours**.
+- Confirmed products remain in the live Radar catalogue for **up to 24 hours**, preventing the evening drain between daily AutoScan rounds.
+- First startup restores still-fresh 6–24h products that the previous live TTL had already moved to History, using preserved Radar snapshots only.
+- A successful AutoScan category pass retires old live product families that are absent from the newly verified clean category set.
+- Partial/failed category passes never clear live Radar products.
+- Historical products preserve last confirmed Score and Peak Score; no Radar evidence rows are deleted.
+- No database migration, new Railway variable, or worker algorithm change.
 
-See `RELEASE_4_21_15.md`.
+See `RELEASE_4_21_16.md`.
 
 ---
 

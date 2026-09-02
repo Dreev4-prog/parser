@@ -65,7 +65,7 @@ The initial counter never participates in this score.
 - positive growth -> observed / Early; recheck after 60 minutes
 - second consecutive positive interval -> confirmed / Strong
 - two independent persistent listings -> Product Hot
-- stale Radar products are moved to historical after six hours without a new observed signal
+- active remeasurement stops after six hours; a confirmed product can stay live for up to 24 hours, or until the next successful AutoScan of that category shows the product family is absent
 - quiet/expired observations can be re-armed by a later Radar circle after a cooldown, using a new baseline
 
 

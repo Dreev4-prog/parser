@@ -50,7 +50,7 @@ def test_context_cohort_and_family_exclude_expired_or_excluded_rows():
 
 def test_stale_radar31_snapshots_cannot_resurrect_hot():
     block = RADAR.split('def _snapshot_live_evidence', 1)[1].split('def _next_lifecycle_checkpoint', 1)[0]
-    assert 'RADAR_V3_MAX_OBSERVATION_HOURS * 60' in block
+    assert 'RADAR_V3_LIVE_RETENTION_HOURS * 60' in block
     assert 'RadarRankEvidence("historical", 0.0' in block
     assert 'False)' in block
 
