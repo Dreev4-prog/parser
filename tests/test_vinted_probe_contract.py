@@ -89,16 +89,24 @@ async def test_probe_full_mock_pass():
             return httpx.Response(200, text="ok", headers={"content-type": "text/html"})
         if request.url.path == "/api/v2/catalog/items":
             page = int(request.url.params.get("page", "1"))
-            if page > 1:
-                assert request.url.params.get("time") == "1700000000"
+            assert request.url.params.get("time") is not None
             payload = {
-                "pagination": {"time": 1700000000},
+                "pagination": {"time": 1700000000 + page},
                 "items": [
                     {"id": page * 10 + 1, "title": "A", "url": f"https://www.vinted.de/items/{page * 10 + 1}-a", "view_count": 0, "favourite_count": 1},
                     {"id": page * 10 + 2, "title": "B", "url": f"https://www.vinted.de/items/{page * 10 + 2}-b", "view_count": 2, "favourite_count": 0},
                 ]
             }
             return httpx.Response(200, json=payload)
+        if request.url.path.startswith("/api/v2/items/") and request.url.path.endswith("/details"):
+            item_id = int(request.url.path.split("/")[-2])
+            return httpx.Response(200, json={"item": {
+                "id": item_id,
+                "view_count": item_id,
+                "favourite_count": 3,
+                "created_at_ts": "2026-09-05T07:00:00Z",
+                "is_closed": False,
+            }})
         if request.url.path.startswith("/items/"):
             item_id = int(request.url.path.split("/")[-1].split("-", 1)[0])
             return httpx.Response(200, text=_mock_item_html(item_id), headers={"content-type": "text/html"})
@@ -107,7 +115,7 @@ async def test_probe_full_mock_pass():
     config = VintedProbeConfig(
         base_url="https://www.vinted.de",
         pages=2,
-        per_page=96,
+        per_page=2,
         page_concurrency=2,
         detail_sample=4,
         detail_concurrency=2,
@@ -115,7 +123,7 @@ async def test_probe_full_mock_pass():
     )
     report = await run_probe(config, transport=httpx.MockTransport(handler))
     assert report["catalog"]["unique_items"] == 4
-    assert report["catalog"]["snapshot_times"]["ALL"] == 1700000000
+    assert report["catalog"]["depth_recovery"][0]["recovery_complete"] is True
     assert report["detail"]["identity_ok"] == 4
     assert report["detail"]["exact_view_samples"] == 4
     assert report["quality_gates"]["radar_ready"]["pass"] is True
@@ -145,3 +153,38 @@ def test_quality_gate_requires_exact_views():
     assert gates["identity"]["pass"] is True
     assert gates["exact_views"]["pass"] is False
     assert gates["radar_ready"]["pass"] is False
+
+
+@pytest.mark.asyncio
+async def test_probe_recovers_unique_depth_from_live_page_overlap():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/":
+            return httpx.Response(200, text="ok")
+        if request.url.path == "/api/v2/catalog/items":
+            page = int(request.url.params.get("page", "1"))
+            pages = {
+                1: [101, 100],
+                2: [100, 99],   # one overlap
+                3: [99, 98],    # recovery page restores requested 4 unique
+            }
+            ids = pages.get(page, [])
+            return httpx.Response(200, json={
+                "pagination": {"time": 1700000000 + page},
+                "items": [{"id": item_id, "title": str(item_id), "url": f"https://www.vinted.de/items/{item_id}-x"} for item_id in ids],
+            })
+        return httpx.Response(404)
+
+    config = VintedProbeConfig(
+        pages=2,
+        per_page=2,
+        recovery_pages=2,
+        detail_sample=0,
+        min_interval_seconds=0,
+    )
+    report = await run_probe(config, transport=httpx.MockTransport(handler))
+    depth = report["catalog"]["depth_recovery"][0]
+    assert depth["fetched_pages"] == 3
+    assert depth["recovery_pages_used"] == 1
+    assert depth["unique_seen"] == 4
+    assert depth["recovery_complete"] is True
+    assert report["quality_gates"]["pagination_integrity"]["pass"] is True

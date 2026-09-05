@@ -1,8 +1,8 @@
-# DT PARSER 4.22.1 — Vinted Probe HTML Detail + Stable Pagination
+# DT PARSER 4.22.2 — Vinted Detail API + Unique Depth Recovery
 
-The first live Vinted Probe run confirmed catalog access and exposed two live issues: the old anonymous `/api/v2/items/{id}` detail route returned 404, and newest-first pagination overlapped without a shared snapshot. v4.22.1 reads public item-page Next.js hydration for exact detail metrics and freezes pages 2+ to page 1 `pagination.time`. Radar remains fail-closed until identity, chronology, exact views and repeated-read stability all pass. Kleinanzeigen production logic is unchanged.
+The second live Vinted Probe run confirmed that the public item HTML matches item identity but does not expose exact `view_count` or upload chronology. It also proved that `pagination.time` is not a reliable frozen snapshot cursor on the live newest-first feed. v4.22.2 therefore tests Vinted's current browser endpoint `/api/v2/items/{id}/details` first, keeps HTML as a fail-closed fallback, and changes pagination correctness from “low duplicates” to bounded recovery of the requested unique depth. Kleinanzeigen production logic remains unchanged.
 
-See `RELEASE_4_22_1.md`.
+See `RELEASE_4_22_2.md`.
 
 ---
 

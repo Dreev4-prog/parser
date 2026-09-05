@@ -94,6 +94,7 @@ class VintedProbeConfig:
     report_path: str = ""
     stability_reads: int = 3
     stability_delay_seconds: float = 1.2
+    recovery_pages: int = 3
 
     @classmethod
     def from_env(cls) -> "VintedProbeConfig":
@@ -117,6 +118,7 @@ class VintedProbeConfig:
             report_path=os.getenv("VINTED_PROBE_REPORT_PATH", "").strip(),
             stability_reads=max(0, min(5, int(os.getenv("VINTED_PROBE_STABILITY_READS", "3")))),
             stability_delay_seconds=max(0.2, min(10.0, float(os.getenv("VINTED_PROBE_STABILITY_DELAY_SECONDS", "1.2")))),
+            recovery_pages=max(0, min(10, int(os.getenv("VINTED_PROBE_RECOVERY_PAGES", "3")))),
         )
 
 
@@ -233,17 +235,19 @@ class VintedProbeClient:
             return outcome
         return outcome
 
-    async def fetch_catalog_page(self, catalog_id: int | None, page: int, *, snapshot_time: int | float | str | None = None) -> tuple[list[VintedItem], str, int | float | str | None]:
+    async def fetch_catalog_page(self, catalog_id: int | None, page: int) -> tuple[list[VintedItem], str, int | float | str | None]:
+        """Read one newest-first catalog page.
+
+        `pagination.time` is telemetry/cache-buster data, not a proven snapshot
+        cursor. v4.22.2 therefore uses a fresh request time and recovers unique
+        depth by continuing to deeper pages when a live feed shifts underneath us.
+        """
         params: dict[str, Any] = {
             "page": page,
             "per_page": self.config.per_page,
             "order": "newest_first",
+            "time": time.time(),
         }
-        if snapshot_time is not None:
-            # Vinted returns pagination.time. Reusing that value freezes the
-            # newest-first snapshot so page 2 cannot collapse onto page 1 while
-            # new listings are arriving.
-            params["time"] = snapshot_time
         if catalog_id is not None:
             params["catalog_ids"] = catalog_id
         _response, payload, outcome = await self._request(
@@ -252,26 +256,49 @@ class VintedProbeClient:
             params=params,
         )
         if outcome != "ok" or not isinstance(payload, dict):
-            return [], outcome, snapshot_time
+            return [], outcome, None
         raw_items = payload.get("items")
         if not isinstance(raw_items, list):
-            return [], "invalid_catalog_shape", snapshot_time
+            return [], "invalid_catalog_shape", None
         pagination = payload.get("pagination") if isinstance(payload.get("pagination"), dict) else {}
         response_time = pagination.get("time") if pagination else None
-        effective_snapshot = snapshot_time if snapshot_time is not None else response_time
         items: list[VintedItem] = []
         for raw in raw_items:
             item = normalize_catalog_item(raw, self.config.base_url)
             if item is not None:
                 items.append(item)
-        return items, "ok", effective_snapshot
+        return items, "ok", response_time
 
     async def fetch_item_detail(self, item: VintedItem) -> VintedMetricSample:
-        # The legacy /api/v2/items/{id} JSON endpoint now returns 404 for
-        # anonymous web sessions on current Vinted. The public item page still
-        # embeds the exact item model in the Next.js hydration payload.
+        """Fetch identity-bound metrics using the current browser detail API first.
+
+        Current Vinted browser code uses `/api/v2/items/{id}/details`. The older
+        `/api/v2/items/{id}` route is not used. If the browser-detail endpoint is
+        unavailable or omits a field, the public Next.js item page is a strictly
+        identity-bound fallback. Missing metrics always remain UNKNOWN.
+        """
+        api_url = f"{self.config.base_url}/api/v2/items/{item.item_id}/details"
+        _response, payload, api_outcome = await self._request(
+            "detail_api",
+            api_url,
+            params={"localize": "true"},
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Referer": item.url or f"{self.config.base_url}/",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
+        api_sample: VintedMetricSample | None = None
+        if api_outcome == "ok" and isinstance(payload, dict):
+            api_sample = normalize_detail_metrics(payload, expected_item_id=item.item_id)
+            api_sample.source = "detail_api_details"
+            if api_sample.outcome == "wrong_identity":
+                return api_sample
+            if api_sample.identity_ok and api_sample.view_count is not None and api_sample.upload_raw is not None:
+                return api_sample
+
         detail_url = item.url or f"{self.config.base_url}/items/{item.item_id}"
-        response, html, outcome = await self._request(
+        response, html, html_outcome = await self._request(
             "detail_html",
             detail_url,
             expect_json=False,
@@ -280,16 +307,32 @@ class VintedProbeClient:
                 "Referer": f"{self.config.base_url}/",
             },
         )
-        if outcome != "ok" or response is None or not isinstance(html, str):
+        if html_outcome != "ok" or response is None or not isinstance(html, str):
+            if api_sample is not None and api_sample.identity_ok:
+                api_sample.notes.append(f"HTML fallback unavailable: {html_outcome}")
+                return api_sample
             return VintedMetricSample(
                 item_id=item.item_id,
-                source="detail_html",
+                source="detail_api_details+html",
                 measured_at=_utcnow_iso(),
                 identity_ok=False,
-                outcome=outcome,
-                notes=["No exact metric accepted from the public item page."],
+                outcome=api_outcome if api_outcome != "ok" else html_outcome,
+                notes=["No exact metric accepted from current detail API or public item page."],
             )
-        return normalize_public_item_html(html, expected_item_id=item.item_id)
+
+        html_sample = normalize_public_item_html(html, expected_item_id=item.item_id)
+        if api_sample is None or not api_sample.identity_ok:
+            return html_sample
+        if not html_sample.identity_ok:
+            api_sample.notes.append("HTML fallback did not match requested item identity.")
+            return api_sample
+
+        for field_name in ("view_count", "favourite_count", "upload_raw", "sold", "closed", "reserved", "hidden", "visible"):
+            if getattr(api_sample, field_name) is None:
+                setattr(api_sample, field_name, getattr(html_sample, field_name))
+        api_sample.source = "detail_api_details+html"
+        api_sample.notes.extend(note for note in html_sample.notes if note not in api_sample.notes)
+        return api_sample
 
 
 def _utcnow_iso() -> str:
@@ -584,32 +627,56 @@ async def run_probe(config: VintedProbeConfig, *, transport: httpx.AsyncBaseTran
         bootstrap_outcome = await client.bootstrap()
 
         categories: tuple[int | None, ...] = config.catalog_ids or (None,)
-        page_sem = asyncio.Semaphore(config.page_concurrency)
+        category_sem = asyncio.Semaphore(config.page_concurrency)
         page_results: list[tuple[int | None, int, list[VintedItem], str, int | float | str | None]] = []
+        catalog_depth: list[dict[str, Any]] = []
 
-        async def fetch_page(catalog_id: int | None, page: int, snapshot_time: int | float | str | None = None):
-            async with page_sem:
-                items, outcome, effective_snapshot = await client.fetch_catalog_page(
-                    catalog_id,
-                    page,
-                    snapshot_time=snapshot_time,
-                )
-                return catalog_id, page, items, outcome, effective_snapshot
+        async def scan_catalog(catalog_id: int | None) -> dict[str, Any]:
+            """Pages stay sequential inside one category; categories can run in parallel.
 
-        # Page 1 establishes Vinted's pagination.time snapshot. Remaining pages of
-        # the same category reuse it so the live newest-first feed cannot shift the
-        # page boundary underneath a concurrent scan.
-        first_page_results = await asyncio.gather(*(fetch_page(catalog_id, 1, None) for catalog_id in categories))
-        page_results.extend(first_page_results)
+            This is the production shape we want for two Vinted Scan Workers:
+            split categories between workers, but never race page 1/2/3 of the same
+            live newest-first feed. When overlap reduces unique depth, continue a
+            bounded number of extra pages until the requested unique depth is restored.
+            """
+            async with category_sem:
+                seen: set[int] = set()
+                target_unique = config.pages * config.per_page
+                max_pages = config.pages + config.recovery_pages
+                fetched = 0
+                outcome = "ok"
+                exhausted = False
+                response_times: list[Any] = []
+                for page in range(1, max_pages + 1):
+                    items, page_outcome, response_time = await client.fetch_catalog_page(catalog_id, page)
+                    page_results.append((catalog_id, page, items, page_outcome, response_time))
+                    fetched += 1
+                    if response_time is not None:
+                        response_times.append(response_time)
+                    if page_outcome != "ok":
+                        outcome = page_outcome
+                        break
+                    seen.update(item.item_id for item in items)
+                    if len(items) < config.per_page:
+                        exhausted = True
+                        break
+                    if page >= config.pages and len(seen) >= target_unique:
+                        break
+                depth_ok = len(seen) >= target_unique or exhausted
+                return {
+                    "catalog_id": catalog_id,
+                    "requested_pages": config.pages,
+                    "fetched_pages": fetched,
+                    "recovery_pages_used": max(0, fetched - config.pages),
+                    "target_unique": target_unique,
+                    "unique_seen": len(seen),
+                    "exhausted": exhausted,
+                    "recovery_complete": depth_ok,
+                    "outcome": outcome,
+                    "response_times": response_times,
+                }
 
-        remaining_jobs = []
-        for catalog_id, _page, _items, outcome, snapshot_time in first_page_results:
-            if outcome != "ok":
-                continue
-            for page in range(2, config.pages + 1):
-                remaining_jobs.append(fetch_page(catalog_id, page, snapshot_time))
-        if remaining_jobs:
-            page_results.extend(await asyncio.gather(*remaining_jobs))
+        catalog_depth = list(await asyncio.gather(*(scan_catalog(catalog_id) for catalog_id in categories)))
 
         items_by_id: dict[int, VintedItem] = {}
         catalog_failures: list[dict[str, Any]] = []
@@ -721,6 +788,7 @@ async def run_probe(config: VintedProbeConfig, *, transport: httpx.AsyncBaseTran
                 "access_token_configured": bool(config.access_token_web),
                 "stability_reads": config.stability_reads,
                 "stability_delay_seconds": config.stability_delay_seconds,
+                "recovery_pages": config.recovery_pages,
             },
             "bootstrap_outcome": bootstrap_outcome,
             "elapsed_seconds": elapsed_seconds,
@@ -730,7 +798,8 @@ async def run_probe(config: VintedProbeConfig, *, transport: httpx.AsyncBaseTran
                 "items_returned": raw_item_count,
                 "unique_items": len(unique_items),
                 "duplicates": max(0, raw_item_count - len(unique_items)),
-                "snapshot_times": snapshot_times,
+                "pagination_times": snapshot_times,
+                "depth_recovery": catalog_depth,
                 "page_overlaps": page_overlaps,
                 "catalog_view_count": {
                     "unknown": catalog_unknown_views,
@@ -746,7 +815,7 @@ async def run_probe(config: VintedProbeConfig, *, transport: httpx.AsyncBaseTran
                 "promoted_true": len(promoted_true),
             },
             "detail": {
-                "source": "public_item_html_next_hydration",
+                "source": "api_v2_item_details_then_public_html",
                 "requested": len(detail_targets),
                 "identity_ok": sum(1 for sample in detail_samples if sample.identity_ok),
                 "wrong_identity": len(wrong_identity),
@@ -761,8 +830,10 @@ async def run_probe(config: VintedProbeConfig, *, transport: httpx.AsyncBaseTran
             "latency_ms": {
                 "catalog_avg": _average_ms(client.records, "catalog"),
                 "catalog_p95": _percentile_ms(client.records, "catalog", 0.95),
-                "detail_avg": _average_ms(client.records, "detail_html"),
-                "detail_p95": _percentile_ms(client.records, "detail_html", 0.95),
+                "detail_api_avg": _average_ms(client.records, "detail_api"),
+                "detail_api_p95": _percentile_ms(client.records, "detail_api", 0.95),
+                "detail_html_avg": _average_ms(client.records, "detail_html"),
+                "detail_html_p95": _percentile_ms(client.records, "detail_html", 0.95),
             },
             "http_outcomes": status_counts,
             "quality_gates": {},
@@ -796,6 +867,12 @@ def evaluate_quality_gates(report: dict[str, Any]) -> dict[str, Any]:
     stability = report.get("view_stability") if isinstance(report.get("view_stability"), dict) else {}
     stability_status = str(stability.get("status") or "not_run")
     duplicate_ratio = (float(catalog.get("duplicates") or 0) / float(catalog.get("items_returned") or 1)) if int(catalog.get("items_returned") or 0) > 0 else 0.0
+    depth_recovery = catalog.get("depth_recovery") if isinstance(catalog.get("depth_recovery"), list) else []
+    pagination_ok = bool(depth_recovery) and all(
+        bool(entry.get("recovery_complete")) and str(entry.get("outcome") or "") == "ok"
+        for entry in depth_recovery
+        if isinstance(entry, dict)
+    )
     return {
         "catalog_access": {
             "pass": unique_items > 0 and not failures,
@@ -806,8 +883,8 @@ def evaluate_quality_gates(report: dict[str, Any]) -> dict[str, Any]:
             "reason": f"{identity_ok}/{detail_requested} detail samples matched requested item ID",
         },
         "pagination_integrity": {
-            "pass": unique_items > 0 and duplicate_ratio <= 0.10,
-            "reason": f"deduplicated catalog duplicate ratio={duplicate_ratio:.3f}",
+            "pass": unique_items > 0 and pagination_ok and not failures,
+            "reason": f"bounded unique-depth recovery={'PASS' if pagination_ok else 'FAIL'}; raw duplicate ratio={duplicate_ratio:.3f}",
         },
         "exact_views": {
             "pass": detail_requested > 0 and exact_views == detail_requested,
@@ -822,7 +899,7 @@ def evaluate_quality_gates(report: dict[str, Any]) -> dict[str, Any]:
             "reason": f"short repeated-read stability={stability_status}; changes are treated conservatively as possible contamination or concurrent traffic",
         },
         "radar_ready": {
-            "pass": unique_items > 0 and detail_requested > 0 and identity_ok == detail_requested and exact_views == detail_requested and upload_samples == detail_requested and stability_status == "stable" and duplicate_ratio <= 0.10,
+            "pass": unique_items > 0 and detail_requested > 0 and identity_ok == detail_requested and exact_views == detail_requested and upload_samples == detail_requested and stability_status == "stable" and pagination_ok and not failures,
             "reason": "Radar remains disabled until catalog, pagination, identity, chronology, exact-view and short stability gates all pass",
         },
     }
@@ -833,16 +910,31 @@ def format_probe_summary(report: dict[str, Any]) -> str:
     detail = report.get("detail", {})
     latency = report.get("latency_ms", {})
     gates = report.get("quality_gates", {})
+    depth = catalog.get("depth_recovery") if isinstance(catalog.get("depth_recovery"), list) else []
+    recovery_bits = []
+    for entry in depth:
+        if not isinstance(entry, dict):
+            continue
+        label = entry.get("catalog_id") if entry.get("catalog_id") is not None else "ALL"
+        recovery_bits.append(
+            f"{label}:{entry.get('unique_seen')}/{entry.get('target_unique')}u "
+            f"pages={entry.get('fetched_pages')} rec={entry.get('recovery_pages_used')} "
+            f"{'OK' if entry.get('recovery_complete') else 'SHORT'}"
+        )
+
     def gate(name: str) -> str:
         data = gates.get(name, {}) if isinstance(gates, dict) else {}
         return "PASS" if data.get("pass") else "FAIL"
+
     return "\n".join([
-        "DT Vinted Probe v0.2",
+        "DT Vinted Probe v0.3",
         f"bootstrap={report.get('bootstrap_outcome')} elapsed={report.get('elapsed_seconds')}s",
         f"catalog requests={catalog.get('requests')} unique={catalog.get('unique_items')} duplicates={catalog.get('duplicates')} failures={len(catalog.get('failures') or [])}",
+        f"catalog recovery={' | '.join(recovery_bits) if recovery_bits else 'n/a'}",
         f"catalog latency avg={latency.get('catalog_avg')}ms p95={latency.get('catalog_p95')}ms",
-        f"detail requested={detail.get('requested')} identity_ok={detail.get('identity_ok')} exact_views={detail.get('exact_view_samples')} exact_favourites={detail.get('exact_favourite_samples')}",
-        f"detail latency avg={latency.get('detail_avg')}ms p95={latency.get('detail_p95')}ms",
+        f"detail requested={detail.get('requested')} identity_ok={detail.get('identity_ok')} exact_views={detail.get('exact_view_samples')} exact_favourites={detail.get('exact_favourite_samples')} chronology={detail.get('upload_time_samples')}",
+        f"detail api latency avg={latency.get('detail_api_avg')}ms p95={latency.get('detail_api_p95')}ms",
+        f"detail html fallback avg={latency.get('detail_html_avg')}ms p95={latency.get('detail_html_p95')}ms",
         f"view_stability={report.get('view_stability')}",
         f"gates: catalog={gate('catalog_access')} pagination={gate('pagination_integrity')} identity={gate('identity')} chronology={gate('chronology')} exact_views={gate('exact_views')} stability={gate('view_stability')} radar_ready={gate('radar_ready')}",
         f"http_outcomes={report.get('http_outcomes')}",

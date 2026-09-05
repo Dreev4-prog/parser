@@ -46,4 +46,4 @@ def test_startup_radar_guard_cannot_delete_tables():
         assert token not in block
 
 def test_release_keeps_42114_startup_guard():
-    assert (ROOT / "VERSION").read_text().strip() == "4.22.1"
+    assert (ROOT / "VERSION").read_text().strip() == "4.22.2"
