@@ -1,13 +1,30 @@
-# v4.23.5 GitHub patch
+# v4.23.6 GitHub patch
 
-Apply on top of **v4.23.4**.
+Накладывать **поверх v4.23.5** с сохранением путей.
 
-This patch removes the remaining Vinted Lab UI pauses: stale-while-revalidate Redis/PostgreSQL UI caches with strict timeouts, cached category-tree navigation, background-only stale Radar refresh, O(1) Radar item lookup, and fast full-market result paging without repeated `COUNT(*)` / `view_count` sorting.
+## Что исправляет
 
-Replace the files from this archive preserving paths, then redeploy:
+- DT Radar AutoScan заимствует свободную мощность, когда нет пользовательских сканов.
+- Page Worker prefetch для idle AutoScan расширяется до 20 страниц.
+- Exact views используют до x8 локальной concurrency в idle-режиме.
+- Большой UNKNOWN exact-tail сначала ремонтируется только по проблемным URL через View Worker fleet, а не отправляет категорию сразу на полный повтор.
+- Accurate idle-tail repair расширен до 32 URL маленькими chunks.
+- При появлении пользователя новые Turbo repair/prefetch операции прекращаются.
+- Добавлен breakdown причин `⚠️ допроверка`.
+- Старые failed_categories могут быть классифицированы после deploy без повторного полного круга.
 
-- Parser / Bot
-- all Vinted Scan Worker replicas
-- all Vinted Metrics Worker replicas
+## Не менялось
 
-No SQL migration and no new Railway variables are required. Vinted Session Worker is unchanged.
+- 99% exact coverage gate.
+- soft tail max 8.
+- UNKNOWN остаётся NULL.
+- 20 страниц TODAY на категорию.
+- DT Score / Organic правила.
+- пользовательские scan lanes / FIFO.
+- Vinted Lab / Vinted Radar логика v4.23.5.
+
+## Deploy
+
+Redeploy только **Parser / Bot**.
+
+Новых обязательных Railway Variables и ручных SQL-миграций нет.

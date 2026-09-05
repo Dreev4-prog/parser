@@ -230,6 +230,26 @@ RADAR_AUTOSCAN_SYSTEM_BACKOFF_BASE_SECONDS = 8.0
 RADAR_AUTOSCAN_MAX_BACKOFF_SECONDS = 30.0
 RADAR_AUTOSCAN_SUCCESS_GAP_SECONDS = 0.25
 RADAR_AUTOSCAN_SAFE_VIEW_CONCURRENCY = 4
+
+# v4.23.6 Idle Turbo. AutoScan may borrow otherwise-idle capacity, but user scans
+# always remain the priority boundary. These are optional overrides; production
+# works with the defaults and needs no new Railway variables.
+def _radar_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(str(os.getenv(name, str(default))).strip())
+    except (TypeError, ValueError):
+        log.warning("Invalid %s; using default=%s", name, default)
+        value = int(default)
+    return max(int(minimum), min(int(maximum), int(value)))
+
+RADAR_AUTOSCAN_IDLE_TURBO_ENABLED = str(os.getenv("RADAR_AUTOSCAN_IDLE_TURBO_ENABLED", "1")).strip().lower() not in {"0", "false", "no", "off"}
+RADAR_AUTOSCAN_IDLE_VIEW_CONCURRENCY = _radar_env_int("RADAR_AUTOSCAN_IDLE_VIEW_CONCURRENCY", 8, 4, 12)
+RADAR_AUTOSCAN_IDLE_REMOTE_RETRY_MAX = _radar_env_int("RADAR_AUTOSCAN_IDLE_REMOTE_RETRY_MAX", 256, 24, 500)
+RADAR_AUTOSCAN_IDLE_REMOTE_RETRY_SECONDS = _radar_env_seconds("RADAR_AUTOSCAN_IDLE_REMOTE_RETRY_SECONDS", 45, 10)
+RADAR_AUTOSCAN_IDLE_VIEW_REPAIR_MAX = _radar_env_int("RADAR_AUTOSCAN_IDLE_VIEW_REPAIR_MAX", 32, 12, 64)
+RADAR_AUTOSCAN_IDLE_VIEW_REPAIR_CHUNK = _radar_env_int("RADAR_AUTOSCAN_IDLE_VIEW_REPAIR_CHUNK", 16, 6, 24)
+RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES = _radar_env_int("RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES", 20, 10, RADAR_AUTOSCAN_DEPTH)
+
 # v4.22.6 Fast Today + Exact Tail. A tiny unresolved exact-view tail no longer
 # forces a full 20-page category rescan. Unknown counters stay NULL and therefore
 # cannot seed Radar; only the verified majority creates baselines. A materially
@@ -3804,7 +3824,17 @@ async def enrich_autoscan_view_counts(
     total = len(urls)
     base_ready = int(live.views_ready or 0) if live is not None else 0
     autoscan_view_priority = "scan_inline"
-    autoscan_view_concurrency = max(1, min(RADAR_AUTOSCAN_SAFE_VIEW_CONCURRENCY, VIEW_COUNT_CONCURRENCY))
+    normal_view_concurrency = max(1, min(RADAR_AUTOSCAN_SAFE_VIEW_CONCURRENCY, VIEW_COUNT_CONCURRENCY))
+    idle_turbo = await _radar_autoscan_idle_turbo_available()
+    autoscan_view_concurrency = normal_view_concurrency
+    if idle_turbo:
+        autoscan_view_concurrency = max(
+            normal_view_concurrency,
+            min(
+                RADAR_AUTOSCAN_IDLE_VIEW_CONCURRENCY,
+                max(1, int(getattr(TRAFFIC, "base_view_limit", RADAR_AUTOSCAN_IDLE_VIEW_CONCURRENCY))),
+            ),
+        )
 
     async def fleet_progress(done: int, _total: int) -> None:
         if live is None:
@@ -3826,9 +3856,9 @@ async def enrich_autoscan_view_counts(
     combined: dict[str, ViewCountResult] = {}
     mode = "remote-fleet-first" if remote_ready else "direct-safe-fallback"
     log.info(
-        "Radar AutoScan views start category=%s total=%s mode=%s priority=%s concurrency=%s",
+        "Radar AutoScan views start category=%s total=%s mode=%s priority=%s concurrency=%s idle_turbo=%s",
         (live.category_name if live is not None else "autoscan"), total, mode,
-        autoscan_view_priority, autoscan_view_concurrency,
+        autoscan_view_priority, autoscan_view_concurrency, idle_turbo,
     )
 
     try:
@@ -3902,35 +3932,122 @@ async def enrich_autoscan_view_counts(
             )
 
     unresolved = [url for url in urls if combined.get(url) is None or combined[url].views is None]
-    tail_recovered = 0
-    # A handful of transient misses should never cause a 20-page category replay.
-    # Retry only that exact tail once through the proven accurate path. Large tails
-    # are intentionally not browser-flooded here; they remain fail-closed/retryable.
-    if unresolved and len(unresolved) <= RADAR_AUTOSCAN_VIEW_TAIL_RETRY_MAX:
+
+    # v4.23.6: if no user is scanning, give a materially incomplete exact batch one
+    # cheap second pass through the distributed View Worker fleet before condemning
+    # the whole 20-page category to a future full rescan. We only retry UNKNOWN URLs;
+    # verified counters are never re-requested or replaced. If a user arrives, this
+    # extra work is skipped immediately at the next boundary.
+    remote_recovered = 0
+    if (
+        remote_ready
+        and len(unresolved) > RADAR_AUTOSCAN_VIEW_TAIL_RETRY_MAX
+        and len(unresolved) <= RADAR_AUTOSCAN_IDLE_REMOTE_RETRY_MAX
+        and await _radar_autoscan_idle_turbo_available()
+    ):
         log.info(
-            "Radar AutoScan exact tail retry category=%s unresolved=%s/%s",
+            "Radar AutoScan idle fleet repair category=%s unresolved=%s/%s timeout=%ss",
             (live.category_name if live is not None else "autoscan"), len(unresolved), total,
+            int(RADAR_AUTOSCAN_IDLE_REMOTE_RETRY_SECONDS),
         )
         try:
-            tail = await parser.fetch_public_view_counts(
-                unresolved,
-                concurrency=min(autoscan_view_concurrency, len(unresolved)),
-                progress_cb=None,
-                traffic_priority=autoscan_view_priority,
-                browser_fallback=True,
-                direct_http_only=False,
-                accurate=True,
+            remote_retry = await asyncio.wait_for(
+                REMOTE_VIEW_MANAGER.fetch(unresolved, traffic_priority=autoscan_view_priority),
+                timeout=RADAR_AUTOSCAN_IDLE_REMOTE_RETRY_SECONDS,
             )
-            for url, result in tail.items():
-                if result is not None and result.views is not None:
-                    combined[url] = result
-                    tail_recovered += 1
+            if remote_retry:
+                for url, item in remote_retry.items():
+                    if item is not None and item.views is not None:
+                        combined[url] = ViewCountResult(
+                            item.views, item.raw_text, item.source,
+                            item.final_url, item.page_title, item.error,
+                        )
+                        remote_recovered += 1
+        except asyncio.TimeoutError:
+            log.warning(
+                "Radar AutoScan idle fleet repair timeout category=%s unresolved=%s",
+                (live.category_name if live is not None else "autoscan"), len(unresolved),
+            )
         except Exception:
             log.warning(
-                "Radar AutoScan exact tail retry failed category=%s unresolved=%s",
+                "Radar AutoScan idle fleet repair failed category=%s unresolved=%s",
                 (live.category_name if live is not None else "autoscan"), len(unresolved),
                 exc_info=True,
             )
+
+        # One final cheap official-counter salvage is worthwhile after a remote retry;
+        # it never opens a browser and therefore remains much cheaper than rescanning.
+        unresolved = [url for url in urls if combined.get(url) is None or combined[url].views is None]
+        if unresolved and await _radar_autoscan_idle_turbo_available():
+            try:
+                salvage2 = await parser.fetch_public_view_counts(
+                    unresolved,
+                    concurrency=autoscan_view_concurrency,
+                    progress_cb=None,
+                    traffic_priority=autoscan_view_priority,
+                    browser_fallback=False,
+                    direct_http_only=True,
+                    accurate=False,
+                    batch_size=80,
+                    batch_pause_seconds=0.03,
+                )
+                for url, result in salvage2.items():
+                    if result is not None and result.views is not None:
+                        combined[url] = result
+                        direct_salvaged += 1
+            except Exception:
+                log.debug("Radar AutoScan idle second direct salvage failed", exc_info=True)
+
+    unresolved = [url for url in urls if combined.get(url) is None or combined[url].views is None]
+    tail_recovered = 0
+    # A handful of transient misses should never cause a 20-page category replay.
+    # Retry only that exact tail once through the proven accurate path. In normal
+    # multi-user mode the historical <=12 bound is unchanged. When the bot is idle,
+    # AutoScan may repair up to 32 UNKNOWNs in small chunks; the idle check runs before
+    # every chunk, so a newly queued user immediately ends further turbo repair.
+    idle_tail_allowed = await _radar_autoscan_idle_turbo_available()
+    tail_retry_limit = (
+        RADAR_AUTOSCAN_IDLE_VIEW_REPAIR_MAX if idle_tail_allowed
+        else RADAR_AUTOSCAN_VIEW_TAIL_RETRY_MAX
+    )
+    if unresolved and len(unresolved) <= tail_retry_limit:
+        log.info(
+            "Radar AutoScan exact tail retry category=%s unresolved=%s/%s limit=%s idle_turbo=%s",
+            (live.category_name if live is not None else "autoscan"), len(unresolved), total,
+            tail_retry_limit, idle_tail_allowed,
+        )
+        chunks = [
+            unresolved[i:i + (RADAR_AUTOSCAN_IDLE_VIEW_REPAIR_CHUNK if idle_tail_allowed else len(unresolved))]
+            for i in range(0, len(unresolved), (RADAR_AUTOSCAN_IDLE_VIEW_REPAIR_CHUNK if idle_tail_allowed else len(unresolved)))
+        ]
+        for chunk in chunks:
+            if idle_tail_allowed and not await _radar_autoscan_idle_turbo_available():
+                log.info(
+                    "Radar AutoScan idle exact repair yielded to foreground user category=%s remaining=%s",
+                    (live.category_name if live is not None else "autoscan"),
+                    len([url for url in urls if combined.get(url) is None or combined[url].views is None]),
+                )
+                break
+            try:
+                tail = await parser.fetch_public_view_counts(
+                    chunk,
+                    concurrency=min(autoscan_view_concurrency, len(chunk)),
+                    progress_cb=None,
+                    traffic_priority=autoscan_view_priority,
+                    browser_fallback=True,
+                    direct_http_only=False,
+                    accurate=True,
+                )
+                for url, result in tail.items():
+                    if result is not None and result.views is not None:
+                        combined[url] = result
+                        tail_recovered += 1
+            except Exception:
+                log.warning(
+                    "Radar AutoScan exact tail retry failed category=%s chunk=%s",
+                    (live.category_name if live is not None else "autoscan"), len(chunk),
+                    exc_info=True,
+                )
 
     now = datetime.utcnow()
     updated = 0
@@ -3977,9 +4094,9 @@ async def enrich_autoscan_view_counts(
         live.views_ready = base_ready + total
         live.views_failed += failed
     log.info(
-        "Radar AutoScan views complete category=%s total=%s exact=%s failed=%s coverage=%.2f%% mode=%s direct_salvaged=%s tail_recovered=%s sources=%s",
+        "Radar AutoScan views complete category=%s total=%s exact=%s failed=%s coverage=%.2f%% mode=%s direct_salvaged=%s remote_recovered=%s tail_recovered=%s sources=%s",
         (live.category_name if live is not None else "autoscan"), total, updated, failed,
-        (updated / max(1, total)) * 100.0, mode, direct_salvaged, tail_recovered, dict(source_counts),
+        (updated / max(1, total)) * 100.0, mode, direct_salvaged, remote_recovered, tail_recovered, dict(source_counts),
     )
     return total, updated, failed
 
@@ -4532,6 +4649,11 @@ def _radar_autoscan_default_state() -> dict:
         "processed": 0,
         "successful": 0,
         "needs_review": 0,
+        "review_views": 0,
+        "review_pages": 0,
+        "review_watchdog": 0,
+        "review_gate": 0,
+        "review_other": 0,
         "system_errors": 0,
         "skipped_nonproduct": 0,
         "failed": 0,  # compatibility total = needs_review + system_errors
@@ -4634,6 +4756,29 @@ def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
             "kind": kind,
         })
     state["failed_categories"] = failures[:500]
+
+    # v4.23.6 can classify an already-finished older round immediately from its
+    # persisted failed_categories list. New rounds maintain these counters live.
+    review_counter_keys = ("review_views", "review_pages", "review_watchdog", "review_gate", "review_other")
+    if not any(key in raw_state for key in review_counter_keys):
+        inferred_breakdown = {key: 0 for key in review_counter_keys}
+        for item in failures:
+            kind = str(item.get("kind") or "partial").lower()
+            if kind == "system":
+                continue
+            reason_lower = str(item.get("reason") or "").lower()
+            if "watchdog категории" in reason_lower:
+                inferred_breakdown["review_watchdog"] += 1
+            elif kind == "radar_views":
+                inferred_breakdown["review_views"] += 1
+            elif kind == "radar_gate_unknown":
+                inferred_breakdown["review_gate"] += 1
+            elif kind == "partial" and any(token in reason_lower for token in ("страниц", "page", "дата", "chronolog")):
+                inferred_breakdown["review_pages"] += 1
+            else:
+                inferred_breakdown["review_other"] += 1
+        state.update(inferred_breakdown)
+
     state["retry_parent_total"] = max(0, int(state.get("retry_parent_total") or 0))
     state["retry_parent_successful"] = max(0, int(state.get("retry_parent_successful") or 0))
     state["retry_parent_round_id"] = str(state.get("retry_parent_round_id") or "")[:80]
@@ -4688,6 +4833,7 @@ def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
         "processed", "successful", "failed", "skipped_nonproduct", "pages_verified",
         "listings_seen", "new_listings", "radar_saved", "views_requested", "views_verified",
         "views_failed", "view_tail_deferred", "view_tail_categories",
+        "review_views", "review_pages", "review_watchdog", "review_gate", "review_other",
     ):
         state[key] = max(0, int(state.get(key) or 0))
     # New counters are authoritative when present; otherwise infer legacy failures.
@@ -4765,6 +4911,11 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
         "processed": 0,
         "successful": 0,
         "needs_review": 0,
+        "review_views": 0,
+        "review_pages": 0,
+        "review_watchdog": 0,
+        "review_gate": 0,
+        "review_other": 0,
         "system_errors": 0,
         "skipped_nonproduct": 0,
         "failed": 0,
@@ -4855,6 +5006,11 @@ def _radar_autoscan_retry_round(state: dict) -> dict | None:
         "processed": 0,
         "successful": 0,
         "needs_review": 0,
+        "review_views": 0,
+        "review_pages": 0,
+        "review_watchdog": 0,
+        "review_gate": 0,
+        "review_other": 0,
         "system_errors": 0,
         "skipped_nonproduct": 0,
         "failed": 0,
@@ -4899,6 +5055,27 @@ async def _radar_foreground_counts() -> tuple[int, int]:
         running = sum(1 for job in active_jobs.values() if job.state == "running" and not job.cancel_requested)
         queued = sum(1 for job in active_jobs.values() if job.state == "queued" and not job.cancel_requested)
     return int(running), int(queued)
+
+
+async def _radar_autoscan_idle_turbo_available() -> bool:
+    """True only while AutoScan can safely borrow capacity unused by users.
+
+    The decision is intentionally re-checked between repair chunks/prefetch top-ups.
+    A newly queued user therefore stops *new* turbo work immediately; already leased
+    short requests are allowed to finish under the existing traffic controller.
+    """
+    if not RADAR_AUTOSCAN_IDLE_TURBO_ENABLED:
+        return False
+    running, queued = await _radar_foreground_counts()
+    if running or queued:
+        return False
+    try:
+        snap = await TRAFFIC.snapshot()
+    except Exception:
+        # Foreground counters are the hard priority boundary. If local telemetry is
+        # temporarily unavailable, stay conservative and do not turbo.
+        return False
+    return int(snap.penalty_level or 0) <= 0 and float(snap.cooldown_seconds or 0.0) <= 0.0
 
 
 async def _notify_radar_autoscan_admins(
@@ -5143,6 +5320,34 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
     successful = int(state.get("successful") or 0)
     needs_review = int(state.get("needs_review") or 0)
     system_errors = int(state.get("system_errors") or 0)
+    review_views = int(state.get("review_views") or 0)
+    review_pages = int(state.get("review_pages") or 0)
+    review_watchdog = int(state.get("review_watchdog") or 0)
+    review_gate = int(state.get("review_gate") or 0)
+    review_other = int(state.get("review_other") or 0)
+    resource_line = ""
+    if status == "running":
+        fg_running, fg_queued = await _radar_foreground_counts()
+        if await _radar_autoscan_idle_turbo_available():
+            resource_line = (
+                f"⚡ Ресурсы: <b>Idle Turbo</b> · views до x{RADAR_AUTOSCAN_IDLE_VIEW_CONCURRENCY} "
+                f"· prefetch {RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES} стр."
+            )
+        else:
+            resource_line = f"🛡 Ресурсы: <b>приоритет пользователей</b> · активных {fg_running} · очередь {fg_queued}"
+
+    review_parts = []
+    if review_views:
+        review_parts.append(f"👁 views {review_views}")
+    if review_pages:
+        review_parts.append(f"📄 pages {review_pages}")
+    if review_watchdog:
+        review_parts.append(f"⏱ watchdog {review_watchdog}")
+    if review_gate:
+        review_parts.append(f"🔒 gate {review_gate}")
+    if review_other:
+        review_parts.append(f"❓ другое {review_other}")
+    review_breakdown_line = " · ".join(review_parts)
 
     elapsed_text = "—"
     started_at = str(state.get("started_at") or "")
@@ -5171,6 +5376,7 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         + (f" · сейчас {current_number}/{total}" if status == "running" else "") + "\n"
         f"📄 Глубина: <b>{depth} страниц только за сегодня на категорию</b>\n"
         + (live_stage_line + "\n" if live_stage_line else "")
+        + (resource_line + "\n" if resource_line else "")
         + f"⏱ Время круга: <b>{elapsed_text}</b>\n\n"
         + "<b>🔎 Текущий круг</b>\n"
         + f"📄 Страниц TODAY собрано: <b>{pages_verified}</b> <i>(макс. {total_pages_target})</i>\n"
@@ -5180,8 +5386,9 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         + f"🎯 Baseline создано: <b>{baselines}</b>\n"
         + f"✅ Категорий успешно: <b>{successful}</b>"
         + (f" · 🟡 exact-tail <b>{int(state.get('view_tail_categories') or 0)}</b> кат." if int(state.get('view_tail_categories') or 0) else "")
-        + f" · ⚠️ допроверка <b>{needs_review}</b> · ❌ ошибок <b>{system_errors}</b>\n\n"
-        + "<b>🧪 Radar-наблюдения</b>\n"
+        + f" · ⚠️ допроверка <b>{needs_review}</b> · ❌ ошибок <b>{system_errors}</b>\n"
+        + (f"↳ {review_breakdown_line}\n" if review_breakdown_line else "")
+        + "\n<b>🧪 Radar-наблюдения</b>\n"
         + "Подробная воронка Candidate / Early / Strong / Hot, Confidence, Acceleration и категории вынесены в <b>📊 Аналитика Radar</b>.\n"
         + "Так тяжёлая статистика больше не может заблокировать управление AutoScan.\n\n"
         + f"Последний круг: <b>{html.escape(last_line)}</b>\n"
@@ -5873,6 +6080,20 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                 else:
                     failure_kind = failure_kind or "partial"
                     state["needs_review"] = int(state.get("needs_review") or 0) + 1
+                    reason_lower = str(error_text or "").lower()
+                    if error_text.startswith("watchdog категории"):
+                        state["review_watchdog"] = int(state.get("review_watchdog") or 0) + 1
+                    elif failure_kind == "radar_views":
+                        state["review_views"] = int(state.get("review_views") or 0) + 1
+                    elif failure_kind == "radar_gate_unknown":
+                        state["review_gate"] = int(state.get("review_gate") or 0) + 1
+                    elif failure_kind == "partial" and (
+                        "страниц" in reason_lower or "page" in reason_lower or "дата" in reason_lower
+                        or "chronolog" in reason_lower or (result is not None and not result.date_complete)
+                    ):
+                        state["review_pages"] = int(state.get("review_pages") or 0) + 1
+                    else:
+                        state["review_other"] = int(state.get("review_other") or 0) + 1
                 state.setdefault("failed_categories", []).append({
                     "key": cat.key,
                     "name": cat.name,
@@ -7938,9 +8159,12 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
 
         async def top_up_direct_prefetch(current_page: int) -> None:
             nonlocal direct_prefetch_last
+            prefetch_window = PAGE_PREFETCH_WINDOW_PAGES + PAGE_PREFETCH_EXTRA_PAGES
+            if user_id == RADAR_AUTOSCAN_USER_ID and await _radar_autoscan_idle_turbo_available():
+                prefetch_window = max(prefetch_window, RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES)
             next_range = rolling_prefetch_range(
                 current_page, direct_prefetch_last, limit,
-                window_pages=PAGE_PREFETCH_WINDOW_PAGES + PAGE_PREFETCH_EXTRA_PAGES,
+                window_pages=prefetch_window,
                 low_water_pages=PAGE_PREFETCH_LOW_WATER_PAGES,
             )
             if next_range is None:
@@ -11674,7 +11898,7 @@ VINTED_ADMIN_MAX_CATEGORIES = 24
 _VINTED_ADMIN_CFG: dict[int, dict[str, Any]] = {}
 _VINTED_ADMIN_WATCHERS: dict[tuple[int, int], asyncio.Task] = {}
 
-# v4.23.5: Vinted Lab navigation should not wait on a fresh Redis/PostgreSQL round-trip
+# v4.23.6: Vinted Lab navigation should not wait on a fresh Redis/PostgreSQL round-trip
 # for every button.  These are tiny, deliberately short UI caches; scan/Radar workers
 # still write the source-of-truth state normally.  A stale value is preferable to a
 # frozen Telegram callback when Redis/DB is briefly busy with a full-market round.
