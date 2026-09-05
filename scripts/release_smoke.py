@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.23.2", "VERSION=4.23.2")
+    check((ROOT / "VERSION").read_text().strip() == "4.23.3", "VERSION=4.23.3")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -140,7 +140,11 @@ def main() -> int:
     check('callback_data="av:home"' in bot and '_vinted_watch_scan' in bot, "admin-only Vinted Lab has live progress UI")
     check('dtparser:vintedlab' in lab and 'SCAN_STREAM' in lab and 'METRICS_STREAM' in lab, "Vinted Lab uses an isolated Redis namespace")
     check('row.metric_status = "exact" if row.identity_ok and row.view_count is not None else "unknown"' in lab, "Vinted exact metrics remain fail-closed")
-    print("\nDT Parser 4.23.2 Vinted Radar 1.0 Start Hotfix release smoke: PASS")
+    vinted_radar = (ROOT / "vinted_radar.py").read_text(encoding="utf-8")
+    check('VINTED_RADAR_SCOPE = "balanced_market_segments_v1"' in vinted_radar and 'VINTED_RADAR_TARGET_SEGMENTS = 120' in vinted_radar and 'VINTED_RADAR_MAX_SEGMENTS = 150' in vinted_radar, "Vinted Radar uses bounded balanced market segments")
+    check('def balanced_catalog_segments_from_tree(' in lab and 'frontier[idx:idx + 1] = list(chosen.get("children") or [])' in lab, "Vinted market partition preserves non-overlapping tree coverage")
+    check('item_catalog_id = _int(getattr(item, "catalog_id", None), 0) or int(catalog_id)' in lab, "Vinted Radar preserves precise item catalog id when available")
+    print("\nDT Parser 4.23.3 Vinted Radar 1.0 Balanced Market Segments release smoke: PASS")
     return 0
 
 

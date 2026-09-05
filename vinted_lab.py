@@ -356,9 +356,8 @@ def flatten_catalog_tree(roots: Iterable[dict[str, Any]]) -> dict[int, dict[str,
 def leaf_catalogs_from_tree(roots: Iterable[dict[str, Any]]) -> list[tuple[int, str]]:
     """Return every terminal market category once, with a readable breadcrumb.
 
-    Radar scans leaves only. Scanning a parent and its children in the same round would
-    over-sample the same listings and bias Like Momentum, so parent nodes are deliberately
-    excluded whenever they expose children.
+    Radar uses this complete leaf set to validate that the market tree is structurally
+    complete before building its bounded non-overlapping scan segments.
     """
     leaves: list[tuple[int, str]] = []
     seen: set[int] = set()
@@ -383,6 +382,92 @@ def leaf_catalogs_from_tree(roots: Iterable[dict[str, Any]]) -> list[tuple[int, 
         if isinstance(root, dict):
             walk(root, [])
     return leaves
+
+
+def balanced_catalog_segments_from_tree(
+    roots: Iterable[dict[str, Any]], *, target_segments: int = 120, max_segments: int = 150,
+) -> list[tuple[int, str]]:
+    """Partition the complete market tree into non-overlapping scan segments.
+
+    Vinted's DE tree contains thousands of terminal catalog ids. Scanning every leaf at
+    15 pages would create tens of thousands of requests per Radar round. Instead we start
+    with the market roots and repeatedly split the currently broadest subtree until the
+    requested segment budget is reached. Because a node is replaced by its children, a
+    parent and child are never scanned together and every terminal category remains covered
+    by exactly one selected subtree.
+    """
+    target_segments = max(1, int(target_segments or 1))
+    max_segments = max(target_segments, int(max_segments or target_segments))
+
+    def build(node: dict[str, Any], path: list[str], depth: int) -> dict[str, Any] | None:
+        catalog_id = _int(node.get("id"), 0)
+        if catalog_id <= 0:
+            return None
+        title = str(node.get("title") or f"Catalog {catalog_id}").strip()
+        current_path = [*path, title]
+        children_meta: list[dict[str, Any]] = []
+        for child in list(node.get("catalogs") or []):
+            if not isinstance(child, dict):
+                continue
+            child_meta = build(child, current_path, depth + 1)
+            if child_meta is not None:
+                children_meta.append(child_meta)
+        leaf_count = sum(int(child["leaf_count"]) for child in children_meta) if children_meta else 1
+        meta = {
+            "id": catalog_id,
+            "name": " › ".join(current_path)[-255:],
+            "depth": depth,
+            "children": children_meta,
+            "leaf_count": max(1, int(leaf_count)),
+        }
+        return meta
+
+    frontier: list[dict[str, Any]] = []
+    seen_roots: set[int] = set()
+    for raw_root in roots:
+        if not isinstance(raw_root, dict):
+            continue
+        meta = build(raw_root, [], 0)
+        if meta is None or int(meta["id"]) in seen_roots:
+            continue
+        seen_roots.add(int(meta["id"]))
+        frontier.append(meta)
+
+    if not frontier:
+        return []
+
+    # Split the largest remaining market subtree first. This makes the mixed-depth
+    # partition much more balanced than a fixed depth while keeping the queue bounded.
+    while len(frontier) < target_segments:
+        candidates: list[tuple[int, int, int, dict[str, Any]]] = []
+        for entry in frontier:
+            children = list(entry.get("children") or [])
+            if not children:
+                continue
+            projected = len(frontier) - 1 + len(children)
+            if projected > max_segments:
+                continue
+            candidates.append((
+                int(entry.get("leaf_count") or 1),
+                -int(entry.get("depth") or 0),
+                len(children),
+                entry,
+            ))
+        if not candidates:
+            break
+        _leaf_span, _neg_depth, _child_count, chosen = max(candidates, key=lambda row: (row[0], row[1], row[2], -int(row[3].get("id") or 0)))
+        idx = frontier.index(chosen)
+        frontier[idx:idx + 1] = list(chosen.get("children") or [])
+
+    result: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    for entry in frontier:
+        cid = int(entry.get("id") or 0)
+        if cid <= 0 or cid in seen:
+            continue
+        seen.add(cid)
+        result.append((cid, str(entry.get("name") or f"Catalog {cid}")[:255]))
+    return result
 
 
 class VintedQueueUnavailable(RuntimeError):
@@ -676,11 +761,22 @@ async def cancel_scan(scan_id: int) -> bool:
         scan = await session.get(VintedScan, int(scan_id))
         if scan is None or scan.status in {"completed", "partial", "failed", "cancelled"}:
             return False
+        now = utcnow()
         scan.status = "cancel_requested"
         scan.stage = "stopping"
-        scan.updated_at = utcnow()
+        scan.updated_at = now
+        # Queued Redis messages can still be ACKed after a stop, but they must not keep
+        # the database scan permanently non-terminal. Running categories are allowed to
+        # finish their current bounded task; every not-yet-started category is cancelled
+        # immediately. This is also what makes the v4.23.3 leaf->segment migration safe.
+        await session.execute(
+            update(VintedScanCategory)
+            .where(VintedScanCategory.scan_id == int(scan_id), VintedScanCategory.status == "queued")
+            .values(status="cancelled", finished_at=now, updated_at=now)
+        )
         await session.commit()
-        return True
+    await recalc_scan(scan_id)
+    return True
 
 
 async def recalc_scan(scan_id: int) -> VintedScan | None:
@@ -780,8 +876,9 @@ async def save_catalog_page(
             item_id = int(getattr(item, "item_id", 0) or 0)
             if item_id <= 0 or item_id in existing:
                 continue
+            item_catalog_id = _int(getattr(item, "catalog_id", None), 0) or int(catalog_id)
             row = VintedScanItem(
-                scan_id=int(scan_id), item_id=item_id, catalog_id=int(catalog_id), category_name=category_name[:255],
+                scan_id=int(scan_id), item_id=item_id, catalog_id=item_catalog_id, category_name=category_name[:255],
                 title=str(getattr(item, "title", "") or "")[:500], url=str(getattr(item, "url", "") or "")[:1200],
                 price_amount=getattr(item, "price_amount", None), currency=str(getattr(item, "currency", "") or "")[:16],
                 brand=str(getattr(item, "brand", "") or "")[:255], size=str(getattr(item, "size", "") or "")[:120],

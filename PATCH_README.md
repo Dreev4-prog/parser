@@ -1,7 +1,7 @@
-# v4.23.2 GitHub hotfix
+# v4.23.3 GitHub patch
 
-Накладывать поверх **v4.23.1**.
+Apply on top of **v4.23.2**.
 
-После push/redeploy обязательно обновить **Parser / Bot**. Vinted Scan Worker можно redeploy вместе с репозиторием; логика сканирования страниц не менялась.
+Main change: Vinted Radar validates the complete Vinted category tree but scans it as roughly **120 non-overlapping market segments** instead of thousands of terminal categories. Each segment keeps the same **15-page maximum** and the Telegram progress screen shows the real segment/page pass.
 
-Новых обязательных Railway variables и SQL-миграций нет.
+Redeploy **Parser/Bot** and all **Vinted Scan Worker** replicas after replacing the files. No SQL migration and no new Railway variables are required.

@@ -516,7 +516,10 @@ def normalize_catalog_item(raw: Any, base_url: str = DEFAULT_BASE_URL) -> Vinted
         condition=str(raw.get("status") or raw.get("status_title") or ""),
         seller_id=_int_or_none(user.get("id")),
         seller_login=str(user.get("login") or ""),
-        catalog_id=_int_or_none(raw.get("catalog_id")),
+        catalog_id=(
+            _int_or_none(_first(raw, ("catalog_id", "catalogId")))
+            or _int_or_none(_nested(raw, "catalog", "id"))
+        ),
         promoted=promoted,
         visible=visible,
         catalog_view_count=_int_or_none(_first(raw, ("view_count", "views_count", "views"))),

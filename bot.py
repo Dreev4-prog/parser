@@ -156,7 +156,7 @@ from vinted_session_store import (
 )
 from vinted_radar import (
     VINTED_RADAR_HISTORY_DAYS, VINTED_RADAR_INTERVAL_MINUTES, VINTED_RADAR_LIVE_HOURS,
-    VINTED_RADAR_PAGES_PER_CATEGORY,
+    VINTED_RADAR_PAGES_PER_CATEGORY, VINTED_RADAR_TARGET_SEGMENTS,
     build_radar_snapshot as build_vinted_radar_snapshot,
     disable_radar as disable_vinted_radar,
     enable_radar as enable_vinted_radar,
@@ -11732,7 +11732,7 @@ async def _vinted_home_text() -> str:
         "",
         "<b>Режимы</b>",
         "🔎 Parser — разовый проход выбранных категорий.",
-        f"📡 Radar 1.0 — весь Vinted · по {VINTED_RADAR_PAGES_PER_CATEGORY} стр. каждой конечной категории · повтор каждые {VINTED_RADAR_INTERVAL_MINUTES} мин.",
+        f"📡 Radar 1.0 — весь Vinted · около {VINTED_RADAR_TARGET_SEGMENTS} непересекающихся сегментов · до {VINTED_RADAR_PAGES_PER_CATEGORY} стр. каждый · повтор каждые {VINTED_RADAR_INTERVAL_MINUTES} мин.",
     ]
     if worker_status.get("error"):
         lines.extend(["", f"⚠️ Redis: <code>{html.escape(str(worker_status['error'])[:180])}</code>"])
@@ -11744,7 +11744,7 @@ async def _vinted_home_text() -> str:
             "",
             "<b>Последний запуск</b>",
             f"{_vinted_mode_label(scan.mode)} · {_vinted_status_label(scan.status)}",
-            f"Категории: <b>{int(scan.completed_categories or 0)}/{int(scan.total_categories or 0)}</b> · товаров: <b>{int(scan.total_items or 0)}</b>",
+            f"{'Сегменты' if str(scan.mode or '') == 'radar' else 'Категории'}: <b>{int(scan.completed_categories or 0)}/{int(scan.total_categories or 0)}</b> · товаров: <b>{int(scan.total_items or 0)}</b>",
             f"❤️ Catalog likes: <b>{int(like_stats.get('total', 0) or 0)}</b> · с лайками: <b>{int(like_stats.get('nonzero', 0) or 0)}</b>/{int(like_stats.get('known', 0) or 0)}",
         ])
         if scan.mode != "radar":
@@ -11911,13 +11911,16 @@ async def _vinted_scan_text(scan_id: int) -> tuple[str, VintedScan | None]:
     queued = int(cat_stats.get("queued", 0) or 0)
     partial = int(cat_stats.get("partial", 0) or 0)
     failed = int(cat_stats.get("failed", 0) or 0)
+    radar_mode = str(scan.mode or "") == "radar"
+    pass_label = "Radar-сегментов" if radar_mode else "категорий"
+    counter_label = "Сегменты" if radar_mode else "Категории"
     lines = [
         f"<b>{_vinted_mode_label(scan.mode)}</b>",
         f"Статус: <b>{_vinted_status_label(scan.status)}</b>",
         "",
-        "<b>📄 Проход категорий</b>",
+        f"<b>📄 Проход {pass_label}</b>",
         f"{_progress_bar(int(scan_pct))} <b>{scan_pct:.1f}%</b>",
-        f"Категории: <b>{int(scan.completed_categories or 0)}/{int(scan.total_categories or 0)}</b> · сейчас <b>{running}</b> · в очереди <b>{queued}</b>",
+        f"{counter_label}: <b>{int(scan.completed_categories or 0)}/{int(scan.total_categories or 0)}</b> · сейчас <b>{running}</b> · в очереди <b>{queued}</b>",
         f"📄 Реально пройдено страниц: <b>{pages_real}</b> · основной лимит <b>{pages_primary}/{pages_plan}</b>",
         f"Найдено уникальных: <b>{int(scan.total_items or 0)}</b>",
     ]
@@ -11926,7 +11929,7 @@ async def _vinted_scan_text(scan_id: int) -> tuple[str, VintedScan | None]:
     if partial or failed:
         lines.append(f"⚠️ Partial: <b>{partial}</b> · failed: <b>{failed}</b>")
 
-    if scan.mode == "radar":
+    if radar_mode:
         scan_workers = [w for w in list(worker_status.get("scan_workers") or []) if int(w.get("scan_id", 0) or 0) == int(scan.id) and int(w.get("active", 0) or 0)]
         if scan_workers:
             lines.extend(["", "<b>🟣 Сейчас проходят</b>"])
@@ -11942,11 +11945,11 @@ async def _vinted_scan_text(scan_id: int) -> tuple[str, VintedScan | None]:
         f"Считано: <b>{int(like_stats.get('known', 0) or 0)}/{int(like_stats.get('items', 0) or 0)}</b> · с лайками: <b>{int(like_stats.get('nonzero', 0) or 0)}</b>",
         f"Всего ❤️: <b>{int(like_stats.get('total', 0) or 0)}</b> · максимум у товара: <b>{int(like_stats.get('max', 0) or 0)}</b>",
     ])
-    if scan.mode == "radar":
+    if radar_mode:
         lines.extend([
             "",
             "<b>📡 Radar 1.0</b>",
-            f"Весь рынок: только конечные категории · до <b>{VINTED_RADAR_PAGES_PER_CATEGORY} стр.</b> на каждую.",
+            f"Весь рынок: <b>{int(scan.total_categories or 0)} Radar-сегментов</b> · до <b>{VINTED_RADAR_PAGES_PER_CATEGORY} стр.</b> на каждый.",
             f"Повтор: каждые <b>{VINTED_RADAR_INTERVAL_MINUTES} мин.</b> · Live товара: <b>{VINTED_RADAR_LIVE_HOURS} ч</b>.",
             "<i>Первый ❤️-замер — baseline. Views/detail API для Radar не используются.</i>",
         ])
@@ -11972,7 +11975,7 @@ async def _vinted_scan_text(scan_id: int) -> tuple[str, VintedScan | None]:
             if row not in display and len(display) < 8:
                 display.append(row)
         if display:
-            lines.extend(["", "<b>Последние / активные категории</b>"])
+            lines.extend(["", f"<b>Последние / активные {'сегменты' if radar_mode else 'категории'}</b>"])
             for row in display[:8]:
                 icon = {"queued": "▫️", "running": "🟣", "completed": "✅", "partial": "⚠️", "failed": "❌", "cancelled": "⏹"}.get(row.status, "▫️")
                 lines.append(f"{icon} {html.escape(row.category_name[:48])} · стр. <b>{int(row.pages_fetched or 0)}/{int(row.pages_target or 0)}</b> · <b>{int(row.unique_items or 0)}</b>")
@@ -12205,7 +12208,7 @@ async def _vinted_radar_screen(filter_name: str = "all", page: int = 0) -> tuple
         f"<i>Like Momentum · Live {VINTED_RADAR_LIVE_HOURS}ч · обучение {VINTED_RADAR_HISTORY_DAYS} дней</i>",
         "",
         auto_line,
-        f"Охват: <b>все конечные категории</b> · <b>{len(snapshot.categories)}</b> кат. · до <b>{int(snapshot.pages)} стр.</b> каждая",
+        f"Охват: <b>весь рынок</b> · <b>{len(snapshot.categories)}</b> непересекающихся сегментов · до <b>{int(snapshot.pages)} стр.</b> каждый",
     ]
     if snapshot.last_scan_id:
         current = await vinted_scan_progress(int(snapshot.last_scan_id))
@@ -12219,7 +12222,7 @@ async def _vinted_radar_screen(filter_name: str = "all", page: int = 0) -> tuple
                 "",
                 f"<b>{'✅ Последний проход' if terminal else '🟣 Текущий проход'} #{int(current_scan.id)}</b>",
                 f"{_progress_bar(int(pct))} <b>{pct:.1f}%</b>",
-                f"Категории: <b>{int(current_scan.completed_categories or 0)}/{int(current_scan.total_categories or 0)}</b> · сейчас <b>{int(cs.get('running', 0) or 0)}</b> · очередь <b>{int(cs.get('queued', 0) or 0)}</b>",
+                f"Сегменты: <b>{int(current_scan.completed_categories or 0)}/{int(current_scan.total_categories or 0)}</b> · сейчас <b>{int(cs.get('running', 0) or 0)}</b> · очередь <b>{int(cs.get('queued', 0) or 0)}</b>",
                 f"📄 Страниц реально: <b>{int(ps.get('fetched_total', 0) or 0)}</b> · основной проход <b>{int(ps.get('primary_done', 0) or 0)}/{int(ps.get('plan_max', 0) or 0)}</b>",
                 f"📦 Уникальных: <b>{int(current_scan.total_items or 0)}</b>",
             ])
@@ -12455,8 +12458,8 @@ async def vinted_admin_lab_handler(callback: CallbackQuery) -> None:
         await _edit_or_answer(
             callback.message,
             "<b>📡 Vinted Radar 1.0 · запуск</b>\n\n"
-            "⏳ <b>1/3</b> Получаю полный каталог Vinted…\n"
-            f"План: все конечные категории · по <b>{VINTED_RADAR_PAGES_PER_CATEGORY}</b> страниц.",
+            "⏳ <b>1/3</b> Получаю полный каталог Vinted и строю оптимальный план рынка…\n"
+            f"План: около <b>{VINTED_RADAR_TARGET_SEGMENTS}</b> непересекающихся сегментов · до <b>{VINTED_RADAR_PAGES_PER_CATEGORY}</b> страниц каждый.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Radar", callback_data="av:radar:all:0")]]),
         )
         try:
@@ -12481,8 +12484,8 @@ async def vinted_admin_lab_handler(callback: CallbackQuery) -> None:
         await _edit_or_answer(
             callback.message,
             "<b>📡 Vinted Radar 1.0 · запуск</b>\n\n"
-            f"✅ Каталог: <b>{len(categories)}</b> конечных категорий · <code>{html.escape(str(source))}</code>\n"
-            f"⏳ <b>2/3</b> Создаю круг · {VINTED_RADAR_PAGES_PER_CATEGORY} страниц на категорию…",
+            f"✅ План рынка: <b>{len(categories)}</b> Radar-сегментов · <code>{html.escape(str(source))}</code>\n"
+            f"⏳ <b>2/3</b> Создаю круг · до {VINTED_RADAR_PAGES_PER_CATEGORY} страниц на сегмент…",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Radar", callback_data="av:radar:all:0")]]),
         )
         try:
@@ -12492,8 +12495,8 @@ async def vinted_admin_lab_handler(callback: CallbackQuery) -> None:
             await _edit_or_answer(
                 callback.message,
                 "<b>📡 Vinted Radar 1.0 · запуск</b>\n\n"
-                f"✅ Каталог: <b>{len(categories)}</b> категорий\n"
-                f"⏳ <b>3/3</b> Ставлю категории в очередь Scan Worker…",
+                f"✅ План рынка: <b>{len(categories)}</b> сегментов\n"
+                f"⏳ <b>3/3</b> Ставлю сегменты в очередь Scan Worker…",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Radar", callback_data="av:radar:all:0")]]),
             )
             queued = await enqueue_vinted_scan(scan.id)
@@ -12535,7 +12538,7 @@ async def vinted_admin_lab_handler(callback: CallbackQuery) -> None:
 
     if action == "new":
         if len(parts) > 2 and parts[2] == "r":
-            await callback.answer("Radar теперь сам сканирует весь Vinted по 15 страниц — категории выбирать не нужно.", show_alert=True)
+            await callback.answer("Radar сам сканирует весь Vinted: рынок разбит на оптимизированные непересекающиеся сегменты, до 15 страниц каждый.", show_alert=True)
             text_value, keyboard = await _vinted_radar_screen("all", 0)
             await _edit_or_answer(callback.message, text_value, reply_markup=keyboard)
             return
@@ -12644,7 +12647,7 @@ async def vinted_admin_lab_handler(callback: CallbackQuery) -> None:
 async def vinted_radar_autoscan_scheduler() -> None:
     """Persistent Vinted Radar 1.0 cadence.
 
-    The full terminal-category market snapshot repeats hourly by default; every category gets the same 15-page primary depth. Individual products
+    The balanced full-market segment snapshot repeats hourly by default; every segment gets the same 15-page primary depth. Individual products
     participate in Live scoring only for their first 24h; older observations remain
     available to the seven-day learning/reference pool.
     """

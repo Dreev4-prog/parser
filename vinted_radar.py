@@ -16,7 +16,8 @@ from sqlalchemy import delete, select
 from db import SessionLocal
 from models import AppSetting, VintedMetricHistory, VintedScan, VintedScanCategory, VintedScanItem
 from vinted_lab import (
-    VINTED_QUEUE, create_scan, enqueue_scan, fetch_catalog_tree, leaf_catalogs_from_tree, recalc_scan,
+    VINTED_QUEUE, balanced_catalog_segments_from_tree, cancel_scan, create_scan, enqueue_scan,
+    fetch_catalog_tree, leaf_catalogs_from_tree, recalc_scan,
 )
 
 log = logging.getLogger("vinted-radar")
@@ -27,8 +28,13 @@ VINTED_RADAR_HISTORY_DAYS = max(2, min(30, int(os.getenv("VINTED_RADAR_HISTORY_D
 VINTED_RADAR_INTERVAL_MINUTES = max(15, min(360, int(os.getenv("VINTED_RADAR_INTERVAL_MINUTES", "60") or 60)))
 VINTED_RADAR_CACHE_SECONDS = max(5, min(120, int(os.getenv("VINTED_RADAR_CACHE_SECONDS", "20") or 20)))
 VINTED_RADAR_PAGES_PER_CATEGORY = 15
-VINTED_RADAR_SCOPE = "all_leaf_categories"
+# v4.23.3: the DE catalog contains thousands of terminal ids. Radar keeps complete
+# market coverage by partitioning the tree into a bounded set of non-overlapping
+# parent segments instead of scheduling every leaf as its own 15-page job.
+VINTED_RADAR_SCOPE = "balanced_market_segments_v1"
 VINTED_RADAR_MIN_LEAF_CATEGORIES = 20
+VINTED_RADAR_TARGET_SEGMENTS = 120
+VINTED_RADAR_MAX_SEGMENTS = 150
 
 _TERMINAL_SCAN_STATES = {"completed", "partial", "failed", "cancelled"}
 _ACTIVE_SCAN_STATES = {"queued", "running", "metrics", "cancel_requested"}
@@ -313,18 +319,28 @@ async def radar_config() -> dict[str, Any]:
 
 
 async def resolve_all_market_categories(*, force: bool = False, cached: list[dict[str, Any]] | None = None, cached_scope: str = "") -> tuple[list[tuple[int, str]], str]:
-    """Resolve the complete live Vinted market as terminal catalog categories.
+    """Resolve the complete Vinted market into a bounded non-overlapping scan plan.
 
-    A parent and its children are never scanned in the same Radar round. If Vinted's
-    category metadata is temporarily unavailable, an already validated full-market
-    snapshot is retained; a tiny local fallback is never silently advertised as the
-    complete market.
+    The full German tree can contain thousands of terminal catalog ids. Scheduling
+    15 pages for every leaf is wasteful and makes a one-hour Radar cadence impossible.
+    We still validate the complete leaf tree, then partition it into roughly 120
+    mixed-depth parent segments. Replacing a parent by its children preserves complete
+    market coverage without parent/child overlap.
     """
     roots, source = await fetch_catalog_tree(force=force)
     if str(source).startswith(("live", "snapshot")):
         leaves = leaf_catalogs_from_tree(roots)
         if len(leaves) >= VINTED_RADAR_MIN_LEAF_CATEGORIES:
-            return leaves, str(source)
+            segments = balanced_catalog_segments_from_tree(
+                roots, target_segments=VINTED_RADAR_TARGET_SEGMENTS, max_segments=VINTED_RADAR_MAX_SEGMENTS,
+            )
+            if segments:
+                plan_source = f"{source}|{len(segments)}seg/{len(leaves)}leaf"
+                log.info(
+                    "Vinted Radar market plan source=%s leaves=%s segments=%s pages_max=%s",
+                    source, len(leaves), len(segments), len(segments) * VINTED_RADAR_PAGES_PER_CATEGORY,
+                )
+                return segments, plan_source[:80]
         log.warning("Vinted Radar catalog tree looks incomplete source=%s leaves=%s", source, len(leaves))
     if cached_scope == VINTED_RADAR_SCOPE and cached:
         kept = []
@@ -338,7 +354,7 @@ async def resolve_all_market_categories(*, force: bool = False, cached: list[dic
                 seen.add(cid)
                 kept.append((cid, str(item.get("name") or f"Catalog {cid}")[:255]))
         if kept:
-            return kept, "cached-full-market"
+            return kept[:VINTED_RADAR_MAX_SEGMENTS], "cached-balanced-market"
     return [], str(source or "unavailable")
 
 
@@ -439,13 +455,25 @@ async def maybe_start_due_round() -> VintedScan | None:
     cfg = await radar_config()
     if not cfg["enabled"] or not VINTED_QUEUE.enabled:
         return None
+    scope_mismatch = str(cfg.get("scope") or "") != VINTED_RADAR_SCOPE
     active = await _latest_active_radar_scan()
     if active is not None:
         fresh = await recalc_scan(active.id)
         if fresh is not None and str(fresh.status or "") in _ACTIVE_SCAN_STATES:
+            if scope_mismatch:
+                # v4.23.3 migration: do not let a legacy thousands-of-leaves queue run
+                # for hours after deploy. Queued categories are cancelled immediately;
+                # already-running bounded tasks are allowed to finish safely.
+                await cancel_scan(fresh.id)
+                log.warning(
+                    "Vinted Radar migration cancelled legacy scope scan=%s categories=%s scope=%s",
+                    fresh.id, fresh.total_categories, cfg.get("scope"),
+                )
             return None
     now = utcnow()
-    last_scan_at = cfg.get("last_scan_at")
+    # A scope migration starts a fresh optimized round as soon as the old one is gone;
+    # it does not wait out the previous one-hour cadence.
+    last_scan_at = None if scope_mismatch else cfg.get("last_scan_at")
     interval = timedelta(minutes=int(cfg["interval_minutes"]))
     if last_scan_at is not None and now < last_scan_at + interval:
         return None

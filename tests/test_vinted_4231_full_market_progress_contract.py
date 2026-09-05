@@ -14,20 +14,23 @@ def test_radar_has_fixed_equal_15_page_primary_depth():
     assert 'pages_target = max(1, min(15, int(fields.get("pages") or 3)))' in WORKER
 
 
-def test_radar_scans_leaf_categories_only_to_avoid_parent_child_bias():
+def test_radar_partitions_full_leaf_tree_into_non_overlapping_segments():
     assert 'def leaf_catalogs_from_tree(' in LAB
-    block = LAB.split('def leaf_catalogs_from_tree(', 1)[1].split('\n\n\nclass VintedQueueUnavailable', 1)[0]
-    assert 'if children:' in block
-    assert 'walk(child, current_path)' in block
-    assert 'leaves.append' in block
-    assert 'VINTED_RADAR_SCOPE = "all_leaf_categories"' in RADAR
+    assert 'def balanced_catalog_segments_from_tree(' in LAB
+    block = LAB.split('def balanced_catalog_segments_from_tree(', 1)[1].split('\n\n\nclass VintedQueueUnavailable', 1)[0]
+    assert 'frontier[idx:idx + 1] = list(chosen.get("children") or [])' in block
+    assert 'projected > max_segments' in block
+    assert 'VINTED_RADAR_SCOPE = "balanced_market_segments_v1"' in RADAR
+    assert 'VINTED_RADAR_TARGET_SEGMENTS = 120' in RADAR
+    assert 'VINTED_RADAR_MAX_SEGMENTS = 150' in RADAR
     assert 'resolve_all_market_categories' in RADAR
 
 
 def test_incomplete_fallback_tree_never_silently_claims_full_market():
     assert 'VINTED_RADAR_MIN_LEAF_CATEGORIES = 20' in RADAR
     assert 'if len(leaves) >= VINTED_RADAR_MIN_LEAF_CATEGORIES:' in RADAR
-    assert 'cached-full-market' in RADAR
+    assert 'balanced_catalog_segments_from_tree' in RADAR
+    assert 'cached-balanced-market' in RADAR
     assert 'return [], str(source or "unavailable")' in RADAR
 
 
@@ -51,7 +54,7 @@ def test_progress_snapshot_exposes_real_page_passage():
     assert '"fetched_total": page_fetched_total' in LAB
     assert '"category_status": status_counts' in LAB
     assert '📄 Реально пройдено страниц' in BOT
-    assert 'Последние / активные категории' in BOT
+    assert "Последние / активные {'сегменты' if radar_mode else 'категории'}" in BOT
     assert 'Смотреть проход страниц' in BOT
 
 
