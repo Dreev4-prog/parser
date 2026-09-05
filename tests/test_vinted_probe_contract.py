@@ -10,6 +10,7 @@ from vinted_probe import (
     evaluate_quality_gates,
     normalize_catalog_item,
     normalize_detail_metrics,
+    normalize_public_item_html,
     run_probe,
 )
 
@@ -52,6 +53,35 @@ def test_missing_view_count_stays_unknown_not_zero():
     assert any("UNKNOWN" in note for note in sample.notes)
 
 
+def _mock_item_html(item_id: int, views: int | None = None) -> str:
+    views = item_id if views is None else views
+    payload = {
+        "item": {
+            "id": item_id,
+            "view_count": views,
+            "favourite_count": 3,
+            "created_at": "2026-09-05T07:00:00Z",
+            "is_closed": False,
+        }
+    }
+    encoded = json.dumps(json.dumps(payload, separators=(",", ":")))
+    return f'<html><script>self.__next_f.push([1,{encoded}])</script></html>'
+
+
+def test_public_html_parser_identity_and_metrics():
+    sample = normalize_public_item_html(_mock_item_html(123, views=19), expected_item_id=123)
+    assert sample.identity_ok is True
+    assert sample.view_count == 19
+    assert sample.favourite_count == 3
+    assert sample.upload_raw == "2026-09-05T07:00:00Z"
+
+
+def test_public_html_wrong_identity_fails_closed():
+    sample = normalize_public_item_html(_mock_item_html(999, views=19), expected_item_id=123)
+    assert sample.identity_ok is False
+    assert sample.view_count is None
+
+
 @pytest.mark.asyncio
 async def test_probe_full_mock_pass():
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -59,16 +89,19 @@ async def test_probe_full_mock_pass():
             return httpx.Response(200, text="ok", headers={"content-type": "text/html"})
         if request.url.path == "/api/v2/catalog/items":
             page = int(request.url.params.get("page", "1"))
+            if page > 1:
+                assert request.url.params.get("time") == "1700000000"
             payload = {
+                "pagination": {"time": 1700000000},
                 "items": [
-                    {"id": page * 10 + 1, "title": "A", "view_count": 0, "favourite_count": 1},
-                    {"id": page * 10 + 2, "title": "B", "view_count": 2, "favourite_count": 0},
+                    {"id": page * 10 + 1, "title": "A", "url": f"https://www.vinted.de/items/{page * 10 + 1}-a", "view_count": 0, "favourite_count": 1},
+                    {"id": page * 10 + 2, "title": "B", "url": f"https://www.vinted.de/items/{page * 10 + 2}-b", "view_count": 2, "favourite_count": 0},
                 ]
             }
             return httpx.Response(200, json=payload)
-        if request.url.path.startswith("/api/v2/items/"):
-            item_id = int(request.url.path.rsplit("/", 1)[-1])
-            return httpx.Response(200, json={"item": {"id": item_id, "view_count": item_id, "favourite_count": 3, "created_at": "2026-09-05T07:00:00Z"}})
+        if request.url.path.startswith("/items/"):
+            item_id = int(request.url.path.split("/")[-1].split("-", 1)[0])
+            return httpx.Response(200, text=_mock_item_html(item_id), headers={"content-type": "text/html"})
         return httpx.Response(404)
 
     config = VintedProbeConfig(
@@ -82,6 +115,7 @@ async def test_probe_full_mock_pass():
     )
     report = await run_probe(config, transport=httpx.MockTransport(handler))
     assert report["catalog"]["unique_items"] == 4
+    assert report["catalog"]["snapshot_times"]["ALL"] == 1700000000
     assert report["detail"]["identity_ok"] == 4
     assert report["detail"]["exact_view_samples"] == 4
     assert report["quality_gates"]["radar_ready"]["pass"] is True

@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.22.0", "VERSION=4.22.0")
+    check((ROOT / "VERSION").read_text().strip() == "4.22.1", "VERSION=4.22.1")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -132,7 +132,7 @@ def main() -> int:
     vinted = (ROOT / "vinted_probe.py").read_text(encoding="utf-8")
     check("UNKNOWN is never converted to zero" in vinted and "wrong_identity" in vinted, "Vinted exact-metric path is fail-closed")
     check("does not solve anti-bot challenges" in vinted, "Vinted Probe has no challenge bypass logic")
-    print("\nDT Parser 4.22.0 Vinted Parser Probe release smoke: PASS")
+    print("\nDT Parser 4.22.1 Vinted HTML Detail + Stable Pagination release smoke: PASS")
     return 0
 
 

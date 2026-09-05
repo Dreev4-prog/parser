@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import statistics
 import time
 from dataclasses import asdict, dataclass, field
@@ -195,11 +196,11 @@ class VintedProbeClient:
             return "not_found"
         return f"http_{response.status_code}"
 
-    async def _request(self, kind: str, url: str, *, params: dict[str, Any] | None = None, expect_json: bool = True) -> tuple[httpx.Response | None, Any | None, str]:
+    async def _request(self, kind: str, url: str, *, params: dict[str, Any] | None = None, expect_json: bool = True, headers: dict[str, str] | None = None) -> tuple[httpx.Response | None, Any | None, str]:
         await self._gate.wait()
         started = time.perf_counter()
         try:
-            response = await self.client.get(url, params=params)
+            response = await self.client.get(url, params=params, headers=headers)
         except httpx.HTTPError as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
             self.records.append(ProbeHTTPRecord(kind, url, None, elapsed, "transport_error", detail=type(exc).__name__))
@@ -232,12 +233,17 @@ class VintedProbeClient:
             return outcome
         return outcome
 
-    async def fetch_catalog_page(self, catalog_id: int | None, page: int) -> tuple[list[VintedItem], str]:
+    async def fetch_catalog_page(self, catalog_id: int | None, page: int, *, snapshot_time: int | float | str | None = None) -> tuple[list[VintedItem], str, int | float | str | None]:
         params: dict[str, Any] = {
             "page": page,
             "per_page": self.config.per_page,
             "order": "newest_first",
         }
+        if snapshot_time is not None:
+            # Vinted returns pagination.time. Reusing that value freezes the
+            # newest-first snapshot so page 2 cannot collapse onto page 1 while
+            # new listings are arriving.
+            params["time"] = snapshot_time
         if catalog_id is not None:
             params["catalog_ids"] = catalog_id
         _response, payload, outcome = await self._request(
@@ -246,32 +252,44 @@ class VintedProbeClient:
             params=params,
         )
         if outcome != "ok" or not isinstance(payload, dict):
-            return [], outcome
+            return [], outcome, snapshot_time
         raw_items = payload.get("items")
         if not isinstance(raw_items, list):
-            return [], "invalid_catalog_shape"
+            return [], "invalid_catalog_shape", snapshot_time
+        pagination = payload.get("pagination") if isinstance(payload.get("pagination"), dict) else {}
+        response_time = pagination.get("time") if pagination else None
+        effective_snapshot = snapshot_time if snapshot_time is not None else response_time
         items: list[VintedItem] = []
         for raw in raw_items:
             item = normalize_catalog_item(raw, self.config.base_url)
             if item is not None:
                 items.append(item)
-        return items, "ok"
+        return items, "ok", effective_snapshot
 
     async def fetch_item_detail(self, item: VintedItem) -> VintedMetricSample:
-        _response, payload, outcome = await self._request(
-            "detail_api",
-            f"{self.config.base_url}/api/v2/items/{item.item_id}",
+        # The legacy /api/v2/items/{id} JSON endpoint now returns 404 for
+        # anonymous web sessions on current Vinted. The public item page still
+        # embeds the exact item model in the Next.js hydration payload.
+        detail_url = item.url or f"{self.config.base_url}/items/{item.item_id}"
+        response, html, outcome = await self._request(
+            "detail_html",
+            detail_url,
+            expect_json=False,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": f"{self.config.base_url}/",
+            },
         )
-        if outcome != "ok" or not isinstance(payload, dict):
+        if outcome != "ok" or response is None or not isinstance(html, str):
             return VintedMetricSample(
                 item_id=item.item_id,
-                source="detail_api",
+                source="detail_html",
                 measured_at=_utcnow_iso(),
                 identity_ok=False,
                 outcome=outcome,
-                notes=["No exact metric accepted from this response."],
+                notes=["No exact metric accepted from the public item page."],
             )
-        return normalize_detail_metrics(payload, expected_item_id=item.item_id)
+        return normalize_public_item_html(html, expected_item_id=item.item_id)
 
 
 def _utcnow_iso() -> str:
@@ -391,6 +409,142 @@ def normalize_detail_metrics(payload: dict[str, Any], *, expected_item_id: int) 
     )
 
 
+
+def _next_flight_blob(html: str) -> str:
+    """Decode string chunks emitted by Next.js `self.__next_f.push` calls."""
+    parts: list[str] = []
+    pattern = re.compile(r'self\.__next_f\.push\(\[\d+\s*,\s*("(?:[^"\\]|\\.)*")\s*\]\)', re.S)
+    for match in pattern.finditer(html):
+        try:
+            decoded = json.loads(match.group(1))
+        except (ValueError, TypeError):
+            continue
+        if isinstance(decoded, str):
+            parts.append(decoded)
+    return "\n".join(parts)
+
+
+def _json_scalar_near(text: str, start: int, keys: tuple[str, ...], *, radius: int = 50000) -> Any:
+    left = max(0, start - radius // 4)
+    right = min(len(text), start + radius)
+    window = text[left:right]
+    for key in keys:
+        # Handle ordinary decoded JSON and still-escaped JSON strings.
+        patterns = (
+            rf'"{re.escape(key)}"\s*:\s*(null|true|false|-?\d+(?:\.\d+)?|"(?:[^"\\]|\\.)*")',
+            rf'\\"{re.escape(key)}\\"\s*:\s*(null|true|false|-?\d+(?:\.\d+)?|\\"(?:[^"\\]|\\.)*\\")',
+        )
+        for pattern in patterns:
+            m = re.search(pattern, window, re.S)
+            if not m:
+                continue
+            raw = m.group(1)
+            try:
+                if raw.startswith('\\"') and raw.endswith('\\"'):
+                    raw = '"' + raw[2:-2].replace('\\"', '"') + '"'
+                return json.loads(raw)
+            except Exception:
+                if raw == "null":
+                    return None
+                if raw == "true":
+                    return True
+                if raw == "false":
+                    return False
+                try:
+                    return float(raw) if "." in raw else int(raw)
+                except Exception:
+                    return raw.strip('"')
+    return None
+
+
+def _candidate_identity_positions(text: str, expected_item_id: int) -> list[int]:
+    patterns = (
+        rf'"id"\s*:\s*"?{expected_item_id}"?',
+        rf'\\"id\\"\s*:\s*"?{expected_item_id}"?',
+        rf'"item_id"\s*:\s*"?{expected_item_id}"?',
+        rf'\\"item_id\\"\s*:\s*"?{expected_item_id}"?',
+    )
+    positions: list[int] = []
+    for pattern in patterns:
+        positions.extend(match.start() for match in re.finditer(pattern, text))
+    return sorted(set(positions))
+
+
+def normalize_public_item_html(html: str, *, expected_item_id: int) -> VintedMetricSample:
+    """Extract exact public item metrics from Vinted's server-rendered Next.js page.
+
+    Fail-closed rules are deliberate: a metric is accepted only from a text region
+    that also contains the requested item identity. Missing values remain UNKNOWN.
+    """
+    measured_at = _utcnow_iso()
+    sources = [_next_flight_blob(html), html]
+    chosen_text = ""
+    chosen_pos: int | None = None
+    for text in sources:
+        if not text:
+            continue
+        positions = _candidate_identity_positions(text, expected_item_id)
+        if not positions:
+            continue
+        # Prefer an identity occurrence near an explicit item object / metric field.
+        best: tuple[int, int] | None = None
+        for pos in positions:
+            window = text[max(0, pos - 10000): min(len(text), pos + 50000)]
+            score = sum(token in window for token in ('"view_count"', '\\"view_count\\"', '"favourite_count"', '\\"favourite_count\\"', '"upload_date"', '"created_at'))
+            candidate = (score, pos)
+            if best is None or candidate > best:
+                best = candidate
+        if best is not None:
+            chosen_text = text
+            chosen_pos = best[1]
+            if best[0] > 0:
+                break
+
+    if chosen_pos is None:
+        return VintedMetricSample(
+            item_id=expected_item_id,
+            source="detail_html",
+            measured_at=measured_at,
+            identity_ok=False,
+            outcome="identity_not_found",
+            notes=["Requested item ID was not found in the public page hydration payload."],
+        )
+
+    view_count = _int_or_none(_json_scalar_near(chosen_text, chosen_pos, ("view_count", "views_count", "views")))
+    favourite_count = _int_or_none(_json_scalar_near(chosen_text, chosen_pos, ("favourite_count", "favorites_count", "favourites_count")))
+    upload_raw = _json_scalar_near(chosen_text, chosen_pos, ("created_at", "created_at_ts", "upload_date", "uploaded_at"))
+    sold = _bool_or_none(_json_scalar_near(chosen_text, chosen_pos, ("is_sold", "sold")))
+    closed = _bool_or_none(_json_scalar_near(chosen_text, chosen_pos, ("is_closed", "closed")))
+    reserved = _bool_or_none(_json_scalar_near(chosen_text, chosen_pos, ("is_reserved", "reserved")))
+    hidden = _bool_or_none(_json_scalar_near(chosen_text, chosen_pos, ("is_hidden", "hidden")))
+    visible = _bool_or_none(_json_scalar_near(chosen_text, chosen_pos, ("is_visible", "visible")))
+
+    notes: list[str] = []
+    if view_count is None:
+        notes.append("view_count absent from identity-bound public page payload: exact views remain UNKNOWN")
+    if favourite_count is None:
+        notes.append("favourite_count absent from identity-bound public page payload")
+    if upload_raw is None:
+        notes.append("upload chronology absent from identity-bound public page payload")
+
+    return VintedMetricSample(
+        item_id=expected_item_id,
+        source="detail_html",
+        measured_at=measured_at,
+        view_count=view_count,
+        favourite_count=favourite_count,
+        upload_raw=upload_raw,
+        sold=sold,
+        closed=closed,
+        reserved=reserved,
+        hidden=hidden,
+        visible=visible,
+        identity_ok=True,
+        outcome="ok",
+        notes=notes,
+    )
+
+
 def _bool_or_none(value: Any) -> bool | None:
     if value is None:
         return None
@@ -429,26 +583,45 @@ async def run_probe(config: VintedProbeConfig, *, transport: httpx.AsyncBaseTran
     async with VintedProbeClient(config, transport=transport) as client:
         bootstrap_outcome = await client.bootstrap()
 
-        catalog_targets: list[tuple[int | None, int]] = []
         categories: tuple[int | None, ...] = config.catalog_ids or (None,)
-        for catalog_id in categories:
-            for page in range(1, config.pages + 1):
-                catalog_targets.append((catalog_id, page))
-
         page_sem = asyncio.Semaphore(config.page_concurrency)
+        page_results: list[tuple[int | None, int, list[VintedItem], str, int | float | str | None]] = []
 
-        async def fetch_target(catalog_id: int | None, page: int):
+        async def fetch_page(catalog_id: int | None, page: int, snapshot_time: int | float | str | None = None):
             async with page_sem:
-                items, outcome = await client.fetch_catalog_page(catalog_id, page)
-                return catalog_id, page, items, outcome
+                items, outcome, effective_snapshot = await client.fetch_catalog_page(
+                    catalog_id,
+                    page,
+                    snapshot_time=snapshot_time,
+                )
+                return catalog_id, page, items, outcome, effective_snapshot
 
-        page_results = await asyncio.gather(*(fetch_target(catalog_id, page) for catalog_id, page in catalog_targets))
+        # Page 1 establishes Vinted's pagination.time snapshot. Remaining pages of
+        # the same category reuse it so the live newest-first feed cannot shift the
+        # page boundary underneath a concurrent scan.
+        first_page_results = await asyncio.gather(*(fetch_page(catalog_id, 1, None) for catalog_id in categories))
+        page_results.extend(first_page_results)
+
+        remaining_jobs = []
+        for catalog_id, _page, _items, outcome, snapshot_time in first_page_results:
+            if outcome != "ok":
+                continue
+            for page in range(2, config.pages + 1):
+                remaining_jobs.append(fetch_page(catalog_id, page, snapshot_time))
+        if remaining_jobs:
+            page_results.extend(await asyncio.gather(*remaining_jobs))
 
         items_by_id: dict[int, VintedItem] = {}
         catalog_failures: list[dict[str, Any]] = []
         raw_item_count = 0
-        for catalog_id, page, items, outcome in page_results:
+        page_item_ids: dict[str, list[int]] = {}
+        snapshot_times: dict[str, Any] = {}
+        for catalog_id, page, items, outcome, snapshot_time in page_results:
             raw_item_count += len(items)
+            key = f"{catalog_id if catalog_id is not None else 'ALL'}:{page}"
+            page_item_ids[key] = [item.item_id for item in items]
+            if snapshot_time is not None:
+                snapshot_times[str(catalog_id if catalog_id is not None else "ALL")] = snapshot_time
             if outcome != "ok":
                 catalog_failures.append({"catalog_id": catalog_id, "page": page, "outcome": outcome})
             for item in items:
@@ -507,13 +680,34 @@ async def run_probe(config: VintedProbeConfig, *, transport: httpx.AsyncBaseTran
         promoted_known = [item for item in unique_items if item.promoted is not None]
         promoted_true = [item for item in unique_items if item.promoted is True]
 
+        # Per-page overlap makes pagination failures explainable instead of reducing
+        # the issue to one global duplicate count.
+        page_overlaps: list[dict[str, Any]] = []
+        keys = list(page_item_ids)
+        for i, key_a in enumerate(keys):
+            cat_a, page_a = key_a.rsplit(":", 1)
+            set_a = set(page_item_ids[key_a])
+            for key_b in keys[i + 1:]:
+                cat_b, page_b = key_b.rsplit(":", 1)
+                if cat_a != cat_b:
+                    continue
+                set_b = set(page_item_ids[key_b])
+                overlap = set_a & set_b
+                if overlap:
+                    page_overlaps.append({
+                        "catalog": cat_a,
+                        "page_a": int(page_a),
+                        "page_b": int(page_b),
+                        "overlap": len(overlap),
+                    })
+
         status_counts: dict[str, int] = {}
         for record in client.records:
             status_counts[record.outcome] = status_counts.get(record.outcome, 0) + 1
 
         elapsed_seconds = round(time.perf_counter() - started, 3)
         report: dict[str, Any] = {
-            "schema": "dt-vinted-probe-v1",
+            "schema": "dt-vinted-probe-v2",
             "generated_at": _utcnow_iso(),
             "config": {
                 "base_url": config.base_url,
@@ -531,11 +725,13 @@ async def run_probe(config: VintedProbeConfig, *, transport: httpx.AsyncBaseTran
             "bootstrap_outcome": bootstrap_outcome,
             "elapsed_seconds": elapsed_seconds,
             "catalog": {
-                "requests": len(catalog_targets),
+                "requests": len(page_results),
                 "failures": catalog_failures,
                 "items_returned": raw_item_count,
                 "unique_items": len(unique_items),
                 "duplicates": max(0, raw_item_count - len(unique_items)),
+                "snapshot_times": snapshot_times,
+                "page_overlaps": page_overlaps,
                 "catalog_view_count": {
                     "unknown": catalog_unknown_views,
                     "zero": catalog_zero_views,
@@ -550,6 +746,7 @@ async def run_probe(config: VintedProbeConfig, *, transport: httpx.AsyncBaseTran
                 "promoted_true": len(promoted_true),
             },
             "detail": {
+                "source": "public_item_html_next_hydration",
                 "requested": len(detail_targets),
                 "identity_ok": sum(1 for sample in detail_samples if sample.identity_ok),
                 "wrong_identity": len(wrong_identity),
@@ -564,8 +761,8 @@ async def run_probe(config: VintedProbeConfig, *, transport: httpx.AsyncBaseTran
             "latency_ms": {
                 "catalog_avg": _average_ms(client.records, "catalog"),
                 "catalog_p95": _percentile_ms(client.records, "catalog", 0.95),
-                "detail_avg": _average_ms(client.records, "detail_api"),
-                "detail_p95": _percentile_ms(client.records, "detail_api", 0.95),
+                "detail_avg": _average_ms(client.records, "detail_html"),
+                "detail_p95": _percentile_ms(client.records, "detail_html", 0.95),
             },
             "http_outcomes": status_counts,
             "quality_gates": {},
@@ -579,7 +776,6 @@ async def run_probe(config: VintedProbeConfig, *, transport: httpx.AsyncBaseTran
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         return report
-
 
 def _count_values(values: Iterable[str]) -> dict[str, int]:
     result: dict[str, int] = {}
@@ -641,7 +837,7 @@ def format_probe_summary(report: dict[str, Any]) -> str:
         data = gates.get(name, {}) if isinstance(gates, dict) else {}
         return "PASS" if data.get("pass") else "FAIL"
     return "\n".join([
-        "DT Vinted Probe v0.1",
+        "DT Vinted Probe v0.2",
         f"bootstrap={report.get('bootstrap_outcome')} elapsed={report.get('elapsed_seconds')}s",
         f"catalog requests={catalog.get('requests')} unique={catalog.get('unique_items')} duplicates={catalog.get('duplicates')} failures={len(catalog.get('failures') or [])}",
         f"catalog latency avg={latency.get('catalog_avg')}ms p95={latency.get('catalog_p95')}ms",
@@ -663,4 +859,5 @@ __all__ = [
     "format_probe_summary",
     "normalize_catalog_item",
     "normalize_detail_metrics",
+    "normalize_public_item_html",
 ]

@@ -13,7 +13,7 @@ class ReleaseStaticTests(unittest.TestCase):
             ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
     def test_release_version(self):
-        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.22.0")
+        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.22.1")
 
     def test_radar3_autoscan_is_today_only_and_baseline_only(self):
         bot = (ROOT / "bot.py").read_text(encoding="utf-8")
