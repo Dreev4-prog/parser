@@ -11674,6 +11674,21 @@ VINTED_ADMIN_MAX_CATEGORIES = 24
 _VINTED_ADMIN_CFG: dict[int, dict[str, Any]] = {}
 _VINTED_ADMIN_WATCHERS: dict[tuple[int, int], asyncio.Task] = {}
 
+# v4.23.5: Vinted Lab navigation should not wait on a fresh Redis/PostgreSQL round-trip
+# for every button.  These are tiny, deliberately short UI caches; scan/Radar workers
+# still write the source-of-truth state normally.  A stale value is preferable to a
+# frozen Telegram callback when Redis/DB is briefly busy with a full-market round.
+VINTED_UI_STATUS_CACHE_SECONDS = 2.0
+VINTED_UI_PROGRESS_CACHE_SECONDS = 3.0
+VINTED_UI_TREE_CACHE_SECONDS = 1800.0
+_VINTED_WORKER_STATUS_CACHE: tuple[float, dict[str, Any]] | None = None
+_VINTED_WORKER_STATUS_REFRESH_TASK: asyncio.Task | None = None
+_VINTED_SCAN_PROGRESS_CACHE: dict[int, tuple[float, dict[str, Any] | None]] = {}
+_VINTED_SCAN_PROGRESS_REFRESH_TASKS: dict[int, asyncio.Task] = {}
+_VINTED_SCANS_CACHE: dict[int, tuple[float, list[VintedScan]]] = {}
+_VINTED_SCANS_REFRESH_TASKS: dict[int, asyncio.Task] = {}
+_VINTED_TREE_CONTEXT_CACHE: tuple[float, list[dict[str, Any]], dict[int, dict[str, Any]], str] | None = None
+
 
 def _vinted_cfg(user_id: int) -> dict[str, Any]:
     cfg = _VINTED_ADMIN_CFG.get(int(user_id))
@@ -11704,28 +11719,127 @@ def _vinted_terminal(status: str) -> bool:
     return str(status or "") in {"completed", "partial", "failed", "cancelled"}
 
 
-async def _vinted_worker_status_fast(timeout: float = 2.0) -> dict[str, Any]:
-    """Keep Telegram callbacks responsive even when Redis is degraded."""
+def _vinted_empty_worker_status(error: str = "") -> dict[str, Any]:
+    return {
+        "enabled": bool(VINTED_QUEUE.enabled),
+        "error": str(error or ""),
+        "scan_workers": [],
+        "metrics_workers": [],
+        "scan_queue": 0,
+        "metrics_queue": 0,
+    }
+
+
+async def _vinted_refresh_worker_status(timeout: float = 0.75) -> None:
+    global _VINTED_WORKER_STATUS_CACHE, _VINTED_WORKER_STATUS_REFRESH_TASK
     try:
-        return await asyncio.wait_for(VINTED_QUEUE.worker_status(), timeout=max(0.5, float(timeout)))
+        status = await asyncio.wait_for(VINTED_QUEUE.worker_status(), timeout=max(0.25, float(timeout)))
+        _VINTED_WORKER_STATUS_CACHE = (time.monotonic(), status)
+    except Exception:
+        pass
+    finally:
+        if _VINTED_WORKER_STATUS_REFRESH_TASK is asyncio.current_task():
+            _VINTED_WORKER_STATUS_REFRESH_TASK = None
+
+
+async def _vinted_worker_status_fast(timeout: float = 0.75, *, force: bool = False) -> dict[str, Any]:
+    """Stale-while-revalidate worker state: repeated navigation never waits on Redis."""
+    global _VINTED_WORKER_STATUS_CACHE, _VINTED_WORKER_STATUS_REFRESH_TASK
+    now = time.monotonic()
+    cached = _VINTED_WORKER_STATUS_CACHE
+    if cached is not None and not force:
+        if now - cached[0] > VINTED_UI_STATUS_CACHE_SECONDS:
+            if _VINTED_WORKER_STATUS_REFRESH_TASK is None or _VINTED_WORKER_STATUS_REFRESH_TASK.done():
+                _VINTED_WORKER_STATUS_REFRESH_TASK = asyncio.create_task(_vinted_refresh_worker_status(timeout))
+        return cached[1]
+    try:
+        status = await asyncio.wait_for(VINTED_QUEUE.worker_status(), timeout=max(0.25, float(timeout)))
+        _VINTED_WORKER_STATUS_CACHE = (time.monotonic(), status)
+        return status
     except asyncio.TimeoutError:
-        return {
-            "enabled": bool(VINTED_QUEUE.enabled),
-            "error": "Redis status timeout",
-            "scan_workers": [],
-            "metrics_workers": [],
-            "scan_queue": 0,
-            "metrics_queue": 0,
-        }
+        if cached is not None:
+            return cached[1]
+        return _vinted_empty_worker_status("Redis status timeout")
     except Exception as exc:
-        return {
-            "enabled": bool(VINTED_QUEUE.enabled),
-            "error": f"{type(exc).__name__}: {exc}",
-            "scan_workers": [],
-            "metrics_workers": [],
-            "scan_queue": 0,
-            "metrics_queue": 0,
-        }
+        if cached is not None:
+            return cached[1]
+        return _vinted_empty_worker_status(f"{type(exc).__name__}: {exc}")
+
+
+async def _vinted_refresh_scans(key: int, timeout: float = 0.8) -> None:
+    try:
+        scans = await asyncio.wait_for(list_vinted_scans(key), timeout=max(0.25, float(timeout)))
+        _VINTED_SCANS_CACHE[key] = (time.monotonic(), scans)
+    except Exception:
+        pass
+    finally:
+        task = _VINTED_SCANS_REFRESH_TASKS.get(key)
+        if task is asyncio.current_task():
+            _VINTED_SCANS_REFRESH_TASKS.pop(key, None)
+
+
+async def _vinted_list_scans_fast(limit: int, *, timeout: float = 0.8, force: bool = False) -> list[VintedScan]:
+    key = max(1, min(50, int(limit)))
+    now = time.monotonic()
+    cached = _VINTED_SCANS_CACHE.get(key)
+    if cached is not None and not force:
+        if now - cached[0] > VINTED_UI_STATUS_CACHE_SECONDS:
+            task = _VINTED_SCANS_REFRESH_TASKS.get(key)
+            if task is None or task.done():
+                _VINTED_SCANS_REFRESH_TASKS[key] = asyncio.create_task(_vinted_refresh_scans(key, timeout))
+        return cached[1]
+    try:
+        scans = await asyncio.wait_for(list_vinted_scans(key), timeout=max(0.25, float(timeout)))
+        _VINTED_SCANS_CACHE[key] = (time.monotonic(), scans)
+        return scans
+    except Exception:
+        return cached[1] if cached is not None else []
+
+
+async def _vinted_refresh_scan_progress(scan_id: int, timeout: float = 0.9) -> None:
+    scan_id = int(scan_id)
+    try:
+        snapshot = await asyncio.wait_for(vinted_scan_progress(scan_id), timeout=max(0.25, float(timeout)))
+        _VINTED_SCAN_PROGRESS_CACHE[scan_id] = (time.monotonic(), snapshot)
+    except Exception:
+        pass
+    finally:
+        task = _VINTED_SCAN_PROGRESS_REFRESH_TASKS.get(scan_id)
+        if task is asyncio.current_task():
+            _VINTED_SCAN_PROGRESS_REFRESH_TASKS.pop(scan_id, None)
+
+
+def _vinted_schedule_scan_progress_refresh(scan_id: int, timeout: float = 0.9) -> None:
+    scan_id = int(scan_id)
+    task = _VINTED_SCAN_PROGRESS_REFRESH_TASKS.get(scan_id)
+    if task is None or task.done():
+        _VINTED_SCAN_PROGRESS_REFRESH_TASKS[scan_id] = asyncio.create_task(_vinted_refresh_scan_progress(scan_id, timeout))
+
+
+async def _vinted_scan_progress_fast(
+    scan_id: int, *, timeout: float = 0.9, force: bool = False, wait_if_cold: bool = True,
+) -> dict[str, Any] | None:
+    scan_id = int(scan_id)
+    now = time.monotonic()
+    cached = _VINTED_SCAN_PROGRESS_CACHE.get(scan_id)
+    if cached is not None and not force:
+        if now - cached[0] > VINTED_UI_PROGRESS_CACHE_SECONDS:
+            _vinted_schedule_scan_progress_refresh(scan_id, timeout)
+        return cached[1]
+    if cached is None and not force and not wait_if_cold:
+        _vinted_schedule_scan_progress_refresh(scan_id, timeout)
+        return None
+    try:
+        snapshot = await asyncio.wait_for(vinted_scan_progress(scan_id), timeout=max(0.25, float(timeout)))
+        _VINTED_SCAN_PROGRESS_CACHE[scan_id] = (time.monotonic(), snapshot)
+        if len(_VINTED_SCAN_PROGRESS_CACHE) > 64:
+            cutoff = time.monotonic() - 120.0
+            for old_id, (stamp, _value) in list(_VINTED_SCAN_PROGRESS_CACHE.items()):
+                if stamp < cutoff:
+                    _VINTED_SCAN_PROGRESS_CACHE.pop(old_id, None)
+        return snapshot
+    except Exception:
+        return cached[1] if cached is not None else None
 
 
 def _vinted_home_keyboard() -> InlineKeyboardMarkup:
@@ -11746,7 +11860,7 @@ async def _vinted_home_text() -> str:
     # On full-market scans that can mean tens of thousands of rows and made every admin
     # button look frozen.  Home now uses only Redis worker state + tiny DB metadata.
     worker_status, scans, radar_overview = await asyncio.gather(
-        _vinted_worker_status_fast(), list_vinted_scans(1), vinted_radar_overview()
+        _vinted_worker_status_fast(), _vinted_list_scans_fast(1), vinted_radar_overview()
     )
     scan_workers = len(list(worker_status.get("scan_workers") or []))
     metrics_workers = len(list(worker_status.get("metrics_workers") or []))
@@ -11790,8 +11904,15 @@ async def _vinted_home_text() -> str:
 
 
 async def _vinted_tree_context() -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]], str]:
+    global _VINTED_TREE_CONTEXT_CACHE
+    now = time.monotonic()
+    cached = _VINTED_TREE_CONTEXT_CACHE
+    if cached is not None and now - cached[0] <= VINTED_UI_TREE_CACHE_SECONDS:
+        return cached[1], cached[2], cached[3]
     roots, source = await fetch_vinted_catalog_tree()
-    return roots, flatten_vinted_catalog_tree(roots), source
+    flat = flatten_vinted_catalog_tree(roots)
+    _VINTED_TREE_CONTEXT_CACHE = (time.monotonic(), roots, flat, source)
+    return roots, flat, source
 
 
 def _vinted_setup_header(cfg: dict[str, Any], source: str) -> str:
@@ -11917,7 +12038,7 @@ def _vinted_scan_keyboard(scan: VintedScan) -> InlineKeyboardMarkup:
 
 
 async def _vinted_scan_text(scan_id: int) -> tuple[str, VintedScan | None]:
-    snapshot, worker_status = await asyncio.gather(vinted_scan_progress(scan_id), _vinted_worker_status_fast())
+    snapshot, worker_status = await asyncio.gather(_vinted_scan_progress_fast(scan_id), _vinted_worker_status_fast())
     if not snapshot:
         return "<b>Vinted scan не найден.</b>", None
     scan: VintedScan = snapshot["scan"]
@@ -12132,7 +12253,7 @@ def _vinted_session_open_keyboard(url: str) -> InlineKeyboardMarkup:
 
 
 async def _vinted_history_screen() -> tuple[str, InlineKeyboardMarkup]:
-    scans = await list_vinted_scans(12)
+    scans = await _vinted_list_scans_fast(12)
     rows: list[list[InlineKeyboardButton]] = []
     lines = ["<b>📂 Vinted · история сканов</b>"]
     if not scans:
@@ -12272,7 +12393,7 @@ async def _vinted_radar_screen(filter_name: str = "all", page: int = 0) -> tuple
         f"Охват: <b>весь рынок</b> · <b>{len(snapshot.categories)}</b> непересекающихся сегментов · до <b>{int(snapshot.pages)} стр.</b> каждый",
     ]
     if snapshot.last_scan_id:
-        current = await vinted_scan_progress(int(snapshot.last_scan_id))
+        current = await _vinted_scan_progress_fast(int(snapshot.last_scan_id), wait_if_cold=False)
         if current:
             current_scan: VintedScan = current["scan"]
             ps = dict(current.get("pages") or {})
@@ -12325,10 +12446,10 @@ async def _vinted_radar_screen(filter_name: str = "all", page: int = 0) -> tuple
         [InlineKeyboardButton(text="📡 Все", callback_data="av:radar:all:0"), InlineKeyboardButton(text="🔄 Обновить", callback_data=f"av:radar:{filter_name}:{page}")],
     ]
     if snapshot.last_scan_id:
-        latest_scan = await get_vinted_scan(int(snapshot.last_scan_id))
-        if latest_scan is not None:
-            pass_label = "🟣 Смотреть проход страниц" if not _vinted_terminal(latest_scan.status) else "📄 Последний проход страниц"
-            rows.append([InlineKeyboardButton(text=pass_label, callback_data=f"av:scan:{int(latest_scan.id)}")])
+        latest_cached = _VINTED_SCAN_PROGRESS_CACHE.get(int(snapshot.last_scan_id))
+        latest_scan = latest_cached[1].get("scan") if latest_cached and latest_cached[1] else None
+        pass_label = "🟣 Смотреть проход страниц" if latest_scan is not None and not _vinted_terminal(latest_scan.status) else "📄 Последний проход страниц"
+        rows.append([InlineKeyboardButton(text=pass_label, callback_data=f"av:scan:{int(snapshot.last_scan_id)}")])
     for entry in chunk:
         rows.append([InlineKeyboardButton(text=f"{_vinted_radar_status_icon(entry.status).split()[0]} {entry.score} · {(entry.title or str(entry.item_id))[:42]}", callback_data=f"av:ri:{entry.item_id}")])
     nav: list[InlineKeyboardButton] = []
@@ -12413,6 +12534,8 @@ async def _vinted_watch_scan(bot_obj: Bot, chat_id: int, message_id: int, scan_i
         while True:
             await asyncio.sleep(8)
             try:
+                # Force one fresh progress read per watcher tick; ordinary button navigation uses stale-while-revalidate.
+                await _vinted_scan_progress_fast(scan_id, force=True)
                 text_value, scan = await asyncio.wait_for(_vinted_scan_text(scan_id), timeout=4.0)
             except asyncio.TimeoutError:
                 continue

@@ -732,14 +732,27 @@ async def list_scans(limit: int = 12) -> list[VintedScan]:
 
 
 async def list_scan_items(scan_id: int, *, offset: int = 0, limit: int = 10) -> tuple[list[VintedScanItem], int]:
+    """Page saved items without re-sorting/counting a huge Radar table on every click."""
+    scan_id = int(scan_id)
     async with SessionLocal() as session:
-        total = int((await session.execute(
-            select(func.count(VintedScanItem.id)).where(VintedScanItem.scan_id == int(scan_id))
-        )).scalar_one() or 0)
+        scan = await session.get(VintedScan, scan_id)
+        if scan is None:
+            return [], 0
+        radar_mode = str(scan.mode or "manual") == "radar"
+        if radar_mode:
+            # Radar total_items is maintained atomically in save_catalog_page().  Avoid a
+            # COUNT(*) and a useless view_count sort over a full-market catalog-only scan.
+            total = int(scan.total_items or 0)
+            order_by = (VintedScanItem.id.asc(),)
+        else:
+            total = int((await session.execute(
+                select(func.count(VintedScanItem.id)).where(VintedScanItem.scan_id == scan_id)
+            )).scalar_one() or 0)
+            order_by = (VintedScanItem.view_count.is_(None), VintedScanItem.view_count.desc(), VintedScanItem.id.asc())
         rows = list((await session.execute(
             select(VintedScanItem)
-            .where(VintedScanItem.scan_id == int(scan_id))
-            .order_by(VintedScanItem.view_count.is_(None), VintedScanItem.view_count.desc(), VintedScanItem.id.asc())
+            .where(VintedScanItem.scan_id == scan_id)
+            .order_by(*order_by)
             .offset(max(0, int(offset)))
             .limit(max(1, min(25, int(limit))))
         )).scalars().all())

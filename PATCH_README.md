@@ -1,8 +1,8 @@
-# v4.23.4 GitHub patch
+# v4.23.5 GitHub patch
 
-Apply on top of **v4.23.3**.
+Apply on top of **v4.23.4**.
 
-Main fix: opening **Vinted Lab / Vinted Radar** no longer performs the large seven-day scoring/likes work on the Telegram UI path. Radar scoring is single-flight, cached for 120 seconds by default, CPU scoring is moved off the asyncio event loop, Radar progress stops repeatedly aggregating the full item table, and scan watchers cannot keep overwriting another Vinted screen.
+This patch removes the remaining Vinted Lab UI pauses: stale-while-revalidate Redis/PostgreSQL UI caches with strict timeouts, cached category-tree navigation, background-only stale Radar refresh, O(1) Radar item lookup, and fast full-market result paging without repeated `COUNT(*)` / `view_count` sorting.
 
 Replace the files from this archive preserving paths, then redeploy:
 
@@ -10,4 +10,4 @@ Replace the files from this archive preserving paths, then redeploy:
 - all Vinted Scan Worker replicas
 - all Vinted Metrics Worker replicas
 
-No SQL migration and no new Railway variables are required.
+No SQL migration and no new Railway variables are required. Vinted Session Worker is unchanged.

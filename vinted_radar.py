@@ -276,6 +276,10 @@ class VintedRadarSnapshot:
     pages: int
 
 
+VINTED_RADAR_UI_CONFIG_CACHE_SECONDS = 3.0
+_config_cache: tuple[float, dict[str, Any]] | None = None
+
+
 async def _load_setting() -> dict[str, Any]:
     async with SessionLocal() as session:
         row = await session.get(AppSetting, VINTED_RADAR_SETTING_KEY)
@@ -289,6 +293,7 @@ async def _load_setting() -> dict[str, Any]:
 
 
 async def _save_setting(payload: dict[str, Any]) -> None:
+    global _config_cache
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     async with SessionLocal() as session:
         row = await session.get(AppSetting, VINTED_RADAR_SETTING_KEY)
@@ -299,6 +304,7 @@ async def _save_setting(payload: dict[str, Any]) -> None:
             row.value = body
             row.updated_at = utcnow()
         await session.commit()
+    _config_cache = None
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -311,6 +317,11 @@ def _parse_dt(value: Any) -> datetime | None:
 
 
 async def radar_config() -> dict[str, Any]:
+    global _config_cache
+    now_mono = time.monotonic()
+    cached = _config_cache
+    if cached is not None and now_mono - cached[0] <= VINTED_RADAR_UI_CONFIG_CACHE_SECONDS:
+        return cached[1]
     raw = await _load_setting()
     categories = []
     for item in list(raw.get("categories") or []):
@@ -322,7 +333,7 @@ async def radar_config() -> dict[str, Any]:
             cid = 0
         if cid > 0:
             categories.append({"id": cid, "name": str(item.get("name") or f"Catalog {cid}")[:255]})
-    return {
+    cfg = {
         "enabled": bool(raw.get("enabled", False)),
         "admin_user_id": int(raw.get("admin_user_id") or 0),
         "scope": str(raw.get("scope") or "legacy_selected"),
@@ -335,6 +346,8 @@ async def radar_config() -> dict[str, Any]:
         "rounds_started": max(0, int(raw.get("rounds_started") or 0)),
         "updated_at": _parse_dt(raw.get("updated_at")),
     }
+    _config_cache = (time.monotonic(), cfg)
+    return cfg
 
 
 async def resolve_all_market_categories(*, force: bool = False, cached: list[dict[str, Any]] | None = None, cached_scope: str = "") -> tuple[list[tuple[int, str]], str]:
@@ -549,11 +562,13 @@ async def next_due_at() -> datetime | None:
 
 _cache_lock = asyncio.Lock()
 _cache_value: tuple[float, VintedRadarSnapshot] | None = None
+_cache_index: dict[int, VintedRadarEntry] = {}
 
 
 def invalidate_radar_cache() -> None:
-    global _cache_value
+    global _cache_value, _cache_index
     _cache_value = None
+    _cache_index = {}
 
 
 async def radar_overview() -> dict[str, Any]:
@@ -885,7 +900,7 @@ def _snapshot_is_fresh(cached: tuple[float, VintedRadarSnapshot] | None, now_mon
 
 
 async def build_radar_snapshot(*, force: bool = False) -> VintedRadarSnapshot:
-    global _cache_value
+    global _cache_value, _cache_index
     cached = _cache_value
     if not force and _snapshot_is_fresh(cached):
         return cached[1]
@@ -895,6 +910,7 @@ async def build_radar_snapshot(*, force: bool = False) -> VintedRadarSnapshot:
             return cached[1]
         started = time.monotonic()
         snapshot = await _build_snapshot()
+        _cache_index = {int(entry.item_id): entry for entry in snapshot.entries}
         _cache_value = (time.monotonic(), snapshot)
         log.info(
             "Vinted Radar snapshot rebuilt | rows/live_history=%s live=%s elapsed=%.2fs",
@@ -938,9 +954,14 @@ def peek_radar_snapshot() -> VintedRadarSnapshot | None:
 
 
 async def get_radar_entry(item_id: int, *, force: bool = False) -> VintedRadarEntry | None:
-    snapshot = await build_radar_snapshot(force=force)
+    """Return the last completed entry instantly; stale refresh stays background-only."""
     target = int(item_id)
-    for entry in snapshot.entries:
-        if entry.item_id == target:
-            return entry
-    return None
+    if force:
+        snapshot = await build_radar_snapshot(force=True)
+        return _cache_index.get(target) or next((entry for entry in snapshot.entries if entry.item_id == target), None)
+    cached = _cache_value
+    if cached is None:
+        request_radar_snapshot_refresh(force=False)
+        return None
+    request_radar_snapshot_refresh(force=False)
+    return _cache_index.get(target)
