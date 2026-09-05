@@ -61,7 +61,7 @@ def test_radar_admin_no_longer_requires_category_selection():
     assert '▶️ Запустить Radar · весь Vinted' in BOT
     assert 'callback_data="av:radarstart"' in BOT
     radar_start = BOT.split('if action == "radarstart":', 1)[1].split('if action == "radarstop":', 1)[0]
-    assert 'resolve_vinted_radar_categories(force=True)' in radar_start
+    assert 'resolve_vinted_radar_categories(force=False)' in radar_start
     assert 'categories=categories' in radar_start
 
 

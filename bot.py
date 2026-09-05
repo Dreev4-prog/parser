@@ -11775,7 +11775,7 @@ def _vinted_setup_header(cfg: dict[str, Any], source: str) -> str:
     return (
         f"<b>{_vinted_mode_label(mode)}</b>\n\n"
         f"Категории: <b>{len(selected)}/{VINTED_ADMIN_MAX_CATEGORIES}</b> · глубина: <b>{int(cfg.get('pages') or 3)} стр.</b>\n"
-        f"Каталог Vinted: <b>{'live' if str(source).startswith('live') else 'fallback'}</b>{selected_line}\n\n"
+        f"Каталог Vinted: <b>{'live' if str(source).startswith('live') else ('snapshot' if str(source).startswith('snapshot') else 'fallback')}</b>{selected_line}\n\n"
         "Выбирай разделы. Можно зайти внутрь дерева или выбрать весь текущий раздел."
         + radar_note
     )
@@ -12441,16 +12441,61 @@ async def vinted_admin_lab_handler(callback: CallbackQuery) -> None:
 
     if action == "radarstart":
         if not VINTED_QUEUE.enabled:
-            await callback.answer("Vinted Lab: REDIS_URL не подключён к Parser.", show_alert=True)
+            await _edit_or_answer(
+                callback.message,
+                "<b>📡 Vinted Radar 1.0</b>\n\n🔴 REDIS_URL не подключён к Parser — очередь Radar недоступна.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Radar", callback_data="av:radar:all:0")]]),
+            )
             return
-        categories, source = await resolve_vinted_radar_categories(force=True)
-        if not categories:
-            await callback.answer("Не удалось получить полный live-каталог Vinted. Radar не запущен частично — попробуй ещё раз через минуту.", show_alert=True)
-            return
-        scan = await create_vinted_scan(
-            admin_user_id=callback.from_user.id, mode="radar", categories=categories, pages=VINTED_RADAR_PAGES_PER_CATEGORY,
+
+        # v4.23.2: answer the user immediately.  v4.23.1 waited for a forced
+        # network catalog refresh before editing the message, so a 403/timeout looked
+        # exactly like a dead button.  All later failures are rendered in the message
+        # instead of trying to answer the same Telegram callback a second time.
+        await _edit_or_answer(
+            callback.message,
+            "<b>📡 Vinted Radar 1.0 · запуск</b>\n\n"
+            "⏳ <b>1/3</b> Получаю полный каталог Vinted…\n"
+            f"План: все конечные категории · по <b>{VINTED_RADAR_PAGES_PER_CATEGORY}</b> страниц.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Radar", callback_data="av:radar:all:0")]]),
         )
         try:
+            categories, source = await resolve_vinted_radar_categories(force=False)
+        except Exception as exc:
+            log.exception("Vinted Radar catalog resolve failed")
+            categories, source = [], f"error:{type(exc).__name__}"
+        if not categories:
+            await _edit_or_answer(
+                callback.message,
+                "<b>📡 Vinted Radar 1.0</b>\n\n"
+                "🔴 Не удалось подтвердить полный каталог Vinted. Частичный Radar специально не запускаю.\n"
+                f"Источник: <code>{html.escape(str(source or 'unavailable'))}</code>\n\n"
+                "Нажми повторить: live-каталог проверится снова, затем используется безопасный metadata snapshot.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Повторить запуск", callback_data="av:radarstart")],
+                    [InlineKeyboardButton(text="⬅️ Radar", callback_data="av:radar:all:0")],
+                ]),
+            )
+            return
+
+        await _edit_or_answer(
+            callback.message,
+            "<b>📡 Vinted Radar 1.0 · запуск</b>\n\n"
+            f"✅ Каталог: <b>{len(categories)}</b> конечных категорий · <code>{html.escape(str(source))}</code>\n"
+            f"⏳ <b>2/3</b> Создаю круг · {VINTED_RADAR_PAGES_PER_CATEGORY} страниц на категорию…",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Radar", callback_data="av:radar:all:0")]]),
+        )
+        try:
+            scan = await create_vinted_scan(
+                admin_user_id=callback.from_user.id, mode="radar", categories=categories, pages=VINTED_RADAR_PAGES_PER_CATEGORY,
+            )
+            await _edit_or_answer(
+                callback.message,
+                "<b>📡 Vinted Radar 1.0 · запуск</b>\n\n"
+                f"✅ Каталог: <b>{len(categories)}</b> категорий\n"
+                f"⏳ <b>3/3</b> Ставлю категории в очередь Scan Worker…",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Radar", callback_data="av:radar:all:0")]]),
+            )
             queued = await enqueue_vinted_scan(scan.id)
             if queued <= 0:
                 raise RuntimeError("empty queue")
@@ -12459,8 +12504,22 @@ async def vinted_admin_lab_handler(callback: CallbackQuery) -> None:
                 initial_scan_id=scan.id, initial_scan_at=scan.created_at,
             )
         except Exception as exc:
-            await cancel_vinted_scan(scan.id)
-            await callback.answer(f"Radar не удалось запустить: {type(exc).__name__}", show_alert=True)
+            if "scan" in locals() and scan is not None:
+                try:
+                    await cancel_vinted_scan(scan.id)
+                except Exception:
+                    pass
+            log.exception("Vinted Radar initial enqueue failed")
+            await _edit_or_answer(
+                callback.message,
+                "<b>📡 Vinted Radar 1.0</b>\n\n"
+                f"🔴 Запуск остановлен на очереди: <code>{html.escape(type(exc).__name__)}</code>.\n"
+                "Ни один частичный круг не будет считаться успешным.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Повторить запуск", callback_data="av:radarstart")],
+                    [InlineKeyboardButton(text="⬅️ Radar", callback_data="av:radar:all:0")],
+                ]),
+            )
             return
         text_value, fresh = await _vinted_scan_text(scan.id)
         fresh = fresh or scan

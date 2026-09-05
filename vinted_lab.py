@@ -58,6 +58,15 @@ FALLBACK_CATALOGS: list[dict[str, Any]] = [
 _catalog_cache: tuple[float, list[dict[str, Any]], str] | None = None
 _catalog_lock = asyncio.Lock()
 
+# v4.23.2: full-market Radar must not become a no-op when Vinted temporarily
+# hides `/api/v2/catalog/initializers` from Railway.  A current public DE catalog
+# snapshot is used only as metadata fallback; live Vinted data always has priority.
+VINTED_CATALOG_SNAPSHOT_URL = (
+    os.getenv("VINTED_CATALOG_SNAPSHOT_URL")
+    or "https://raw.githubusercontent.com/JakobAIOdev/vinted-dataset/main/output/de/groups.json"
+).strip()
+VINTED_CATALOG_SNAPSHOT_TIMEOUT_SECONDS = max(3.0, min(20.0, float(os.getenv("VINTED_CATALOG_SNAPSHOT_TIMEOUT_SECONDS", "8") or 8)))
+
 
 def utcnow() -> datetime:
     return datetime.utcnow()
@@ -164,6 +173,62 @@ def _normalize_catalog_node(raw: Any) -> dict[str, Any] | None:
     return {"id": catalog_id, "title": title, "catalogs": children}
 
 
+def _normalize_catalog_snapshot(payload: Any) -> list[dict[str, Any]]:
+    """Convert the public DE dataset shape (`children` mapping) to our catalog tree.
+
+    This fallback is metadata only.  It never contains demand metrics and is accepted
+    only after structural validation by the Radar resolver.
+    """
+    if not isinstance(payload, dict):
+        return []
+
+    def convert(label: str, raw: Any) -> dict[str, Any] | None:
+        if not isinstance(raw, dict):
+            return None
+        catalog_id = _int(raw.get("id"), 0)
+        if catalog_id <= 0:
+            return None
+        title = str(raw.get("title") or raw.get("name") or label or f"Catalog {catalog_id}").strip()
+        children_raw = raw.get("children")
+        children: list[dict[str, Any]] = []
+        if isinstance(children_raw, dict):
+            for child_label, child_raw in children_raw.items():
+                child = convert(str(child_label), child_raw)
+                if child is not None:
+                    children.append(child)
+        elif isinstance(children_raw, list):
+            for child_raw in children_raw:
+                child = convert("", child_raw)
+                if child is not None:
+                    children.append(child)
+        return {"id": catalog_id, "title": title, "catalogs": children}
+
+    roots: list[dict[str, Any]] = []
+    for label, raw in payload.items():
+        root = convert(str(label), raw)
+        if root is not None:
+            roots.append(root)
+    return roots
+
+
+async def _fetch_catalog_snapshot() -> list[dict[str, Any]]:
+    if not VINTED_CATALOG_SNAPSHOT_URL.startswith(("https://", "http://")):
+        return []
+    try:
+        headers = {"Accept": "application/json", "User-Agent": DEFAULT_USER_AGENT}
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=VINTED_CATALOG_SNAPSHOT_TIMEOUT_SECONDS) as client:
+            response = await client.get(VINTED_CATALOG_SNAPSHOT_URL)
+            if response.status_code != 200:
+                log.warning("Vinted catalog snapshot unavailable status=%s", response.status_code)
+                return []
+            roots = _normalize_catalog_snapshot(response.json())
+            if roots:
+                return roots
+    except Exception as exc:
+        log.warning("Vinted catalog snapshot fallback failed: %s", type(exc).__name__)
+    return []
+
+
 async def fetch_catalog_tree(*, force: bool = False) -> tuple[list[dict[str, Any]], str]:
     """Fetch current Vinted DE category roots, with a safe local fallback.
 
@@ -171,6 +236,7 @@ async def fetch_catalog_tree(*, force: bool = False) -> tuple[list[dict[str, Any
     block already-configured scans; the admin can still test the broad fallback roots.
     """
     global _catalog_cache
+    previous_cache = _catalog_cache
     now = time.monotonic()
     if not force and _catalog_cache and now - _catalog_cache[0] < 1800:
         return _catalog_cache[1], _catalog_cache[2]
@@ -245,6 +311,20 @@ async def fetch_catalog_tree(*, force: bool = False) -> tuple[list[dict[str, Any
                             return roots, "live"
         except Exception as exc:
             log.debug("Vinted catalog metadata fallback: %s", exc)
+
+        # A forced refresh must not destroy a previously validated complete tree.
+        if previous_cache and str(previous_cache[2]).startswith(("live", "snapshot")):
+            roots = json.loads(json.dumps(previous_cache[1]))
+            _catalog_cache = (time.monotonic(), roots, str(previous_cache[2]))
+            return roots, str(previous_cache[2])
+
+        # Public metadata snapshot fallback.  This is deliberately preferred over the
+        # tiny local demo tree because Radar promises an all-category market pass.
+        snapshot_roots = await _fetch_catalog_snapshot()
+        if snapshot_roots:
+            _catalog_cache = (time.monotonic(), snapshot_roots, "snapshot-de")
+            return snapshot_roots, "snapshot-de"
+
         roots = json.loads(json.dumps(FALLBACK_CATALOGS))
         _catalog_cache = (time.monotonic(), roots, "fallback")
         return roots, "fallback"

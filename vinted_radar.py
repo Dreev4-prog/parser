@@ -321,7 +321,7 @@ async def resolve_all_market_categories(*, force: bool = False, cached: list[dic
     complete market.
     """
     roots, source = await fetch_catalog_tree(force=force)
-    if str(source).startswith("live"):
+    if str(source).startswith(("live", "snapshot")):
         leaves = leaf_catalogs_from_tree(roots)
         if len(leaves) >= VINTED_RADAR_MIN_LEAF_CATEGORIES:
             return leaves, str(source)

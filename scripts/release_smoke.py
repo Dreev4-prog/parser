@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.23.1", "VERSION=4.23.1")
+    check((ROOT / "VERSION").read_text().strip() == "4.23.2", "VERSION=4.23.2")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -140,7 +140,7 @@ def main() -> int:
     check('callback_data="av:home"' in bot and '_vinted_watch_scan' in bot, "admin-only Vinted Lab has live progress UI")
     check('dtparser:vintedlab' in lab and 'SCAN_STREAM' in lab and 'METRICS_STREAM' in lab, "Vinted Lab uses an isolated Redis namespace")
     check('row.metric_status = "exact" if row.identity_ok and row.view_count is not None else "unknown"' in lab, "Vinted exact metrics remain fail-closed")
-    print("\nDT Parser 4.23.1 Vinted Radar 1.0 Full-Market Progress release smoke: PASS")
+    print("\nDT Parser 4.23.2 Vinted Radar 1.0 Start Hotfix release smoke: PASS")
     return 0
 
 
