@@ -11964,7 +11964,7 @@ async def _vinted_session_screen() -> tuple[str, InlineKeyboardMarkup]:
         captured = captured.replace("T", " ")[:19] + " UTC"
     lines = [
         "<b>🔐 Vinted Session</b>",
-        "<i>Вход открывается из админ-панели в одноразовом защищённом окне. Пароль в БД не сохраняется.</i>",
+        "<i>Вход выполняется в твоём обычном Chrome с твоего интернет-соединения. Railway больше не открывает страницу Vinted.</i>",
         "",
         f"Session: <b>{'🟢 сохранена' if session_raw else '🟠 не настроена'}</b>",
     ]
@@ -11993,11 +11993,11 @@ async def _vinted_session_screen() -> tuple[str, InlineKeyboardMarkup]:
         ])
     lines.extend([
         "",
-        "После сохранения Metrics Worker подхватят новую сессию автоматически примерно за 10–15 секунд — redeploy не нужен.",
+        "После локального входа Helper передаст только cookies авторизованной Vinted-сессии. Metrics Worker подхватят её автоматически примерно за 10–15 секунд — redeploy не нужен.",
     ])
     rows: list[list[InlineKeyboardButton]] = []
     if service_online and public_url.startswith("https://"):
-        rows.append([InlineKeyboardButton(text="🌐 Открыть вход Vinted", callback_data="av:sessionnew")])
+        rows.append([InlineKeyboardButton(text="🌐 Войти через мой Chrome", callback_data="av:sessionnew")])
     rows.append([InlineKeyboardButton(text="🔄 Проверить", callback_data="av:session")])
     if session_raw:
         rows.append([InlineKeyboardButton(text="🗑 Удалить сессию", callback_data="av:sessionclearask")])
@@ -12007,7 +12007,7 @@ async def _vinted_session_screen() -> tuple[str, InlineKeyboardMarkup]:
 
 def _vinted_session_open_keyboard(url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌐 Открыть Vinted и войти", url=url)],
+        [InlineKeyboardButton(text="🌐 Открыть локальный вход", url=url)],
         [InlineKeyboardButton(text="🔄 Я вошёл · проверить", callback_data="av:session")],
         [InlineKeyboardButton(text="⬅️ Vinted Session", callback_data="av:session")],
     ])
@@ -12139,10 +12139,12 @@ async def vinted_admin_lab_handler(callback: CallbackQuery) -> None:
         token = await create_session_ticket(callback.from_user.id, ttl_minutes=15)
         setup_url = f"{public_url}/setup#token={token}"
         text_value = (
-            "<b>🔐 Вход в Vinted</b>\n\n"
-            "Ссылка одноразовая и действует <b>15 минут</b>. Открой её, войди в свой Vinted и нажми "
-            "<b>✅ Сохранить сессию</b>. После этого вернись сюда.\n\n"
-            "<i>Пароль не сохраняется. Сохраняются только cookies авторизованной Vinted-сессии.</i>"
+            "<b>🔐 Локальный вход в Vinted</b>\n\n"
+            "Ссылка одноразовая и действует <b>15 минут</b>. Она откроет страницу DT Session, а сам Vinted затем "
+            "запустится <b>в твоём обычном Chrome</b> с твоего IP.\n\n"
+            "При первом использовании нужно один раз установить DT Vinted Local Helper. После этого достаточно просто войти в Vinted — "
+            "сессия сохранится автоматически.\n\n"
+            "<i>Пароль и 2FA DT не получает. Передаются только cookies подтверждённой Vinted-сессии.</i>"
         )
         await _edit_or_answer(callback.message, text_value, reply_markup=_vinted_session_open_keyboard(setup_url))
         return

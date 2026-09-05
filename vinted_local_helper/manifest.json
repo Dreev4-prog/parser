@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "DT Vinted Local Session Helper",
+  "version": "1.0.0",
+  "description": "Transfers your own logged-in Vinted browser session to your DT Vinted Session Worker after explicit pairing from the admin panel.",
+  "permissions": ["cookies", "storage", "tabs"],
+  "host_permissions": [
+    "https://www.vinted.de/*",
+    "https://vinted.de/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.vinted.de/*", "https://vinted.de/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_title": "DT Vinted Local Session Helper",
+    "default_popup": "popup.html"
+  }
+}

@@ -15,20 +15,23 @@ def test_admin_panel_has_one_click_session_flow():
     source = (ROOT / "bot.py").read_text(encoding="utf-8")
     assert 'text="🔐 Vinted Session"' in source
     assert 'callback_data="av:sessionnew"' in source
-    assert 'text="🌐 Открыть Vinted и войти"' in source
+    assert 'text="🌐 Открыть локальный вход"' in source
     assert "create_session_ticket" in source
     assert "get_session_service" in source
 
 
-def test_session_worker_is_isolated_and_manual_only():
+def test_session_worker_is_isolated_and_local_browser_only():
     source = (ROOT / "vinted_session_worker.py").read_text(encoding="utf-8")
     assert "Vinted Session Worker requires DATABASE_URL" in source
     assert "access_log=None" in source
-    assert "keyboard.insert_text" in source
-    assert "Never log text" in source
-    assert "CAPTCHA" not in source or "solve" not in source.lower()
+    assert "/api/local/import" in source
+    assert "/helper.zip" in source
+    assert "admin-local-browser-helper" in source
+    assert "playwright" not in source.lower()
+    assert "keyboard.insert_text" not in source
     assert "save_vinted_session" in source
-    assert "access_token_web" in source and "refresh_token_web" in source
+    local = (ROOT / "vinted_local_session.py").read_text(encoding="utf-8")
+    assert "access_token_web" in local
 
 
 def test_metrics_worker_hot_reloads_admin_db_session():
