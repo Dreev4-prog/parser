@@ -273,6 +273,38 @@ def flatten_catalog_tree(roots: Iterable[dict[str, Any]]) -> dict[int, dict[str,
     return out
 
 
+def leaf_catalogs_from_tree(roots: Iterable[dict[str, Any]]) -> list[tuple[int, str]]:
+    """Return every terminal market category once, with a readable breadcrumb.
+
+    Radar scans leaves only. Scanning a parent and its children in the same round would
+    over-sample the same listings and bias Like Momentum, so parent nodes are deliberately
+    excluded whenever they expose children.
+    """
+    leaves: list[tuple[int, str]] = []
+    seen: set[int] = set()
+
+    def walk(node: dict[str, Any], path: list[str]) -> None:
+        catalog_id = _int(node.get("id"), 0)
+        if catalog_id <= 0:
+            return
+        title = str(node.get("title") or f"Catalog {catalog_id}").strip()
+        current_path = [*path, title]
+        children = [child for child in list(node.get("catalogs") or []) if isinstance(child, dict) and _int(child.get("id"), 0) > 0]
+        if children:
+            for child in children:
+                walk(child, current_path)
+            return
+        if catalog_id in seen:
+            return
+        seen.add(catalog_id)
+        leaves.append((catalog_id, " › ".join(current_path)[-255:]))
+
+    for root in roots:
+        if isinstance(root, dict):
+            walk(root, [])
+    return leaves
+
+
 class VintedQueueUnavailable(RuntimeError):
     pass
 
@@ -437,7 +469,7 @@ def make_worker_id(role: str) -> str:
 
 async def create_scan(*, admin_user_id: int, mode: str, categories: list[tuple[int, str]], pages: int) -> VintedScan:
     mode = "radar" if mode == "radar" else "manual"
-    pages = max(1, min(10, int(pages)))
+    pages = max(1, min(15, int(pages)))
     uid = uuid.uuid4().hex[:16]
     now = utcnow()
     async with SessionLocal() as session:
@@ -812,20 +844,38 @@ async def scan_progress_snapshot(scan_id: int) -> dict[str, Any] | None:
             "max": int(like_row[4] or 0),
         }
         scan_units = 0.0
+        page_plan_max = 0
+        page_primary_done = 0
+        page_fetched_total = 0
+        status_counts = {"queued": 0, "running": 0, "completed": 0, "partial": 0, "failed": 0, "cancelled": 0}
         for row in cats:
+            target = max(1, int(row.pages_target or scan.pages_per_category or 1))
+            fetched = max(0, int(row.pages_fetched or 0))
+            page_plan_max += target
+            page_primary_done += min(target, fetched)
+            page_fetched_total += fetched
+            status_counts[str(row.status or "queued")] = status_counts.get(str(row.status or "queued"), 0) + 1
             if row.status in {"completed", "partial", "failed", "cancelled"}:
                 scan_units += 1.0
             else:
-                target = max(1, int(row.pages_target or scan.pages_per_category or 1))
-                scan_units += min(0.99, max(0.0, int(row.pages_fetched or 0) / target))
+                scan_units += min(0.99, max(0.0, fetched / target))
         scan_percent = round(100.0 * scan_units / max(1, len(cats)), 1)
+        page_percent = round(100.0 * page_primary_done / max(1, page_plan_max), 1) if page_plan_max else 0.0
         metrics_percent = round(100.0 * int(scan.metrics_done or 0) / max(1, int(scan.metrics_total or 0)), 1) if int(scan.metrics_total or 0) else 0.0
         return {
             "scan": scan,
             "categories": cats,
             "scan_percent": scan_percent,
+            "page_percent": page_percent,
             "metrics_percent": metrics_percent,
             "catalog_likes": catalog_likes,
+            "pages": {
+                "plan_max": page_plan_max,
+                "primary_done": page_primary_done,
+                "fetched_total": page_fetched_total,
+                "recovery": max(0, page_fetched_total - page_primary_done),
+            },
+            "category_status": status_counts,
         }
 
 

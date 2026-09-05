@@ -31,19 +31,23 @@ async def _process_task(client: VintedProbeClient, fields: dict[str, str], state
     scan_id = int(fields.get("scan_id") or 0)
     catalog_id = int(fields.get("catalog_id") or 0)
     category_name = str(fields.get("category_name") or f"Catalog {catalog_id}")
-    pages_target = max(1, min(10, int(fields.get("pages") or 3)))
+    pages_target = max(1, min(15, int(fields.get("pages") or 3)))
     if scan_id <= 0 or catalog_id <= 0:
         return
     if not await mark_category_running(scan_id, catalog_id):
         return
     collect_detail_metrics = await scan_collects_detail_metrics(scan_id)
 
-    state.update({"active": 1, "scan_id": scan_id, "catalog_id": catalog_id, "category": category_name, "page": 0})
+    state.update({"active": 1, "scan_id": scan_id, "catalog_id": catalog_id, "category": category_name, "page": 0, "pages_target": pages_target})
     seen: set[int] = set()
     duplicate_count = 0
     fetched_pages = 0
     target_unique = pages_target * client.config.per_page
-    max_pages = pages_target + client.config.recovery_pages
+    # Radar fairness is page-based: every terminal category gets the same primary
+    # depth and never receives hidden recovery pages. Manual Parser keeps bounded
+    # unique-depth recovery for its existing behaviour.
+    radar_mode = not collect_detail_metrics
+    max_pages = pages_target if radar_mode else pages_target + client.config.recovery_pages
     final_status = "completed"
     error_text = ""
     started = time.monotonic()
@@ -79,9 +83,11 @@ async def _process_task(client: VintedProbeClient, fields: dict[str, str], state
             state.update({"unique": len(seen), "duplicates": duplicate_count, "last_outcome": outcome})
             if len(items) < client.config.per_page:
                 break
-            if page >= pages_target and len(seen) >= target_unique:
+            if radar_mode and page >= pages_target:
                 break
-        if fetched_pages >= max_pages and len(seen) < target_unique:
+            if not radar_mode and page >= pages_target and len(seen) >= target_unique:
+                break
+        if not radar_mode and fetched_pages >= max_pages and len(seen) < target_unique:
             final_status = "partial"
             error_text = f"unique_depth {len(seen)}/{target_unique}"
     except Exception as exc:
@@ -104,6 +110,7 @@ async def _process_task(client: VintedProbeClient, fields: dict[str, str], state
             "catalog_id": 0,
             "category": "",
             "page": 0,
+            "pages_target": 0,
             "processed_categories": int(state.get("processed_categories", 0)) + 1,
             "last_seconds": round(time.monotonic() - started, 2),
             "last_unique": len(seen),

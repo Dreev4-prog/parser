@@ -1,18 +1,14 @@
-# v4.23.0 GitHub patch
+# v4.23.1 GitHub patch
 
-Накладывать поверх **v4.22.9**.
+Накладывать **поверх v4.23.0**.
 
-Изменённые файлы:
+Заменить/добавить файлы из архива с сохранением путей. После push/redeploy обязательны:
 
-- `VERSION`
-- `bot.py`
-- `vinted_lab.py`
-- `vinted_scan_worker.py`
-- `vinted_radar.py` (new)
-- `scripts/release_smoke.py`
-- `tests/test_release_static.py`
-- `tests/test_radar42114_startup_contract.py`
-- `tests/test_vinted_4230_radar10_contract.py` (new)
-- `RELEASE_4_23_0.md`
+- Parser / Bot
+- все Vinted Scan Worker
 
-После деплоя: redeploy Parser/Bot и Vinted Scan Worker replicas. Vinted Metrics Worker для Radar 1.0 больше не нужен, но остаётся для ручного Parser режима.
+Vinted Metrics Worker и Vinted Session Worker функционально этим патчем не менялись.
+
+Новых Railway variables и ручных SQL-миграций нет.
+
+После deploy старый Radar-конфиг с выбранными категориями больше не используется для новых due-rounds. Для чистого старта можно нажать «Остановить Radar AutoScan» и затем «▶️ Запустить Radar · весь Vinted».

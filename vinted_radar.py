@@ -11,11 +11,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Iterable
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from db import SessionLocal
-from models import AppSetting, VintedScan, VintedScanItem
-from vinted_lab import VINTED_QUEUE, create_scan, enqueue_scan, recalc_scan
+from models import AppSetting, VintedMetricHistory, VintedScan, VintedScanCategory, VintedScanItem
+from vinted_lab import (
+    VINTED_QUEUE, create_scan, enqueue_scan, fetch_catalog_tree, leaf_catalogs_from_tree, recalc_scan,
+)
 
 log = logging.getLogger("vinted-radar")
 
@@ -24,6 +26,9 @@ VINTED_RADAR_LIVE_HOURS = max(6, min(48, int(os.getenv("VINTED_RADAR_LIVE_HOURS"
 VINTED_RADAR_HISTORY_DAYS = max(2, min(30, int(os.getenv("VINTED_RADAR_HISTORY_DAYS", "7") or 7)))
 VINTED_RADAR_INTERVAL_MINUTES = max(15, min(360, int(os.getenv("VINTED_RADAR_INTERVAL_MINUTES", "60") or 60)))
 VINTED_RADAR_CACHE_SECONDS = max(5, min(120, int(os.getenv("VINTED_RADAR_CACHE_SECONDS", "20") or 20)))
+VINTED_RADAR_PAGES_PER_CATEGORY = 15
+VINTED_RADAR_SCOPE = "all_leaf_categories"
+VINTED_RADAR_MIN_LEAF_CATEGORIES = 20
 
 _TERMINAL_SCAN_STATES = {"completed", "partial", "failed", "cancelled"}
 _ACTIVE_SCAN_STATES = {"queued", "running", "metrics", "cancel_requested"}
@@ -295,8 +300,10 @@ async def radar_config() -> dict[str, Any]:
     return {
         "enabled": bool(raw.get("enabled", False)),
         "admin_user_id": int(raw.get("admin_user_id") or 0),
+        "scope": str(raw.get("scope") or "legacy_selected"),
+        "catalog_source": str(raw.get("catalog_source") or ""),
         "categories": categories,
-        "pages": max(1, min(10, int(raw.get("pages") or 3))),
+        "pages": VINTED_RADAR_PAGES_PER_CATEGORY,
         "interval_minutes": max(15, min(360, int(raw.get("interval_minutes") or VINTED_RADAR_INTERVAL_MINUTES))),
         "last_scan_id": int(raw.get("last_scan_id") or 0) or None,
         "last_scan_at": _parse_dt(raw.get("last_scan_at")),
@@ -305,16 +312,61 @@ async def radar_config() -> dict[str, Any]:
     }
 
 
+async def resolve_all_market_categories(*, force: bool = False, cached: list[dict[str, Any]] | None = None, cached_scope: str = "") -> tuple[list[tuple[int, str]], str]:
+    """Resolve the complete live Vinted market as terminal catalog categories.
+
+    A parent and its children are never scanned in the same Radar round. If Vinted's
+    category metadata is temporarily unavailable, an already validated full-market
+    snapshot is retained; a tiny local fallback is never silently advertised as the
+    complete market.
+    """
+    roots, source = await fetch_catalog_tree(force=force)
+    if str(source).startswith("live"):
+        leaves = leaf_catalogs_from_tree(roots)
+        if len(leaves) >= VINTED_RADAR_MIN_LEAF_CATEGORIES:
+            return leaves, str(source)
+        log.warning("Vinted Radar catalog tree looks incomplete source=%s leaves=%s", source, len(leaves))
+    if cached_scope == VINTED_RADAR_SCOPE and cached:
+        kept = []
+        seen: set[int] = set()
+        for item in cached:
+            try:
+                cid = int(item.get("id") or 0)
+            except Exception:
+                cid = 0
+            if cid > 0 and cid not in seen:
+                seen.add(cid)
+                kept.append((cid, str(item.get("name") or f"Catalog {cid}")[:255]))
+        if kept:
+            return kept, "cached-full-market"
+    return [], str(source or "unavailable")
+
+
+def _rotated_categories(categories: list[tuple[int, str]], round_index: int) -> list[tuple[int, str]]:
+    if not categories:
+        return []
+    # Shift the start by one category every round. Over time every category occupies
+    # every position in the pass, so no catalog is permanently first or last.
+    offset = max(0, int(round_index or 0)) % len(categories)
+    return categories[offset:] + categories[:offset]
+
+
 async def enable_radar(
-    *, admin_user_id: int, categories: list[tuple[int, str]], pages: int,
-    initial_scan_id: int | None = None, initial_scan_at: datetime | None = None,
+    *, admin_user_id: int, categories: list[tuple[int, str]] | None = None,
+    catalog_source: str = "", initial_scan_id: int | None = None, initial_scan_at: datetime | None = None,
 ) -> dict[str, Any]:
     now = utcnow()
+    if not categories:
+        categories, catalog_source = await resolve_all_market_categories(force=True)
+    if not categories:
+        raise RuntimeError("Vinted full catalog tree is temporarily unavailable")
     payload = {
         "enabled": True,
         "admin_user_id": int(admin_user_id),
+        "scope": VINTED_RADAR_SCOPE,
+        "catalog_source": str(catalog_source or "live")[:80],
         "categories": [{"id": int(cid), "name": str(name)[:255]} for cid, name in categories if int(cid) > 0],
-        "pages": max(1, min(10, int(pages))),
+        "pages": VINTED_RADAR_PAGES_PER_CATEGORY,
         "interval_minutes": VINTED_RADAR_INTERVAL_MINUTES,
         "last_scan_id": int(initial_scan_id or 0),
         "last_scan_at": (initial_scan_at or now).isoformat(timespec="seconds"),
@@ -331,8 +383,10 @@ async def disable_radar() -> dict[str, Any]:
     raw = {
         "enabled": False,
         "admin_user_id": cfg["admin_user_id"],
+        "scope": cfg.get("scope") or VINTED_RADAR_SCOPE,
+        "catalog_source": cfg.get("catalog_source") or "",
         "categories": cfg["categories"],
-        "pages": cfg["pages"],
+        "pages": VINTED_RADAR_PAGES_PER_CATEGORY,
         "interval_minutes": cfg["interval_minutes"],
         "last_scan_id": int(cfg.get("last_scan_id") or 0),
         "last_scan_at": cfg["last_scan_at"].isoformat(timespec="seconds") if cfg.get("last_scan_at") else "",
@@ -354,15 +408,39 @@ async def _latest_active_radar_scan() -> VintedScan | None:
         )).scalar_one_or_none()
 
 
+async def cleanup_expired_radar_scans(*, max_scans: int = 4) -> int:
+    """Bound Radar storage to the learning horizon without touching manual scans.
+
+    Full-market 15-page snapshots can be large. We keep seven complete learning days
+    plus one safety day, then delete old Radar children explicitly because these legacy
+    tables intentionally do not rely on database FK cascades.
+    """
+    cutoff = utcnow() - timedelta(days=VINTED_RADAR_HISTORY_DAYS + 1)
+    limit = max(1, min(24, int(max_scans or 4)))
+    async with SessionLocal() as session:
+        ids = list((await session.execute(
+            select(VintedScan.id)
+            .where(VintedScan.mode == "radar", VintedScan.created_at < cutoff)
+            .order_by(VintedScan.created_at.asc())
+            .limit(limit)
+        )).scalars().all())
+        if not ids:
+            return 0
+        await session.execute(delete(VintedMetricHistory).where(VintedMetricHistory.scan_id.in_(ids)))
+        await session.execute(delete(VintedScanItem).where(VintedScanItem.scan_id.in_(ids)))
+        await session.execute(delete(VintedScanCategory).where(VintedScanCategory.scan_id.in_(ids)))
+        await session.execute(delete(VintedScan).where(VintedScan.id.in_(ids)))
+        await session.commit()
+        log.info("Vinted Radar retention cleanup removed scans=%s cutoff=%s", len(ids), cutoff.isoformat(timespec="seconds"))
+        return len(ids)
+
+
 async def maybe_start_due_round() -> VintedScan | None:
     cfg = await radar_config()
-    if not cfg["enabled"] or not cfg["categories"] or not VINTED_QUEUE.enabled:
+    if not cfg["enabled"] or not VINTED_QUEUE.enabled:
         return None
     active = await _latest_active_radar_scan()
     if active is not None:
-        # v4.22.x Radar rounds could remain stuck in `metrics` because Exact Views
-        # were mandatory. Recalculate once under the catalog-only 1.0 contract so
-        # an old completed catalog round cannot block the new scheduler forever.
         fresh = await recalc_scan(active.id)
         if fresh is not None and str(fresh.status or "") in _ACTIVE_SCAN_STATES:
             return None
@@ -371,12 +449,24 @@ async def maybe_start_due_round() -> VintedScan | None:
     interval = timedelta(minutes=int(cfg["interval_minutes"]))
     if last_scan_at is not None and now < last_scan_at + interval:
         return None
-    categories = [(int(x["id"]), str(x["name"])) for x in cfg["categories"]]
+
+    try:
+        await cleanup_expired_radar_scans(max_scans=4)
+    except Exception:
+        log.exception("Vinted Radar retention cleanup failed")
+
+    categories, source = await resolve_all_market_categories(
+        force=True, cached=list(cfg.get("categories") or []), cached_scope=str(cfg.get("scope") or ""),
+    )
+    if not categories:
+        log.warning("Vinted Radar full-market round skipped: catalog metadata unavailable")
+        return None
+    ordered = _rotated_categories(categories, int(cfg.get("rounds_started") or 0))
     scan = await create_scan(
         admin_user_id=int(cfg["admin_user_id"] or 0),
         mode="radar",
-        categories=categories,
-        pages=int(cfg["pages"]),
+        categories=ordered,
+        pages=VINTED_RADAR_PAGES_PER_CATEGORY,
     )
     try:
         queued = await enqueue_scan(scan.id)
@@ -388,8 +478,10 @@ async def maybe_start_due_round() -> VintedScan | None:
     payload = {
         "enabled": True,
         "admin_user_id": int(cfg["admin_user_id"] or 0),
-        "categories": cfg["categories"],
-        "pages": int(cfg["pages"]),
+        "scope": VINTED_RADAR_SCOPE,
+        "catalog_source": source,
+        "categories": [{"id": cid, "name": name} for cid, name in categories],
+        "pages": VINTED_RADAR_PAGES_PER_CATEGORY,
         "interval_minutes": int(cfg["interval_minutes"]),
         "last_scan_id": int(scan.id),
         "last_scan_at": scan.created_at.isoformat(timespec="seconds"),
