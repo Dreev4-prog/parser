@@ -1,16 +1,18 @@
-# DT Parser v4.22.9 — Vinted Catalog Likes
+# v4.23.0 GitHub patch
 
-Накладывать поверх v4.22.8.
+Накладывать поверх **v4.22.9**.
 
-## Что делает патч
-- Поднимает `favourite_count` из Vinted catalog в отдельную рабочую метрику `Catalog Likes`.
-- Показывает покрытие, число товаров с лайками, сумму лайков и максимум.
-- В карточке товара показывает likes с источником `catalog` или `detail`.
-- Для повторного скана показывает Δ likes по тому же `item_id` относительно предыдущего сохранённого скана.
-- `UNKNOWN` никогда не превращается в `0`.
-- Не меняет Kleinanzeigen, Radar 3.x, Page/Date/View/Lifecycle workers или Vinted session flow.
+Изменённые файлы:
 
-## Деплой
-Заменить/добавить файлы из архива в корне репозитория, затем redeploy Parser. Vinted Scan Worker можно redeploy для одинаковой версии, но логика его каталога не менялась.
+- `VERSION`
+- `bot.py`
+- `vinted_lab.py`
+- `vinted_scan_worker.py`
+- `vinted_radar.py` (new)
+- `scripts/release_smoke.py`
+- `tests/test_release_static.py`
+- `tests/test_radar42114_startup_contract.py`
+- `tests/test_vinted_4230_radar10_contract.py` (new)
+- `RELEASE_4_23_0.md`
 
-Новых Railway Variables и SQL миграций нет.
+После деплоя: redeploy Parser/Bot и Vinted Scan Worker replicas. Vinted Metrics Worker для Radar 1.0 больше не нужен, но остаётся для ручного Parser режима.

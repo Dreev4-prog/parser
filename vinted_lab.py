@@ -509,6 +509,17 @@ async def get_scan(scan_id: int) -> VintedScan | None:
         return await session.get(VintedScan, int(scan_id))
 
 
+async def scan_collects_detail_metrics(scan_id: int) -> bool:
+    """Manual parser may probe detail metrics; Radar 1.0 is catalog-only.
+
+    Vinted Radar uses catalog likes and repeated catalog snapshots, so blocked detail
+    endpoints must never keep a Radar round in the metrics stage.
+    """
+    async with SessionLocal() as session:
+        row = await session.get(VintedScan, int(scan_id))
+        return bool(row is not None and str(row.mode or "manual") != "radar")
+
+
 async def get_scan_categories(scan_id: int) -> list[VintedScanCategory]:
     async with SessionLocal() as session:
         return list((await session.execute(
@@ -578,9 +589,12 @@ async def recalc_scan(scan_id: int) -> VintedScan | None:
             ).where(VintedScanItem.scan_id == scan.id)
         )).all())
         scan.total_items = len(metric_rows)
-        scan.metrics_total = scan.total_items
+        radar_catalog_only = str(scan.mode or "manual") == "radar"
+        scan.metrics_total = 0 if radar_catalog_only else scan.total_items
         terminal_metric_states = {"exact", "unknown", "error", "cancelled"}
-        scan.metrics_done = sum(1 for status, _views, _fav, _upload in metric_rows if str(status or "") in terminal_metric_states)
+        scan.metrics_done = 0 if radar_catalog_only else sum(
+            1 for status, _views, _fav, _upload in metric_rows if str(status or "") in terminal_metric_states
+        )
         scan.exact_views = sum(1 for _status, views, _fav, _upload in metric_rows if views is not None)
         scan.exact_favourites = sum(1 for _status, _views, fav, _upload in metric_rows if fav is not None)
         scan.chronology_count = sum(1 for _status, _views, _fav, upload in metric_rows if upload is not None)

@@ -154,6 +154,14 @@ from vinted_session_store import (
     clear_vinted_session, create_session_ticket, get_session_service,
     load_vinted_session_json, load_vinted_session_meta,
 )
+from vinted_radar import (
+    VINTED_RADAR_HISTORY_DAYS, VINTED_RADAR_INTERVAL_MINUTES, VINTED_RADAR_LIVE_HOURS,
+    build_radar_snapshot as build_vinted_radar_snapshot,
+    disable_radar as disable_vinted_radar,
+    enable_radar as enable_vinted_radar,
+    get_radar_entry as get_vinted_radar_entry,
+    maybe_start_due_round as maybe_start_vinted_radar_round,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("kleinanzeigen-bot")
@@ -11685,7 +11693,7 @@ def _vinted_status_label(status: str) -> str:
 
 
 def _vinted_mode_label(mode: str) -> str:
-    return "📡 Vinted Radar · тестовый круг" if str(mode) == "radar" else "🔎 Vinted Parser"
+    return "📡 Vinted Radar 1.0" if str(mode) == "radar" else "🔎 Vinted Parser"
 
 
 def _vinted_terminal(status: str) -> bool:
@@ -11694,8 +11702,9 @@ def _vinted_terminal(status: str) -> bool:
 
 def _vinted_home_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📡 Vinted Radar 1.0", callback_data="av:radar:all:0")],
+        [InlineKeyboardButton(text="⚙️ Настроить Radar", callback_data="av:new:r")],
         [InlineKeyboardButton(text="🔎 Новый Vinted-скан", callback_data="av:new:m")],
-        [InlineKeyboardButton(text="📡 Тестовый Radar-круг", callback_data="av:new:r")],
         [InlineKeyboardButton(text="📂 История сканов", callback_data="av:history")],
         [InlineKeyboardButton(text="🔐 Vinted Session", callback_data="av:session")],
         [InlineKeyboardButton(text="⚙️ Vinted Workers", callback_data="av:workers")],
@@ -11705,7 +11714,9 @@ def _vinted_home_keyboard() -> InlineKeyboardMarkup:
 
 
 async def _vinted_home_text() -> str:
-    worker_status, scans = await asyncio.gather(VINTED_QUEUE.worker_status(), list_vinted_scans(1))
+    worker_status, scans, radar_snapshot = await asyncio.gather(
+        VINTED_QUEUE.worker_status(), list_vinted_scans(1), build_vinted_radar_snapshot()
+    )
     scan_workers = len(list(worker_status.get("scan_workers") or []))
     metrics_workers = len(list(worker_status.get("metrics_workers") or []))
     lines = [
@@ -11716,9 +11727,11 @@ async def _vinted_home_text() -> str:
         f"Metrics Worker: <b>{'🟢' if metrics_workers else '🔴'} {metrics_workers}/2</b>",
         f"Очередь: scan <b>{int(worker_status.get('scan_queue', 0) or 0)}</b> · metrics <b>{int(worker_status.get('metrics_queue', 0) or 0)}</b>",
         "",
-        "<b>Режим теста</b>",
-        "🔎 Parser — быстрый проход выбранных категорий + точные метрики, где Vinted их подтверждает.",
-        "📡 Radar — тот же изолированный baseline-круг. Rising/Hot включим только после прохождения Exact Views gate.",
+        f"📡 Radar AutoScan: <b>{'🟢 ВКЛ' if radar_snapshot.auto_enabled else '⏸ ВЫКЛ'}</b> · Live <b>{radar_snapshot.live_total}</b> · HOT <b>{radar_snapshot.hot}</b> · Rising <b>{radar_snapshot.rising}</b>",
+        "",
+        "<b>Режимы</b>",
+        "🔎 Parser — разовый проход выбранных категорий.",
+        f"📡 Radar 1.0 — Catalog Likes + повторные замеры каждые {VINTED_RADAR_INTERVAL_MINUTES} мин.; Live-окно {VINTED_RADAR_LIVE_HOURS} ч.",
     ]
     if worker_status.get("error"):
         lines.extend(["", f"⚠️ Redis: <code>{html.escape(str(worker_status['error'])[:180])}</code>"])
@@ -11732,8 +11745,9 @@ async def _vinted_home_text() -> str:
             f"{_vinted_mode_label(scan.mode)} · {_vinted_status_label(scan.status)}",
             f"Категории: <b>{int(scan.completed_categories or 0)}/{int(scan.total_categories or 0)}</b> · товаров: <b>{int(scan.total_items or 0)}</b>",
             f"❤️ Catalog likes: <b>{int(like_stats.get('total', 0) or 0)}</b> · с лайками: <b>{int(like_stats.get('nonzero', 0) or 0)}</b>/{int(like_stats.get('known', 0) or 0)}",
-            f"Exact views: <b>{int(scan.exact_views or 0)}</b> · chronology: <b>{int(scan.chronology_count or 0)}</b>",
         ])
+        if scan.mode != "radar":
+            lines.append(f"Exact views: <b>{int(scan.exact_views or 0)}</b> · chronology: <b>{int(scan.chronology_count or 0)}</b>")
     return "\n".join(lines)
 
 
@@ -11752,11 +11766,17 @@ def _vinted_setup_header(cfg: dict[str, Any], source: str) -> str:
         if len(selected_names) > 5:
             preview += f" … +{len(selected_names) - 5}"
         selected_line = f"\nВыбрано: <i>{preview}</i>"
+    radar_note = (
+        f"\n\n<i>Radar 1.0 после запуска будет повторять эти категории каждые {VINTED_RADAR_INTERVAL_MINUTES} мин. "
+        f"Товар участвует в Live {VINTED_RADAR_LIVE_HOURS} ч от первого обнаружения.</i>"
+        if mode == "radar" else ""
+    )
     return (
         f"<b>{_vinted_mode_label(mode)}</b>\n\n"
         f"Категории: <b>{len(selected)}/{VINTED_ADMIN_MAX_CATEGORIES}</b> · глубина: <b>{int(cfg.get('pages') or 3)} стр.</b>\n"
         f"Каталог Vinted: <b>{'live' if str(source).startswith('live') else 'fallback'}</b>{selected_line}\n\n"
         "Выбирай разделы. Можно зайти внутрь дерева или выбрать весь текущий раздел."
+        + radar_note
     )
 
 
@@ -11817,7 +11837,8 @@ async def _vinted_category_screen(user_id: int, node_id: int = 0, page: int = 0)
 
     rows.append(_vinted_pages_row(cfg))
     if selected:
-        rows.append([InlineKeyboardButton(text=f"▶️ Запустить · {len(selected)} кат.", callback_data="av:start")])
+        start_label = (f"📡 Запустить Radar · {len(selected)} кат." if str(cfg.get("mode") or "manual") == "radar" else f"▶️ Запустить · {len(selected)} кат.")
+        rows.append([InlineKeyboardButton(text=start_label, callback_data="av:start")])
         rows.append([InlineKeyboardButton(text="🧹 Очистить выбор", callback_data="av:clear")])
     if node_id:
         rows.append([InlineKeyboardButton(text="⬅️ Уровень выше", callback_data=f"av:cat:{parent_id}:0")])
@@ -11888,16 +11909,25 @@ async def _vinted_scan_text(scan_id: int) -> tuple[str, VintedScan | None]:
         "<b>❤️ Likes из каталога</b>",
         f"Считано: <b>{int(like_stats.get('known', 0) or 0)}/{int(like_stats.get('items', 0) or 0)}</b> · с лайками: <b>{int(like_stats.get('nonzero', 0) or 0)}</b>",
         f"Всего ❤️: <b>{int(like_stats.get('total', 0) or 0)}</b> · максимум у товара: <b>{int(like_stats.get('max', 0) or 0)}</b>",
-        "",
-        "<b>👁 Exact Metrics</b>",
-        f"{_progress_bar(int(metric_pct))} <b>{metric_pct:.1f}%</b>",
-        f"Проверено: <b>{int(scan.metrics_done or 0)}/{int(scan.metrics_total or 0)}</b>",
-        f"✅ Exact views: <b>{int(scan.exact_views or 0)}</b> · ❓ views UNKNOWN: <b>{unknown_views}</b>",
-        f"🕒 Chronology: <b>{int(scan.chronology_count or 0)}</b> · detail likes: <b>{int(scan.exact_favourites or 0)}</b>",
-        f"Provider: <b>{provider_line}</b>",
     ]
     if scan.mode == "radar":
-        lines.extend(["", "<i>Radar-тест сейчас собирает baseline. Rising/Hot не вычисляются, пока Exact Views gate не подтверждён.</i>"])
+        lines.extend([
+            "",
+            "<b>📡 Radar 1.0</b>",
+            f"Этот круг — один snapshot. Повтор: каждые <b>{VINTED_RADAR_INTERVAL_MINUTES} мин.</b>",
+            f"Live-окно товара: <b>{VINTED_RADAR_LIVE_HOURS} ч</b> от первого обнаружения.",
+            "<i>Views/detail API для Radar не используются. Первый замер ❤️ — baseline; Rising/Hot появляются только после подтверждённого роста.</i>",
+        ])
+    else:
+        lines.extend([
+            "",
+            "<b>👁 Exact Metrics</b>",
+            f"{_progress_bar(int(metric_pct))} <b>{metric_pct:.1f}%</b>",
+            f"Проверено: <b>{int(scan.metrics_done or 0)}/{int(scan.metrics_total or 0)}</b>",
+            f"✅ Exact views: <b>{int(scan.exact_views or 0)}</b> · ❓ views UNKNOWN: <b>{unknown_views}</b>",
+            f"🕒 Chronology: <b>{int(scan.chronology_count or 0)}</b> · detail likes: <b>{int(scan.exact_favourites or 0)}</b>",
+            f"Provider: <b>{provider_line}</b>",
+        ])
     if cats:
         lines.extend(["", "<b>Категории</b>"])
         for row in cats[:8]:
@@ -12083,6 +12113,159 @@ async def _vinted_result_screen(scan_id: int, offset: int) -> tuple[str, InlineK
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _vinted_radar_status_icon(status: str) -> str:
+    return {
+        "hot": "🔥 HOT",
+        "rising": "📈 RISING",
+        "deal": "💎 DEAL",
+        "candidate": "👀 CANDIDATE",
+        "baseline": "▫️ BASELINE",
+    }.get(str(status or ""), "▫️ BASELINE")
+
+
+def _vinted_radar_age(hours: float) -> str:
+    minutes = max(0, int(float(hours or 0.0) * 60))
+    if minutes < 60:
+        return f"{minutes}м"
+    h, m = divmod(minutes, 60)
+    return f"{h}ч {m}м" if m else f"{h}ч"
+
+
+def _vinted_radar_filter_name(value: str) -> str:
+    return {
+        "all": "Все сигналы",
+        "hot": "HOT",
+        "rising": "Rising",
+        "deal": "Deals",
+        "candidate": "Candidates",
+    }.get(str(value or "all"), "Все сигналы")
+
+
+async def _vinted_radar_screen(filter_name: str = "all", page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    filter_name = filter_name if filter_name in {"all", "hot", "rising", "deal", "candidate"} else "all"
+    page = max(0, int(page or 0))
+    snapshot = await build_vinted_radar_snapshot()
+    entries = [e for e in snapshot.entries if e.status != "baseline"]
+    if filter_name != "all":
+        entries = [e for e in entries if e.status == filter_name]
+    per_page = 5
+    pages = max(1, (len(entries) + per_page - 1) // per_page)
+    page = min(page, pages - 1)
+    chunk = entries[page * per_page:(page + 1) * per_page]
+
+    if snapshot.auto_enabled:
+        auto_line = f"🟢 AutoScan: каждые <b>{int(snapshot.auto_interval_minutes)} мин.</b>"
+        if snapshot.next_scan_at:
+            seconds = max(0, int((snapshot.next_scan_at - datetime.utcnow()).total_seconds()))
+            auto_line += f" · следующий примерно через <b>{max(0, seconds // 60)} мин.</b>"
+    else:
+        auto_line = "⏸ AutoScan: <b>выключен</b>"
+
+    lines = [
+        "<b>📡 Vinted Radar 1.0</b>",
+        f"<i>Like Momentum · Live {VINTED_RADAR_LIVE_HOURS}ч · обучение {VINTED_RADAR_HISTORY_DAYS} дней</i>",
+        "",
+        auto_line,
+        f"Категории: <b>{len(snapshot.categories)}</b> · глубина: <b>{int(snapshot.pages)} стр.</b>",
+        "",
+        f"🔥 HOT: <b>{snapshot.hot}</b> · 📈 Rising: <b>{snapshot.rising}</b> · 💎 Deals: <b>{snapshot.deals}</b>",
+        f"👀 Candidates: <b>{snapshot.candidates}</b> · baseline: <b>{snapshot.baselines}</b>",
+        f"Live товаров: <b>{snapshot.live_total}</b> · история: <b>{snapshot.history_items}</b>",
+        "",
+        f"<b>{html.escape(_vinted_radar_filter_name(filter_name))}</b> · стр. {page + 1}/{pages}",
+    ]
+    if not chunk:
+        lines.extend([
+            "",
+            "Пока подтверждённых сигналов нет.",
+            "<i>Первый замер ❤️ — только baseline. Для Rising/HOT нужен следующий Radar-круг и реальный рост лайков.</i>",
+        ])
+    else:
+        for entry in chunk:
+            delta = "—" if entry.like_delta is None else (f"+{entry.like_delta}" if entry.like_delta > 0 else str(entry.like_delta))
+            velocity = "—" if entry.like_velocity is None else f"{entry.like_velocity:.2f}/ч"
+            price = "—" if entry.price_amount is None else f"{entry.price_amount:g} {html.escape(entry.currency or 'EUR')}"
+            edge = "—" if entry.price_edge_pct is None else f"{entry.price_edge_pct:+.0f}%"
+            likes = "UNKNOWN" if entry.likes is None else str(entry.likes)
+            lines.extend([
+                "",
+                f"{_vinted_radar_status_icon(entry.status)} · <b>{entry.score}/100</b>",
+                f"<b>{html.escape((entry.title or f'Item {entry.item_id}')[:62])}</b>",
+                f"💶 {price} · 💸 к рынку <b>{edge}</b>",
+                f"❤️ <b>{likes}</b> · Δ <b>{delta}</b> · скорость <b>{velocity}</b>",
+                f"⏱ В Radar: <b>{_vinted_radar_age(entry.age_hours)}</b> · бренд: <b>{html.escape(entry.brand or '—')}</b>",
+            ])
+
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="🔥 HOT", callback_data="av:radar:hot:0"), InlineKeyboardButton(text="📈 Rising", callback_data="av:radar:rising:0")],
+        [InlineKeyboardButton(text="💎 Deals", callback_data="av:radar:deal:0"), InlineKeyboardButton(text="👀 Candidates", callback_data="av:radar:candidate:0")],
+        [InlineKeyboardButton(text="📡 Все", callback_data="av:radar:all:0"), InlineKeyboardButton(text="🔄 Обновить", callback_data=f"av:radar:{filter_name}:{page}")],
+    ]
+    for entry in chunk:
+        rows.append([InlineKeyboardButton(text=f"{_vinted_radar_status_icon(entry.status).split()[0]} {entry.score} · {(entry.title or str(entry.item_id))[:42]}", callback_data=f"av:ri:{entry.item_id}")])
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"av:radar:{filter_name}:{page - 1}"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"av:radar:{filter_name}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    if snapshot.auto_enabled:
+        rows.append([InlineKeyboardButton(text="⏸ Остановить Radar AutoScan", callback_data="av:radarstop")])
+    else:
+        rows.append([InlineKeyboardButton(text="⚙️ Настроить / запустить Radar", callback_data="av:new:r")])
+    rows.append([InlineKeyboardButton(text="⬅️ Vinted Lab", callback_data="av:home")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _vinted_radar_item_screen(item_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    entry = await get_vinted_radar_entry(item_id)
+    if entry is None:
+        return (
+            "<b>📡 Vinted Radar</b>\n\nТовар уже вышел из Live-окна или ещё не имеет Radar snapshot.",
+            InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Radar", callback_data="av:radar:all:0")]]),
+        )
+    delta = "—" if entry.like_delta is None else (f"+{entry.like_delta}" if entry.like_delta > 0 else str(entry.like_delta))
+    velocity = "—" if entry.like_velocity is None else f"{entry.like_velocity:.2f} ❤️/ч"
+    accel = "—" if entry.acceleration is None else f"{entry.acceleration:+.2f} ❤️/ч²"
+    price = "—" if entry.price_amount is None else f"{entry.price_amount:g} {html.escape(entry.currency or 'EUR')}"
+    median = "—" if entry.price_median is None else f"{entry.price_median:g} {html.escape(entry.currency or 'EUR')}"
+    edge = "—" if entry.price_edge_pct is None else f"{entry.price_edge_pct:+.1f}%"
+    likes = "UNKNOWN" if entry.likes is None else str(entry.likes)
+    pct = int(round(entry.like_percentile * 100)) if entry.like_percentile > 0 else 0
+    c = entry.components
+    lines = [
+        f"<b>{_vinted_radar_status_icon(entry.status)} · {entry.score}/100</b>",
+        "",
+        f"<b>{html.escape(entry.title or f'Item {entry.item_id}')}</b>",
+        f"Категория: <b>{html.escape(entry.category_name or '—')}</b>",
+        f"Бренд: <b>{html.escape(entry.brand or '—')}</b> · размер: <b>{html.escape(entry.size or '—')}</b>",
+        f"Состояние: <b>{html.escape(entry.condition or '—')}</b>",
+        "",
+        f"❤️ Likes: <b>{likes}</b> · Δ <b>{delta}</b>",
+        f"🚀 Like Velocity: <b>{velocity}</b> · percentile <b>P{pct}</b>",
+        f"⚡ Acceleration: <b>{accel}</b>",
+        f"⏱ В Radar: <b>{_vinted_radar_age(entry.age_hours)}</b> · замеров: <b>{entry.sample_count}</b>",
+        "",
+        f"💶 Цена: <b>{price}</b> · медиана похожих: <b>{median}</b>",
+        f"💸 Price Edge: <b>{edge}</b>",
+        f"💎 Похожих по бренду в Live: <b>{entry.scarcity_count}</b>",
+        f"👤 Объявлений этого продавца в Live: <b>{entry.seller_active_count}</b>",
+        "",
+        "<b>Score</b>",
+        f"❤️ Velocity <b>{c.get('like_velocity', 0)}/35</b> · 🚀 accel <b>{c.get('acceleration', 0)}/15</b>",
+        f"💸 price <b>{c.get('price_edge', 0)}/20</b> · ❤️ peers <b>{c.get('likes_vs_peers', 0)}/10</b>",
+        f"💎 scarcity <b>{c.get('scarcity', 0)}/10</b> · 👤 seller <b>{c.get('seller', 0)}/5</b> · 🔥 brand <b>{c.get('brand_momentum', 0)}/5</b>",
+    ]
+    if entry.sample_count < 2:
+        lines.extend(["", "<i>Первый замер — baseline. Demand-статус HOT/RISING появится только после подтверждённого роста ❤️.</i>"])
+    rows: list[list[InlineKeyboardButton]] = []
+    if entry.url:
+        rows.append([InlineKeyboardButton(text="🔗 Открыть Vinted", url=entry.url)])
+    rows.append([InlineKeyboardButton(text="⬅️ Radar", callback_data="av:radar:all:0")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def _vinted_watch_scan(bot_obj: Bot, chat_id: int, message_id: int, scan_id: int) -> None:
     """Best-effort live percentage updates. Manual Refresh remains the durable fallback."""
     try:
@@ -12179,6 +12362,25 @@ async def vinted_admin_lab_handler(callback: CallbackQuery) -> None:
         await _edit_or_answer(callback.message, text_value, reply_markup=keyboard)
         return
 
+    if action == "radar":
+        filter_name = parts[2] if len(parts) > 2 else "all"
+        page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+        text_value, keyboard = await _vinted_radar_screen(filter_name, page)
+        await _edit_or_answer(callback.message, text_value, reply_markup=keyboard)
+        return
+
+    if action == "ri":
+        item_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        text_value, keyboard = await _vinted_radar_item_screen(item_id)
+        await _edit_or_answer(callback.message, text_value, reply_markup=keyboard)
+        return
+
+    if action == "radarstop":
+        await disable_vinted_radar()
+        text_value, keyboard = await _vinted_radar_screen("all", 0)
+        await _edit_or_answer(callback.message, text_value, reply_markup=keyboard)
+        return
+
     if action == "new":
         cfg = _vinted_cfg(callback.from_user.id)
         cfg["selected"] = {}
@@ -12235,11 +12437,21 @@ async def vinted_admin_lab_handler(callback: CallbackQuery) -> None:
             categories=[(int(cid), str(name)) for cid, name in selected.items()],
             pages=int(cfg.get("pages") or 3),
         )
+        enqueue_ok = False
         try:
-            await enqueue_vinted_scan(scan.id)
+            queued = await enqueue_vinted_scan(scan.id)
+            enqueue_ok = queued > 0
         except Exception as exc:
             await cancel_vinted_scan(scan.id)
             await callback.answer(f"Не удалось поставить в очередь: {type(exc).__name__}", show_alert=True)
+        if enqueue_ok and str(cfg.get("mode") or "manual") == "radar":
+            await enable_vinted_radar(
+                admin_user_id=callback.from_user.id,
+                categories=[(int(cid), str(name)) for cid, name in selected.items()],
+                pages=int(cfg.get("pages") or 3),
+                initial_scan_id=scan.id,
+                initial_scan_at=scan.created_at,
+            )
         cfg["selected"] = {}
         text_value, fresh = await _vinted_scan_text(scan.id)
         fresh = fresh or scan
@@ -12280,6 +12492,28 @@ async def vinted_admin_lab_handler(callback: CallbackQuery) -> None:
         return
 
     await _edit_or_answer(callback.message, await _vinted_home_text(), reply_markup=_vinted_home_keyboard())
+async def vinted_radar_autoscan_scheduler() -> None:
+    """Persistent Vinted Radar 1.0 cadence.
+
+    The global category snapshot repeats hourly by default. Individual products
+    participate in Live scoring only for their first 24h; older observations remain
+    available to the seven-day learning/reference pool.
+    """
+    while True:
+        try:
+            scan = await maybe_start_vinted_radar_round()
+            if scan is not None:
+                log.info(
+                    "Vinted Radar 1.0 AutoScan queued | scan=%s categories=%s pages=%s",
+                    scan.id, scan.total_categories, scan.pages_per_category,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Vinted Radar 1.0 AutoScan scheduler error")
+        await asyncio.sleep(30)
+
+
 # ---- end Vinted Lab ---------------------------------------------------------------
 
 
@@ -17617,6 +17851,7 @@ async def main() -> None:
     organic_velocity_task = asyncio.create_task(organic_velocity_scheduler(), name="verified-organic-velocity")
     radar_autoscan_task = asyncio.create_task(radar_autoscan_scheduler(bot), name="dt-radar-autoscan")
     radar_daily_digest_task = asyncio.create_task(radar_daily_digest_scheduler(bot), name="dt-radar-daily-digest")
+    vinted_radar_task = asyncio.create_task(vinted_radar_autoscan_scheduler(), name="vinted-radar-1-autoscan")
     observation_tasks = [] if DISTRIBUTED_WORKERS else [
         asyncio.create_task(observation_scheduler(bot, i), name=f"view-observation-worker-{i}")
         for i in range(1, OBSERVATION_CONCURRENCY + 1)
@@ -17636,11 +17871,12 @@ async def main() -> None:
         organic_velocity_task.cancel()
         radar_autoscan_task.cancel()
         radar_daily_digest_task.cancel()
+        vinted_radar_task.cancel()
         for task in observation_tasks:
             task.cancel()
         for task in worker_tasks:
             task.cancel()
-        shutdown_tasks = [payment_task, subscription_task, archive_task, radar_task, radar_v3_observation_task, organic_velocity_task, radar_autoscan_task, radar_daily_digest_task, *observation_tasks, *worker_tasks]
+        shutdown_tasks = [payment_task, subscription_task, archive_task, radar_task, radar_v3_observation_task, organic_velocity_task, radar_autoscan_task, radar_daily_digest_task, vinted_radar_task, *observation_tasks, *worker_tasks]
         if distributed_queue_ticker_task is not None:
             shutdown_tasks.insert(0, distributed_queue_ticker_task)
         if ticker_task is not None:

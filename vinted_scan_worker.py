@@ -10,7 +10,7 @@ from app_version import APP_VERSION
 from db import init_db
 from vinted_lab import (
     VINTED_QUEUE, complete_category, make_worker_id, mark_category_running,
-    save_catalog_page,
+    save_catalog_page, scan_collects_detail_metrics,
 )
 from vinted_probe import VintedProbeClient, VintedProbeConfig
 
@@ -36,6 +36,7 @@ async def _process_task(client: VintedProbeClient, fields: dict[str, str], state
         return
     if not await mark_category_running(scan_id, catalog_id):
         return
+    collect_detail_metrics = await scan_collects_detail_metrics(scan_id)
 
     state.update({"active": 1, "scan_id": scan_id, "catalog_id": catalog_id, "category": category_name, "page": 0})
     seen: set[int] = set()
@@ -72,8 +73,9 @@ async def _process_task(client: VintedProbeClient, fields: dict[str, str], state
                 items=page_new,
                 duplicate_count=page_dupes,
             )
-            for item_id in new_ids:
-                await VINTED_QUEUE.enqueue_metric(scan_id=scan_id, item_id=item_id)
+            if collect_detail_metrics:
+                for item_id in new_ids:
+                    await VINTED_QUEUE.enqueue_metric(scan_id=scan_id, item_id=item_id)
             state.update({"unique": len(seen), "duplicates": duplicate_count, "last_outcome": outcome})
             if len(items) < client.config.per_page:
                 break
