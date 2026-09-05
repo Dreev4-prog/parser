@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import socket
 import time
 import uuid
@@ -68,6 +69,82 @@ def _int(value: Any, default: int = 0) -> int:
         return default
 
 
+
+def _balanced_json_slice(source: str, start: int) -> str | None:
+    if start < 0 or start >= len(source) or source[start] not in "[{":
+        return None
+    opener = source[start]
+    closer = "}" if opener == "{" else "]"
+    depth = 0
+    in_string = False
+    escaped = False
+    for idx in range(start, len(source)):
+        ch = source[idx]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return source[start:idx + 1]
+    return None
+
+
+def _json_array_after_marker(source: str, marker: str) -> list[Any] | None:
+    pos = source.find(marker)
+    if pos < 0:
+        return None
+    start = source.find("[", pos + len(marker))
+    if start < 0:
+        return None
+    blob = _balanced_json_slice(source, start)
+    if not blob:
+        return None
+    try:
+        parsed = json.loads(blob)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def _extract_catalog_tree_from_html(html_text: str) -> list[Any] | None:
+    """Read current nested catalog metadata from Vinted's own Next.js payload.
+
+    This is metadata only.  It does not open item pages or collect demand evidence.
+    The parser mirrors the normal page payload structure and falls back safely if
+    Vinted changes it.
+    """
+    if not html_text:
+        return None
+    sources = [html_text]
+    # Current Vinted serialises much of the catalog tree inside Next.js Flight chunks.
+    pattern = re.compile(r'self\.__next_f\.push\(\[\d+\s*,\s*("(?:[^"\\]|\\.)*")\s*\]\)', re.S)
+    for match in pattern.finditer(html_text):
+        try:
+            decoded = json.loads(match.group(1))
+        except Exception:
+            continue
+        if isinstance(decoded, str) and decoded:
+            sources.append(decoded)
+    markers = ('"catalogTree":', '"dtos":{"catalogs":', '\\"catalogTree\\":', '\\"dtos\\":{\\"catalogs\\":')
+    for source in sources:
+        for marker in markers:
+            tree = _json_array_after_marker(source, marker)
+            if tree:
+                return tree
+    return None
+
+
 def _normalize_catalog_node(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
@@ -108,10 +185,45 @@ async def fetch_catalog_tree(*, force: bool = False) -> tuple[list[dict[str, Any
             "User-Agent": DEFAULT_USER_AGENT,
             "Referer": f"{base}/catalog",
             "X-Requested-With": "XMLHttpRequest",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
         }
         try:
             async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=12.0) as client:
-                await client.get(f"{base}/catalog")
+                # If the admin captured a normal logged-in Vinted browser session, reuse only
+                # first-party cookies for category metadata. This often exposes the complete
+                # current tree when anonymous initializers are restricted. Missing/invalid
+                # session data still falls back safely and never blocks scanning.
+                raw_session = os.getenv("VINTED_SESSION_JSON", "").strip()
+                if raw_session:
+                    try:
+                        session_payload = json.loads(raw_session)
+                        cookies = session_payload.get("cookies") if isinstance(session_payload, dict) else session_payload
+                        host = base.split("//", 1)[-1].split("/", 1)[0]
+                        if isinstance(cookies, dict):
+                            for name, value in cookies.items():
+                                if isinstance(name, str) and value is not None:
+                                    client.cookies.set(name, str(value), domain=host, path="/")
+                        elif isinstance(cookies, list):
+                            for entry in cookies:
+                                if not isinstance(entry, dict):
+                                    continue
+                                name = str(entry.get("name") or "").strip()
+                                value = entry.get("value")
+                                domain = str(entry.get("domain") or host).strip() or host
+                                if name and value is not None and domain.lstrip(".").endswith("vinted.de"):
+                                    client.cookies.set(name, str(value), domain=domain, path=str(entry.get("path") or "/"))
+                    except Exception:
+                        pass
+                bootstrap_response = await client.get(f"{base}/catalog")
+                if bootstrap_response.status_code == 200:
+                    raw_tree = _extract_catalog_tree_from_html(bootstrap_response.text)
+                    if isinstance(raw_tree, list):
+                        roots = [node for raw in raw_tree if (node := _normalize_catalog_node(raw))]
+                        if roots:
+                            _catalog_cache = (time.monotonic(), roots, "live-page")
+                            return roots, "live-page"
                 response = await client.get(
                     f"{base}/api/v2/catalog/initializers",
                     params={"page": 1, "time": time.time()},

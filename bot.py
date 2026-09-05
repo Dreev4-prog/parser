@@ -175,7 +175,7 @@ _trial_credit_guard = asyncio.Lock()
 # backoff after partial/system failures. Non-product/service categories remain available
 # to the normal parser; they are excluded only from the automatic Radar seeding round.
 RADAR_AUTOSCAN_SETTING_KEY = "dt_radar_autoscan_v1"
-RADAR_AUTOSCAN_POLICY_VERSION = 6
+RADAR_AUTOSCAN_POLICY_VERSION = 7
 RADAR_AUTOSCAN_DEPTH = 20
 # Radar 3.0 observes live demand only on today's market. Yesterday context was retired in v4.21.5.
 RADAR_CONTEXT_DEPTH = 0
@@ -214,7 +214,39 @@ RADAR_AUTOSCAN_SYSTEM_BACKOFF_BASE_SECONDS = 8.0
 RADAR_AUTOSCAN_MAX_BACKOFF_SECONDS = 30.0
 RADAR_AUTOSCAN_SUCCESS_GAP_SECONDS = 0.25
 RADAR_AUTOSCAN_SAFE_VIEW_CONCURRENCY = 4
+# v4.22.6 Fast Today + Exact Tail. A tiny unresolved exact-view tail no longer
+# forces a full 20-page category rescan. Unknown counters stay NULL and therefore
+# cannot seed Radar; only the verified majority creates baselines. A materially
+# incomplete batch remains fail-closed and still goes to the normal retry list.
+RADAR_AUTOSCAN_MIN_VIEW_COVERAGE_PCT = 99.0
+RADAR_AUTOSCAN_VIEW_SOFT_TAIL_MIN = 3
+RADAR_AUTOSCAN_VIEW_SOFT_TAIL_MAX = 8
+RADAR_AUTOSCAN_VIEW_TAIL_RETRY_MAX = 12
 RADAR_AUTOSCAN_LAUNCH_WATCHDOG_SECONDS = 20
+
+
+def _radar_autoscan_view_tail_budget(requested: int) -> int:
+    requested = max(0, int(requested or 0))
+    if requested <= 0:
+        return 0
+    one_percent = max(1, (requested + 99) // 100)
+    return min(
+        RADAR_AUTOSCAN_VIEW_SOFT_TAIL_MAX,
+        max(RADAR_AUTOSCAN_VIEW_SOFT_TAIL_MIN, one_percent),
+    )
+
+
+def _radar_autoscan_views_usable(requested: int, verified: int) -> bool:
+    requested = max(0, int(requested or 0))
+    verified = max(0, min(requested, int(verified or 0))) if requested else 0
+    if requested <= 0 or verified >= requested:
+        return True
+    missing = requested - verified
+    coverage_pct = (verified / requested) * 100.0
+    return (
+        coverage_pct >= RADAR_AUTOSCAN_MIN_VIEW_COVERAGE_PCT
+        and missing <= _radar_autoscan_view_tail_budget(requested)
+    )
 # v4.12.0 Daily Radar Growth Loop. One factual daily digest turns the live Radar
 # database into a recurring acquisition/retention surface. The digest is enabled by
 # default, sends at 20:00 Moscow time, and stores its last send date in AppSetting so
@@ -3723,13 +3755,14 @@ async def enrich_autoscan_view_counts(
     items: list[ParsedListing],
     live: CategoryLiveProgress | None = None,
 ) -> tuple[int, int, int]:
-    """Exact, completeness-first view collection for Radar AutoScan.
+    """Collect exact Radar counters with the dedicated View Worker fleet first.
 
-    v4.15.4 removes the old 24-item recovery cap. The cheap official counter is
-    still tried for every clean listing first. Every unresolved URL is then sent
-    through the exact View Worker/browser path. If any URL remains unknown, the
-    category is marked Radar-incomplete and is NOT ranked, because an unknown ad
-    could otherwise be the real TOP-1.
+    v4.22.6 removes the old "Parser HTTP pass over every ad -> View Worker only for
+    misses" bottleneck when the fleet is healthy. The whole exact batch is sharded
+    across the dedicated View Workers immediately. The proven local parser remains a
+    bounded fallback, and a *small* unresolved tail gets one final targeted exact
+    retry. Every unresolved value is persisted as NULL; no approximate/stale counter
+    can enter Radar.
     """
     if not items:
         return 0, 0, 0
@@ -3754,97 +3787,134 @@ async def enrich_autoscan_view_counts(
     url_to_id = {item.url: item.external_id for item in targets}
     total = len(urls)
     base_ready = int(live.views_ready or 0) if live is not None else 0
+    autoscan_view_priority = "scan_inline"
+    autoscan_view_concurrency = max(1, min(RADAR_AUTOSCAN_SAFE_VIEW_CONCURRENCY, VIEW_COUNT_CONCURRENCY))
 
-    async def direct_progress(done: int, _total: int) -> None:
+    async def fleet_progress(done: int, _total: int) -> None:
         if live is None:
             return
         live.views_ready = base_ready + min(total, max(0, int(done)))
         if done == _total or (done > 0 and done % 50 == 0):
             log.info(
-                "Radar AutoScan views direct category=%s checked=%s/%s",
+                "Radar AutoScan views fleet category=%s checked=%s/%s",
                 live.category_name, min(total, int(done)), total,
             )
 
-    # Exact counters are part of the foreground AutoScan category itself, not
-    # maintenance traffic. Marking them "background" throttled the category to
-    # TRAFFIC_BACKGROUND_VIEWS_DURING_SCANS (often one slot) and could make a
-    # healthy scan look stalled while the background pause was active.
-    autoscan_view_priority = "scan_inline"
-    autoscan_view_concurrency = max(1, min(RADAR_AUTOSCAN_SAFE_VIEW_CONCURRENCY, VIEW_COUNT_CONCURRENCY))
-    log.info(
-        "Radar AutoScan views start category=%s total=%s priority=%s concurrency=%s",
-        (live.category_name if live is not None else "autoscan"), total, autoscan_view_priority, autoscan_view_concurrency,
-    )
-
-    direct_results = await parser.fetch_public_view_counts(
-        urls,
-        concurrency=autoscan_view_concurrency,
-        progress_cb=direct_progress,
-        traffic_priority=autoscan_view_priority,
-        browser_fallback=False,
-        direct_http_only=True,
-        accurate=False,
-        batch_size=80,
-        batch_pause_seconds=0.05,
-    )
-
-    unresolved = [url for url in urls if direct_results.get(url) is None or direct_results[url].views is None]
-    exact_recovery: dict[str, ViewCountResult] = {}
-    if unresolved:
-        log.info(
-            "Radar AutoScan exact recovery category=%s unresolved=%s/%s remote_enabled=%s",
-            (live.category_name if live is not None else "autoscan"), len(unresolved), total, REMOTE_VIEW_WORKER_ENABLED,
-        )
-
-        async def recovery_progress(done: int, _total: int) -> None:
-            if live is None:
-                return
-            # Direct phase already visited every URL; recovery progress is shown in logs.
-            live.views_ready = base_ready + total
-            if done == _total or (done > 0 and done % 25 == 0):
-                log.info(
-                    "Radar AutoScan views recovery category=%s checked=%s/%s",
-                    live.category_name, int(done), len(unresolved),
-                )
-
-        # If this deployment is configured for the dedicated View Worker fleet,
-        # an absent heartbeat is a recoverable infrastructure problem, not a reason
-        # to open hundreds of exact browser fallbacks inside the main parser. Leave
-        # the misses unknown; the AutoScan category becomes ⚠️ and can be retried.
-        remote_ready = True
-        if REMOTE_VIEW_WORKER_ENABLED:
+    remote_ready = False
+    if REMOTE_VIEW_WORKER_ENABLED:
+        try:
             remote_ready = await REMOTE_VIEW_MANAGER.worker_alive()
-            if not remote_ready:
-                log.warning(
-                    "Radar AutoScan exact worker offline category=%s unresolved=%s; category will require retry",
-                    (live.category_name if live is not None else "autoscan"), len(unresolved),
-                )
-        if remote_ready:
-            try:
-                exact_recovery = await asyncio.wait_for(
-                    fetch_exact_views_v438_compatible(
-                        parser,
-                        unresolved,
-                        concurrency=autoscan_view_concurrency,
-                        progress_cb=recovery_progress,
-                        traffic_priority=autoscan_view_priority,
-                    ),
-                    timeout=RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                # Preserve direct exact counters and leave only the unresolved tail
-                # unknown. The category is then fail-closed and goes to retry.
-                exact_recovery = {}
-                log.warning(
-                    "Radar AutoScan exact recovery watchdog category=%s unresolved=%s timeout=%ss",
-                    (live.category_name if live is not None else "autoscan"), len(unresolved),
-                    int(RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS),
-                )
+        except Exception:
+            remote_ready = False
 
-    combined = dict(direct_results)
-    for url, result in exact_recovery.items():
-        if result.views is not None:
-            combined[url] = result
+    combined: dict[str, ViewCountResult] = {}
+    mode = "remote-fleet-first" if remote_ready else "direct-safe-fallback"
+    log.info(
+        "Radar AutoScan views start category=%s total=%s mode=%s priority=%s concurrency=%s",
+        (live.category_name if live is not None else "autoscan"), total, mode,
+        autoscan_view_priority, autoscan_view_concurrency,
+    )
+
+    try:
+        if remote_ready:
+            combined = await asyncio.wait_for(
+                fetch_exact_views_v438_compatible(
+                    parser,
+                    urls,
+                    concurrency=autoscan_view_concurrency,
+                    progress_cb=fleet_progress,
+                    traffic_priority=autoscan_view_priority,
+                ),
+                timeout=RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS,
+            )
+        else:
+            # Do not open hundreds of browser fallbacks inside Parser when the fleet
+            # is offline. The verified official counter remains a cheap safe salvage
+            # path; any remaining tail stays UNKNOWN and is judged by coverage below.
+            combined = await parser.fetch_public_view_counts(
+                urls,
+                concurrency=autoscan_view_concurrency,
+                progress_cb=fleet_progress,
+                traffic_priority=autoscan_view_priority,
+                browser_fallback=False,
+                direct_http_only=True,
+                accurate=False,
+                batch_size=80,
+                batch_pause_seconds=0.05,
+            )
+    except asyncio.TimeoutError:
+        log.warning(
+            "Radar AutoScan fleet watchdog category=%s total=%s timeout=%ss",
+            (live.category_name if live is not None else "autoscan"), total,
+            int(RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS),
+        )
+        combined = combined or {}
+
+    # Fleet output is authoritative when present, but an explicit UNKNOWN or a
+    # timed-out/missing shard may still be recoverable through the cheap verified
+    # official counter. Run that salvage only for the unresolved subset, never for
+    # URLs the fleet already completed. This preserves partial work and prevents a
+    # single bad shard from turning into a complete category replay.
+    unresolved = [url for url in urls if combined.get(url) is None or combined[url].views is None]
+    direct_salvaged = 0
+    if unresolved and remote_ready:
+        log.info(
+            "Radar AutoScan direct salvage category=%s unresolved=%s/%s",
+            (live.category_name if live is not None else "autoscan"), len(unresolved), total,
+        )
+        try:
+            salvage = await parser.fetch_public_view_counts(
+                unresolved,
+                concurrency=autoscan_view_concurrency,
+                progress_cb=None,
+                traffic_priority=autoscan_view_priority,
+                browser_fallback=False,
+                direct_http_only=True,
+                accurate=False,
+                batch_size=80,
+                batch_pause_seconds=0.05,
+            )
+            for url, result in salvage.items():
+                if result is not None and result.views is not None:
+                    combined[url] = result
+                    direct_salvaged += 1
+        except Exception:
+            log.warning(
+                "Radar AutoScan direct salvage failed category=%s unresolved=%s",
+                (live.category_name if live is not None else "autoscan"), len(unresolved),
+                exc_info=True,
+            )
+
+    unresolved = [url for url in urls if combined.get(url) is None or combined[url].views is None]
+    tail_recovered = 0
+    # A handful of transient misses should never cause a 20-page category replay.
+    # Retry only that exact tail once through the proven accurate path. Large tails
+    # are intentionally not browser-flooded here; they remain fail-closed/retryable.
+    if unresolved and len(unresolved) <= RADAR_AUTOSCAN_VIEW_TAIL_RETRY_MAX:
+        log.info(
+            "Radar AutoScan exact tail retry category=%s unresolved=%s/%s",
+            (live.category_name if live is not None else "autoscan"), len(unresolved), total,
+        )
+        try:
+            tail = await parser.fetch_public_view_counts(
+                unresolved,
+                concurrency=min(autoscan_view_concurrency, len(unresolved)),
+                progress_cb=None,
+                traffic_priority=autoscan_view_priority,
+                browser_fallback=True,
+                direct_http_only=False,
+                accurate=True,
+            )
+            for url, result in tail.items():
+                if result is not None and result.views is not None:
+                    combined[url] = result
+                    tail_recovered += 1
+        except Exception:
+            log.warning(
+                "Radar AutoScan exact tail retry failed category=%s unresolved=%s",
+                (live.category_name if live is not None else "autoscan"), len(unresolved),
+                exc_info=True,
+            )
 
     now = datetime.utcnow()
     updated = 0
@@ -3887,15 +3957,13 @@ async def enrich_autoscan_view_counts(
             await session.commit()
 
     if live is not None:
+        # Progress means every target was checked, not that every target succeeded.
         live.views_ready = base_ready + total
         live.views_failed += failed
     log.info(
-        "Radar AutoScan views complete category=%s total=%s exact=%s failed=%s coverage=%.2f%% direct_ok=%s recovered=%s sources=%s",
+        "Radar AutoScan views complete category=%s total=%s exact=%s failed=%s coverage=%.2f%% mode=%s direct_salvaged=%s tail_recovered=%s sources=%s",
         (live.category_name if live is not None else "autoscan"), total, updated, failed,
-        (updated / max(1, total)) * 100.0,
-        total - len(unresolved),
-        sum(1 for value in exact_recovery.values() if value.views is not None),
-        dict(source_counts),
+        (updated / max(1, total)) * 100.0, mode, direct_salvaged, tail_recovered, dict(source_counts),
     )
     return total, updated, failed
 
@@ -4460,6 +4528,8 @@ def _radar_autoscan_default_state() -> dict:
         "views_requested": 0,
         "views_verified": 0,
         "views_failed": 0,
+        "view_tail_deferred": 0,
+        "view_tail_categories": 0,
         "radar_candidates": 0,
         "radar_high_baseline_pending": 0,
         "radar_high_baseline_verified": 0,
@@ -4598,7 +4668,11 @@ def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
     state["total"] = len(keys)
     state["current_index"] = max(0, min(len(keys), int(state.get("current_index") or 0)))
 
-    for key in ("processed", "successful", "failed", "skipped_nonproduct", "pages_verified", "listings_seen", "new_listings", "radar_saved"):
+    for key in (
+        "processed", "successful", "failed", "skipped_nonproduct", "pages_verified",
+        "listings_seen", "new_listings", "radar_saved", "views_requested", "views_verified",
+        "views_failed", "view_tail_deferred", "view_tail_categories",
+    ):
         state[key] = max(0, int(state.get(key) or 0))
     # New counters are authoritative when present; otherwise infer legacy failures.
     if "needs_review" in raw_state or "system_errors" in raw_state:
@@ -4687,6 +4761,8 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
         "views_requested": 0,
         "views_verified": 0,
         "views_failed": 0,
+        "view_tail_deferred": 0,
+        "view_tail_categories": 0,
         "radar_candidates": 0,
         "radar_high_baseline_pending": 0,
         "radar_high_baseline_verified": 0,
@@ -4738,6 +4814,11 @@ def _radar_autoscan_retry_round(state: dict) -> dict | None:
     new_state.update(keep)
     coverage_total = int(last.get("coverage_total") or last.get("total") or len(_radar_autoscan_categories()))
     coverage_success = int(last.get("coverage_successful") or last.get("successful") or 0)
+    retry_target_date = str(last.get("target_date") or now.date().isoformat())[:10]
+    try:
+        datetime.strptime(retry_target_date, "%Y-%m-%d")
+    except Exception:
+        retry_target_date = now.date().isoformat()
     new_state.update({
         "policy_version": RADAR_AUTOSCAN_POLICY_VERSION,
         "status": "running",
@@ -4747,7 +4828,7 @@ def _radar_autoscan_retry_round(state: dict) -> dict | None:
         "mode": "retry",
         "layer": "fresh",
         "context_for_date": str(last.get("context_for_date") or ""),
-        "target_date": now.date().isoformat(),
+        "target_date": retry_target_date,
         "category_keys": keys,
         "current_index": 0,
         "current_category_key": "",
@@ -4770,6 +4851,8 @@ def _radar_autoscan_retry_round(state: dict) -> dict | None:
         "views_requested": 0,
         "views_verified": 0,
         "views_failed": 0,
+        "view_tail_deferred": 0,
+        "view_tail_categories": 0,
         "radar_candidates": 0,
         "radar_high_baseline_pending": 0,
         "radar_high_baseline_verified": 0,
@@ -5074,11 +5157,14 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         + (live_stage_line + "\n" if live_stage_line else "")
         + f"⏱ Время круга: <b>{elapsed_text}</b>\n\n"
         + "<b>🔎 Текущий круг</b>\n"
-        + f"📄 Подтверждено страниц: <b>{pages_verified}/{total_pages_target}</b>\n"
+        + f"📄 Страниц TODAY собрано: <b>{pages_verified}</b> <i>(макс. {total_pages_target})</i>\n"
         + f"🧾 Обнаружено чистых объявлений: <b>{listings_seen}</b> · новых <b>{new_listings}</b>\n"
-        + f"👁 Точные просмотры: <b>{views_verified}/{views_requested}</b>\n"
+        + f"👁 Точные просмотры: <b>{views_verified}/{views_requested}</b>"
+        + (f" · ❓ tail <b>{int(state.get('view_tail_deferred') or 0)}</b>" if int(state.get('view_tail_deferred') or 0) else "") + "\n"
         + f"🎯 Baseline создано: <b>{baselines}</b>\n"
-        + f"✅ Категорий успешно: <b>{successful}</b> · ⚠️ допроверка <b>{needs_review}</b> · ❌ ошибок <b>{system_errors}</b>\n\n"
+        + f"✅ Категорий успешно: <b>{successful}</b>"
+        + (f" · 🟡 exact-tail <b>{int(state.get('view_tail_categories') or 0)}</b> кат." if int(state.get('view_tail_categories') or 0) else "")
+        + f" · ⚠️ допроверка <b>{needs_review}</b> · ❌ ошибок <b>{system_errors}</b>\n\n"
         + "<b>🧪 Radar-наблюдения</b>\n"
         + "Подробная воронка Candidate / Early / Strong / Hot, Confidence, Acceleration и категории вынесены в <b>📊 Аналитика Radar</b>.\n"
         + "Так тяжёлая статистика больше не может заблокировать управление AutoScan.\n\n"
@@ -5278,6 +5364,8 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         "views_requested": int(state.get("views_requested") or 0),
         "views_verified": int(state.get("views_verified") or 0),
         "views_failed": int(state.get("views_failed") or 0),
+        "view_tail_deferred": int(state.get("view_tail_deferred") or 0),
+        "view_tail_categories": int(state.get("view_tail_categories") or 0),
         "radar_candidates": int(state.get("radar_candidates") or 0),
         "radar_high_baseline_pending": int(state.get("radar_high_baseline_pending") or 0),
         "radar_high_baseline_verified": int(state.get("radar_high_baseline_verified") or 0),
@@ -5352,10 +5440,11 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         + f"\n📊 Покрытие категорий: <b>{coverage_successful}/{coverage_total} · {category_coverage_pct}%</b>"
         + f"\n📊 Страниц от максимума: <b>{page_coverage_pct}%</b> · <b>{coverage_pages_verified}/{coverage_total * _radar_layer_depth(state)}</b>"
         + (f"\n⏭ Нетоварных пропущено: <b>{skipped_nonproduct}</b>" if skipped_nonproduct else "")
-        + f"\n📄 Подтверждено страниц в этом запуске: <b>{int(summary['pages_verified'])}</b>"
+        + f"\n📄 Страниц TODAY собрано в этом запуске: <b>{int(summary['pages_verified'])}</b>"
         + f"\n🧾 Чистых объявлений даты: <b>{int(summary['listings_seen'])}</b> · новых <b>{int(summary['new_listings'])}</b>"
         + f"\n🚫 Сразу исключено: TOP/Promo <b>{int(summary['search_promoted_filtered'])}</b> · снижение <b>{int(summary['search_reduced_filtered'])}</b>"
         + f"\n👁 Точные просмотры: <b>{int(summary['views_verified'])}/{int(summary['views_requested'])}</b>"
+        + (f" · ❓ tail <b>{int(summary.get('view_tail_deferred') or 0)}</b>" if int(summary.get('view_tail_deferred') or 0) else "")
         + (
             f"\n🟡 Initial ≥{ORGANIC_HIGH_BASELINE_VIEWS}: <b>{int(summary.get('radar_high_baseline_pending') or 0)}</b> ждут 2 замера · "
             f"✅ delta verified <b>{int(summary.get('radar_high_baseline_verified') or 0)}</b>"
@@ -5593,13 +5682,21 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                     local_radar_stats = None
                     local_failure_kind = ""
                     local_error_text = ""
-                    if local_result.date_complete and not local_result.radar_views_complete:
+                    if local_result.date_complete and not local_result.radar_views_usable:
                         local_failure_kind = "radar_views"
                         local_error_text = (
-                            f"Radar views неполные: {int(local_result.views_verified or 0)}/"
+                            f"Radar views существенно неполные: {int(local_result.views_verified or 0)}/"
                             f"{int(local_result.views_requested or 0)} точных счётчиков"
                         )
                     elif local_result.date_complete:
+                        if not local_result.radar_views_complete and int(local_result.view_tail_count or 0) > 0:
+                            log.warning(
+                                "DT Radar AutoScan soft exact tail category=%s exact=%s/%s tail=%s budget=%s; "
+                                "verified rows seed baseline, UNKNOWN rows stay excluded without full rescan",
+                                cat.name, int(local_result.views_verified or 0), int(local_result.views_requested or 0),
+                                int(local_result.view_tail_count or 0),
+                                _radar_autoscan_view_tail_budget(int(local_result.views_requested or 0)),
+                            )
                         live_state = await load_radar_autoscan_state()
                         if live_state.get("status") == "running":
                             live_state["current_stage"] = ("context_gate" if str(state.get("layer") or "fresh") == "context" else "organic_gate")
@@ -5698,7 +5795,7 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
             state["processed"] = int(state.get("processed") or 0) + 1
             if result is not None:
                 state["pages_verified"] = int(state.get("pages_verified") or 0) + min(
-                    round_depth, max(0, int(result.verified_pages or 0))
+                    round_depth, max(0, int(result.collection_pages_confirmed or 0))
                 )
                 state["listings_seen"] = int(state.get("listings_seen") or 0) + max(0, int(result.today_seen or 0))
                 state["new_listings"] = int(state.get("new_listings") or 0) + max(0, int(result.new_count or 0))
@@ -5707,6 +5804,9 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                 state["views_requested"] = int(state.get("views_requested") or 0) + max(0, int(result.views_requested or 0))
                 state["views_verified"] = int(state.get("views_verified") or 0) + max(0, int(result.views_verified or 0))
                 state["views_failed"] = int(state.get("views_failed") or 0) + max(0, int(result.view_failures or 0))
+                if result.radar_views_usable and not result.radar_views_complete and int(result.view_tail_count or 0) > 0:
+                    state["view_tail_deferred"] = int(state.get("view_tail_deferred") or 0) + int(result.view_tail_count or 0)
+                    state["view_tail_categories"] = int(state.get("view_tail_categories") or 0) + 1
                 state["radar_saved"] = int(state.get("radar_saved") or 0) + max(0, int(radar_saved or 0))
             if radar_stats is not None:
                 state["radar_candidates"] = int(state.get("radar_candidates") or 0) + int(radar_stats.eligible_with_views or 0)
@@ -5763,7 +5863,7 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                     "reason": error_text or "нужно повторно подтвердить категорию",
                     "verified_pages": min(
                         round_depth,
-                        max(0, int(result.verified_pages or 0)) if result is not None else 0,
+                        max(0, int(result.collection_pages_confirmed or 0)) if result is not None else 0,
                     ),
                     "depth": round_depth,
                     "kind": failure_kind,
@@ -6212,10 +6312,15 @@ class ScanResult:
     repeated_pages: int = 0
     low_quality_pages: int = 0
     verified_pages: int = 0
+    # Exact number of verified pages that actually contained the requested day.
+    # `verified_pages` above is transport/quality telemetry and may include date probes.
+    collection_pages_confirmed: int = 0
     view_failures: int = 0
     views_requested: int = 0
     views_verified: int = 0
     radar_views_complete: bool = True
+    radar_views_usable: bool = True
+    view_tail_count: int = 0
     quality_score: int = 0
     quality_note: str = ""
 
@@ -7159,6 +7264,57 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
                 log.debug("Date predictor confirmation write failed", exc_info=True)
 
         if STABLE_SCAN_ENGINE:
+            # v4.22.6 TODAY FAST PATH. AutoScan is today-only, so the first verified
+            # nationwide page is the cheapest authoritative chronology probe. If it
+            # already contains today's listings, skip Date Worker prediction entirely
+            # and start collection at page 1. If the newest verified page is already
+            # older/empty, today's category is proven empty. Weak/mixed evidence falls
+            # through to the unchanged universal Date Worker/local locator.
+            if user_id == RADAR_AUTOSCAN_USER_ID and today_fast_path and str(feed_name) == "nationwide":
+                try:
+                    _tf_items, tf_relation, _tf_pairs, _tf_days = await stable_fetch(1, "today_fast")
+                    tf_info = cache.get(1)
+                    tf_verified = bool(
+                        tf_info is not None
+                        and getattr(tf_info, "page_verified", False)
+                        and getattr(tf_info, "request_matches_page", True)
+                        and not getattr(tf_info, "suspicious", False)
+                    )
+                    if tf_relation == "target" and tf_verified:
+                        try:
+                            await save_date_index(
+                                cat.key, target_date, base_url, status="found",
+                                candidate_page=1, max_page=site_max_page,
+                            )
+                        except Exception:
+                            log.debug("Today fast-path date-index write failed", exc_info=True)
+                        await remember_confirmed_date_hint(1)
+                        log.info(
+                            "Today fast path HIT category=%s target=%s page=1 requests=%s",
+                            cat.name, target_date, network_requests,
+                        )
+                        return locator_result("found", candidate_page=1)
+                    if tf_relation in {"older", "empty"} and tf_verified:
+                        try:
+                            await save_date_index(
+                                cat.key, target_date, base_url, status="absent", max_page=site_max_page,
+                            )
+                        except Exception:
+                            log.debug("Today fast-path absent write failed", exc_info=True)
+                        log.info(
+                            "Today fast path EMPTY category=%s target=%s relation=%s requests=%s",
+                            cat.name, target_date, tf_relation, network_requests,
+                        )
+                        return locator_result("absent", "самая новая подтверждённая страница уже не содержит сегодняшних объявлений")
+                    log.info(
+                        "Today fast path fallback category=%s target=%s relation=%s verified=%s; universal locator continues",
+                        cat.name, target_date, tf_relation, tf_verified,
+                    )
+                except TemporaryAccessError:
+                    raise
+                except Exception:
+                    log.debug("Today fast path failed; universal locator continues", exc_info=True)
+
             # v4.1.0 kept one deterministic newest-sorted locator for every date/feed.
             # Sparse/hidden timestamp templates are not a broken page: any weak
             # probe falls back to the deterministic sequential stream below.
@@ -8403,10 +8559,16 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             repeated_pages=repeated_pages,
             low_quality_pages=low_quality_pages,
             verified_pages=verified_pages,
+            collection_pages_confirmed=collection_pages_confirmed,
             view_failures=view_failures,
             views_requested=views_requested,
             views_verified=views_verified,
             radar_views_complete=bool(user_id != RADAR_AUTOSCAN_USER_ID or views_requested == views_verified),
+            radar_views_usable=bool(
+                user_id != RADAR_AUTOSCAN_USER_ID
+                or _radar_autoscan_views_usable(views_requested, views_verified)
+            ),
+            view_tail_count=max(0, int(views_requested or 0) - int(views_verified or 0)),
             quality_score=quality_score,
             quality_note=quality_note,
         )
@@ -8470,10 +8632,16 @@ async def scan_one_category(parser: KleinanzeigenParser, cat, user_id: int, page
             repeated_pages=repeated_pages,
             low_quality_pages=low_quality_pages,
             verified_pages=verified_pages,
+            collection_pages_confirmed=collection_pages_confirmed,
             view_failures=view_failures,
             views_requested=views_requested,
             views_verified=views_verified,
             radar_views_complete=bool(user_id != RADAR_AUTOSCAN_USER_ID or views_requested == views_verified),
+            radar_views_usable=bool(
+                user_id != RADAR_AUTOSCAN_USER_ID
+                or _radar_autoscan_views_usable(views_requested, views_verified)
+            ),
+            view_tail_count=max(0, int(views_requested or 0) - int(views_verified or 0)),
             quality_score=quality_score,
             quality_note=quality_note,
         )
@@ -11579,7 +11747,7 @@ def _vinted_setup_header(cfg: dict[str, Any], source: str) -> str:
     return (
         f"<b>{_vinted_mode_label(mode)}</b>\n\n"
         f"Категории: <b>{len(selected)}/{VINTED_ADMIN_MAX_CATEGORIES}</b> · глубина: <b>{int(cfg.get('pages') or 3)} стр.</b>\n"
-        f"Каталог Vinted: <b>{'live' if source == 'live' else 'fallback'}</b>{selected_line}\n\n"
+        f"Каталог Vinted: <b>{'live' if str(source).startswith('live') else 'fallback'}</b>{selected_line}\n\n"
         "Выбирай разделы. Можно зайти внутрь дерева или выбрать весь текущий раздел."
     )
 
@@ -11679,13 +11847,26 @@ def _vinted_scan_keyboard(scan: VintedScan) -> InlineKeyboardMarkup:
 
 
 async def _vinted_scan_text(scan_id: int) -> tuple[str, VintedScan | None]:
-    snapshot = await vinted_scan_progress(scan_id)
+    snapshot, worker_status = await asyncio.gather(vinted_scan_progress(scan_id), VINTED_QUEUE.worker_status())
     if not snapshot:
         return "<b>Vinted scan не найден.</b>", None
     scan: VintedScan = snapshot["scan"]
     cats: list[VintedScanCategory] = list(snapshot["categories"])
     scan_pct = float(snapshot.get("scan_percent") or 0.0)
     metric_pct = float(snapshot.get("metrics_percent") or 0.0)
+    metrics_workers = list(worker_status.get("metrics_workers") or [])
+    provider_states = [str(w.get("provider_status") or "") for w in metrics_workers]
+    if any(state == "ready" for state in provider_states):
+        provider_line = "🟢 browser-session ready"
+    elif any(state in {"blocked", "challenge", "expired", "session_expired", "circuit_open"} for state in provider_states):
+        provider_line = "🔴 session blocked/expired"
+    elif metrics_workers and all(state == "session_missing" for state in provider_states):
+        provider_line = "🟠 VINTED_SESSION_JSON не задан"
+    elif metrics_workers:
+        provider_line = "🟡 " + html.escape(", ".join(sorted(set(filter(None, provider_states))) or ["starting"])[:80])
+    else:
+        provider_line = "🔴 Metrics Worker offline"
+    unknown_views = max(0, int(scan.metrics_done or 0) - int(scan.exact_views or 0))
     lines = [
         f"<b>{_vinted_mode_label(scan.mode)}</b>",
         f"Статус: <b>{_vinted_status_label(scan.status)}</b>",
@@ -11697,8 +11878,10 @@ async def _vinted_scan_text(scan_id: int) -> tuple[str, VintedScan | None]:
         "",
         "<b>👁 Exact Metrics</b>",
         f"{_progress_bar(int(metric_pct))} <b>{metric_pct:.1f}%</b>",
-        f"Обработано: <b>{int(scan.metrics_done or 0)}/{int(scan.metrics_total or 0)}</b>",
-        f"Exact views: <b>{int(scan.exact_views or 0)}</b> · favourites: <b>{int(scan.exact_favourites or 0)}</b> · chronology: <b>{int(scan.chronology_count or 0)}</b>",
+        f"Проверено: <b>{int(scan.metrics_done or 0)}/{int(scan.metrics_total or 0)}</b>",
+        f"✅ Exact views: <b>{int(scan.exact_views or 0)}</b> · ❓ views UNKNOWN: <b>{unknown_views}</b>",
+        f"❤️ Favourites: <b>{int(scan.exact_favourites or 0)}</b> · 🕒 chronology: <b>{int(scan.chronology_count or 0)}</b>",
+        f"Provider: <b>{provider_line}</b>",
     ]
     if scan.mode == "radar":
         lines.extend(["", "<i>Radar-тест сейчас собирает baseline. Rising/Hot не вычисляются, пока Exact Views gate не подтверждён.</i>"])
@@ -11739,6 +11922,14 @@ async def _vinted_workers_text() -> str:
                 lines.append(f"Категорий: <b>{int(worker.get('processed_categories', 0) or 0)}</b> · сейчас: <b>{html.escape(str(worker.get('category') or '—')[:28])}</b> · page <b>{int(worker.get('page', 0) or 0)}</b>")
             else:
                 lines.append(f"Items: <b>{int(worker.get('processed', 0) or 0)}</b> · exact <b>{int(worker.get('exact_total', 0) or 0)}</b> · unknown <b>{int(worker.get('unknown_total', 0) or 0)}</b> · errors <b>{int(worker.get('errors', 0) or 0)}</b>")
+                lines.append(
+                    f"Provider: <b>{html.escape(str(worker.get('provider_status') or '—'))}</b> · "
+                    f"pool <b>{int(worker.get('concurrency', worker.get('provider_concurrency', 0)) or 0)}</b> · "
+                    f"last <b>{int(worker.get('last_ms', 0) or 0)} ms</b>"
+                )
+                detail = str(worker.get('provider_detail') or '').strip()
+                if detail:
+                    lines.append(f"Detail: <code>{html.escape(detail[:120])}</code>")
     if status.get("error"):
         lines.extend(["", f"⚠️ <code>{html.escape(str(status['error'])[:250])}</code>"])
     return "\n".join(lines)

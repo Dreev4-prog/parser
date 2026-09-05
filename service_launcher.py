@@ -94,11 +94,16 @@ def main() -> None:
         # Vinted Probe is intentionally isolated from Kleinanzeigen Page/Date/View queues.
         os.environ.setdefault("DISTRIBUTED_WORKERS", "1")
     if role in {"vinted-scan-worker", "vinted-metrics-worker"}:
-        # Vinted Lab owns a separate Redis namespace and PostgreSQL tables. Keep the
-        # services on a small independent DB pool so they cannot starve the main bot.
+        # Vinted Lab owns a separate Redis namespace and PostgreSQL tables. Metrics
+        # v4.22.5 runs four concurrent slots per replica, so give only that isolated
+        # service a slightly wider short-lived DB pool; Kleinanzeigen pools are untouched.
         os.environ.setdefault("DISTRIBUTED_WORKERS", "1")
-        os.environ.setdefault("DB_POOL_SIZE", "2")
-        os.environ.setdefault("DB_MAX_OVERFLOW", "1")
+        if role == "vinted-metrics-worker":
+            os.environ.setdefault("DB_POOL_SIZE", "4")
+            os.environ.setdefault("DB_MAX_OVERFLOW", "2")
+        else:
+            os.environ.setdefault("DB_POOL_SIZE", "2")
+            os.environ.setdefault("DB_MAX_OVERFLOW", "1")
     target = {
         "view-worker": "view_counter_worker.py",
         "page-worker": "page_worker.py",
