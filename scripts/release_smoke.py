@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.22.2", "VERSION=4.22.2")
+    check((ROOT / "VERSION").read_text().strip() == "4.22.3", "VERSION=4.22.3")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -135,7 +135,7 @@ def main() -> int:
     check("/api/v2/items/{item.item_id}/details" in vinted, "Vinted Probe tests current browser item-details endpoint")
     check("recovery_pages_used" in vinted and "recovery_complete" in vinted, "Vinted live pagination restores requested unique depth with bounded recovery")
     check("pagination.time` is telemetry/cache-buster data" in vinted, "Vinted pagination.time is not trusted as a snapshot cursor")
-    print("\nDT Parser 4.22.2 Vinted Detail API + Unique Depth Recovery release smoke: PASS")
+    print("\nDT Parser 4.22.3 Vinted Session/OAuth Exact Metrics Probe release smoke: PASS")
     return 0
 
 

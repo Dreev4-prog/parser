@@ -20,6 +20,10 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
 )
+MOBILE_USER_AGENT = "vinted-ios Vinted/22.6.1 (lt.manodrabuziai.fr; build:21794; iOS 15.2.0) iPhone10,6"
+MOBILE_APP_VERSION = "22.6.1"
+MOBILE_DEVICE_MODEL = "iPhone10,6"
+DEFAULT_PROBE_CATALOG_IDS = (4, 5)  # realistic category-specific probe: women/men clothing
 
 
 class VintedProbeError(RuntimeError):
@@ -104,6 +108,8 @@ class VintedProbeConfig:
             value = chunk.strip()
             if value.isdigit():
                 catalog_ids.append(int(value))
+        if not catalog_ids:
+            catalog_ids = list(DEFAULT_PROBE_CATALOG_IDS)
         return cls(
             base_url=os.getenv("VINTED_BASE_URL", DEFAULT_BASE_URL).strip().rstrip("/") or DEFAULT_BASE_URL,
             catalog_ids=tuple(catalog_ids),
@@ -168,6 +174,10 @@ class VintedProbeClient:
         if token:
             host = urlparse(config.base_url).hostname or "www.vinted.de"
             self.client.cookies.set("access_token_web", token, domain=host, path="/")
+        self._public_oauth_token: str = ""
+        self._public_oauth_attempted = False
+        self.bootstrap_cookie_names: list[str] = []
+        self.oauth_outcome: str = "not_attempted"
 
     async def __aenter__(self) -> "VintedProbeClient":
         return self
@@ -227,10 +237,50 @@ class VintedProbeClient:
             return response, payload, "rate_limited"
         return response, payload, outcome
 
+    async def _post_json(self, kind: str, url: str, *, payload: dict[str, Any], headers: dict[str, str] | None = None) -> tuple[httpx.Response | None, Any | None, str]:
+        await self._gate.wait()
+        started = time.perf_counter()
+        try:
+            response = await self.client.post(url, json=payload, headers=headers)
+        except httpx.HTTPError as exc:
+            elapsed = int((time.perf_counter() - started) * 1000)
+            self.records.append(ProbeHTTPRecord(kind, url, None, elapsed, "transport_error", detail=type(exc).__name__))
+            return None, None, "transport_error"
+        elapsed = int((time.perf_counter() - started) * 1000)
+        outcome = self._outcome_for(response)
+        content_type = response.headers.get("content-type", "")
+        self.records.append(ProbeHTTPRecord(kind, str(response.url), response.status_code, elapsed, outcome, content_type=content_type))
+        if outcome != "ok":
+            return response, None, outcome
+        try:
+            return response, response.json(), outcome
+        except ValueError:
+            self.records[-1].outcome = "invalid_json"
+            return response, None, "invalid_json"
+
+    async def _ensure_public_oauth_token(self) -> str:
+        if self._public_oauth_attempted:
+            return self.oauth_outcome
+        self._public_oauth_attempted = True
+        _response, payload, outcome = await self._post_json(
+            "oauth_public",
+            f"{self.config.base_url}/oauth/token",
+            payload={"grant_type": "password", "client_id": "ios", "scope": "public"},
+            headers={"User-Agent": MOBILE_USER_AGENT, "Accept": "application/json"},
+        )
+        if outcome == "ok" and isinstance(payload, dict) and isinstance(payload.get("access_token"), str):
+            self._public_oauth_token = payload["access_token"]
+            self.oauth_outcome = "ok"
+        else:
+            self.oauth_outcome = outcome
+        return self.oauth_outcome
+
     async def bootstrap(self) -> str:
-        # A normal anonymous page request may establish cookies. If Vinted requires
-        # a browser-only challenge, fail closed and report it rather than bypassing it.
-        response, _text, outcome = await self._request("bootstrap", f"{self.config.base_url}/", expect_json=False)
+        # `/catalog` is the normal browsing entry used by current Vinted clients to
+        # establish an anonymous web session. We record cookie NAMES only; values
+        # are never logged. If the session is challenged, the probe fails closed.
+        response, _text, outcome = await self._request("bootstrap", f"{self.config.base_url}/catalog", expect_json=False)
+        self.bootstrap_cookie_names = sorted({cookie.name for cookie in self.client.cookies.jar})
         if response is None:
             return outcome
         return outcome
@@ -270,70 +320,101 @@ class VintedProbeClient:
         return items, "ok", response_time
 
     async def fetch_item_detail(self, item: VintedItem) -> VintedMetricSample:
-        """Fetch identity-bound metrics using the current browser detail API first.
+        """Fetch exact metrics without trusting public-page views.
 
-        Current Vinted browser code uses `/api/v2/items/{id}/details`. The older
-        `/api/v2/items/{id}` route is not used. If the browser-detail endpoint is
-        unavailable or omits a field, the public Next.js item page is a strictly
-        identity-bound fallback. Missing metrics always remain UNKNOWN.
+        Order:
+        1) authenticated-by-session web item endpoint `/api/v2/items/{id}`;
+        2) browser detail endpoint `/api/v2/items/{id}/details`;
+        3) read-only public OAuth token + mobile item endpoint.
+
+        The public HTML page is intentionally NOT used for exact views in v4.22.3,
+        because ordinary item-page GETs may themselves affect Vinted's view counter.
+        Missing values stay UNKNOWN.
         """
-        api_url = f"{self.config.base_url}/api/v2/items/{item.item_id}/details"
-        _response, payload, api_outcome = await self._request(
-            "detail_api",
-            api_url,
-            params={"localize": "true"},
-            headers={
-                "Accept": "application/json, text/plain, */*",
-                "Referer": item.url or f"{self.config.base_url}/",
-                "X-Requested-With": "XMLHttpRequest",
-            },
+        base_headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Referer": item.url or f"{self.config.base_url}/catalog",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        attempts: list[tuple[str, str, dict[str, str], dict[str, Any]]] = [
+            ("detail_web_item", f"{self.config.base_url}/api/v2/items/{item.item_id}", base_headers, {"localize": "true"}),
+            ("detail_web_details", f"{self.config.base_url}/api/v2/items/{item.item_id}/details", base_headers, {"localize": "true"}),
+        ]
+        best: VintedMetricSample | None = None
+        for kind, url, headers, params in attempts:
+            _response, payload, outcome = await self._request(kind, url, params=params, headers=headers)
+            if outcome != "ok" or not isinstance(payload, dict):
+                continue
+            sample = normalize_detail_metrics(payload, expected_item_id=item.item_id)
+            sample.source = kind
+            if sample.outcome == "wrong_identity":
+                return sample
+            if sample.identity_ok:
+                best = _merge_metric_samples(best, sample)
+                if best.view_count is not None and best.upload_raw is not None:
+                    return best
+
+        oauth_outcome = await self._ensure_public_oauth_token()
+        if oauth_outcome == "ok" and self._public_oauth_token:
+            mobile_headers = {
+                "Authorization": f"Bearer {self._public_oauth_token}",
+                "User-Agent": MOBILE_USER_AGENT,
+                "x-app-version": MOBILE_APP_VERSION,
+                "x-device-model": MOBILE_DEVICE_MODEL,
+                "short-bundle-version": MOBILE_APP_VERSION,
+                "Accept": "application/json",
+            }
+            for kind, path in (
+                ("detail_mobile_item", f"/api/v2/items/{item.item_id}"),
+                ("detail_mobile_details", f"/api/v2/items/{item.item_id}/details"),
+            ):
+                _response, payload, outcome = await self._request(
+                    kind, f"{self.config.base_url}{path}", params={"localize": "true"}, headers=mobile_headers
+                )
+                if outcome != "ok" or not isinstance(payload, dict):
+                    continue
+                sample = normalize_detail_metrics(payload, expected_item_id=item.item_id)
+                sample.source = kind
+                if sample.outcome == "wrong_identity":
+                    return sample
+                if sample.identity_ok:
+                    best = _merge_metric_samples(best, sample)
+                    if best.view_count is not None and best.upload_raw is not None:
+                        return best
+
+        if best is not None:
+            if best.view_count is None:
+                best.notes.append("exact view_count unavailable from web/mobile APIs; remains UNKNOWN")
+            if best.upload_raw is None:
+                best.notes.append("upload chronology unavailable from web/mobile APIs")
+            return best
+        return VintedMetricSample(
+            item_id=item.item_id,
+            source="web_api+mobile_oauth",
+            measured_at=_utcnow_iso(),
+            identity_ok=False,
+            outcome="exact_detail_unavailable",
+            notes=[
+                "No identity-bound exact detail API succeeded.",
+                f"public_oauth={oauth_outcome}",
+                "Public HTML is not used for exact views because it may affect the view counter.",
+            ],
         )
-        api_sample: VintedMetricSample | None = None
-        if api_outcome == "ok" and isinstance(payload, dict):
-            api_sample = normalize_detail_metrics(payload, expected_item_id=item.item_id)
-            api_sample.source = "detail_api_details"
-            if api_sample.outcome == "wrong_identity":
-                return api_sample
-            if api_sample.identity_ok and api_sample.view_count is not None and api_sample.upload_raw is not None:
-                return api_sample
 
-        detail_url = item.url or f"{self.config.base_url}/items/{item.item_id}"
-        response, html, html_outcome = await self._request(
-            "detail_html",
-            detail_url,
-            expect_json=False,
-            headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Referer": f"{self.config.base_url}/",
-            },
-        )
-        if html_outcome != "ok" or response is None or not isinstance(html, str):
-            if api_sample is not None and api_sample.identity_ok:
-                api_sample.notes.append(f"HTML fallback unavailable: {html_outcome}")
-                return api_sample
-            return VintedMetricSample(
-                item_id=item.item_id,
-                source="detail_api_details+html",
-                measured_at=_utcnow_iso(),
-                identity_ok=False,
-                outcome=api_outcome if api_outcome != "ok" else html_outcome,
-                notes=["No exact metric accepted from current detail API or public item page."],
-            )
 
-        html_sample = normalize_public_item_html(html, expected_item_id=item.item_id)
-        if api_sample is None or not api_sample.identity_ok:
-            return html_sample
-        if not html_sample.identity_ok:
-            api_sample.notes.append("HTML fallback did not match requested item identity.")
-            return api_sample
-
-        for field_name in ("view_count", "favourite_count", "upload_raw", "sold", "closed", "reserved", "hidden", "visible"):
-            if getattr(api_sample, field_name) is None:
-                setattr(api_sample, field_name, getattr(html_sample, field_name))
-        api_sample.source = "detail_api_details+html"
-        api_sample.notes.extend(note for note in html_sample.notes if note not in api_sample.notes)
-        return api_sample
-
+def _merge_metric_samples(base: VintedMetricSample | None, incoming: VintedMetricSample) -> VintedMetricSample:
+    if base is None:
+        return incoming
+    for field_name in ("view_count", "favourite_count", "upload_raw", "sold", "closed", "reserved", "hidden", "visible"):
+        if getattr(base, field_name) is None and getattr(incoming, field_name) is not None:
+            setattr(base, field_name, getattr(incoming, field_name))
+    if incoming.source not in base.source:
+        base.source = f"{base.source}+{incoming.source}"
+    for note in incoming.notes:
+        if note not in base.notes:
+            base.notes.append(note)
+    base.identity_ok = base.identity_ok or incoming.identity_ok
+    return base
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -774,7 +855,7 @@ async def run_probe(config: VintedProbeConfig, *, transport: httpx.AsyncBaseTran
 
         elapsed_seconds = round(time.perf_counter() - started, 3)
         report: dict[str, Any] = {
-            "schema": "dt-vinted-probe-v2",
+            "schema": "dt-vinted-probe-v3",
             "generated_at": _utcnow_iso(),
             "config": {
                 "base_url": config.base_url,
@@ -791,6 +872,12 @@ async def run_probe(config: VintedProbeConfig, *, transport: httpx.AsyncBaseTran
                 "recovery_pages": config.recovery_pages,
             },
             "bootstrap_outcome": bootstrap_outcome,
+            "session": {
+                "cookie_names": client.bootstrap_cookie_names,
+                "has_access_token_web": "access_token_web" in client.bootstrap_cookie_names or bool(config.access_token_web),
+                "has_refresh_token_web": "refresh_token_web" in client.bootstrap_cookie_names,
+                "public_oauth": client.oauth_outcome,
+            },
             "elapsed_seconds": elapsed_seconds,
             "catalog": {
                 "requests": len(page_results),
@@ -815,7 +902,7 @@ async def run_probe(config: VintedProbeConfig, *, transport: httpx.AsyncBaseTran
                 "promoted_true": len(promoted_true),
             },
             "detail": {
-                "source": "api_v2_item_details_then_public_html",
+                "source": "web_item_api_then_web_details_then_public_oauth_mobile",
                 "requested": len(detail_targets),
                 "identity_ok": sum(1 for sample in detail_samples if sample.identity_ok),
                 "wrong_identity": len(wrong_identity),
@@ -830,10 +917,10 @@ async def run_probe(config: VintedProbeConfig, *, transport: httpx.AsyncBaseTran
             "latency_ms": {
                 "catalog_avg": _average_ms(client.records, "catalog"),
                 "catalog_p95": _percentile_ms(client.records, "catalog", 0.95),
-                "detail_api_avg": _average_ms(client.records, "detail_api"),
-                "detail_api_p95": _percentile_ms(client.records, "detail_api", 0.95),
-                "detail_html_avg": _average_ms(client.records, "detail_html"),
-                "detail_html_p95": _percentile_ms(client.records, "detail_html", 0.95),
+                "detail_web_item_avg": _average_ms(client.records, "detail_web_item"),
+                "detail_web_details_avg": _average_ms(client.records, "detail_web_details"),
+                "detail_mobile_item_avg": _average_ms(client.records, "detail_mobile_item"),
+                "oauth_public_avg": _average_ms(client.records, "oauth_public"),
             },
             "http_outcomes": status_counts,
             "quality_gates": {},
@@ -927,14 +1014,13 @@ def format_probe_summary(report: dict[str, Any]) -> str:
         return "PASS" if data.get("pass") else "FAIL"
 
     return "\n".join([
-        "DT Vinted Probe v0.3",
-        f"bootstrap={report.get('bootstrap_outcome')} elapsed={report.get('elapsed_seconds')}s",
+        "DT Vinted Probe v0.4",
+        f"bootstrap={report.get('bootstrap_outcome')} session={report.get('session')} elapsed={report.get('elapsed_seconds')}s",
         f"catalog requests={catalog.get('requests')} unique={catalog.get('unique_items')} duplicates={catalog.get('duplicates')} failures={len(catalog.get('failures') or [])}",
         f"catalog recovery={' | '.join(recovery_bits) if recovery_bits else 'n/a'}",
         f"catalog latency avg={latency.get('catalog_avg')}ms p95={latency.get('catalog_p95')}ms",
         f"detail requested={detail.get('requested')} identity_ok={detail.get('identity_ok')} exact_views={detail.get('exact_view_samples')} exact_favourites={detail.get('exact_favourite_samples')} chronology={detail.get('upload_time_samples')}",
-        f"detail api latency avg={latency.get('detail_api_avg')}ms p95={latency.get('detail_api_p95')}ms",
-        f"detail html fallback avg={latency.get('detail_html_avg')}ms p95={latency.get('detail_html_p95')}ms",
+        f"detail web/item avg={latency.get('detail_web_item_avg')}ms web/details avg={latency.get('detail_web_details_avg')}ms mobile/item avg={latency.get('detail_mobile_item_avg')}ms oauth={latency.get('oauth_public_avg')}ms",
         f"view_stability={report.get('view_stability')}",
         f"gates: catalog={gate('catalog_access')} pagination={gate('pagination_integrity')} identity={gate('identity')} chronology={gate('chronology')} exact_views={gate('exact_views')} stability={gate('view_stability')} radar_ready={gate('radar_ready')}",
         f"http_outcomes={report.get('http_outcomes')}",

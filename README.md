@@ -1,3 +1,11 @@
+# DT PARSER 4.22.3 — Vinted Session/OAuth Exact Metrics Probe
+
+The third live Vinted Probe run proved three things: the anonymous catalog is reachable, the global ALL feed is too fast-moving for page-number depth recovery, and anonymous item-detail API requests are blocked while public item HTML still omits exact views/chronology. v4.22.3 therefore tests a realistic category-specific scan by default (`catalog_ids=4,5`), bootstraps through `/catalog` to acquire the normal anonymous web session, probes both current web item API routes, and if they remain blocked attempts Vinted's read-only public mobile OAuth flow before giving up. Public item HTML is no longer used for exact-view measurement because ordinary item-page GETs may contaminate the counter. Missing metrics remain UNKNOWN. Kleinanzeigen production logic is unchanged.
+
+See `RELEASE_4_22_3.md`.
+
+---
+
 # DT PARSER 4.22.2 — Vinted Detail API + Unique Depth Recovery
 
 The second live Vinted Probe run confirmed that the public item HTML matches item identity but does not expose exact `view_count` or upload chronology. It also proved that `pagination.time` is not a reliable frozen snapshot cursor on the live newest-first feed. v4.22.2 therefore tests Vinted's current browser endpoint `/api/v2/items/{id}/details` first, keeps HTML as a fail-closed fallback, and changes pagination correctness from “low duplicates” to bounded recovery of the requested unique depth. Kleinanzeigen production logic remains unchanged.

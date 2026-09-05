@@ -85,7 +85,7 @@ def test_public_html_wrong_identity_fails_closed():
 @pytest.mark.asyncio
 async def test_probe_full_mock_pass():
     async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/":
+        if request.url.path == "/catalog":
             return httpx.Response(200, text="ok", headers={"content-type": "text/html"})
         if request.url.path == "/api/v2/catalog/items":
             page = int(request.url.params.get("page", "1"))
@@ -98,8 +98,8 @@ async def test_probe_full_mock_pass():
                 ]
             }
             return httpx.Response(200, json=payload)
-        if request.url.path.startswith("/api/v2/items/") and request.url.path.endswith("/details"):
-            item_id = int(request.url.path.split("/")[-2])
+        if request.url.path.startswith("/api/v2/items/") and not request.url.path.endswith("/details"):
+            item_id = int(request.url.path.split("/")[-1])
             return httpx.Response(200, json={"item": {
                 "id": item_id,
                 "view_count": item_id,
@@ -107,6 +107,9 @@ async def test_probe_full_mock_pass():
                 "created_at_ts": "2026-09-05T07:00:00Z",
                 "is_closed": False,
             }})
+        if request.url.path.startswith("/api/v2/items/") and request.url.path.endswith("/details"):
+            item_id = int(request.url.path.split("/")[-2])
+            return httpx.Response(200, json={"item": {"id": item_id}})
         if request.url.path.startswith("/items/"):
             item_id = int(request.url.path.split("/")[-1].split("-", 1)[0])
             return httpx.Response(200, text=_mock_item_html(item_id), headers={"content-type": "text/html"})
@@ -132,7 +135,7 @@ async def test_probe_full_mock_pass():
 @pytest.mark.asyncio
 async def test_probe_401_fails_closed():
     async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/":
+        if request.url.path == "/catalog":
             return httpx.Response(200, text="ok")
         return httpx.Response(401, json={"code": 100, "message_code": "invalid_authentication_token"})
 
@@ -158,7 +161,7 @@ def test_quality_gate_requires_exact_views():
 @pytest.mark.asyncio
 async def test_probe_recovers_unique_depth_from_live_page_overlap():
     async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/":
+        if request.url.path == "/catalog":
             return httpx.Response(200, text="ok")
         if request.url.path == "/api/v2/catalog/items":
             page = int(request.url.params.get("page", "1"))
@@ -188,3 +191,39 @@ async def test_probe_recovers_unique_depth_from_live_page_overlap():
     assert depth["unique_seen"] == 4
     assert depth["recovery_complete"] is True
     assert report["quality_gates"]["pagination_integrity"]["pass"] is True
+
+
+def test_from_env_uses_realistic_category_probe_by_default(monkeypatch):
+    monkeypatch.delenv("VINTED_PROBE_CATALOG_IDS", raising=False)
+    config = VintedProbeConfig.from_env()
+    assert config.catalog_ids == (4, 5)
+
+
+@pytest.mark.asyncio
+async def test_probe_public_oauth_mobile_detail_fallback():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/catalog":
+            return httpx.Response(200, text="ok")
+        if request.url.path == "/api/v2/catalog/items":
+            return httpx.Response(200, json={
+                "pagination": {"time": 1700000000},
+                "items": [{"id": 123, "title": "A", "url": "https://www.vinted.de/items/123-a"}],
+            })
+        if request.url.path in {"/api/v2/items/123", "/api/v2/items/123/details"} and not request.headers.get("authorization"):
+            return httpx.Response(403, text="blocked")
+        if request.url.path == "/oauth/token":
+            return httpx.Response(200, json={"access_token": "public-token", "refresh_token": "r", "created_at": 1, "expires_in": 3600})
+        if request.url.path == "/api/v2/items/123" and request.headers.get("authorization") == "Bearer public-token":
+            return httpx.Response(200, json={"item": {
+                "id": 123, "view_count": 9, "favourite_count": 2, "created_at": "2026-09-05T07:00:00Z"
+            }})
+        return httpx.Response(404)
+
+    config = VintedProbeConfig(
+        pages=1, per_page=1, recovery_pages=0, detail_sample=1, stability_reads=2, stability_delay_seconds=0.2, min_interval_seconds=0
+    )
+    report = await run_probe(config, transport=httpx.MockTransport(handler))
+    assert report["detail"]["exact_view_samples"] == 1
+    assert report["detail"]["upload_time_samples"] == 1
+    assert report["session"]["public_oauth"] == "ok"
+    assert report["quality_gates"]["radar_ready"]["pass"] is True
