@@ -148,7 +148,7 @@ from vinted_lab import (
     enqueue_scan as enqueue_vinted_scan, fetch_catalog_tree as fetch_vinted_catalog_tree,
     flatten_catalog_tree as flatten_vinted_catalog_tree, get_scan as get_vinted_scan,
     list_scans as list_vinted_scans, list_scan_items as list_vinted_scan_items,
-    scan_progress_snapshot as vinted_scan_progress,
+    scan_progress_snapshot as vinted_scan_progress, catalog_like_delta as vinted_catalog_like_delta,
 )
 from vinted_session_store import (
     clear_vinted_session, create_session_ticket, get_session_service,
@@ -11724,12 +11724,15 @@ async def _vinted_home_text() -> str:
         lines.extend(["", f"⚠️ Redis: <code>{html.escape(str(worker_status['error'])[:180])}</code>"])
     if scans:
         scan = scans[0]
+        latest_snapshot = await vinted_scan_progress(scan.id)
+        like_stats = dict((latest_snapshot or {}).get("catalog_likes") or {})
         lines.extend([
             "",
             "<b>Последний запуск</b>",
             f"{_vinted_mode_label(scan.mode)} · {_vinted_status_label(scan.status)}",
             f"Категории: <b>{int(scan.completed_categories or 0)}/{int(scan.total_categories or 0)}</b> · товаров: <b>{int(scan.total_items or 0)}</b>",
-            f"Exact views: <b>{int(scan.exact_views or 0)}</b> · favourites: <b>{int(scan.exact_favourites or 0)}</b>",
+            f"❤️ Catalog likes: <b>{int(like_stats.get('total', 0) or 0)}</b> · с лайками: <b>{int(like_stats.get('nonzero', 0) or 0)}</b>/{int(like_stats.get('known', 0) or 0)}",
+            f"Exact views: <b>{int(scan.exact_views or 0)}</b> · chronology: <b>{int(scan.chronology_count or 0)}</b>",
         ])
     return "\n".join(lines)
 
@@ -11872,6 +11875,7 @@ async def _vinted_scan_text(scan_id: int) -> tuple[str, VintedScan | None]:
     else:
         provider_line = "🔴 Metrics Worker offline"
     unknown_views = max(0, int(scan.metrics_done or 0) - int(scan.exact_views or 0))
+    like_stats = dict(snapshot.get("catalog_likes") or {})
     lines = [
         f"<b>{_vinted_mode_label(scan.mode)}</b>",
         f"Статус: <b>{_vinted_status_label(scan.status)}</b>",
@@ -11881,11 +11885,15 @@ async def _vinted_scan_text(scan_id: int) -> tuple[str, VintedScan | None]:
         f"Категории: <b>{int(scan.completed_categories or 0)}/{int(scan.total_categories or 0)}</b>",
         f"Найдено уникальных: <b>{int(scan.total_items or 0)}</b>",
         "",
+        "<b>❤️ Likes из каталога</b>",
+        f"Считано: <b>{int(like_stats.get('known', 0) or 0)}/{int(like_stats.get('items', 0) or 0)}</b> · с лайками: <b>{int(like_stats.get('nonzero', 0) or 0)}</b>",
+        f"Всего ❤️: <b>{int(like_stats.get('total', 0) or 0)}</b> · максимум у товара: <b>{int(like_stats.get('max', 0) or 0)}</b>",
+        "",
         "<b>👁 Exact Metrics</b>",
         f"{_progress_bar(int(metric_pct))} <b>{metric_pct:.1f}%</b>",
         f"Проверено: <b>{int(scan.metrics_done or 0)}/{int(scan.metrics_total or 0)}</b>",
         f"✅ Exact views: <b>{int(scan.exact_views or 0)}</b> · ❓ views UNKNOWN: <b>{unknown_views}</b>",
-        f"❤️ Favourites: <b>{int(scan.exact_favourites or 0)}</b> · 🕒 chronology: <b>{int(scan.chronology_count or 0)}</b>",
+        f"🕒 Chronology: <b>{int(scan.chronology_count or 0)}</b> · detail likes: <b>{int(scan.exact_favourites or 0)}</b>",
         f"Provider: <b>{provider_line}</b>",
     ]
     if scan.mode == "radar":
@@ -12037,7 +12045,14 @@ async def _vinted_result_screen(scan_id: int, offset: int) -> tuple[str, InlineK
         )
     item: VintedScanItem = items[0]
     views = str(item.view_count) if item.view_count is not None else "UNKNOWN"
-    fav = str(item.favourite_count) if item.favourite_count is not None else "UNKNOWN"
+    catalog_fav = item.catalog_favourite_count
+    detail_fav = item.favourite_count
+    fav_value = detail_fav if detail_fav is not None else catalog_fav
+    fav = str(fav_value) if fav_value is not None else "UNKNOWN"
+    fav_source = "detail" if detail_fav is not None else ("catalog" if catalog_fav is not None else "UNKNOWN")
+    like_delta = await vinted_catalog_like_delta(scan_id, item.item_id)
+    delta_value = like_delta.get("delta")
+    delta_text = "—" if delta_value is None else (f"+{int(delta_value)}" if int(delta_value) > 0 else str(int(delta_value)))
     price = "—" if item.price_amount is None else f"{float(item.price_amount):g} {html.escape(item.currency or 'EUR')}"
     lines = [
         f"<b>📦 Vinted · {offset + 1}/{total}</b>",
@@ -12048,7 +12063,7 @@ async def _vinted_result_screen(scan_id: int, offset: int) -> tuple[str, InlineK
         f"Бренд: <b>{html.escape(item.brand or '—')}</b> · размер: <b>{html.escape(item.size or '—')}</b>",
         "",
         f"👁 Exact views: <b>{views}</b>",
-        f"❤️ Favourites: <b>{fav}</b>",
+        f"❤️ Likes: <b>{fav}</b> · source: <b>{html.escape(fav_source)}</b> · Δ к прошлому скану: <b>{delta_text}</b>",
         f"🕒 Chronology: <b>{html.escape(str(item.upload_raw or 'UNKNOWN'))}</b>",
         f"Identity: <b>{'✅' if item.identity_ok else '▫️ UNKNOWN'}</b> · metric: <code>{html.escape(item.metric_outcome or item.metric_status or '—')}</code>",
     ]

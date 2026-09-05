@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Any, Iterable
 
 import httpx
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 
 from app_version import APP_VERSION
 from db import SessionLocal
@@ -781,6 +781,22 @@ async def scan_progress_snapshot(scan_id: int) -> dict[str, Any] | None:
         cats = list((await session.execute(
             select(VintedScanCategory).where(VintedScanCategory.scan_id == scan.id).order_by(VintedScanCategory.id)
         )).scalars().all())
+        like_row = (await session.execute(
+            select(
+                func.count(VintedScanItem.id),
+                func.count(VintedScanItem.catalog_favourite_count),
+                func.coalesce(func.sum(case((VintedScanItem.catalog_favourite_count > 0, 1), else_=0)), 0),
+                func.coalesce(func.sum(VintedScanItem.catalog_favourite_count), 0),
+                func.coalesce(func.max(VintedScanItem.catalog_favourite_count), 0),
+            ).where(VintedScanItem.scan_id == scan.id)
+        )).one()
+        catalog_likes = {
+            "items": int(like_row[0] or 0),
+            "known": int(like_row[1] or 0),
+            "nonzero": int(like_row[2] or 0),
+            "total": int(like_row[3] or 0),
+            "max": int(like_row[4] or 0),
+        }
         scan_units = 0.0
         for row in cats:
             if row.status in {"completed", "partial", "failed", "cancelled"}:
@@ -795,4 +811,45 @@ async def scan_progress_snapshot(scan_id: int) -> dict[str, Any] | None:
             "categories": cats,
             "scan_percent": scan_percent,
             "metrics_percent": metrics_percent,
+            "catalog_likes": catalog_likes,
+        }
+
+
+async def catalog_like_delta(scan_id: int, item_id: int) -> dict[str, int | None]:
+    """Compare public catalog favourite_count with the previous saved scan of the same item.
+
+    This never guesses missing values: absent catalog counts stay UNKNOWN.
+    """
+    async with SessionLocal() as session:
+        current_scan = await session.get(VintedScan, int(scan_id))
+        if current_scan is None:
+            return {"current": None, "previous": None, "delta": None, "previous_scan_id": None}
+        current = (await session.execute(
+            select(VintedScanItem.catalog_favourite_count).where(
+                VintedScanItem.scan_id == int(scan_id),
+                VintedScanItem.item_id == int(item_id),
+            )
+        )).scalar_one_or_none()
+        if current is None:
+            return {"current": None, "previous": None, "delta": None, "previous_scan_id": None}
+        prev = (await session.execute(
+            select(VintedScanItem.scan_id, VintedScanItem.catalog_favourite_count)
+            .join(VintedScan, VintedScan.id == VintedScanItem.scan_id)
+            .where(
+                VintedScanItem.item_id == int(item_id),
+                VintedScanItem.scan_id != int(scan_id),
+                VintedScanItem.catalog_favourite_count.is_not(None),
+                VintedScan.created_at < current_scan.created_at,
+            )
+            .order_by(VintedScan.created_at.desc(), VintedScanItem.id.desc())
+            .limit(1)
+        )).first()
+        if prev is None:
+            return {"current": int(current), "previous": None, "delta": None, "previous_scan_id": None}
+        previous = int(prev[1])
+        return {
+            "current": int(current),
+            "previous": previous,
+            "delta": int(current) - previous,
+            "previous_scan_id": int(prev[0]),
         }

@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.22.4", "VERSION=4.22.4")
+    check((ROOT / "VERSION").read_text().strip() == "4.22.9", "VERSION=4.22.9")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -56,7 +56,7 @@ def main() -> int:
     user_seed = radar.split('async def record_user_scan_radar3_baselines',1)[1].split('async def radar_v3_due_external_ids',1)[0]
     check('radar_v3_category_allowed(str(listing.category_key or ""))' in user_seed and 'radar_v3_category_allowed' in bot.split('def _radar_autoscan_category_allowed',1)[1].split('def _radar_autoscan_categories',1)[0],
           "AutoScan and user-scan baselines share the same Radar category policy")
-    check('RADAR_AUTOSCAN_POLICY_VERSION = 6' in bot and 'state = _radar_autoscan_default_state()' in bot and 'raw_state = {}' in bot,
+    check('RADAR_AUTOSCAN_POLICY_VERSION = 7' in bot and 'state = _radar_autoscan_default_state()' in bot and 'raw_state = {}' in bot,
           "policy upgrade discards old AutoScan telemetry/progress")
     check('if str(obs.status) not in {"observed", "confirmed"}:' in radar and 'continue' in radar,
           "only category-qualified Early/Strong observations can publish DT Score")
@@ -140,7 +140,7 @@ def main() -> int:
     check('callback_data="av:home"' in bot and '_vinted_watch_scan' in bot, "admin-only Vinted Lab has live progress UI")
     check('dtparser:vintedlab' in lab and 'SCAN_STREAM' in lab and 'METRICS_STREAM' in lab, "Vinted Lab uses an isolated Redis namespace")
     check('row.metric_status = "exact" if row.identity_ok and row.view_count is not None else "unknown"' in lab, "Vinted exact metrics remain fail-closed")
-    print("\nDT Parser 4.22.4 Vinted Admin Lab + Isolated Worker Fleet release smoke: PASS")
+    print("\nDT Parser 4.22.9 Vinted Catalog Likes release smoke: PASS")
     return 0
 
 
