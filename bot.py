@@ -150,6 +150,10 @@ from vinted_lab import (
     list_scans as list_vinted_scans, list_scan_items as list_vinted_scan_items,
     scan_progress_snapshot as vinted_scan_progress,
 )
+from vinted_session_store import (
+    clear_vinted_session, create_session_ticket, get_session_service,
+    load_vinted_session_json, load_vinted_session_meta,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("kleinanzeigen-bot")
@@ -11693,6 +11697,7 @@ def _vinted_home_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔎 Новый Vinted-скан", callback_data="av:new:m")],
         [InlineKeyboardButton(text="📡 Тестовый Radar-круг", callback_data="av:new:r")],
         [InlineKeyboardButton(text="📂 История сканов", callback_data="av:history")],
+        [InlineKeyboardButton(text="🔐 Vinted Session", callback_data="av:session")],
         [InlineKeyboardButton(text="⚙️ Vinted Workers", callback_data="av:workers")],
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="av:home")],
         [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
@@ -11861,7 +11866,7 @@ async def _vinted_scan_text(scan_id: int) -> tuple[str, VintedScan | None]:
     elif any(state in {"blocked", "challenge", "expired", "session_expired", "circuit_open"} for state in provider_states):
         provider_line = "🔴 session blocked/expired"
     elif metrics_workers and all(state == "session_missing" for state in provider_states):
-        provider_line = "🟠 VINTED_SESSION_JSON не задан"
+        provider_line = "🟠 Vinted Session не задана"
     elif metrics_workers:
         provider_line = "🟡 " + html.escape(", ".join(sorted(set(filter(None, provider_states))) or ["starting"])[:80])
     else:
@@ -11939,6 +11944,72 @@ def _vinted_workers_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="av:workers")],
         [InlineKeyboardButton(text="⬅️ Vinted Lab", callback_data="av:home")],
+    ])
+
+
+async def _vinted_session_screen() -> tuple[str, InlineKeyboardMarkup]:
+    session_raw, meta, service, worker_status = await asyncio.gather(
+        load_vinted_session_json(),
+        load_vinted_session_meta(),
+        get_session_service(),
+        VINTED_QUEUE.worker_status(),
+    )
+    metrics_workers = list(worker_status.get("metrics_workers") or [])
+    provider_states = sorted({str(w.get("provider_status") or "") for w in metrics_workers if w.get("provider_status")})
+    sources = sorted({str(w.get("session_source") or "") for w in metrics_workers if w.get("session_source")})
+    service_online = bool(service.get("online"))
+    public_url = str(service.get("public_url") or "").strip()
+    captured = str(meta.get("captured_at") or meta.get("updated_at") or "")
+    if captured:
+        captured = captured.replace("T", " ")[:19] + " UTC"
+    lines = [
+        "<b>🔐 Vinted Session</b>",
+        "<i>Вход открывается из админ-панели в одноразовом защищённом окне. Пароль в БД не сохраняется.</i>",
+        "",
+        f"Session: <b>{'🟢 сохранена' if session_raw else '🟠 не настроена'}</b>",
+    ]
+    if session_raw:
+        lines.append(
+            f"Cookies: <b>{int(meta.get('cookie_count', 0) or 0)}</b> · access/refresh: "
+            f"<b>{'✅' if meta.get('has_access_token_web') else '—'}/{'✅' if meta.get('has_refresh_token_web') else '—'}</b>"
+        )
+        if captured:
+            lines.append(f"Сохранена: <b>{html.escape(captured)}</b>")
+    lines.extend([
+        "",
+        f"Session Worker: <b>{'🟢 online' if service_online else '🔴 offline'}</b>",
+    ])
+    if service_online:
+        lines.append(f"v<b>{html.escape(str(service.get('version') or '—'))}</b> · HTTPS: <b>{'✅' if public_url.startswith('https://') else '⚠️'}</b>")
+        if not public_url.startswith("https://"):
+            lines.append("⚠️ Railway → <b>Vinted Session Worker → Networking → Generate Domain</b>.")
+    else:
+        lines.append("Для входа нужен отдельный Railway-сервис <b>Vinted Session Worker</b> с публичным Domain.")
+    if metrics_workers:
+        lines.extend([
+            "",
+            f"Metrics Worker: <b>{len(metrics_workers)}/2</b> · provider: <b>{html.escape(', '.join(provider_states) or 'starting')}</b>",
+            f"Источник сессии: <b>{html.escape(', '.join(sources) or '—')}</b>",
+        ])
+    lines.extend([
+        "",
+        "После сохранения Metrics Worker подхватят новую сессию автоматически примерно за 10–15 секунд — redeploy не нужен.",
+    ])
+    rows: list[list[InlineKeyboardButton]] = []
+    if service_online and public_url.startswith("https://"):
+        rows.append([InlineKeyboardButton(text="🌐 Открыть вход Vinted", callback_data="av:sessionnew")])
+    rows.append([InlineKeyboardButton(text="🔄 Проверить", callback_data="av:session")])
+    if session_raw:
+        rows.append([InlineKeyboardButton(text="🗑 Удалить сессию", callback_data="av:sessionclearask")])
+    rows.append([InlineKeyboardButton(text="⬅️ Vinted Lab", callback_data="av:home")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _vinted_session_open_keyboard(url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Открыть Vinted и войти", url=url)],
+        [InlineKeyboardButton(text="🔄 Я вошёл · проверить", callback_data="av:session")],
+        [InlineKeyboardButton(text="⬅️ Vinted Session", callback_data="av:session")],
     ])
 
 
@@ -12052,6 +12123,43 @@ async def vinted_admin_lab_handler(callback: CallbackQuery) -> None:
 
     if action == "home":
         await _edit_or_answer(callback.message, await _vinted_home_text(), reply_markup=_vinted_home_keyboard())
+        return
+
+    if action == "session":
+        text_value, keyboard = await _vinted_session_screen()
+        await _edit_or_answer(callback.message, text_value, reply_markup=keyboard)
+        return
+
+    if action == "sessionnew":
+        service = await get_session_service()
+        public_url = str(service.get("public_url") or "").strip().rstrip("/")
+        if not service.get("online") or not public_url.startswith("https://"):
+            await callback.answer("Vinted Session Worker offline или для него не создан Railway Domain.", show_alert=True)
+            return
+        token = await create_session_ticket(callback.from_user.id, ttl_minutes=15)
+        setup_url = f"{public_url}/setup#token={token}"
+        text_value = (
+            "<b>🔐 Вход в Vinted</b>\n\n"
+            "Ссылка одноразовая и действует <b>15 минут</b>. Открой её, войди в свой Vinted и нажми "
+            "<b>✅ Сохранить сессию</b>. После этого вернись сюда.\n\n"
+            "<i>Пароль не сохраняется. Сохраняются только cookies авторизованной Vinted-сессии.</i>"
+        )
+        await _edit_or_answer(callback.message, text_value, reply_markup=_vinted_session_open_keyboard(setup_url))
+        return
+
+    if action == "sessionclearask":
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Да, удалить", callback_data="av:sessionclear")],
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data="av:session")],
+        ])
+        await _edit_or_answer(callback.message, "<b>Удалить сохранённую Vinted Session?</b>\n\nMetrics Worker перейдут в UNKNOWN до нового входа.", reply_markup=keyboard)
+        return
+
+    if action == "sessionclear":
+        await clear_vinted_session()
+        await callback.answer("Vinted Session удалена", show_alert=True)
+        text_value, keyboard = await _vinted_session_screen()
+        await _edit_or_answer(callback.message, text_value, reply_markup=keyboard)
         return
 
     if action == "new":

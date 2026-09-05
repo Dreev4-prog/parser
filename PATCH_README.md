@@ -1,24 +1,50 @@
-# DT PARSER v4.22.6 — GitHub Web Patch
+# DT PARSER v4.22.7 — GitHub Web patch from v4.22.6
 
-Base: v4.22.4 Vinted Admin Lab Workers.
+Replace/add these files on top of **v4.22.6**. Do not delete any other repository files.
 
-This compact patch contains only runtime files changed by v4.22.5 + v4.22.6.
-It intentionally excludes unchanged assets, docs, tests and history to keep GitHub web upload small.
+## What this patch adds
 
-Replace/add these files in the repository root:
-- bot.py
-- service_launcher.py
-- vinted_lab.py
-- vinted_metrics_worker.py
-- vinted_browser_metrics.py (new)
-- VERSION
+Admin-only login flow:
 
-Local helper files (not required by Railway runtime):
-- capture_vinted_session.py
-- CAPTURE_VINTED_SESSION_MAC.command
+`Админ-панель -> Vinted Lab -> Vinted Session -> Открыть вход Vinted`
 
-No manual SQL migration is required.
-No new mandatory Railway variable is required for the Kleinanzeigen AutoScan patch.
-VINTED_SESSION_JSON remains optional and is only for the Vinted exact-metrics browser-session path.
+A new isolated Railway service opens the Vinted browser session. The admin logs in manually in the secure one-time browser page and presses `Сохранить сессию`. The resulting browser cookies are saved in PostgreSQL; password/2FA text is not persisted or logged.
 
-After replacing files, redeploy Parser. Vinted Metrics Worker should also be redeployed if you are testing the v4.22.5 exact-session path.
+## Railway: one new service
+
+Create from the same repository:
+
+- **Name:** `Vinted Session Worker`
+- **Start Command:** `python service_launcher.py`
+- **Replicas:** 1
+- **DATABASE_URL:** same PostgreSQL as Parser/Vinted workers
+- **REDIS_URL:** not required
+- **BOT_TOKEN:** not required
+- **VINTED_SESSION_JSON:** not required
+
+Then open **Networking -> Generate Domain** for this service. If the service was already running, redeploy once after the domain is generated.
+
+The Session Worker publishes its HTTPS address to PostgreSQL. Parser reads it automatically; no URL variable is needed.
+
+## Existing services
+
+Deploy Parser and both Vinted Metrics Worker replicas from v4.22.7. Scan Worker can stay on the same checkout/version for consistency; its algorithm is unchanged.
+
+Metrics Worker priority for session source:
+1. explicit legacy `VINTED_SESSION_JSON` env, if present;
+2. otherwise session captured from Admin and stored in PostgreSQL.
+
+If you want Admin login to control the session, do not keep an old `VINTED_SESSION_JSON` override on Metrics Worker.
+
+After a new Admin session is saved, Metrics Worker hot-reloads it automatically in about 10–15 seconds; no redeploy is needed.
+
+## Security boundary
+
+- login URL uses a one-time 15-minute token;
+- token is kept in the URL fragment and sent to the service in a header, so it is not placed in normal HTTP access-log URLs;
+- aiohttp access logging is disabled on the Session Worker;
+- login text/password/2FA are forwarded only to the isolated browser keyboard and are never stored/logged;
+- only first-party Vinted browser session state is stored;
+- no CAPTCHA solving, proxy rotation, stealth/fingerprint bypass, or challenge bypass is included.
+
+Kleinanzeigen parser/Page/Date/View/Radar/AutoScan v4.22.6 logic is unchanged.

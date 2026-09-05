@@ -18,14 +18,30 @@ from vinted_lab import (
     save_metric_sample,
 )
 from vinted_probe import DEFAULT_BASE_URL, VintedItem
+from vinted_session_store import load_vinted_session_json, session_fingerprint
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("vinted-metrics-worker")
 
 
-async def _heartbeat(worker_id: str, state: dict[str, Any], provider: VintedBrowserMetricClient) -> None:
+async def _heartbeat(worker_id: str, state: dict[str, Any], provider: VintedBrowserMetricClient, *, session_from_env: bool) -> None:
+    last_db_check = 0.0
+    last_db_fingerprint = str(state.get("session_fingerprint") or "")
     while True:
         try:
+            now = time.monotonic()
+            if not session_from_env and now - last_db_check >= 10.0:
+                last_db_check = now
+                db_fingerprint = await session_fingerprint()
+                if db_fingerprint and db_fingerprint != last_db_fingerprint:
+                    raw = await load_vinted_session_json()
+                    if raw:
+                        status = await provider.reload_session(raw)
+                        last_db_fingerprint = db_fingerprint
+                        state["session_fingerprint"] = db_fingerprint
+                        state["session_source"] = "admin-db"
+                        state["session_configured"] = provider.configured
+                        log.info("Vinted Metrics session hot-reloaded from admin DB | status=%s", status)
             state.update(provider.health_snapshot())
             await VINTED_QUEUE.heartbeat(role="metrics", worker_id=worker_id, payload=state)
         except Exception as exc:
@@ -117,13 +133,17 @@ async def main() -> None:
     worker_id = make_worker_id("vmetrics")
     pool_size = max(1, min(8, int(os.getenv("VINTED_METRICS_CONCURRENCY", "4") or 4)))
     min_interval = max(0.08, min(2.0, float(os.getenv("VINTED_METRICS_MIN_INTERVAL_SECONDS", "0.18") or 0.18)))
+    env_session = os.getenv("VINTED_SESSION_JSON", "").strip()
+    db_session = "" if env_session else await load_vinted_session_json()
+    raw_session = env_session or db_session
     provider = VintedBrowserMetricClient(
         base_url=(os.getenv("VINTED_BASE_URL") or DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL,
-        session_json=os.getenv("VINTED_SESSION_JSON", "").strip(),
+        session_json=raw_session,
         concurrency=pool_size,
         min_interval_seconds=min_interval,
     )
     provider_status = await provider.start()
+    db_fingerprint = "" if env_session else await session_fingerprint()
 
     state: dict[str, Any] = {
         "active": 0,
@@ -134,6 +154,8 @@ async def main() -> None:
         "errors": 0,
         "concurrency": pool_size,
         "session_configured": provider.configured,
+        "session_source": "env" if env_session else ("admin-db" if db_session else "missing"),
+        "session_fingerprint": db_fingerprint if not env_session else provider.session_signature(),
     }
     state.update(provider.health_snapshot())
     log.info(
@@ -141,14 +163,14 @@ async def main() -> None:
         APP_VERSION,
         worker_id,
         provider_status,
-        "configured" if provider.configured else "missing",
+        ("env" if env_session else "admin-db") if provider.configured else "missing",
         pool_size,
         min_interval,
     )
     if not provider.configured:
-        log.warning("VINTED_SESSION_JSON missing: metric tasks will fail fast as UNKNOWN instead of wasting HTTP calls")
+        log.warning("Vinted session missing: open Admin -> Vinted Lab -> Vinted Session; worker will hot-reload after save")
 
-    hb = asyncio.create_task(_heartbeat(worker_id, state, provider))
+    hb = asyncio.create_task(_heartbeat(worker_id, state, provider, session_from_env=bool(env_session)))
     slots = [asyncio.create_task(_slot_loop(worker_id, provider, state, idx + 1)) for idx in range(pool_size)]
     try:
         await asyncio.gather(*slots)

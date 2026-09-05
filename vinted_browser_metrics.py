@@ -128,6 +128,35 @@ class VintedBrowserMetricClient:
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._start_lock = asyncio.Lock()
+        self._reload_lock = asyncio.Lock()
+
+
+    def session_signature(self) -> str:
+        import hashlib
+        raw = json.dumps(self.session, ensure_ascii=False, sort_keys=True, separators=(",", ":")) if self.session else ""
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16] if raw else ""
+
+    async def reload_session(self, raw_session: str) -> str:
+        """Replace the authenticated browser state without restarting Railway.
+
+        Used by the admin-session service: Metrics Worker notices a newer DB session,
+        closes only its isolated Vinted browser context and starts a fresh one.
+        """
+        async with self._reload_lock:
+            parsed = _parse_session(raw_session)
+            new_raw = json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":")) if parsed else ""
+            old_raw = json.dumps(self.session, ensure_ascii=False, sort_keys=True, separators=(",", ":")) if self.session else ""
+            if new_raw == old_raw and self._page is not None:
+                return self.health.status
+            await self.close()
+            self.session = parsed
+            self.endpoint_template = str(self.session.get("metric_endpoint_template") or DEFAULT_ENDPOINT_TEMPLATE)
+            if "{item_id}" not in self.endpoint_template:
+                self.endpoint_template = DEFAULT_ENDPOINT_TEMPLATE
+            self.user_agent = str(self.session.get("user_agent") or "").strip()
+            self.locale = str(self.session.get("locale") or "de-DE").strip() or "de-DE"
+            self.health = BrowserMetricHealth(status="session_missing" if not self.session else "starting")
+            return await self.start()
 
     @property
     def configured(self) -> bool:

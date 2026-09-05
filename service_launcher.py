@@ -27,6 +27,8 @@ def _role() -> str:
         return "vinted-scan-worker"
     if explicit in {"vintedmetricsworker", "vintedmetricworker"}:
         return "vinted-metrics-worker"
+    if explicit in {"vintedsessionworker", "vintedloginworker", "vintedauthworker"}:
+        return "vinted-session-worker"
     if explicit in {"vintedprobe", "vintedworker", "vintedprobeworker"}:
         return "vinted-probe"
     if explicit in {"bot", "main", "parserbot", "telegrambot"}:
@@ -56,6 +58,8 @@ def _role() -> str:
         ("lifecycle" in normalized or "fastsold" in normalized) and "worker" in normalized
     ):
         return "lifecycle-worker"
+    if "vinted" in normalized and "worker" in normalized and ("session" in normalized or "login" in normalized or "auth" in normalized):
+        return "vinted-session-worker"
     if "vinted" in normalized and "worker" in normalized and ("metric" in normalized or "metrics" in normalized):
         return "vinted-metrics-worker"
     if "vinted" in normalized and "worker" in normalized and ("scan" in normalized or "catalog" in normalized or "parser" in normalized):
@@ -93,7 +97,7 @@ def main() -> None:
     if role == "vinted-probe":
         # Vinted Probe is intentionally isolated from Kleinanzeigen Page/Date/View queues.
         os.environ.setdefault("DISTRIBUTED_WORKERS", "1")
-    if role in {"vinted-scan-worker", "vinted-metrics-worker"}:
+    if role in {"vinted-scan-worker", "vinted-metrics-worker", "vinted-session-worker"}:
         # Vinted Lab owns a separate Redis namespace and PostgreSQL tables. Metrics
         # v4.22.5 runs four concurrent slots per replica, so give only that isolated
         # service a slightly wider short-lived DB pool; Kleinanzeigen pools are untouched.
@@ -113,6 +117,7 @@ def main() -> None:
         "vinted-probe": "vinted_probe_worker.py",
         "vinted-scan-worker": "vinted_scan_worker.py",
         "vinted-metrics-worker": "vinted_metrics_worker.py",
+        "vinted-session-worker": "vinted_session_worker.py",
     }.get(role, "bot.py")
 
     print(

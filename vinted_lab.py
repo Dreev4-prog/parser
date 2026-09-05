@@ -19,6 +19,7 @@ from app_version import APP_VERSION
 from db import SessionLocal
 from models import VintedMetricHistory, VintedScan, VintedScanCategory, VintedScanItem
 from vinted_probe import DEFAULT_BASE_URL, DEFAULT_USER_AGENT
+from vinted_session_store import load_vinted_session_json
 
 try:
     from redis.asyncio import Redis  # type: ignore
@@ -195,7 +196,7 @@ async def fetch_catalog_tree(*, force: bool = False) -> tuple[list[dict[str, Any
                 # first-party cookies for category metadata. This often exposes the complete
                 # current tree when anonymous initializers are restricted. Missing/invalid
                 # session data still falls back safely and never blocks scanning.
-                raw_session = os.getenv("VINTED_SESSION_JSON", "").strip()
+                raw_session = os.getenv("VINTED_SESSION_JSON", "").strip() or await load_vinted_session_json()
                 if raw_session:
                     try:
                         session_payload = json.loads(raw_session)
