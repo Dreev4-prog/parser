@@ -26,7 +26,7 @@ VINTED_RADAR_SETTING_KEY = "vinted_radar_1_0"
 VINTED_RADAR_LIVE_HOURS = max(6, min(48, int(os.getenv("VINTED_RADAR_LIVE_HOURS", "24") or 24)))
 VINTED_RADAR_HISTORY_DAYS = max(2, min(30, int(os.getenv("VINTED_RADAR_HISTORY_DAYS", "7") or 7)))
 VINTED_RADAR_INTERVAL_MINUTES = max(15, min(360, int(os.getenv("VINTED_RADAR_INTERVAL_MINUTES", "60") or 60)))
-VINTED_RADAR_CACHE_SECONDS = max(5, min(120, int(os.getenv("VINTED_RADAR_CACHE_SECONDS", "20") or 20)))
+VINTED_RADAR_CACHE_SECONDS = max(30, min(300, int(os.getenv("VINTED_RADAR_CACHE_SECONDS", "120") or 120)))
 VINTED_RADAR_PAGES_PER_CATEGORY = 15
 # v4.23.3: the DE catalog contains thousands of terminal ids. Radar keeps complete
 # market coverage by partitioning the tree into a bounded set of non-overlapping
@@ -190,10 +190,29 @@ def _brand_momentum_points(rate: float | None) -> int:
 
 
 @dataclass(slots=True)
+class _RadarItem:
+    id: int
+    scan_id: int
+    item_id: int
+    catalog_id: int | None
+    catalog_favourite_count: int | None
+    price_amount: Any
+    brand: str
+    seller_id: int | None
+    title: str
+    url: str
+    category_name: str
+    currency: str
+    size: str
+    condition: str
+    seller_login: str
+
+
+@dataclass(slots=True)
 class _Sample:
     scan_id: int
     scan_created_at: datetime
-    item: VintedScanItem
+    item: _RadarItem
 
 
 @dataclass(slots=True)
@@ -537,6 +556,33 @@ def invalidate_radar_cache() -> None:
     _cache_value = None
 
 
+async def radar_overview() -> dict[str, Any]:
+    """Cheap UI status for Vinted Lab without rebuilding the seven-day Radar model.
+
+    The full snapshot can contain a large multi-round item history and must not sit on
+    the critical path of every Telegram button.  If a scored snapshot is already in
+    memory we expose its counters; otherwise the home screen shows counters as pending
+    while Radar itself remains available.
+    """
+    cfg = await radar_config()
+    cached = _cache_value
+    snapshot = cached[1] if cached is not None else None
+    request_radar_snapshot_refresh(force=False)
+    age_seconds = None if cached is None else max(0.0, time.monotonic() - cached[0])
+    return {
+        "enabled": bool(cfg.get("enabled")),
+        "last_scan_id": cfg.get("last_scan_id"),
+        "last_scan_at": cfg.get("last_scan_at"),
+        "categories": list(cfg.get("categories") or []),
+        "live_total": None if snapshot is None else int(snapshot.live_total),
+        "hot": None if snapshot is None else int(snapshot.hot),
+        "rising": None if snapshot is None else int(snapshot.rising),
+        "deals": None if snapshot is None else int(snapshot.deals),
+        "candidates": None if snapshot is None else int(snapshot.candidates),
+        "cache_age_seconds": age_seconds,
+    }
+
+
 def _sample_rate(a: _Sample, b: _Sample) -> tuple[int | None, float | None, float | None]:
     a_likes = a.item.catalog_favourite_count
     b_likes = b.item.catalog_favourite_count
@@ -574,42 +620,50 @@ def _status_for(score: int, sample_count: int, like_delta: int | None, price_edg
     return "baseline"
 
 
-async def _build_snapshot() -> VintedRadarSnapshot:
-    now = utcnow()
-    history_cutoff = now - timedelta(days=VINTED_RADAR_HISTORY_DAYS)
-    async with SessionLocal() as session:
-        rows = list((await session.execute(
-            select(VintedScanItem, VintedScan.created_at)
-            .join(VintedScan, VintedScan.id == VintedScanItem.scan_id)
-            .where(
-                VintedScan.mode == "radar",
-                VintedScan.created_at >= history_cutoff,
-                ~VintedScan.status.in_(("failed", "cancelled")),
-            )
-            .order_by(VintedScan.created_at.asc(), VintedScanItem.id.asc())
-        )).all())
+def _score_snapshot_rows(rows: list[Any], now: datetime) -> tuple[list[VintedRadarEntry], int, dict[str, int]]:
+    """CPU-heavy Radar scoring, intentionally executed outside the asyncio loop.
 
+    Rows contain only scalar columns.  Keeping SQLAlchemy ORM objects and percentile /
+    median loops off the Telegram event loop prevents Vinted Radar from stalling every
+    other bot callback while a large seven-day history is scored.
+    """
     grouped: dict[int, list[_Sample]] = {}
-    for item, scan_created_at in rows:
-        grouped.setdefault(int(item.item_id), []).append(
-            _Sample(scan_id=int(item.scan_id), scan_created_at=scan_created_at, item=item)
+    for row in rows:
+        item = _RadarItem(
+            id=int(row[0]),
+            scan_id=int(row[1]),
+            item_id=int(row[2]),
+            catalog_id=int(row[3]) if row[3] is not None else None,
+            catalog_favourite_count=int(row[4]) if row[4] is not None else None,
+            price_amount=row[5],
+            brand=str(row[6] or ""),
+            seller_id=int(row[7]) if row[7] is not None else None,
+            title=str(row[8] or ""),
+            url=str(row[9] or ""),
+            category_name=str(row[10] or ""),
+            currency=str(row[11] or ""),
+            size=str(row[12] or ""),
+            condition=str(row[13] or ""),
+            seller_login=str(row[14] or ""),
+        )
+        scan_created_at = row[15]
+        grouped.setdefault(item.item_id, []).append(
+            _Sample(scan_id=item.scan_id, scan_created_at=scan_created_at, item=item)
         )
 
     # First pass: time-series primitives independent from peer statistics.
     primitives: dict[int, dict[str, Any]] = {}
     for item_id, samples in grouped.items():
-        samples.sort(key=lambda s: (s.scan_created_at, s.item.id))
+        samples.sort(key=lambda sample: (sample.scan_created_at, sample.item.id))
         first_seen = samples[0].scan_created_at
         live_cutoff = first_seen + timedelta(hours=VINTED_RADAR_LIVE_HOURS)
-        # Learning is frozen at the end of the Live window. Later incidental catalog
-        # appearances are stored by scans but never inflate the 0-24h reference pool.
         radar_samples = [sample for sample in samples if sample.scan_created_at <= live_cutoff]
         if not radar_samples:
             radar_samples = [samples[0]]
         latest = radar_samples[-1]
         latest_seen = latest.scan_created_at
         current_likes = latest.item.catalog_favourite_count
-        known = [s for s in radar_samples if s.item.catalog_favourite_count is not None]
+        known = [sample for sample in radar_samples if sample.item.catalog_favourite_count is not None]
         prev_likes: int | None = None
         like_delta: int | None = None
         sample_hours: float | None = None
@@ -643,11 +697,10 @@ async def _build_snapshot() -> VintedRadarSnapshot:
         }
 
     live_ids = {
-        item_id for item_id, p in primitives.items()
-        if p["current_age"] <= float(VINTED_RADAR_LIVE_HOURS)
+        item_id for item_id, primitive in primitives.items()
+        if primitive["current_age"] <= float(VINTED_RADAR_LIVE_HOURS)
     }
 
-    # Current market universe for price/scarcity/seller comparisons.
     live_latest = [primitives[item_id]["latest"].item for item_id in live_ids]
     brand_counts: dict[tuple[int, str], int] = {}
     seller_counts: dict[int, int] = {}
@@ -665,16 +718,15 @@ async def _build_snapshot() -> VintedRadarSnapshot:
             if key[1]:
                 price_groups.setdefault(key, []).append(price)
 
-    # Seven-day reference pools, normalized by age bucket and catalog.
     likes_ref: dict[tuple[int, str], list[int]] = {}
     velocity_ref: dict[tuple[int, str], list[float]] = {}
     brand_velocity_ref: dict[str, list[float]] = {}
-    for p in primitives.values():
-        latest_item = p["latest"].item
+    for primitive in primitives.values():
+        latest_item = primitive["latest"].item
         catalog = int(latest_item.catalog_id or 0)
-        bucket = str(p["bucket"])
-        likes = p["likes"]
-        velocity = p["velocity"]
+        bucket = str(primitive["bucket"])
+        likes = primitive["likes"]
+        velocity = primitive["velocity"]
         if likes is not None:
             likes_ref.setdefault((catalog, bucket), []).append(int(likes))
         if velocity is not None and velocity >= 0:
@@ -685,14 +737,14 @@ async def _build_snapshot() -> VintedRadarSnapshot:
 
     entries: list[VintedRadarEntry] = []
     for item_id in live_ids:
-        p = primitives[item_id]
-        latest_sample: _Sample = p["latest"]
+        primitive = primitives[item_id]
+        latest_sample: _Sample = primitive["latest"]
         item = latest_sample.item
         catalog = int(item.catalog_id or 0)
         brand = _norm(item.brand)
-        bucket = str(p["bucket"])
-        likes = p["likes"]
-        velocity = p["velocity"]
+        bucket = str(primitive["bucket"])
+        likes = primitive["likes"]
+        velocity = primitive["velocity"]
         like_pct = _percentile(likes, likes_ref.get((catalog, bucket), []))
         velocity_pct = _percentile(velocity, velocity_ref.get((catalog, bucket), []))
 
@@ -711,7 +763,7 @@ async def _build_snapshot() -> VintedRadarSnapshot:
 
         components = {
             "like_velocity": _velocity_points(velocity, velocity_pct),
-            "acceleration": _acceleration_points(p["acceleration"]),
+            "acceleration": _acceleration_points(primitive["acceleration"]),
             "price_edge": _price_edge_points(price_edge_pct),
             "likes_vs_peers": _peer_like_points(likes, like_pct),
             "scarcity": _scarcity_points(scarcity_count, brand),
@@ -719,52 +771,89 @@ async def _build_snapshot() -> VintedRadarSnapshot:
             "brand_momentum": _brand_momentum_points(brand_velocity),
         }
         score = max(0, min(100, sum(components.values())))
-        # The first observation is a baseline, never a demand-confirmed HOT/RISING signal.
-        if int(p["sample_count"]) < 2:
+        if int(primitive["sample_count"]) < 2:
             score = min(score, 59)
-        status = _status_for(score, int(p["sample_count"]), p["like_delta"], price_edge_pct)
+        status = _status_for(score, int(primitive["sample_count"]), primitive["like_delta"], price_edge_pct)
         entries.append(VintedRadarEntry(
             item_id=int(item_id),
             scan_id=int(latest_sample.scan_id),
-            title=str(item.title or "")[:500],
-            url=str(item.url or "")[:1200],
+            title=item.title[:500],
+            url=item.url[:1200],
             catalog_id=catalog,
-            category_name=str(item.category_name or "")[:255],
+            category_name=item.category_name[:255],
             price_amount=price,
-            currency=str(item.currency or ""),
-            brand=str(item.brand or ""),
-            size=str(item.size or ""),
-            condition=str(item.condition or ""),
-            seller_id=int(item.seller_id) if item.seller_id else None,
-            seller_login=str(item.seller_login or ""),
-            first_seen_at=p["first_seen"],
-            last_seen_at=p["last_seen"],
-            age_hours=float(p["current_age"]),
-            age_bucket=_age_bucket(float(p["current_age"])),
+            currency=item.currency,
+            brand=item.brand,
+            size=item.size,
+            condition=item.condition,
+            seller_id=item.seller_id,
+            seller_login=item.seller_login,
+            first_seen_at=primitive["first_seen"],
+            last_seen_at=primitive["last_seen"],
+            age_hours=float(primitive["current_age"]),
+            age_bucket=_age_bucket(float(primitive["current_age"])),
             likes=likes,
-            previous_likes=p["previous_likes"],
-            like_delta=p["like_delta"],
-            sample_hours=p["sample_hours"],
+            previous_likes=primitive["previous_likes"],
+            like_delta=primitive["like_delta"],
+            sample_hours=primitive["sample_hours"],
             like_velocity=velocity,
-            acceleration=p["acceleration"],
+            acceleration=primitive["acceleration"],
             price_median=price_median,
             price_edge_pct=price_edge_pct,
             like_percentile=like_pct,
             scarcity_count=scarcity_count,
             seller_active_count=seller_active,
             brand_velocity=brand_velocity,
-            sample_count=int(p["sample_count"]),
+            sample_count=int(primitive["sample_count"]),
             score=score,
             status=status,
             components=components,
         ))
 
     status_order = {"hot": 0, "rising": 1, "deal": 2, "candidate": 3, "baseline": 4}
-    entries.sort(key=lambda e: (status_order.get(e.status, 9), -e.score, -(e.like_velocity or 0.0), -(e.likes or 0)))
+    entries.sort(key=lambda entry: (status_order.get(entry.status, 9), -entry.score, -(entry.like_velocity or 0.0), -(entry.likes or 0)))
+    counts = {name: sum(1 for entry in entries if entry.status == name) for name in ("hot", "rising", "deal", "candidate", "baseline")}
+    return entries, len(primitives), counts
+
+
+async def _build_snapshot() -> VintedRadarSnapshot:
+    now = utcnow()
+    history_cutoff = now - timedelta(days=VINTED_RADAR_HISTORY_DAYS)
+    async with SessionLocal() as session:
+        # Fetch only the scalar columns the score actually needs.  The old ORM query
+        # hydrated every VintedScanItem column for the whole seven-day history.
+        rows = list((await session.execute(
+            select(
+                VintedScanItem.id,
+                VintedScanItem.scan_id,
+                VintedScanItem.item_id,
+                VintedScanItem.catalog_id,
+                VintedScanItem.catalog_favourite_count,
+                VintedScanItem.price_amount,
+                VintedScanItem.brand,
+                VintedScanItem.seller_id,
+                VintedScanItem.title,
+                VintedScanItem.url,
+                VintedScanItem.category_name,
+                VintedScanItem.currency,
+                VintedScanItem.size,
+                VintedScanItem.condition,
+                VintedScanItem.seller_login,
+                VintedScan.created_at,
+            )
+            .join(VintedScan, VintedScan.id == VintedScanItem.scan_id)
+            .where(
+                VintedScan.mode == "radar",
+                VintedScan.created_at >= history_cutoff,
+                ~VintedScan.status.in_(("failed", "cancelled")),
+            )
+            .order_by(VintedScan.created_at.asc(), VintedScanItem.id.asc())
+        )).all())
+
+    entries, history_items, counts = await asyncio.to_thread(_score_snapshot_rows, rows, now)
     cfg = await radar_config()
     last_scan_at = cfg.get("last_scan_at")
     next_scan_at = last_scan_at + timedelta(minutes=int(cfg["interval_minutes"])) if cfg["enabled"] and last_scan_at else None
-    counts = {name: sum(1 for e in entries if e.status == name) for name in ("hot", "rising", "deal", "candidate", "baseline")}
     return VintedRadarSnapshot(
         generated_at=now,
         entries=entries,
@@ -774,7 +863,7 @@ async def _build_snapshot() -> VintedRadarSnapshot:
         deals=counts["deal"],
         candidates=counts["candidate"],
         baselines=counts["baseline"],
-        history_items=len(primitives),
+        history_items=history_items,
         auto_enabled=bool(cfg["enabled"]),
         auto_interval_minutes=int(cfg["interval_minutes"]),
         last_scan_id=cfg.get("last_scan_id"),
@@ -785,20 +874,67 @@ async def _build_snapshot() -> VintedRadarSnapshot:
     )
 
 
+_refresh_task: asyncio.Task | None = None
+
+
+def _snapshot_is_fresh(cached: tuple[float, VintedRadarSnapshot] | None, now_mono: float | None = None) -> bool:
+    if cached is None:
+        return False
+    now_mono = time.monotonic() if now_mono is None else now_mono
+    return now_mono - cached[0] <= VINTED_RADAR_CACHE_SECONDS
+
+
 async def build_radar_snapshot(*, force: bool = False) -> VintedRadarSnapshot:
     global _cache_value
-    now_mono = time.monotonic()
     cached = _cache_value
-    if not force and cached is not None and now_mono - cached[0] <= VINTED_RADAR_CACHE_SECONDS:
+    if not force and _snapshot_is_fresh(cached):
         return cached[1]
     async with _cache_lock:
         cached = _cache_value
-        now_mono = time.monotonic()
-        if not force and cached is not None and now_mono - cached[0] <= VINTED_RADAR_CACHE_SECONDS:
+        if not force and _snapshot_is_fresh(cached):
             return cached[1]
+        started = time.monotonic()
         snapshot = await _build_snapshot()
         _cache_value = (time.monotonic(), snapshot)
+        log.info(
+            "Vinted Radar snapshot rebuilt | rows/live_history=%s live=%s elapsed=%.2fs",
+            snapshot.history_items, snapshot.live_total, time.monotonic() - started,
+        )
         return snapshot
+
+
+async def _background_refresh(force: bool = False) -> None:
+    global _refresh_task
+    try:
+        await build_radar_snapshot(force=force)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Vinted Radar background snapshot refresh failed")
+    finally:
+        if _refresh_task is asyncio.current_task():
+            _refresh_task = None
+
+
+def request_radar_snapshot_refresh(*, force: bool = False) -> bool:
+    """Start at most one background rebuild and return immediately to Telegram UI."""
+    global _refresh_task
+    cached = _cache_value
+    if not force and _snapshot_is_fresh(cached):
+        return False
+    if _refresh_task is not None and not _refresh_task.done():
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    _refresh_task = loop.create_task(_background_refresh(force=force), name="vinted-radar-snapshot-refresh")
+    return True
+
+
+def peek_radar_snapshot() -> VintedRadarSnapshot | None:
+    cached = _cache_value
+    return cached[1] if cached is not None else None
 
 
 async def get_radar_entry(item_id: int, *, force: bool = False) -> VintedRadarEntry | None:

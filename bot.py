@@ -157,7 +157,9 @@ from vinted_session_store import (
 from vinted_radar import (
     VINTED_RADAR_HISTORY_DAYS, VINTED_RADAR_INTERVAL_MINUTES, VINTED_RADAR_LIVE_HOURS,
     VINTED_RADAR_PAGES_PER_CATEGORY, VINTED_RADAR_TARGET_SEGMENTS,
-    build_radar_snapshot as build_vinted_radar_snapshot,
+    radar_overview as vinted_radar_overview,
+    peek_radar_snapshot as peek_vinted_radar_snapshot,
+    request_radar_snapshot_refresh as request_vinted_radar_snapshot_refresh,
     disable_radar as disable_vinted_radar,
     enable_radar as enable_vinted_radar,
     get_radar_entry as get_vinted_radar_entry,
@@ -11670,7 +11672,7 @@ async def _admin_page_worker_text() -> str:
 # bot only orchestrates Vinted-specific Redis streams/tables and renders diagnostics.
 VINTED_ADMIN_MAX_CATEGORIES = 24
 _VINTED_ADMIN_CFG: dict[int, dict[str, Any]] = {}
-_VINTED_ADMIN_WATCHERS: dict[int, asyncio.Task] = {}
+_VINTED_ADMIN_WATCHERS: dict[tuple[int, int], asyncio.Task] = {}
 
 
 def _vinted_cfg(user_id: int) -> dict[str, Any]:
@@ -11702,6 +11704,30 @@ def _vinted_terminal(status: str) -> bool:
     return str(status or "") in {"completed", "partial", "failed", "cancelled"}
 
 
+async def _vinted_worker_status_fast(timeout: float = 2.0) -> dict[str, Any]:
+    """Keep Telegram callbacks responsive even when Redis is degraded."""
+    try:
+        return await asyncio.wait_for(VINTED_QUEUE.worker_status(), timeout=max(0.5, float(timeout)))
+    except asyncio.TimeoutError:
+        return {
+            "enabled": bool(VINTED_QUEUE.enabled),
+            "error": "Redis status timeout",
+            "scan_workers": [],
+            "metrics_workers": [],
+            "scan_queue": 0,
+            "metrics_queue": 0,
+        }
+    except Exception as exc:
+        return {
+            "enabled": bool(VINTED_QUEUE.enabled),
+            "error": f"{type(exc).__name__}: {exc}",
+            "scan_workers": [],
+            "metrics_workers": [],
+            "scan_queue": 0,
+            "metrics_queue": 0,
+        }
+
+
 def _vinted_home_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📡 Vinted Radar 1.0", callback_data="av:radar:all:0")],
@@ -11715,11 +11741,23 @@ def _vinted_home_keyboard() -> InlineKeyboardMarkup:
 
 
 async def _vinted_home_text() -> str:
-    worker_status, scans, radar_snapshot = await asyncio.gather(
-        VINTED_QUEUE.worker_status(), list_vinted_scans(1), build_vinted_radar_snapshot()
+    # v4.23.4: entering Vinted Lab must be a cheap UI operation.  The old home screen
+    # rebuilt the complete seven-day Radar model every time its 20-second cache expired.
+    # On full-market scans that can mean tens of thousands of rows and made every admin
+    # button look frozen.  Home now uses only Redis worker state + tiny DB metadata.
+    worker_status, scans, radar_overview = await asyncio.gather(
+        _vinted_worker_status_fast(), list_vinted_scans(1), vinted_radar_overview()
     )
     scan_workers = len(list(worker_status.get("scan_workers") or []))
     metrics_workers = len(list(worker_status.get("metrics_workers") or []))
+    radar_live = radar_overview.get("live_total")
+    radar_hot = radar_overview.get("hot")
+    radar_rising = radar_overview.get("rising")
+    radar_counts = (
+        f"Live <b>{int(radar_live)}</b> · HOT <b>{int(radar_hot or 0)}</b> · Rising <b>{int(radar_rising or 0)}</b>"
+        if radar_live is not None else
+        "сводка <b>обновляется в фоне</b>"
+    )
     lines = [
         "<b>🟣 Vinted Lab</b>",
         "<i>Закрытый тестовый контур. Kleinanzeigen Page/Date/View Worker здесь не используются.</i>",
@@ -11728,7 +11766,7 @@ async def _vinted_home_text() -> str:
         f"Metrics Worker: <b>{'🟢' if metrics_workers else '🔴'} {metrics_workers}/2</b>",
         f"Очередь: scan <b>{int(worker_status.get('scan_queue', 0) or 0)}</b> · metrics <b>{int(worker_status.get('metrics_queue', 0) or 0)}</b>",
         "",
-        f"📡 Radar AutoScan: <b>{'🟢 ВКЛ' if radar_snapshot.auto_enabled else '⏸ ВЫКЛ'}</b> · Live <b>{radar_snapshot.live_total}</b> · HOT <b>{radar_snapshot.hot}</b> · Rising <b>{radar_snapshot.rising}</b>",
+        f"📡 Radar AutoScan: <b>{'🟢 ВКЛ' if radar_overview.get('enabled') else '⏸ ВЫКЛ'}</b> · {radar_counts}",
         "",
         "<b>Режимы</b>",
         "🔎 Parser — разовый проход выбранных категорий.",
@@ -11738,17 +11776,16 @@ async def _vinted_home_text() -> str:
         lines.extend(["", f"⚠️ Redis: <code>{html.escape(str(worker_status['error'])[:180])}</code>"])
     if scans:
         scan = scans[0]
-        latest_snapshot = await vinted_scan_progress(scan.id)
-        like_stats = dict((latest_snapshot or {}).get("catalog_likes") or {})
         lines.extend([
             "",
             "<b>Последний запуск</b>",
             f"{_vinted_mode_label(scan.mode)} · {_vinted_status_label(scan.status)}",
             f"{'Сегменты' if str(scan.mode or '') == 'radar' else 'Категории'}: <b>{int(scan.completed_categories or 0)}/{int(scan.total_categories or 0)}</b> · товаров: <b>{int(scan.total_items or 0)}</b>",
-            f"❤️ Catalog likes: <b>{int(like_stats.get('total', 0) or 0)}</b> · с лайками: <b>{int(like_stats.get('nonzero', 0) or 0)}</b>/{int(like_stats.get('known', 0) or 0)}",
         ])
         if scan.mode != "radar":
             lines.append(f"Exact views: <b>{int(scan.exact_views or 0)}</b> · chronology: <b>{int(scan.chronology_count or 0)}</b>")
+        else:
+            lines.append("❤️ Like Momentum: <b>считается фоновым Radar snapshot</b>")
     return "\n".join(lines)
 
 
@@ -11880,7 +11917,7 @@ def _vinted_scan_keyboard(scan: VintedScan) -> InlineKeyboardMarkup:
 
 
 async def _vinted_scan_text(scan_id: int) -> tuple[str, VintedScan | None]:
-    snapshot, worker_status = await asyncio.gather(vinted_scan_progress(scan_id), VINTED_QUEUE.worker_status())
+    snapshot, worker_status = await asyncio.gather(vinted_scan_progress(scan_id), _vinted_worker_status_fast())
     if not snapshot:
         return "<b>Vinted scan не найден.</b>", None
     scan: VintedScan = snapshot["scan"]
@@ -11939,12 +11976,13 @@ async def _vinted_scan_text(scan_id: int) -> tuple[str, VintedScan | None]:
                 page_text = f"{current_page}/{target_page}" if current_page <= target_page else f"{current_page} · recovery"
                 lines.append(f"{idx}. <b>{html.escape(str(worker.get('category') or '—')[:58])}</b> · стр. <b>{page_text}</b>")
 
-    lines.extend([
-        "",
-        "<b>❤️ Likes из каталога</b>",
-        f"Считано: <b>{int(like_stats.get('known', 0) or 0)}/{int(like_stats.get('items', 0) or 0)}</b> · с лайками: <b>{int(like_stats.get('nonzero', 0) or 0)}</b>",
-        f"Всего ❤️: <b>{int(like_stats.get('total', 0) or 0)}</b> · максимум у товара: <b>{int(like_stats.get('max', 0) or 0)}</b>",
-    ])
+    if not radar_mode:
+        lines.extend([
+            "",
+            "<b>❤️ Likes из каталога</b>",
+            f"Считано: <b>{int(like_stats.get('known', 0) or 0)}/{int(like_stats.get('items', 0) or 0)}</b> · с лайками: <b>{int(like_stats.get('nonzero', 0) or 0)}</b>",
+            f"Всего ❤️: <b>{int(like_stats.get('total', 0) or 0)}</b> · максимум у товара: <b>{int(like_stats.get('max', 0) or 0)}</b>",
+        ])
     if radar_mode:
         lines.extend([
             "",
@@ -11985,7 +12023,7 @@ async def _vinted_scan_text(scan_id: int) -> tuple[str, VintedScan | None]:
 
 
 async def _vinted_workers_text() -> str:
-    status = await VINTED_QUEUE.worker_status()
+    status = await _vinted_worker_status_fast()
     scan_workers = list(status.get("scan_workers") or [])
     metrics_workers = list(status.get("metrics_workers") or [])
     lines = [
@@ -12032,7 +12070,7 @@ async def _vinted_session_screen() -> tuple[str, InlineKeyboardMarkup]:
         load_vinted_session_json(),
         load_vinted_session_meta(),
         get_session_service(),
-        VINTED_QUEUE.worker_status(),
+        _vinted_worker_status_fast(),
     )
     metrics_workers = list(worker_status.get("metrics_workers") or [])
     provider_states = sorted({str(w.get("provider_status") or "") for w in metrics_workers if w.get("provider_status")})
@@ -12186,7 +12224,30 @@ def _vinted_radar_filter_name(value: str) -> str:
 async def _vinted_radar_screen(filter_name: str = "all", page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     filter_name = filter_name if filter_name in {"all", "hot", "rising", "deal", "candidate"} else "all"
     page = max(0, int(page or 0))
-    snapshot = await build_vinted_radar_snapshot()
+
+    # Never make a Telegram callback wait for the seven-day scoring model.  Vinted Lab
+    # pre-warms it in the background; Radar renders the last completed snapshot while
+    # a single refresh runs.  On a cold process we show a lightweight loading state.
+    snapshot = peek_vinted_radar_snapshot()
+    request_vinted_radar_snapshot_refresh(force=False)
+    if snapshot is None:
+        overview = await vinted_radar_overview()
+        state = "🟢 ВКЛ" if overview.get("enabled") else "⏸ ВЫКЛ"
+        last_scan_id = int(overview.get("last_scan_id") or 0)
+        rows: list[list[InlineKeyboardButton]] = [
+            [InlineKeyboardButton(text="🔄 Проверить готовность", callback_data=f"av:radar:{filter_name}:0")],
+        ]
+        if last_scan_id:
+            rows.append([InlineKeyboardButton(text="📄 Последний проход страниц", callback_data=f"av:scan:{last_scan_id}")])
+        rows.append([InlineKeyboardButton(text="⬅️ Vinted Lab", callback_data="av:home")])
+        return (
+            "<b>📡 Vinted Radar 1.0</b>\n\n"
+            f"Radar AutoScan: <b>{state}</b>\n"
+            "⏳ <b>Сводка Like Momentum пересчитывается в фоне.</b>\n\n"
+            "Можно пользоваться остальными разделами бота — этот расчёт больше не блокирует Telegram. "
+            "Нажми «Проверить готовность» через несколько секунд.",
+            InlineKeyboardMarkup(inline_keyboard=rows),
+        )
     entries = [e for e in snapshot.entries if e.status != "baseline"]
     if filter_name != "all":
         entries = [e for e in entries if e.status == filter_name]
@@ -12286,6 +12347,12 @@ async def _vinted_radar_screen(filter_name: str = "all", page: int = 0) -> tuple
 
 
 async def _vinted_radar_item_screen(item_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    if peek_vinted_radar_snapshot() is None:
+        request_vinted_radar_snapshot_refresh(force=False)
+        return (
+            "<b>📡 Vinted Radar</b>\n\n⏳ Сводка обновляется в фоне. Открой Radar ещё раз через несколько секунд.",
+            InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Radar", callback_data="av:radar:all:0")]]),
+        )
     entry = await get_vinted_radar_entry(item_id)
     if entry is None:
         return (
@@ -12334,12 +12401,21 @@ async def _vinted_radar_item_screen(item_id: int) -> tuple[str, InlineKeyboardMa
 
 
 async def _vinted_watch_scan(bot_obj: Bot, chat_id: int, message_id: int, scan_id: int) -> None:
-    """Best-effort live percentage updates. Manual Refresh remains the durable fallback."""
+    """Best-effort live progress without fighting the admin's button presses.
+
+    v4.23.4 binds one watcher to one Telegram message, refreshes less aggressively and
+    gives every DB/Redis read a timeout.  Navigating away cancels the watcher before the
+    next screen is rendered, so it can no longer overwrite Vinted Lab / Radar / Workers.
+    """
+    key = (int(chat_id), int(message_id))
     try:
         last_text = ""
         while True:
-            await asyncio.sleep(4)
-            text_value, scan = await _vinted_scan_text(scan_id)
+            await asyncio.sleep(8)
+            try:
+                text_value, scan = await asyncio.wait_for(_vinted_scan_text(scan_id), timeout=4.0)
+            except asyncio.TimeoutError:
+                continue
             if scan is None:
                 return
             if text_value != last_text:
@@ -12359,20 +12435,37 @@ async def _vinted_watch_scan(bot_obj: Bot, chat_id: int, message_id: int, scan_i
             if _vinted_terminal(scan.status):
                 return
     finally:
-        current = _VINTED_ADMIN_WATCHERS.get(int(scan_id))
+        current = _VINTED_ADMIN_WATCHERS.get(key)
         if current is asyncio.current_task():
-            _VINTED_ADMIN_WATCHERS.pop(int(scan_id), None)
+            _VINTED_ADMIN_WATCHERS.pop(key, None)
+
+
+def _vinted_message_key(callback: CallbackQuery) -> tuple[int, int] | None:
+    message = callback.message
+    if not message or not getattr(message, "chat", None) or not getattr(message, "message_id", None):
+        return None
+    return int(message.chat.id), int(message.message_id)
+
+
+async def _vinted_cancel_message_watcher(callback: CallbackQuery) -> None:
+    key = _vinted_message_key(callback)
+    if key is None:
+        return
+    old = _VINTED_ADMIN_WATCHERS.pop(key, None)
+    if old and not old.done() and old is not asyncio.current_task():
+        old.cancel()
 
 
 async def _vinted_start_watcher(callback: CallbackQuery, scan_id: int) -> None:
-    message = callback.message
-    if not message or not getattr(message, "chat", None) or not getattr(message, "message_id", None):
+    key = _vinted_message_key(callback)
+    if key is None:
         return
-    old = _VINTED_ADMIN_WATCHERS.pop(int(scan_id), None)
+    old = _VINTED_ADMIN_WATCHERS.pop(key, None)
     if old and not old.done():
         old.cancel()
-    _VINTED_ADMIN_WATCHERS[int(scan_id)] = asyncio.create_task(
-        _vinted_watch_scan(callback.bot, int(message.chat.id), int(message.message_id), int(scan_id))
+    chat_id, message_id = key
+    _VINTED_ADMIN_WATCHERS[key] = asyncio.create_task(
+        _vinted_watch_scan(callback.bot, chat_id, message_id, int(scan_id))
     )
 
 
@@ -12385,6 +12478,7 @@ async def vinted_admin_lab_handler(callback: CallbackQuery) -> None:
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else "home"
     await callback.answer()
+    await _vinted_cancel_message_watcher(callback)
 
     if action == "home":
         await _edit_or_answer(callback.message, await _vinted_home_text(), reply_markup=_vinted_home_keyboard())

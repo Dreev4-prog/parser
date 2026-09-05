@@ -1,7 +1,13 @@
-# v4.23.3 GitHub patch
+# v4.23.4 GitHub patch
 
-Apply on top of **v4.23.2**.
+Apply on top of **v4.23.3**.
 
-Main change: Vinted Radar validates the complete Vinted category tree but scans it as roughly **120 non-overlapping market segments** instead of thousands of terminal categories. Each segment keeps the same **15-page maximum** and the Telegram progress screen shows the real segment/page pass.
+Main fix: opening **Vinted Lab / Vinted Radar** no longer performs the large seven-day scoring/likes work on the Telegram UI path. Radar scoring is single-flight, cached for 120 seconds by default, CPU scoring is moved off the asyncio event loop, Radar progress stops repeatedly aggregating the full item table, and scan watchers cannot keep overwriting another Vinted screen.
 
-Redeploy **Parser/Bot** and all **Vinted Scan Worker** replicas after replacing the files. No SQL migration and no new Railway variables are required.
+Replace the files from this archive preserving paths, then redeploy:
+
+- Parser / Bot
+- all Vinted Scan Worker replicas
+- all Vinted Metrics Worker replicas
+
+No SQL migration and no new Railway variables are required.

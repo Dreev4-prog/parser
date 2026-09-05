@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.23.3", "VERSION=4.23.3")
+    check((ROOT / "VERSION").read_text().strip() == "4.23.4", "VERSION=4.23.4")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -144,7 +144,7 @@ def main() -> int:
     check('VINTED_RADAR_SCOPE = "balanced_market_segments_v1"' in vinted_radar and 'VINTED_RADAR_TARGET_SEGMENTS = 120' in vinted_radar and 'VINTED_RADAR_MAX_SEGMENTS = 150' in vinted_radar, "Vinted Radar uses bounded balanced market segments")
     check('def balanced_catalog_segments_from_tree(' in lab and 'frontier[idx:idx + 1] = list(chosen.get("children") or [])' in lab, "Vinted market partition preserves non-overlapping tree coverage")
     check('item_catalog_id = _int(getattr(item, "catalog_id", None), 0) or int(catalog_id)' in lab, "Vinted Radar preserves precise item catalog id when available")
-    print("\nDT Parser 4.23.3 Vinted Radar 1.0 Balanced Market Segments release smoke: PASS")
+    print("\nDT Parser 4.23.4 Vinted Radar 1.0 Balanced Market Segments release smoke: PASS")
     return 0
 
 

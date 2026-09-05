@@ -780,32 +780,51 @@ async def cancel_scan(scan_id: int) -> bool:
 
 
 async def recalc_scan(scan_id: int) -> VintedScan | None:
+    """Refresh scan counters without loading the whole item table into Python.
+
+    v4.23.4: Radar scans can contain tens of thousands of catalog rows.  The old
+    implementation selected every VintedScanItem after *every* completed segment,
+    which made a full-market pass progressively slower and could starve the bot DB
+    pool.  Radar has no detail-metrics stage, so its item counters are already kept
+    incrementally by save_catalog_page().  Manual scans use one SQL aggregate instead.
+    """
     async with SessionLocal() as session:
         scan = await session.get(VintedScan, int(scan_id))
         if scan is None:
             return None
+
         cats = list((await session.execute(
             select(VintedScanCategory).where(VintedScanCategory.scan_id == scan.id)
         )).scalars().all())
         scan.completed_categories = sum(1 for row in cats if row.status in {"completed", "failed", "cancelled", "partial"})
-        metric_rows = list((await session.execute(
-            select(
-                VintedScanItem.metric_status,
-                VintedScanItem.view_count,
-                VintedScanItem.favourite_count,
-                VintedScanItem.upload_raw,
-            ).where(VintedScanItem.scan_id == scan.id)
-        )).all())
-        scan.total_items = len(metric_rows)
+
         radar_catalog_only = str(scan.mode or "manual") == "radar"
-        scan.metrics_total = 0 if radar_catalog_only else scan.total_items
-        terminal_metric_states = {"exact", "unknown", "error", "cancelled"}
-        scan.metrics_done = 0 if radar_catalog_only else sum(
-            1 for status, _views, _fav, _upload in metric_rows if str(status or "") in terminal_metric_states
-        )
-        scan.exact_views = sum(1 for _status, views, _fav, _upload in metric_rows if views is not None)
-        scan.exact_favourites = sum(1 for _status, _views, fav, _upload in metric_rows if fav is not None)
-        scan.chronology_count = sum(1 for _status, _views, _fav, upload in metric_rows if upload is not None)
+        if radar_catalog_only:
+            # save_catalog_page() already increments total_items for each newly inserted
+            # unique item.  Radar deliberately has no exact/detail metrics.
+            scan.metrics_total = 0
+            scan.metrics_done = 0
+            scan.exact_views = 0
+            scan.exact_favourites = 0
+            scan.chronology_count = 0
+        else:
+            terminal_metric_states = ("exact", "unknown", "error", "cancelled")
+            metric_row = (await session.execute(
+                select(
+                    func.count(VintedScanItem.id),
+                    func.coalesce(func.sum(case((VintedScanItem.metric_status.in_(terminal_metric_states), 1), else_=0)), 0),
+                    func.coalesce(func.sum(case((VintedScanItem.view_count.is_not(None), 1), else_=0)), 0),
+                    func.coalesce(func.sum(case((VintedScanItem.favourite_count.is_not(None), 1), else_=0)), 0),
+                    func.coalesce(func.sum(case((VintedScanItem.upload_raw.is_not(None), 1), else_=0)), 0),
+                ).where(VintedScanItem.scan_id == scan.id)
+            )).one()
+            scan.total_items = int(metric_row[0] or 0)
+            scan.metrics_total = scan.total_items
+            scan.metrics_done = int(metric_row[1] or 0)
+            scan.exact_views = int(metric_row[2] or 0)
+            scan.exact_favourites = int(metric_row[3] or 0)
+            scan.chronology_count = int(metric_row[4] or 0)
+
         if scan.status == "cancel_requested":
             if all(row.status in {"completed", "failed", "cancelled", "partial"} for row in cats):
                 scan.status = "cancelled"
@@ -814,7 +833,7 @@ async def recalc_scan(scan_id: int) -> VintedScan | None:
         else:
             categories_terminal = bool(cats) and all(row.status in {"completed", "failed", "cancelled", "partial"} for row in cats)
             if categories_terminal:
-                if scan.metrics_done >= scan.metrics_total:
+                if int(scan.metrics_done or 0) >= int(scan.metrics_total or 0):
                     any_failed = any(row.status in {"failed", "partial"} for row in cats)
                     scan.status = "partial" if any_failed else "completed"
                     scan.stage = "done"
@@ -898,10 +917,22 @@ async def save_catalog_page(
             cat.pages_fetched = max(int(cat.pages_fetched or 0), int(page))
             cat.duplicate_count = int(cat.duplicate_count or 0) + max(0, int(duplicate_count))
             cat.updated_at = now
-        if new_ids:
-            scan.total_items = int(scan.total_items or 0) + len(new_ids)
-            scan.metrics_total = int(scan.metrics_total or 0) + len(new_ids)
         scan.updated_at = now
+        # Flush the ordinary row changes first, then increment counters atomically.
+        # Multiple Vinted Scan Workers can finish pages at the same time; a Python
+        # read-modify-write on scan.total_items can lose increments under concurrency.
+        await session.flush()
+        if new_ids:
+            await session.execute(
+                update(VintedScan)
+                .where(VintedScan.id == int(scan_id))
+                .values(
+                    total_items=func.coalesce(VintedScan.total_items, 0) + len(new_ids),
+                    metrics_total=func.coalesce(VintedScan.metrics_total, 0) + len(new_ids),
+                    updated_at=now,
+                )
+                .execution_options(synchronize_session=False)
+            )
         await session.commit()
     return new_ids
 
@@ -1004,22 +1035,37 @@ async def scan_progress_snapshot(scan_id: int) -> dict[str, Any] | None:
         cats = list((await session.execute(
             select(VintedScanCategory).where(VintedScanCategory.scan_id == scan.id).order_by(VintedScanCategory.id)
         )).scalars().all())
-        like_row = (await session.execute(
-            select(
-                func.count(VintedScanItem.id),
-                func.count(VintedScanItem.catalog_favourite_count),
-                func.coalesce(func.sum(case((VintedScanItem.catalog_favourite_count > 0, 1), else_=0)), 0),
-                func.coalesce(func.sum(VintedScanItem.catalog_favourite_count), 0),
-                func.coalesce(func.max(VintedScanItem.catalog_favourite_count), 0),
-            ).where(VintedScanItem.scan_id == scan.id)
-        )).one()
-        catalog_likes = {
-            "items": int(like_row[0] or 0),
-            "known": int(like_row[1] or 0),
-            "nonzero": int(like_row[2] or 0),
-            "total": int(like_row[3] or 0),
-            "max": int(like_row[4] or 0),
-        }
+        if str(scan.mode or "manual") == "radar":
+            # v4.23.4: the live page-progress screen is polled frequently.  Running a
+            # SUM/MAX/COUNT over a full-market Radar item table on every poll can lock
+            # up the shared database pool for everyone.  Radar scoring consumes likes
+            # from the background snapshot; page progress only needs persisted counters.
+            catalog_likes = {
+                "items": int(scan.total_items or 0),
+                "known": None,
+                "nonzero": None,
+                "total": None,
+                "max": None,
+                "deferred": True,
+            }
+        else:
+            like_row = (await session.execute(
+                select(
+                    func.count(VintedScanItem.id),
+                    func.count(VintedScanItem.catalog_favourite_count),
+                    func.coalesce(func.sum(case((VintedScanItem.catalog_favourite_count > 0, 1), else_=0)), 0),
+                    func.coalesce(func.sum(VintedScanItem.catalog_favourite_count), 0),
+                    func.coalesce(func.max(VintedScanItem.catalog_favourite_count), 0),
+                ).where(VintedScanItem.scan_id == scan.id)
+            )).one()
+            catalog_likes = {
+                "items": int(like_row[0] or 0),
+                "known": int(like_row[1] or 0),
+                "nonzero": int(like_row[2] or 0),
+                "total": int(like_row[3] or 0),
+                "max": int(like_row[4] or 0),
+                "deferred": False,
+            }
         scan_units = 0.0
         page_plan_max = 0
         page_primary_done = 0
