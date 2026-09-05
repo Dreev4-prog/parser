@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.22.3", "VERSION=4.22.3")
+    check((ROOT / "VERSION").read_text().strip() == "4.22.4", "VERSION=4.22.4")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -135,7 +135,12 @@ def main() -> int:
     check("/api/v2/items/{item.item_id}/details" in vinted, "Vinted Probe tests current browser item-details endpoint")
     check("recovery_pages_used" in vinted and "recovery_complete" in vinted, "Vinted live pagination restores requested unique depth with bounded recovery")
     check("pagination.time` is telemetry/cache-buster data" in vinted, "Vinted pagination.time is not trusted as a snapshot cursor")
-    print("\nDT Parser 4.22.3 Vinted Session/OAuth Exact Metrics Probe release smoke: PASS")
+    lab = (ROOT / "vinted_lab.py").read_text(encoding="utf-8")
+    check('"vinted-scan-worker": "vinted_scan_worker.py"' in launcher and '"vinted-metrics-worker": "vinted_metrics_worker.py"' in launcher, "Vinted Scan/Metrics workers are independently routed")
+    check('callback_data="av:home"' in bot and '_vinted_watch_scan' in bot, "admin-only Vinted Lab has live progress UI")
+    check('dtparser:vintedlab' in lab and 'SCAN_STREAM' in lab and 'METRICS_STREAM' in lab, "Vinted Lab uses an isolated Redis namespace")
+    check('row.metric_status = "exact" if row.identity_ok and row.view_count is not None else "unknown"' in lab, "Vinted exact metrics remain fail-closed")
+    print("\nDT Parser 4.22.4 Vinted Admin Lab + Isolated Worker Fleet release smoke: PASS")
     return 0
 
 

@@ -759,3 +759,112 @@ class AppSetting(Base):
     key: Mapped[str] = mapped_column(String(80), primary_key=True)
     value: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class VintedScan(Base):
+    """Admin-only isolated Vinted parser/Radar test run."""
+
+    __tablename__ = "vinted_scans"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    uid: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    admin_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    mode: Mapped[str] = mapped_column(String(16), default="manual", index=True)
+    status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
+    stage: Mapped[str] = mapped_column(String(48), default="queued")
+    selected_catalogs: Mapped[str] = mapped_column(Text, default="[]")
+    pages_per_category: Mapped[int] = mapped_column(Integer, default=3)
+    total_categories: Mapped[int] = mapped_column(Integer, default=0)
+    completed_categories: Mapped[int] = mapped_column(Integer, default=0)
+    total_items: Mapped[int] = mapped_column(Integer, default=0)
+    metrics_total: Mapped[int] = mapped_column(Integer, default=0)
+    metrics_done: Mapped[int] = mapped_column(Integer, default=0)
+    exact_views: Mapped[int] = mapped_column(Integer, default=0)
+    exact_favourites: Mapped[int] = mapped_column(Integer, default=0)
+    chronology_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    error_text: Mapped[str] = mapped_column(String(1000), default="")
+
+
+class VintedScanCategory(Base):
+    """One catalog task inside a Vinted admin scan."""
+
+    __tablename__ = "vinted_scan_categories"
+    __table_args__ = (UniqueConstraint("scan_id", "catalog_id", name="uq_vinted_scan_category"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scan_id: Mapped[int] = mapped_column(Integer, index=True)
+    catalog_id: Mapped[int] = mapped_column(Integer, index=True)
+    category_name: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
+    pages_target: Mapped[int] = mapped_column(Integer, default=3)
+    pages_fetched: Mapped[int] = mapped_column(Integer, default=0)
+    unique_items: Mapped[int] = mapped_column(Integer, default=0)
+    duplicate_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    error_text: Mapped[str] = mapped_column(String(1000), default="")
+
+
+class VintedScanItem(Base):
+    """Catalog result plus fail-closed exact-metric state for one Vinted scan."""
+
+    __tablename__ = "vinted_scan_items"
+    __table_args__ = (UniqueConstraint("scan_id", "item_id", name="uq_vinted_scan_item"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scan_id: Mapped[int] = mapped_column(Integer, index=True)
+    item_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    catalog_id: Mapped[int] = mapped_column(Integer, index=True)
+    category_name: Mapped[str] = mapped_column(String(255), default="")
+    title: Mapped[str] = mapped_column(String(500), default="")
+    url: Mapped[str] = mapped_column(String(1200), default="")
+    price_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    currency: Mapped[str] = mapped_column(String(16), default="")
+    brand: Mapped[str] = mapped_column(String(255), default="")
+    size: Mapped[str] = mapped_column(String(120), default="")
+    condition: Mapped[str] = mapped_column(String(120), default="")
+    seller_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    seller_login: Mapped[str] = mapped_column(String(120), default="")
+    promoted: Mapped[bool | None] = mapped_column(Boolean, nullable=True, index=True)
+    visible: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Catalog counters are diagnostic only. Vinted currently returns zeroes there;
+    # they are never treated as exact demand evidence.
+    catalog_view_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    catalog_favourite_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    metric_status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
+    metric_source: Mapped[str] = mapped_column(String(80), default="")
+    metric_outcome: Mapped[str] = mapped_column(String(80), default="")
+    identity_ok: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    view_count: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    favourite_count: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    upload_raw: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sold: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    closed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    reserved: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    hidden: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    metrics_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class VintedMetricHistory(Base):
+    """Raw exact-metric attempts; future Radar rechecks append to this table."""
+
+    __tablename__ = "vinted_metric_history"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scan_id: Mapped[int] = mapped_column(Integer, index=True)
+    item_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    measured_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    view_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    favourite_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    upload_raw: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    source: Mapped[str] = mapped_column(String(80), default="")
+    outcome: Mapped[str] = mapped_column(String(80), default="")
+    identity_ok: Mapped[bool] = mapped_column(Boolean, default=False, index=True)

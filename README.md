@@ -1,3 +1,9 @@
+# DT PARSER 4.22.4 — Vinted Admin Lab + Isolated Worker Fleet
+
+Adds an admin-only Vinted parser test UI with hierarchical category selection, live catalog/metric percentages, persistent results and worker diagnostics. Vinted execution is isolated into `Vinted Scan Worker ×2` and `Vinted Metrics Worker ×2` using dedicated Redis streams and `vinted_*` tables; existing Kleinanzeigen Page/Date/View worker logic is untouched. Exact Vinted metrics stay fail-closed: catalog zeroes are never accepted as exact views, and the test Radar mode remains baseline-only until the Exact Views gate passes. See `RELEASE_4_22_4.md`.
+
+---
+
 # DT PARSER 4.22.3 — Vinted Session/OAuth Exact Metrics Probe
 
 The third live Vinted Probe run proved three things: the anonymous catalog is reachable, the global ALL feed is too fast-moving for page-number depth recovery, and anonymous item-detail API requests are blocked while public item HTML still omits exact views/chronology. v4.22.3 therefore tests a realistic category-specific scan by default (`catalog_ids=4,5`), bootstraps through `/catalog` to acquire the normal anonymous web session, probes both current web item API routes, and if they remain blocked attempts Vinted's read-only public mobile OAuth flow before giving up. Public item HTML is no longer used for exact-view measurement because ordinary item-page GETs may contaminate the counter. Missing metrics remain UNKNOWN. Kleinanzeigen production logic is unchanged.

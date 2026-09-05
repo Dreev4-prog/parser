@@ -95,6 +95,7 @@ class VintedProbeConfig:
     request_timeout_seconds: float = 15.0
     min_interval_seconds: float = 0.35
     access_token_web: str = ""
+    session_json: str = ""
     report_path: str = ""
     stability_reads: int = 3
     stability_delay_seconds: float = 1.2
@@ -121,6 +122,7 @@ class VintedProbeConfig:
             request_timeout_seconds=max(5.0, min(60.0, float(os.getenv("VINTED_PROBE_TIMEOUT_SECONDS", "15")))),
             min_interval_seconds=max(0.0, min(5.0, float(os.getenv("VINTED_PROBE_MIN_INTERVAL_SECONDS", "0.35")))),
             access_token_web=os.getenv("VINTED_ACCESS_TOKEN_WEB", "").strip(),
+            session_json=os.getenv("VINTED_SESSION_JSON", "").strip(),
             report_path=os.getenv("VINTED_PROBE_REPORT_PATH", "").strip(),
             stability_reads=max(0, min(5, int(os.getenv("VINTED_PROBE_STABILITY_READS", "3")))),
             stability_delay_seconds=max(0.2, min(10.0, float(os.getenv("VINTED_PROBE_STABILITY_DELAY_SECONDS", "1.2")))),
@@ -170,10 +172,39 @@ class VintedProbeClient:
             timeout=httpx.Timeout(config.request_timeout_seconds),
             transport=transport,
         )
+        host = urlparse(config.base_url).hostname or "www.vinted.de"
         token = config.access_token_web.strip()
         if token:
-            host = urlparse(config.base_url).hostname or "www.vinted.de"
             self.client.cookies.set("access_token_web", token, domain=host, path="/")
+        self.session_cookie_names: list[str] = []
+        raw_session = config.session_json.strip()
+        if raw_session:
+            try:
+                payload = json.loads(raw_session)
+                cookies: Any = payload.get("cookies") if isinstance(payload, dict) and "cookies" in payload else payload
+                if isinstance(cookies, dict):
+                    for name, value in cookies.items():
+                        if not isinstance(name, str) or value is None:
+                            continue
+                        self.client.cookies.set(name, str(value), domain=host, path="/")
+                        self.session_cookie_names.append(name)
+                elif isinstance(cookies, list):
+                    for entry in cookies:
+                        if not isinstance(entry, dict):
+                            continue
+                        name = str(entry.get("name") or "").strip()
+                        value = entry.get("value")
+                        if not name or value is None:
+                            continue
+                        domain = str(entry.get("domain") or host).strip() or host
+                        path = str(entry.get("path") or "/").strip() or "/"
+                        self.client.cookies.set(name, str(value), domain=domain, path=path)
+                        self.session_cookie_names.append(name)
+            except Exception:
+                # Auth configuration is optional. An invalid secret must never crash
+                # catalog collection; exact metrics simply remain fail-closed UNKNOWN.
+                self.session_cookie_names = []
+        self.session_cookie_names = sorted(set(self.session_cookie_names))
         self._public_oauth_token: str = ""
         self._public_oauth_attempted = False
         self.bootstrap_cookie_names: list[str] = []
@@ -867,6 +898,7 @@ async def run_probe(config: VintedProbeConfig, *, transport: httpx.AsyncBaseTran
                 "detail_concurrency": config.detail_concurrency,
                 "min_interval_seconds": config.min_interval_seconds,
                 "access_token_configured": bool(config.access_token_web),
+                "session_json_configured": bool(config.session_json),
                 "stability_reads": config.stability_reads,
                 "stability_delay_seconds": config.stability_delay_seconds,
                 "recovery_pages": config.recovery_pages,

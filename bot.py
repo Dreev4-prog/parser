@@ -18,6 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -78,6 +79,7 @@ from models import (
     AppSetting, BotUser, CategoryScanState, FreeRadarEvent, Listing, ListingIntegrity, ParserRun, PriceHistory, RadarProduct, RadarObservation, RadarSnapshot, ScanListing,
     ScanObservation, ScanViewHistory, SelectedCategory, StableCategoryJob, StablePageCheckpoint,
     SubscriptionPayment, SubscriptionPlan, UserScan, UserSettings, ViewHistory,
+    VintedScan, VintedScanCategory, VintedScanItem,
 )
 from product_identity import TYPE_DISPLAY, ProductIdentity, recognize_product
 from organic_velocity import (
@@ -140,6 +142,13 @@ from date_manager import (
 from stable_engine import (
     load_date_index, load_page_checkpoint, mark_category_job, record_page_failure,
     save_date_index, save_page_checkpoint,
+)
+from vinted_lab import (
+    VINTED_QUEUE, cancel_scan as cancel_vinted_scan, create_scan as create_vinted_scan,
+    enqueue_scan as enqueue_vinted_scan, fetch_catalog_tree as fetch_vinted_catalog_tree,
+    flatten_catalog_tree as flatten_vinted_catalog_tree, get_scan as get_vinted_scan,
+    list_scans as list_vinted_scans, list_scan_items as list_vinted_scan_items,
+    scan_progress_snapshot as vinted_scan_progress,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -10292,6 +10301,7 @@ def admin_keyboard(ai_unread: int = 0, active_scans: int = 0) -> InlineKeyboardM
         [InlineKeyboardButton(text="🎁 Бесплатные сканы", callback_data="admintrial"),
          InlineKeyboardButton(text="👥 Рефералы", callback_data="adminreferral")],
         [InlineKeyboardButton(text="📡 DT Radar 3.0", callback_data="adminradarauto")],
+        [InlineKeyboardButton(text="🟣 Vinted Lab", callback_data="av:home")],
         [InlineKeyboardButton(text="🔎 Найти пользователя", callback_data="adminusersearch")],
         [InlineKeyboardButton(text="📨 Daily Radar", callback_data="admindailyradar"),
          InlineKeyboardButton(text="📣 Рассылка", callback_data="adminbroadcast")],
@@ -11471,6 +11481,490 @@ async def _admin_page_worker_text() -> str:
         "<i>Page Worker ускоряет сбор страниц после того, как Date Worker/локальный fallback подтвердил границу даты.</i>",
     ])
     return "\n".join(lines)
+
+
+# ---- v4.22.4 Admin-only Vinted Lab -------------------------------------------------
+# Vinted is intentionally isolated from the Kleinanzeigen user parser. The Telegram
+# bot only orchestrates Vinted-specific Redis streams/tables and renders diagnostics.
+VINTED_ADMIN_MAX_CATEGORIES = 24
+_VINTED_ADMIN_CFG: dict[int, dict[str, Any]] = {}
+_VINTED_ADMIN_WATCHERS: dict[int, asyncio.Task] = {}
+
+
+def _vinted_cfg(user_id: int) -> dict[str, Any]:
+    cfg = _VINTED_ADMIN_CFG.get(int(user_id))
+    if cfg is None:
+        cfg = {"selected": {}, "pages": 3, "mode": "manual", "node": 0}
+        _VINTED_ADMIN_CFG[int(user_id)] = cfg
+    return cfg
+
+
+def _vinted_status_label(status: str) -> str:
+    return {
+        "queued": "⏳ В очереди",
+        "running": "🟣 Сканирование",
+        "metrics": "👁 Метрики",
+        "cancel_requested": "⏹ Останавливается",
+        "cancelled": "⏹ Остановлен",
+        "completed": "✅ Завершён",
+        "partial": "⚠️ Завершён частично",
+        "failed": "❌ Ошибка",
+    }.get(str(status or ""), html.escape(str(status or "—")))
+
+
+def _vinted_mode_label(mode: str) -> str:
+    return "📡 Vinted Radar · тестовый круг" if str(mode) == "radar" else "🔎 Vinted Parser"
+
+
+def _vinted_terminal(status: str) -> bool:
+    return str(status or "") in {"completed", "partial", "failed", "cancelled"}
+
+
+def _vinted_home_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔎 Новый Vinted-скан", callback_data="av:new:m")],
+        [InlineKeyboardButton(text="📡 Тестовый Radar-круг", callback_data="av:new:r")],
+        [InlineKeyboardButton(text="📂 История сканов", callback_data="av:history")],
+        [InlineKeyboardButton(text="⚙️ Vinted Workers", callback_data="av:workers")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="av:home")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")],
+    ])
+
+
+async def _vinted_home_text() -> str:
+    worker_status, scans = await asyncio.gather(VINTED_QUEUE.worker_status(), list_vinted_scans(1))
+    scan_workers = len(list(worker_status.get("scan_workers") or []))
+    metrics_workers = len(list(worker_status.get("metrics_workers") or []))
+    lines = [
+        "<b>🟣 Vinted Lab</b>",
+        "<i>Закрытый тестовый контур. Kleinanzeigen Page/Date/View Worker здесь не используются.</i>",
+        "",
+        f"Scan Worker: <b>{'🟢' if scan_workers else '🔴'} {scan_workers}/2</b>",
+        f"Metrics Worker: <b>{'🟢' if metrics_workers else '🔴'} {metrics_workers}/2</b>",
+        f"Очередь: scan <b>{int(worker_status.get('scan_queue', 0) or 0)}</b> · metrics <b>{int(worker_status.get('metrics_queue', 0) or 0)}</b>",
+        "",
+        "<b>Режим теста</b>",
+        "🔎 Parser — быстрый проход выбранных категорий + точные метрики, где Vinted их подтверждает.",
+        "📡 Radar — тот же изолированный baseline-круг. Rising/Hot включим только после прохождения Exact Views gate.",
+    ]
+    if worker_status.get("error"):
+        lines.extend(["", f"⚠️ Redis: <code>{html.escape(str(worker_status['error'])[:180])}</code>"])
+    if scans:
+        scan = scans[0]
+        lines.extend([
+            "",
+            "<b>Последний запуск</b>",
+            f"{_vinted_mode_label(scan.mode)} · {_vinted_status_label(scan.status)}",
+            f"Категории: <b>{int(scan.completed_categories or 0)}/{int(scan.total_categories or 0)}</b> · товаров: <b>{int(scan.total_items or 0)}</b>",
+            f"Exact views: <b>{int(scan.exact_views or 0)}</b> · favourites: <b>{int(scan.exact_favourites or 0)}</b>",
+        ])
+    return "\n".join(lines)
+
+
+async def _vinted_tree_context() -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]], str]:
+    roots, source = await fetch_vinted_catalog_tree()
+    return roots, flatten_vinted_catalog_tree(roots), source
+
+
+def _vinted_setup_header(cfg: dict[str, Any], source: str) -> str:
+    selected = dict(cfg.get("selected") or {})
+    mode = str(cfg.get("mode") or "manual")
+    selected_names = [html.escape(str(name)) for name in selected.values()]
+    selected_line = ""
+    if selected_names:
+        preview = ", ".join(selected_names[:5])
+        if len(selected_names) > 5:
+            preview += f" … +{len(selected_names) - 5}"
+        selected_line = f"\nВыбрано: <i>{preview}</i>"
+    return (
+        f"<b>{_vinted_mode_label(mode)}</b>\n\n"
+        f"Категории: <b>{len(selected)}/{VINTED_ADMIN_MAX_CATEGORIES}</b> · глубина: <b>{int(cfg.get('pages') or 3)} стр.</b>\n"
+        f"Каталог Vinted: <b>{'live' if source == 'live' else 'fallback'}</b>{selected_line}\n\n"
+        "Выбирай разделы. Можно зайти внутрь дерева или выбрать весь текущий раздел."
+    )
+
+
+def _vinted_pages_row(cfg: dict[str, Any]) -> list[InlineKeyboardButton]:
+    current = int(cfg.get("pages") or 3)
+    return [InlineKeyboardButton(text=("✅ " if current == value else "") + f"{value} стр.", callback_data=f"av:pg:{value}") for value in (1, 3, 5, 10)]
+
+
+async def _vinted_category_screen(user_id: int, node_id: int = 0, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    roots, flat, source = await _vinted_tree_context()
+    cfg = _vinted_cfg(user_id)
+    cfg["node"] = int(node_id or 0)
+    selected: dict[int, str] = dict(cfg.get("selected") or {})
+    page = max(0, int(page or 0))
+
+    if node_id and node_id in flat:
+        node = flat[node_id]
+        children = list(node.get("catalogs") or [])
+        title = str(node.get("title") or f"Catalog {node_id}")
+        parent_id = int(node.get("parent_id") or 0)
+        text = _vinted_setup_header(cfg, source) + f"\n\n<b>📁 {html.escape(title)}</b>"
+    else:
+        children = roots
+        title = "Категории Vinted"
+        parent_id = 0
+        node_id = 0
+        text = _vinted_setup_header(cfg, source) + "\n\n<b>📂 Категории Vinted</b>"
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if node_id:
+        is_selected = int(node_id) in selected
+        rows.append([InlineKeyboardButton(
+            text=("✅ Убрать этот раздел" if is_selected else "➕ Выбрать этот раздел"),
+            callback_data=f"av:pick:{int(node_id)}",
+        )])
+
+    per_page = 12
+    start = page * per_page
+    chunk = children[start:start + per_page]
+    for child in chunk:
+        cid = int(child.get("id") or 0)
+        if cid <= 0:
+            continue
+        name = str(child.get("title") or f"Catalog {cid}")
+        has_children = bool(child.get("catalogs"))
+        mark = "✅ " if cid in selected else ""
+        icon = "📁" if has_children else "▫️"
+        callback_data = f"av:cat:{cid}:0" if has_children else f"av:pick:{cid}"
+        rows.append([InlineKeyboardButton(text=f"{mark}{icon} {name}"[:60], callback_data=callback_data)])
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"av:cat:{int(node_id)}:{page - 1}"))
+    if start + per_page < len(children):
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"av:cat:{int(node_id)}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+
+    rows.append(_vinted_pages_row(cfg))
+    if selected:
+        rows.append([InlineKeyboardButton(text=f"▶️ Запустить · {len(selected)} кат.", callback_data="av:start")])
+        rows.append([InlineKeyboardButton(text="🧹 Очистить выбор", callback_data="av:clear")])
+    if node_id:
+        rows.append([InlineKeyboardButton(text="⬅️ Уровень выше", callback_data=f"av:cat:{parent_id}:0")])
+    else:
+        rows.append([InlineKeyboardButton(text="⬅️ Vinted Lab", callback_data="av:home")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _vinted_toggle_catalog(user_id: int, catalog_id: int) -> str | None:
+    _roots, flat, _source = await _vinted_tree_context()
+    node = flat.get(int(catalog_id))
+    if not node:
+        return "Категория больше не найдена в текущем каталоге Vinted."
+    cfg = _vinted_cfg(user_id)
+    selected: dict[int, str] = dict(cfg.get("selected") or {})
+    if int(catalog_id) in selected:
+        selected.pop(int(catalog_id), None)
+    else:
+        if len(selected) >= VINTED_ADMIN_MAX_CATEGORIES:
+            return f"Для теста максимум {VINTED_ADMIN_MAX_CATEGORIES} категории за один запуск."
+        selected[int(catalog_id)] = str(node.get("title") or f"Catalog {catalog_id}")
+    cfg["selected"] = selected
+    return None
+
+
+def _vinted_scan_keyboard(scan: VintedScan) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"av:scan:{scan.id}"),
+         InlineKeyboardButton(text="📦 Результаты", callback_data=f"av:res:{scan.id}:0")],
+    ]
+    if not _vinted_terminal(scan.status) and scan.status != "cancel_requested":
+        rows.append([InlineKeyboardButton(text="⏹ Остановить", callback_data=f"av:stop:{scan.id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Vinted Lab", callback_data="av:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _vinted_scan_text(scan_id: int) -> tuple[str, VintedScan | None]:
+    snapshot = await vinted_scan_progress(scan_id)
+    if not snapshot:
+        return "<b>Vinted scan не найден.</b>", None
+    scan: VintedScan = snapshot["scan"]
+    cats: list[VintedScanCategory] = list(snapshot["categories"])
+    scan_pct = float(snapshot.get("scan_percent") or 0.0)
+    metric_pct = float(snapshot.get("metrics_percent") or 0.0)
+    lines = [
+        f"<b>{_vinted_mode_label(scan.mode)}</b>",
+        f"Статус: <b>{_vinted_status_label(scan.status)}</b>",
+        "",
+        "<b>📄 Каталоги</b>",
+        f"{_progress_bar(int(scan_pct))} <b>{scan_pct:.1f}%</b>",
+        f"Категории: <b>{int(scan.completed_categories or 0)}/{int(scan.total_categories or 0)}</b>",
+        f"Найдено уникальных: <b>{int(scan.total_items or 0)}</b>",
+        "",
+        "<b>👁 Exact Metrics</b>",
+        f"{_progress_bar(int(metric_pct))} <b>{metric_pct:.1f}%</b>",
+        f"Обработано: <b>{int(scan.metrics_done or 0)}/{int(scan.metrics_total or 0)}</b>",
+        f"Exact views: <b>{int(scan.exact_views or 0)}</b> · favourites: <b>{int(scan.exact_favourites or 0)}</b> · chronology: <b>{int(scan.chronology_count or 0)}</b>",
+    ]
+    if scan.mode == "radar":
+        lines.extend(["", "<i>Radar-тест сейчас собирает baseline. Rising/Hot не вычисляются, пока Exact Views gate не подтверждён.</i>"])
+    if cats:
+        lines.extend(["", "<b>Категории</b>"])
+        for row in cats[:8]:
+            icon = {"queued": "▫️", "running": "🟣", "completed": "✅", "partial": "⚠️", "failed": "❌", "cancelled": "⏹"}.get(row.status, "▫️")
+            lines.append(
+                f"{icon} {html.escape(row.category_name[:28])} · стр. <b>{int(row.pages_fetched or 0)}/{int(row.pages_target or 0)}</b> · <b>{int(row.unique_items or 0)}</b>"
+            )
+        if len(cats) > 8:
+            lines.append(f"… ещё {len(cats) - 8}")
+    if scan.error_text:
+        lines.extend(["", f"⚠️ <code>{html.escape(scan.error_text[:300])}</code>"])
+    return "\n".join(lines), scan
+
+
+async def _vinted_workers_text() -> str:
+    status = await VINTED_QUEUE.worker_status()
+    scan_workers = list(status.get("scan_workers") or [])
+    metrics_workers = list(status.get("metrics_workers") or [])
+    lines = [
+        "<b>🟣 Vinted Workers</b>",
+        "<i>Полностью отдельные очереди от Kleinanzeigen.</i>",
+        "",
+        f"Scan Worker: <b>{len(scan_workers)}/2</b> · очередь <b>{int(status.get('scan_queue', 0) or 0)}</b>",
+        f"Metrics Worker: <b>{len(metrics_workers)}/2</b> · очередь <b>{int(status.get('metrics_queue', 0) or 0)}</b>",
+    ]
+    for label, workers in (("Scan", scan_workers), ("Metrics", metrics_workers)):
+        for idx, worker in enumerate(sorted(workers, key=lambda x: str(x.get("worker_id") or ""))[:4], start=1):
+            active = int(worker.get("active", 0) or 0)
+            lines.extend([
+                "",
+                f"<b>{label} {idx}</b> · {'🟢 busy' if active else '🟢 idle'} · v{html.escape(str(worker.get('version') or '—'))}",
+                f"ID: <code>{html.escape(str(worker.get('worker_id') or '—')[:42])}</code>",
+            ])
+            if label == "Scan":
+                lines.append(f"Категорий: <b>{int(worker.get('processed_categories', 0) or 0)}</b> · сейчас: <b>{html.escape(str(worker.get('category') or '—')[:28])}</b> · page <b>{int(worker.get('page', 0) or 0)}</b>")
+            else:
+                lines.append(f"Items: <b>{int(worker.get('processed', 0) or 0)}</b> · exact <b>{int(worker.get('exact_total', 0) or 0)}</b> · unknown <b>{int(worker.get('unknown_total', 0) or 0)}</b> · errors <b>{int(worker.get('errors', 0) or 0)}</b>")
+    if status.get("error"):
+        lines.extend(["", f"⚠️ <code>{html.escape(str(status['error'])[:250])}</code>"])
+    return "\n".join(lines)
+
+
+def _vinted_workers_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="av:workers")],
+        [InlineKeyboardButton(text="⬅️ Vinted Lab", callback_data="av:home")],
+    ])
+
+
+async def _vinted_history_screen() -> tuple[str, InlineKeyboardMarkup]:
+    scans = await list_vinted_scans(12)
+    rows: list[list[InlineKeyboardButton]] = []
+    lines = ["<b>📂 Vinted · история сканов</b>"]
+    if not scans:
+        lines.extend(["", "Запусков пока нет."])
+    for scan in scans:
+        created = scan.created_at.strftime("%d.%m %H:%M") if scan.created_at else "—"
+        label = f"{'📡' if scan.mode == 'radar' else '🔎'} {created} · {int(scan.total_items or 0)} · {scan.status}"
+        rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"av:scan:{scan.id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Vinted Lab", callback_data="av:home")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _vinted_result_screen(scan_id: int, offset: int) -> tuple[str, InlineKeyboardMarkup]:
+    offset = max(0, int(offset or 0))
+    items, total = await list_vinted_scan_items(scan_id, offset=offset, limit=1)
+    if not items:
+        return (
+            "<b>📦 Результаты Vinted</b>\n\nПока нет сохранённых объявлений.",
+            InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ К скану", callback_data=f"av:scan:{scan_id}")]]),
+        )
+    item: VintedScanItem = items[0]
+    views = str(item.view_count) if item.view_count is not None else "UNKNOWN"
+    fav = str(item.favourite_count) if item.favourite_count is not None else "UNKNOWN"
+    price = "—" if item.price_amount is None else f"{float(item.price_amount):g} {html.escape(item.currency or 'EUR')}"
+    lines = [
+        f"<b>📦 Vinted · {offset + 1}/{total}</b>",
+        "",
+        f"<b>{html.escape(item.title or f'Item {item.item_id}')}</b>",
+        f"Категория: {html.escape(item.category_name or '—')}",
+        f"Цена: <b>{price}</b>",
+        f"Бренд: <b>{html.escape(item.brand or '—')}</b> · размер: <b>{html.escape(item.size or '—')}</b>",
+        "",
+        f"👁 Exact views: <b>{views}</b>",
+        f"❤️ Favourites: <b>{fav}</b>",
+        f"🕒 Chronology: <b>{html.escape(str(item.upload_raw or 'UNKNOWN'))}</b>",
+        f"Identity: <b>{'✅' if item.identity_ok else '▫️ UNKNOWN'}</b> · metric: <code>{html.escape(item.metric_outcome or item.metric_status or '—')}</code>",
+    ]
+    if item.promoted:
+        lines.append("⚠️ Promoted: <b>да</b>")
+    rows: list[list[InlineKeyboardButton]] = []
+    if item.url:
+        rows.append([InlineKeyboardButton(text="🔗 Открыть Vinted", url=item.url)])
+    nav: list[InlineKeyboardButton] = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"av:res:{scan_id}:{offset - 1}"))
+    if offset + 1 < total:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"av:res:{scan_id}:{offset + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⬅️ К скану", callback_data=f"av:scan:{scan_id}")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _vinted_watch_scan(bot_obj: Bot, chat_id: int, message_id: int, scan_id: int) -> None:
+    """Best-effort live percentage updates. Manual Refresh remains the durable fallback."""
+    try:
+        last_text = ""
+        while True:
+            await asyncio.sleep(4)
+            text_value, scan = await _vinted_scan_text(scan_id)
+            if scan is None:
+                return
+            if text_value != last_text:
+                try:
+                    await bot_obj.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text_value,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=_vinted_scan_keyboard(scan),
+                    )
+                    last_text = text_value
+                except TelegramBadRequest:
+                    pass
+                except Exception:
+                    pass
+            if _vinted_terminal(scan.status):
+                return
+    finally:
+        current = _VINTED_ADMIN_WATCHERS.get(int(scan_id))
+        if current is asyncio.current_task():
+            _VINTED_ADMIN_WATCHERS.pop(int(scan_id), None)
+
+
+async def _vinted_start_watcher(callback: CallbackQuery, scan_id: int) -> None:
+    message = callback.message
+    if not message or not getattr(message, "chat", None) or not getattr(message, "message_id", None):
+        return
+    old = _VINTED_ADMIN_WATCHERS.pop(int(scan_id), None)
+    if old and not old.done():
+        old.cancel()
+    _VINTED_ADMIN_WATCHERS[int(scan_id)] = asyncio.create_task(
+        _vinted_watch_scan(callback.bot, int(message.chat.id), int(message.message_id), int(scan_id))
+    )
+
+
+@dp.callback_query(F.data.startswith("av:"))
+async def vinted_admin_lab_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    data = str(callback.data or "")
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else "home"
+    await callback.answer()
+
+    if action == "home":
+        await _edit_or_answer(callback.message, await _vinted_home_text(), reply_markup=_vinted_home_keyboard())
+        return
+
+    if action == "new":
+        cfg = _vinted_cfg(callback.from_user.id)
+        cfg["selected"] = {}
+        cfg["pages"] = 3
+        cfg["mode"] = "radar" if len(parts) > 2 and parts[2] == "r" else "manual"
+        text_value, keyboard = await _vinted_category_screen(callback.from_user.id, 0, 0)
+        await _edit_or_answer(callback.message, text_value, reply_markup=keyboard)
+        return
+
+    if action == "cat":
+        node_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+        text_value, keyboard = await _vinted_category_screen(callback.from_user.id, node_id, page)
+        await _edit_or_answer(callback.message, text_value, reply_markup=keyboard)
+        return
+
+    if action == "pick":
+        catalog_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        error = await _vinted_toggle_catalog(callback.from_user.id, catalog_id)
+        if error:
+            await callback.answer(error, show_alert=True)
+        cfg = _vinted_cfg(callback.from_user.id)
+        text_value, keyboard = await _vinted_category_screen(callback.from_user.id, int(cfg.get("node") or 0), 0)
+        await _edit_or_answer(callback.message, text_value, reply_markup=keyboard)
+        return
+
+    if action == "pg":
+        value = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 3
+        _vinted_cfg(callback.from_user.id)["pages"] = value if value in {1, 3, 5, 10} else 3
+        cfg = _vinted_cfg(callback.from_user.id)
+        text_value, keyboard = await _vinted_category_screen(callback.from_user.id, int(cfg.get("node") or 0), 0)
+        await _edit_or_answer(callback.message, text_value, reply_markup=keyboard)
+        return
+
+    if action == "clear":
+        cfg = _vinted_cfg(callback.from_user.id)
+        cfg["selected"] = {}
+        text_value, keyboard = await _vinted_category_screen(callback.from_user.id, int(cfg.get("node") or 0), 0)
+        await _edit_or_answer(callback.message, text_value, reply_markup=keyboard)
+        return
+
+    if action == "start":
+        cfg = _vinted_cfg(callback.from_user.id)
+        selected: dict[int, str] = dict(cfg.get("selected") or {})
+        if not selected:
+            await callback.answer("Сначала выбери хотя бы одну категорию.", show_alert=True)
+            return
+        if not VINTED_QUEUE.enabled:
+            await callback.answer("Vinted Lab: REDIS_URL не подключён к Parser.", show_alert=True)
+            return
+        scan = await create_vinted_scan(
+            admin_user_id=callback.from_user.id,
+            mode=str(cfg.get("mode") or "manual"),
+            categories=[(int(cid), str(name)) for cid, name in selected.items()],
+            pages=int(cfg.get("pages") or 3),
+        )
+        try:
+            await enqueue_vinted_scan(scan.id)
+        except Exception as exc:
+            await cancel_vinted_scan(scan.id)
+            await callback.answer(f"Не удалось поставить в очередь: {type(exc).__name__}", show_alert=True)
+        cfg["selected"] = {}
+        text_value, fresh = await _vinted_scan_text(scan.id)
+        fresh = fresh or scan
+        await _edit_or_answer(callback.message, text_value, reply_markup=_vinted_scan_keyboard(fresh))
+        await _vinted_start_watcher(callback, scan.id)
+        return
+
+    if action == "scan":
+        scan_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        text_value, scan = await _vinted_scan_text(scan_id)
+        keyboard = _vinted_scan_keyboard(scan) if scan else _vinted_home_keyboard()
+        await _edit_or_answer(callback.message, text_value, reply_markup=keyboard)
+        if scan and not _vinted_terminal(scan.status):
+            await _vinted_start_watcher(callback, scan.id)
+        return
+
+    if action == "stop":
+        scan_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        await cancel_vinted_scan(scan_id)
+        text_value, scan = await _vinted_scan_text(scan_id)
+        await _edit_or_answer(callback.message, text_value, reply_markup=_vinted_scan_keyboard(scan) if scan else _vinted_home_keyboard())
+        return
+
+    if action == "res":
+        scan_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        offset = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+        text_value, keyboard = await _vinted_result_screen(scan_id, offset)
+        await _edit_or_answer(callback.message, text_value, reply_markup=keyboard)
+        return
+
+    if action == "history":
+        text_value, keyboard = await _vinted_history_screen()
+        await _edit_or_answer(callback.message, text_value, reply_markup=keyboard)
+        return
+
+    if action == "workers":
+        await _edit_or_answer(callback.message, await _vinted_workers_text(), reply_markup=_vinted_workers_keyboard())
+        return
+
+    await _edit_or_answer(callback.message, await _vinted_home_text(), reply_markup=_vinted_home_keyboard())
+# ---- end Vinted Lab ---------------------------------------------------------------
 
 
 @dp.message(Command("admin"))
