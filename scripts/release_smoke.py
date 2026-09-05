@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.21.16", "VERSION=4.21.16")
+    check((ROOT / "VERSION").read_text().strip() == "4.22.0", "VERSION=4.22.0")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -127,7 +127,12 @@ def main() -> int:
     check('_category_feed_identity_matches(requested_url, final_url)' in parser_source, "category redirects preserve requested feed identity")
     check('for item in targets:' in bot and 'vr = results.get(url)' in bot, "partial exact-view maps cannot preserve stale counters")
     check(not list(ROOT.glob('DEPLOY_V4_*.md')), "historical deploy files removed from root")
-    print("\nDT Parser 4.21.16 Radar 24H Category Handoff release smoke: PASS")
+    check((ROOT / "vinted_probe.py").is_file() and (ROOT / "vinted_probe_worker.py").is_file(), "isolated Vinted Probe worker present")
+    check('"vinted-probe": "vinted_probe_worker.py"' in launcher, "service launcher routes Vinted Probe separately")
+    vinted = (ROOT / "vinted_probe.py").read_text(encoding="utf-8")
+    check("UNKNOWN is never converted to zero" in vinted and "wrong_identity" in vinted, "Vinted exact-metric path is fail-closed")
+    check("does not solve anti-bot challenges" in vinted, "Vinted Probe has no challenge bypass logic")
+    print("\nDT Parser 4.22.0 Vinted Parser Probe release smoke: PASS")
     return 0
 
 

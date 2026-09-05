@@ -30,6 +30,8 @@ class ServiceLauncherRoleTests(unittest.TestCase):
             "View Worker": "view-worker",
             "AI Worker": "ai-worker",
             "Lifecycle Worker": "lifecycle-worker",
+            "Vinted Probe": "vinted-probe",
+            "Vinted Worker": "vinted-probe",
         }
         for name, role in expected.items():
             with self.subTest(name=name):

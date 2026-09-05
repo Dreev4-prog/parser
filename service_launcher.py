@@ -23,6 +23,8 @@ def _role() -> str:
         return "ai-worker"
     if explicit in {"lifecycleworker", "radarlifecycleworker", "fastsoldworker"}:
         return "lifecycle-worker"
+    if explicit in {"vintedprobe", "vintedworker", "vintedprobeworker"}:
+        return "vinted-probe"
     if explicit in {"bot", "main", "parserbot", "telegrambot"}:
         return "bot"
 
@@ -50,6 +52,10 @@ def _role() -> str:
         ("lifecycle" in normalized or "fastsold" in normalized) and "worker" in normalized
     ):
         return "lifecycle-worker"
+    if normalized in {"vintedprobe", "vintedworker", "vintedprobeworker"} or (
+        "vinted" in normalized and ("probe" in normalized or "worker" in normalized)
+    ):
+        return "vinted-probe"
 
     # v4.3.17 safety net for Railway services created from the same repo:
     # the dedicated View Worker intentionally needs Redis only, while the main
@@ -76,12 +82,16 @@ def main() -> None:
         # Fast Sold uses PostgreSQL as its durable queue and direct lightweight
         # detail-page checks. Keep the worker on a small independent DB/traffic pool.
         os.environ.setdefault("DISTRIBUTED_WORKERS", "1")
+    if role == "vinted-probe":
+        # Vinted Probe is intentionally isolated from Kleinanzeigen Page/Date/View queues.
+        os.environ.setdefault("DISTRIBUTED_WORKERS", "1")
     target = {
         "view-worker": "view_counter_worker.py",
         "page-worker": "page_worker.py",
         "date-worker": "date_worker.py",
         "ai-worker": "retired_ai_worker.py",
         "lifecycle-worker": "lifecycle_worker.py",
+        "vinted-probe": "vinted_probe_worker.py",
     }.get(role, "bot.py")
 
     print(

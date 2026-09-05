@@ -1,3 +1,11 @@
+# DT Parser 4.22.0 — Vinted Parser Probe
+
+## 4.22.0 isolated Vinted benchmark
+
+The production Kleinanzeigen stack remains unchanged. A new standalone `Vinted Probe` service benchmarks Vinted catalog speed, item identity, metric coverage and exact-view availability before any Vinted Radar logic is allowed to trust the data. Missing metrics stay UNKNOWN; the probe contains no anti-bot challenge bypass. See `RELEASE_4_22_0.md`.
+
+---
+
 # DT Parser 4.21.16 — Radar 24H Category Handoff
 
 ## 4.21.16 live-retention redesign
