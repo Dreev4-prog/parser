@@ -248,7 +248,18 @@ RADAR_AUTOSCAN_IDLE_REMOTE_RETRY_MAX = _radar_env_int("RADAR_AUTOSCAN_IDLE_REMOT
 RADAR_AUTOSCAN_IDLE_REMOTE_RETRY_SECONDS = _radar_env_seconds("RADAR_AUTOSCAN_IDLE_REMOTE_RETRY_SECONDS", 45, 10)
 RADAR_AUTOSCAN_IDLE_VIEW_REPAIR_MAX = _radar_env_int("RADAR_AUTOSCAN_IDLE_VIEW_REPAIR_MAX", 32, 12, 64)
 RADAR_AUTOSCAN_IDLE_VIEW_REPAIR_CHUNK = _radar_env_int("RADAR_AUTOSCAN_IDLE_VIEW_REPAIR_CHUNK", 16, 6, 24)
-RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES = _radar_env_int("RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES", 20, 10, RADAR_AUTOSCAN_DEPTH)
+# Keep Page Worker acceleration rolling even while idle. v4.23.6 warmed all 20
+# pages at once; that could create a request burst large enough to trigger the
+# very transient refusals that later became Radar review categories. Sixteen is
+# still more aggressive than the normal 13-page warm window, without queueing
+# the entire category in one shot.
+RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES = _radar_env_int("RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES", 16, 10, RADAR_AUTOSCAN_DEPTH)
+# v4.23.8: before a retryable category is persisted as `допроверка`, AutoScan gets
+# one fresh-context recovery pass. Verified PostgreSQL page checkpoints are reused,
+# so this is not a blind second 20-page scan. It is skipped as soon as a user scan
+# appears and the original failure remains available for the normal retry round.
+RADAR_AUTOSCAN_INLINE_RECOVERY_PASSES = _radar_env_int("RADAR_AUTOSCAN_INLINE_RECOVERY_PASSES", 1, 0, 2)
+RADAR_AUTOSCAN_INLINE_RECOVERY_DELAY_SECONDS = _radar_env_seconds("RADAR_AUTOSCAN_INLINE_RECOVERY_DELAY_SECONDS", 2, 0)
 
 # v4.22.6 Fast Today + Exact Tail. A tiny unresolved exact-view tail no longer
 # forces a full 20-page category rescan. Unknown counters stay NULL and therefore
@@ -529,16 +540,22 @@ STATUS_UPDATE_INTERVAL_SECONDS = max(0.5, float(os.getenv("STATUS_UPDATE_INTERVA
 # user receives a partial result.
 SCAN_CATEGORY_ATTEMPTS = max(1, min(3, int(os.getenv("SCAN_CATEGORY_ATTEMPTS", "2"))))
 if STABLE_SINGLE_SERVICE_MODE:
-    SCAN_CATEGORY_ATTEMPTS = 1
+    # One unexpected transport/runtime exception gets a clean second attempt.
+    # Structurally partial results use the separate checkpoint-aware recovery pass
+    # below, so normal healthy categories still execute exactly once.
+    SCAN_CATEGORY_ATTEMPTS = 2
 SCAN_CATEGORY_RETRY_SECONDS = max(1.0, min(30.0, float(os.getenv("SCAN_CATEGORY_RETRY_SECONDS", "4"))))
 # v3.7.2: a parser result that is structurally partial is automatically retried
 # inside the same per-user parser session. Verified page checkpoints are reused,
 # so recovery refetches weak/missing areas instead of making the user press a button.
 SCAN_AUTO_RECOVERY_PASSES = max(0, min(3, int(os.getenv("SCAN_AUTO_RECOVERY_PASSES", "3"))))
 if STABLE_SINGLE_SERVICE_MODE:
-    # Page-level retry + one clean browser-context recycle replaces repeated whole
-    # category passes. This makes failures deterministic and keeps scans short.
-    SCAN_AUTO_RECOVERY_PASSES = 0
+    # v4.23.8 First-Pass Recovery. Page-level retries remain the cheap first line,
+    # but one structurally partial category now gets ONE fresh-context recovery
+    # inside the same user launch before we ask the user to press Repeat. Strong
+    # pages are reloaded from PostgreSQL checkpoints, so the control pass repairs
+    # only missing/weak coverage instead of blindly starting from page 1.
+    SCAN_AUTO_RECOVERY_PASSES = 1
 SCAN_AUTO_RECOVERY_DELAY_SECONDS = max(0.5, min(15.0, float(os.getenv("SCAN_AUTO_RECOVERY_DELAY_SECONDS", "2"))))
 SUBSCRIPTION_NOTICE_POLL_SECONDS = max(60, int(os.getenv("SUBSCRIPTION_NOTICE_POLL_SECONDS", "300")))
 
@@ -4665,7 +4682,9 @@ def _radar_autoscan_default_state() -> dict:
         "review_pages": 0,
         "review_watchdog": 0,
         "review_gate": 0,
+        "review_transport": 0,
         "review_other": 0,
+        "inline_recovered": 0,
         "system_errors": 0,
         "skipped_nonproduct": 0,
         "failed": 0,  # compatibility total = needs_review + system_errors
@@ -4771,8 +4790,15 @@ def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
 
     # v4.23.6 can classify an already-finished older round immediately from its
     # persisted failed_categories list. New rounds maintain these counters live.
-    review_counter_keys = ("review_views", "review_pages", "review_watchdog", "review_gate", "review_other")
-    if not any(key in raw_state for key in review_counter_keys):
+    review_counter_keys = (
+        "review_views", "review_pages", "review_watchdog", "review_gate",
+        "review_transport", "review_other",
+    )
+    # v4.23.8 adds an explicit transport bucket. Existing v4.23.6/7 rounds already
+    # persisted exact failure reasons, so when this new counter is absent we can
+    # rebuild the whole breakdown immediately instead of leaving HTTP/timeout
+    # failures hidden under the misleading `другое` label.
+    if "review_transport" not in raw_state:
         inferred_breakdown = {key: 0 for key in review_counter_keys}
         for item in failures:
             kind = str(item.get("kind") or "partial").lower()
@@ -4785,6 +4811,11 @@ def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
                 inferred_breakdown["review_views"] += 1
             elif kind == "radar_gate_unknown":
                 inferred_breakdown["review_gate"] += 1
+            elif kind == "partial" and any(
+                token in reason_lower
+                for token in ("http 403", "http 429", "временн", "таймаут", "timeout", "огранич")
+            ):
+                inferred_breakdown["review_transport"] += 1
             elif kind == "partial" and any(token in reason_lower for token in ("страниц", "page", "дата", "chronolog")):
                 inferred_breakdown["review_pages"] += 1
             else:
@@ -4845,7 +4876,8 @@ def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
         "processed", "successful", "failed", "skipped_nonproduct", "pages_verified",
         "listings_seen", "new_listings", "radar_saved", "views_requested", "views_verified",
         "views_failed", "view_tail_deferred", "view_tail_categories",
-        "review_views", "review_pages", "review_watchdog", "review_gate", "review_other",
+        "review_views", "review_pages", "review_watchdog", "review_gate",
+        "review_transport", "review_other", "inline_recovered",
     ):
         state[key] = max(0, int(state.get(key) or 0))
     # New counters are authoritative when present; otherwise infer legacy failures.
@@ -4927,7 +4959,9 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
         "review_pages": 0,
         "review_watchdog": 0,
         "review_gate": 0,
+        "review_transport": 0,
         "review_other": 0,
+        "inline_recovered": 0,
         "system_errors": 0,
         "skipped_nonproduct": 0,
         "failed": 0,
@@ -5022,7 +5056,9 @@ def _radar_autoscan_retry_round(state: dict) -> dict | None:
         "review_pages": 0,
         "review_watchdog": 0,
         "review_gate": 0,
+        "review_transport": 0,
         "review_other": 0,
+        "inline_recovered": 0,
         "system_errors": 0,
         "skipped_nonproduct": 0,
         "failed": 0,
@@ -5336,17 +5372,37 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
     review_pages = int(state.get("review_pages") or 0)
     review_watchdog = int(state.get("review_watchdog") or 0)
     review_gate = int(state.get("review_gate") or 0)
+    review_transport = int(state.get("review_transport") or 0)
     review_other = int(state.get("review_other") or 0)
+    inline_recovered = int(state.get("inline_recovered") or 0)
     resource_line = ""
     if status == "running":
         fg_running, fg_queued = await _radar_foreground_counts()
-        if await _radar_autoscan_idle_turbo_available():
+        if fg_running or fg_queued:
             resource_line = (
-                f"⚡ Ресурсы: <b>Idle Turbo</b> · views до x{RADAR_AUTOSCAN_IDLE_VIEW_CONCURRENCY} "
-                f"· prefetch {RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES} стр."
+                f"🛡 Ресурсы: <b>приоритет пользователей</b> · "
+                f"активных {fg_running} · очередь {fg_queued}"
             )
         else:
-            resource_line = f"🛡 Ресурсы: <b>приоритет пользователей</b> · активных {fg_running} · очередь {fg_queued}"
+            try:
+                traffic_snap = await TRAFFIC.snapshot()
+            except Exception:
+                traffic_snap = None
+            if traffic_snap is not None and (
+                int(traffic_snap.penalty_level or 0) > 0
+                or float(traffic_snap.cooldown_seconds or 0.0) > 0.0
+            ):
+                resource_line = (
+                    "🧯 Ресурсы: <b>защитный режим Kleinanzeigen</b> · "
+                    f"отказов 60с {int(traffic_snap.refusals_60s or 0)}"
+                )
+            elif await _radar_autoscan_idle_turbo_available():
+                resource_line = (
+                    f"⚡ Ресурсы: <b>Idle Turbo</b> · views до x{RADAR_AUTOSCAN_IDLE_VIEW_CONCURRENCY} "
+                    f"· prefetch {RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES} стр."
+                )
+            else:
+                resource_line = "⚙️ Ресурсы: <b>обычный безопасный режим</b>"
 
     review_parts = []
     if review_views:
@@ -5357,6 +5413,8 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         review_parts.append(f"⏱ watchdog {review_watchdog}")
     if review_gate:
         review_parts.append(f"🔒 gate {review_gate}")
+    if review_transport:
+        review_parts.append(f"🌐 transport {review_transport}")
     if review_other:
         review_parts.append(f"❓ другое {review_other}")
     review_breakdown_line = " · ".join(review_parts)
@@ -5399,6 +5457,7 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         + f"✅ Категорий успешно: <b>{successful}</b>"
         + (f" · 🟡 exact-tail <b>{int(state.get('view_tail_categories') or 0)}</b> кат." if int(state.get('view_tail_categories') or 0) else "")
         + f" · ⚠️ допроверка <b>{needs_review}</b> · ❌ ошибок <b>{system_errors}</b>\n"
+        + (f"♻️ Исправлено внутри круга: <b>{inline_recovered}</b>\n" if inline_recovered else "")
         + (f"↳ {review_breakdown_line}\n" if review_breakdown_line else "")
         + "\n<b>🧪 Radar-наблюдения</b>\n"
         + "Подробная воронка Candidate / Early / Strong / Hot, Confidence, Acceleration и категории вынесены в <b>📊 Аналитика Radar</b>.\n"
@@ -5583,6 +5642,13 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
         "processed": int(state.get("processed") or 0),
         "successful": run_successful,
         "needs_review": needs_review,
+        "review_views": int(state.get("review_views") or 0),
+        "review_pages": int(state.get("review_pages") or 0),
+        "review_watchdog": int(state.get("review_watchdog") or 0),
+        "review_gate": int(state.get("review_gate") or 0),
+        "review_transport": int(state.get("review_transport") or 0),
+        "review_other": int(state.get("review_other") or 0),
+        "inline_recovered": int(state.get("inline_recovered") or 0),
         "system_errors": system_errors,
         "skipped_nonproduct": skipped_nonproduct,
         "failed": failed,
@@ -5754,6 +5820,96 @@ async def _radar_autoscan_run_category_controlled(coro, *, category_name: str):
         await asyncio.gather(stop_waiter, return_exceptions=True)
 
 
+async def _radar_autoscan_inline_recover_category(attempt_factory, parser: KleinanzeigenParser, *, category_name: str):
+    """Give one retryable Radar category a fresh-context repair before persisting review.
+
+    Page/date/view work is already checkpointed, so the second attempt reuses verified
+    PostgreSQL evidence and normally touches only weak/missing areas. The repair is
+    intentionally skipped if a foreground user appears; user scans remain the hard
+    priority boundary. System failures, watchdogs and Organic-Gate UNKNOWNs are not
+    blindly replayed here.
+    """
+    last_values = None
+    last_exc = None
+    recovered = False
+    max_attempts = 1 + max(0, int(RADAR_AUTOSCAN_INLINE_RECOVERY_PASSES))
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            values = await attempt_factory()
+            last_exc = None
+            failure_kind = str(values[3] or "") if len(values) >= 4 else ""
+            retryable = failure_kind in {"partial", "radar_views"}
+            if not retryable:
+                # A recovery pass revisits rows inserted by the first partial pass,
+                # so its DB `new_count` may legitimately be zero. Preserve the
+                # strongest counters/membership from either attempt while accepting
+                # the second pass's complete verdict.
+                if recovered and last_values is not None:
+                    previous_result = last_values[0]
+                    current_result = values[0]
+                    if previous_result is not None and current_result is not None:
+                        current_result.matched_ids = sorted(set(previous_result.matched_ids or []) | set(current_result.matched_ids or []))
+                        for field_name in (
+                            "new_count", "today_seen", "enriched_count", "collection_pages_confirmed",
+                            "views_requested", "views_verified", "promoted_filtered", "price_reduced_filtered",
+                        ):
+                            try:
+                                setattr(
+                                    current_result, field_name,
+                                    max(int(getattr(previous_result, field_name, 0) or 0), int(getattr(current_result, field_name, 0) or 0)),
+                                )
+                            except Exception:
+                                pass
+                return (*values, recovered)
+            last_values = values
+        except (TemporaryAccessError, TimeoutError, asyncio.TimeoutError) as exc:
+            last_exc = exc
+            retryable = True
+
+        if attempt >= max_attempts or not retryable:
+            # If attempt 1 produced a structurally partial result and only the
+            # fresh-context repair itself hit a transient refusal, keep the first
+            # verified evidence instead of degrading the category to result=None.
+            if last_exc is not None and last_values is None:
+                raise last_exc
+            assert last_values is not None
+            return (*last_values, recovered)
+
+        fg_running, fg_queued = await _radar_foreground_counts()
+        if fg_running or fg_queued:
+            log.info(
+                "DT Radar AutoScan inline recovery yielded to users category=%s active=%s queued=%s",
+                category_name, fg_running, fg_queued,
+            )
+            if last_exc is not None and last_values is None:
+                raise last_exc
+            assert last_values is not None
+            return (*last_values, recovered)
+
+        log.warning(
+            "DT Radar AutoScan inline recovery category=%s attempt=%s/%s reason=%s",
+            category_name, attempt + 1, max_attempts,
+            (str(last_exc) if last_exc is not None else str(last_values[4] or last_values[3])),
+        )
+        if RADAR_AUTOSCAN_INLINE_RECOVERY_DELAY_SECONDS > 0:
+            if await _radar_autoscan_interruptible_sleep(RADAR_AUTOSCAN_INLINE_RECOVERY_DELAY_SECONDS):
+                raise RadarAutoScanStopped()
+        try:
+            await parser.reset_scan_browser_context()
+        except Exception:
+            log.debug("DT Radar AutoScan inline recovery context reset failed category=%s", category_name, exc_info=True)
+        try:
+            parser.prepare_category_scan()
+        except Exception:
+            log.debug("DT Radar AutoScan inline recovery parser reset failed category=%s", category_name, exc_info=True)
+        recovered = True
+
+    if last_exc is not None and last_values is None:
+        raise last_exc
+    assert last_values is not None
+    return (*last_values, recovered)
+
 def _radar_autoscan_live_stage_line(state: dict) -> str:
     """Human-readable current category heartbeat for the admin panel."""
     key = str(state.get("current_category_key") or "")
@@ -5904,6 +6060,7 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
             radar_stats = None
             error_text = ""
             failure_kind = ""
+            inline_recovered = False
             recycle_parser = False
             await TRAFFIC.scan_job_started()
             parser.prepare_category_scan()
@@ -5961,8 +6118,11 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                         local_error_text = local_result.reason or "нужно повторно подтвердить категорию"
                     return local_result, local_radar_saved, local_radar_stats, local_failure_kind, local_error_text
 
-                result, radar_saved, radar_stats, failure_kind, error_text = await _radar_autoscan_run_category_controlled(
-                    _category_pipeline(), category_name=cat.name
+                result, radar_saved, radar_stats, failure_kind, error_text, inline_recovered = await _radar_autoscan_run_category_controlled(
+                    _radar_autoscan_inline_recover_category(
+                        _category_pipeline, parser, category_name=cat.name
+                    ),
+                    category_name=cat.name,
                 )
             except RadarAutoScanStopped:
                 log.warning(
@@ -6023,6 +6183,8 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                 await TRAFFIC.scan_job_finished()
 
             state = await load_radar_autoscan_state()
+            if inline_recovered and result is not None and result.date_complete and not failure_kind:
+                state["inline_recovered"] = int(state.get("inline_recovered") or 0) + 1
             # A Stop pressed during the category is honored by the child waiter above.
             if error_text.startswith("watchdog категории"):
                 state["last_watchdog_category"] = cat.name
@@ -6099,6 +6261,11 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                         state["review_views"] = int(state.get("review_views") or 0) + 1
                     elif failure_kind == "radar_gate_unknown":
                         state["review_gate"] = int(state.get("review_gate") or 0) + 1
+                    elif failure_kind == "partial" and any(
+                        token in reason_lower
+                        for token in ("http 403", "http 429", "временн", "таймаут", "timeout", "огранич")
+                    ):
+                        state["review_transport"] = int(state.get("review_transport") or 0) + 1
                     elif failure_kind == "partial" and (
                         "страниц" in reason_lower or "page" in reason_lower or "дата" in reason_lower
                         or "chronolog" in reason_lower or (result is not None and not result.date_complete)
@@ -9641,8 +9808,8 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
                     text = (
                         "<b>⚠️ Не все страницы удалось подтвердить</b>\n\n"
                         f"{job.incomplete_categories} из {len(job.category_keys)} категорий завершены не полностью. "
-                        "Парсер уже повторил проблемную страницу и один раз обновил браузерный контекст. "
-                        "Успешные страницы сохранены в PostgreSQL, поэтому следующий запуск продолжит с проверенных данных."
+                        "Парсер уже повторил слабые страницы, обновил браузерный контекст и сделал один "
+                        "контрольный проход по недостающим участкам. Подтверждённые страницы сохранены в PostgreSQL."
                     )
                 else:
                     text = (
@@ -9653,7 +9820,7 @@ async def finish_job(bot: Bot, job: ScanJob, *, cancelled: bool = False) -> None
                         "повторный скан не начнётся с нуля."
                     )
                 markup = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔄 Повторить скан", callback_data=f"scanrepeat:{job.scan_id}")],
+                    [InlineKeyboardButton(text="🔄 Повторить только проблемные", callback_data=f"scanrecheck:{job.scan_id}")],
                     [InlineKeyboardButton(text="📊 Открыть сохранённый скан", callback_data=f"scan:{job.scan_id}")],
                 ]) if job.scan_id is not None else None
             else:
@@ -9704,6 +9871,16 @@ async def dispatch_category_with_retry(
             await asyncio.sleep(SCAN_CATEGORY_RETRY_SECONDS * attempt)
             if job.stop_event.is_set() or job.cancel_requested:
                 raise ScanStopRequested()
+            parser = JOB_PARSER.get()
+            if parser is not None:
+                try:
+                    await parser.reset_scan_browser_context()
+                except Exception:
+                    log.debug("User exception retry context reset failed category=%s", cat.name, exc_info=True)
+                try:
+                    parser.prepare_category_scan()
+                except Exception:
+                    log.debug("User exception retry parser reset failed category=%s", cat.name, exc_info=True)
     assert last_exc is not None
     raise last_exc
 
@@ -9737,6 +9914,20 @@ async def auto_recover_partial_category(
         await edit_job_status(bot, job, render_user_job_status(job), force=True)
         if attempt > 1 or SCAN_AUTO_RECOVERY_DELAY_SECONDS:
             await asyncio.sleep(SCAN_AUTO_RECOVERY_DELAY_SECONDS * attempt)
+        # Match the condition that made a manual Repeat succeed in production: use
+        # a clean BrowserContext for the control pass while keeping verified page
+        # checkpoints in PostgreSQL. This turns a transient first-pass partial into
+        # an in-job repair instead of requiring a second Telegram launch.
+        parser = JOB_PARSER.get()
+        if parser is not None:
+            try:
+                await parser.reset_scan_browser_context()
+            except Exception:
+                log.debug("User auto-recovery context reset failed category=%s", cat.name, exc_info=True)
+            try:
+                parser.prepare_category_scan()
+            except Exception:
+                log.debug("User auto-recovery parser reset failed category=%s", cat.name, exc_info=True)
         try:
             candidate_dispatch = await dispatch_category_with_retry(
                 bot, job, cat, force_refresh=True

@@ -1,3 +1,31 @@
+# DT PARSER
+
+## v4.23.8 — First-Pass Recovery & Radar Self-Heal
+
+- Stable user scans now self-repair one structurally partial category pass with a fresh BrowserContext while reusing verified PostgreSQL checkpoints; the user should not need a second Telegram launch for a transient first-pass partial.
+- Radar page/date and materially incomplete exact-view partials receive one bounded inline recovery before becoming `допроверка`; foreground user scans can preempt the decision to start that repair.
+- Radar review diagnostics split transient HTTP/timeout pressure into `🌐 transport`, and zero-user Traffic cooldown is shown as Kleinanzeigen protection mode instead of user priority.
+- Idle Page Worker prefetch uses a safer rolling 16-page window instead of queueing the whole 20-page category at once.
+- Exact-view 99%/tail-8, UNKNOWN=NULL, Organic Gate and Radar 3.2 scoring remain unchanged.
+
+See `RELEASE_4_23_8.md`.
+
+## v4.22.6 — AutoScan Fast Today + Exact Tail
+
+- Kleinanzeigen Radar AutoScan now checks the verified nationwide page 1 first for today-only rounds and skips Date Worker prediction when page 1 already proves TODAY.
+- Healthy dedicated View Workers receive the full exact-view batch first; the Parser no longer serially pre-processes every Radar ad before the fleet.
+- A tiny >=99% exact-view remainder (bounded to 3–8 UNKNOWN items depending on batch size) no longer forces a full 20-page category rescan. UNKNOWN stays NULL and cannot seed/score Radar. Materially incomplete batches remain fail-closed and retryable.
+- Up to 12 unresolved counters get one targeted exact retry before the soft-tail decision.
+- AutoScan page telemetry now counts verified target-day collection pages instead of Date/Page probe traffic.
+- Retry rounds preserve the parent round target date across Moscow midnight.
+- User parser lanes, normal user date logic, Organic exclusions, DT Radar 3.2 scoring, Lifecycle/Fast Sold and Vinted Lab are unchanged.
+
+# DT PARSER 4.22.5 — Vinted Exact Browser Session + Fast Metrics Pool
+
+Vinted Metrics now uses one normal captured browser session instead of repeating anonymous 404/403 detail calls. Two Metrics Worker replicas run four exact slots each by default (up to 8 concurrent checks), with strict item-identity verification, UNKNOWN on any protected/uncertain response, and a circuit breaker for repeated 401/403/429/challenge results. The release includes a local Mac session-capture helper, honest Exact/UNKNOWN progress in Vinted Lab, provider diagnostics, and authenticated category-metadata reuse. Kleinanzeigen parser/Radar workers are unchanged. See `RELEASE_4_22_5.md`.
+
+---
+
 # DT PARSER 4.22.4 — Vinted Admin Lab + Isolated Worker Fleet
 
 Adds an admin-only Vinted parser test UI with hierarchical category selection, live catalog/metric percentages, persistent results and worker diagnostics. Vinted execution is isolated into `Vinted Scan Worker ×2` and `Vinted Metrics Worker ×2` using dedicated Redis streams and `vinted_*` tables; existing Kleinanzeigen Page/Date/View worker logic is untouched. Exact Vinted metrics stay fail-closed: catalog zeroes are never accepted as exact views, and the test Radar mode remains baseline-only until the Exact Views gate passes. See `RELEASE_4_22_4.md`.

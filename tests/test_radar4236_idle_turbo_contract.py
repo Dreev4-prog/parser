@@ -22,7 +22,7 @@ def test_idle_turbo_is_opt_in_by_health_and_zero_foreground_users():
 
 def test_idle_turbo_borrows_view_and_page_capacity_without_parallel_categories():
     assert 'RADAR_AUTOSCAN_IDLE_VIEW_CONCURRENCY = _radar_env_int("RADAR_AUTOSCAN_IDLE_VIEW_CONCURRENCY", 8' in BOT
-    assert 'RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES = _radar_env_int("RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES", 20' in BOT
+    assert 'RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES = _radar_env_int("RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES", 16' in BOT
     prefetch = _block("async def top_up_direct_prefetch", "await top_up_direct_prefetch(candidate)")
     assert "user_id == RADAR_AUTOSCAN_USER_ID" in prefetch
     assert "await _radar_autoscan_idle_turbo_available()" in prefetch
@@ -56,10 +56,12 @@ def test_accuracy_gates_are_not_relaxed():
 
 
 def test_review_breakdown_is_persisted_and_visible():
-    for key in ("review_views", "review_pages", "review_watchdog", "review_gate", "review_other"):
+    for key in ("review_views", "review_pages", "review_watchdog", "review_gate", "review_transport", "review_other"):
         assert f'"{key}": 0' in BOT
     assert 'state["review_views"]' in BOT
     assert 'state["review_watchdog"]' in BOT
     assert 'review_parts.append(f"👁 views {review_views}")' in BOT
     assert 'review_parts.append(f"📄 pages {review_pages}")' in BOT
+    assert 'review_parts.append(f"🌐 transport {review_transport}")' in BOT
+    assert "защитный режим Kleinanzeigen" in BOT
     assert "Idle Turbo" in BOT

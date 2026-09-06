@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.23.7", "VERSION=4.23.7")
+    check((ROOT / "VERSION").read_text().strip() == "4.23.8", "VERSION=4.23.8")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -150,8 +150,21 @@ def main() -> int:
           "remote view deadlines preserve completed shards")
     check('self.autoscan_idle_view_limit' in traffic and 'is_autoscan_idle' in traffic and 'idle_burst_ok' in traffic,
           "Idle Turbo has a real traffic-manager burst lane")
+    check('SCAN_CATEGORY_ATTEMPTS = 2' in bot and 'SCAN_AUTO_RECOVERY_PASSES = 1' in bot,
+          "stable user scans get one in-launch clean recovery before partial UI")
+    user_recovery = bot.split('async def auto_recover_partial_category', 1)[1].split('async def process_scan_job', 1)[0]
+    check('reset_scan_browser_context()' in user_recovery and 'parser.prepare_category_scan()' in user_recovery and 'force_refresh=True' in user_recovery,
+          "user partial recovery uses fresh context plus checkpoint-aware forced repair")
+    check('callback_data=f"scanrecheck:{job.scan_id}"' in bot and 'Повторить только проблемные' in bot,
+          "manual fallback retries only incomplete categories")
+    check('async def _radar_autoscan_inline_recover_category' in bot and '{"partial", "radar_views"}' in bot,
+          "Radar retries page/view partials inside the same round before review")
+    check('review_transport' in bot and 'защитный режим Kleinanzeigen' in bot,
+          "Radar exposes site-pressure review causes instead of hiding them under other")
+    check('RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES = _radar_env_int("RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES", 16' in bot,
+          "idle page prefetch is capped below the full 20-page category burst")
 
-    print("\nDT Parser 4.23.7 Full Audit Hardening release smoke: PASS")
+    print("\nDT Parser 4.23.8 First-Pass Recovery & Radar Self-Heal release smoke: PASS")
     return 0
 
 
