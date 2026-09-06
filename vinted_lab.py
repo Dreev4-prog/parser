@@ -9,7 +9,7 @@ import socket
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Iterable
 
 import httpx
@@ -17,7 +17,7 @@ from sqlalchemy import case, func, select, update
 
 from app_version import APP_VERSION
 from db import SessionLocal
-from models import VintedMetricHistory, VintedScan, VintedScanCategory, VintedScanItem
+from models import VintedMetricHistory, VintedRadarWatch, VintedScan, VintedScanCategory, VintedScanItem
 from vinted_probe import DEFAULT_BASE_URL, DEFAULT_USER_AGENT
 from vinted_session_store import load_vinted_session_json
 
@@ -36,6 +36,12 @@ METRICS_STREAM = f"{VINTED_REDIS_PREFIX}:metric_tasks"
 METRICS_GROUP = f"{VINTED_REDIS_PREFIX}:metrics_workers"
 HEARTBEAT_TTL_SECONDS = 25
 PENDING_RECLAIM_IDLE_MS = 60_000
+
+# v4.23.10: targeted Vinted Radar follow-up checkpoints. Full-market scans keep
+# discovering new inventory, while the Metrics fleet revisits only promising items.
+VINTED_RADAR_FOLLOWUP_OFFSETS_MINUTES = (30, 60, 120, 180)
+VINTED_RADAR_FOLLOWUP_RETRY_MINUTES = max(5, min(30, int(os.getenv("VINTED_RADAR_FOLLOWUP_RETRY_MINUTES", "10") or 10)))
+VINTED_RADAR_FOLLOWUP_RETRIES_PER_STEP = max(0, min(3, int(os.getenv("VINTED_RADAR_FOLLOWUP_RETRIES_PER_STEP", "1") or 1)))
 
 FALLBACK_CATALOGS: list[dict[str, Any]] = [
     {
@@ -557,6 +563,35 @@ class VintedLabQueue:
         redis = await self.connect()
         await redis.delete(f"{VINTED_REDIS_PREFIX}:metric_enqueued:{scan_id}:{item_id}")
 
+    async def enqueue_radar_followup(self, *, watch_id: int, scan_id: int, item_id: int, step: int) -> str:
+        """Queue one identity-bound Radar follow-up on the existing Metrics fleet.
+
+        The Redis marker is per watch/step, not per scan item, so +30/+60/+120/+180
+        checkpoints can all run while duplicate scheduler ticks remain idempotent.
+        """
+        await self.ensure_groups()
+        redis = await self.connect()
+        marker = f"{VINTED_REDIS_PREFIX}:radar_followup_enqueued:{int(watch_id)}:{int(step)}"
+        created = await redis.set(marker, "1", ex=30 * 60, nx=True)
+        if not created:
+            return "duplicate"
+        try:
+            return str(await redis.xadd(METRICS_STREAM, {
+                "purpose": "radar_followup",
+                "watch_id": str(int(watch_id)),
+                "scan_id": str(int(scan_id)),
+                "item_id": str(int(item_id)),
+                "step": str(int(step)),
+                "queued_at": str(int(time.time())),
+            }))
+        except Exception:
+            await redis.delete(marker)
+            raise
+
+    async def clear_radar_followup_marker(self, watch_id: int, step: int) -> None:
+        redis = await self.connect()
+        await redis.delete(f"{VINTED_REDIS_PREFIX}:radar_followup_enqueued:{int(watch_id)}:{int(step)}")
+
     async def claim(self, *, role: str, worker_id: str, block_ms: int = 5000) -> tuple[str, dict[str, str]] | None:
         await self.ensure_groups()
         redis = await self.connect()
@@ -1038,6 +1073,152 @@ async def mark_metric_error(scan_id: int, item_id: int, error_text: str) -> None
             row.updated_at = utcnow()
         await session.commit()
     await recalc_scan(scan_id)
+
+
+async def load_radar_followup_item(watch_id: int) -> tuple[VintedRadarWatch, VintedScanItem] | None:
+    """Load a durable Radar watch and the catalog row that supplied its baseline."""
+    async with SessionLocal() as session:
+        watch = await session.get(VintedRadarWatch, int(watch_id))
+        if watch is None:
+            return None
+        item = (await session.execute(select(VintedScanItem).where(
+            VintedScanItem.scan_id == int(watch.source_scan_id),
+            VintedScanItem.item_id == int(watch.item_id),
+        ))).scalar_one_or_none()
+        if item is None:
+            return None
+        return watch, item
+
+
+async def claim_radar_followup_processing(watch_id: int, step: int, *, lease_seconds: int = 300) -> bool:
+    """Claim exactly one queued follow-up message; stale/duplicate Redis messages no-op."""
+    now = utcnow()
+    async with SessionLocal() as session:
+        watch = await session.get(VintedRadarWatch, int(watch_id))
+        if watch is None or int(watch.check_step or 0) != int(step):
+            return False
+        if str(watch.status or "") not in {"queued", "watching", "processing"}:
+            return False
+        if str(watch.status or "") == "processing" and watch.lease_until and watch.lease_until > now:
+            return False
+        watch.status = "processing"
+        watch.lease_until = now + timedelta(seconds=max(60, int(lease_seconds)))
+        watch.updated_at = now
+        await session.commit()
+        return True
+
+
+def _next_followup_due(first_seen: datetime, next_step: int, now: datetime) -> datetime | None:
+    if next_step >= len(VINTED_RADAR_FOLLOWUP_OFFSETS_MINUTES):
+        return None
+    target = first_seen + timedelta(minutes=int(VINTED_RADAR_FOLLOWUP_OFFSETS_MINUTES[next_step]))
+    # Never create two measurements almost back-to-back when a worker was delayed.
+    return max(target, now + timedelta(minutes=5))
+
+
+async def save_radar_followup_sample(watch_id: int, step: int, sample: Any) -> str:
+    """Persist one targeted favourite-count sample and advance the durable schedule."""
+    now = utcnow()
+    async with SessionLocal() as session:
+        watch = await session.get(VintedRadarWatch, int(watch_id))
+        if watch is None or int(watch.check_step or 0) != int(step):
+            return "stale"
+        item = (await session.execute(select(VintedScanItem).where(
+            VintedScanItem.scan_id == int(watch.source_scan_id),
+            VintedScanItem.item_id == int(watch.item_id),
+        ))).scalar_one_or_none()
+        if item is None:
+            watch.status = "failed"
+            watch.last_outcome = "source_item_missing"
+            watch.next_check_at = None
+            watch.lease_until = None
+            watch.updated_at = now
+            await session.commit()
+            return "source_item_missing"
+
+        identity_ok = bool(getattr(sample, "identity_ok", False))
+        favourite_count = getattr(sample, "favourite_count", None)
+        outcome = str(getattr(sample, "outcome", "unknown") or "unknown")[:80]
+        source = str(getattr(sample, "source", "") or "")[:56]
+        exact_like = identity_ok and favourite_count is not None
+
+        watch.checks = int(watch.checks or 0) + 1
+        watch.last_checked_at = now
+        watch.last_outcome = outcome
+        watch.lease_until = None
+        watch.updated_at = now
+
+        if exact_like:
+            fav = int(favourite_count)
+            session.add(VintedMetricHistory(
+                scan_id=int(watch.source_scan_id),
+                item_id=int(watch.item_id),
+                measured_at=now,
+                view_count=None,
+                favourite_count=fav,
+                upload_raw=None,
+                source=(f"radar_followup:{source}" if source else "radar_followup")[:80],
+                outcome=outcome,
+                identity_ok=True,
+            ))
+            watch.last_likes = fav
+            watch.exact_samples = int(watch.exact_samples or 0) + 1
+            watch.retry_count = 0
+            watch.check_step = int(watch.check_step or 0) + 1
+            next_due = _next_followup_due(watch.first_seen_at, int(watch.check_step), now)
+            watch.next_check_at = next_due
+            watch.status = "completed" if next_due is None else "watching"
+            if bool(getattr(sample, "sold", False) or getattr(sample, "closed", False) or getattr(sample, "hidden", False)):
+                watch.status = "completed"
+                watch.next_check_at = None
+                watch.last_outcome = "closed_or_hidden"
+            await session.commit()
+            return "exact"
+
+        # Protected/UNKNOWN responses remain fail-closed. Retry a step once by default;
+        # after that, advance so one bad endpoint response cannot stall a watch forever.
+        retries = int(watch.retry_count or 0) + 1
+        if retries <= VINTED_RADAR_FOLLOWUP_RETRIES_PER_STEP:
+            watch.retry_count = retries
+            watch.status = "watching"
+            watch.next_check_at = now + timedelta(minutes=VINTED_RADAR_FOLLOWUP_RETRY_MINUTES)
+        else:
+            watch.retry_count = 0
+            watch.check_step = int(watch.check_step or 0) + 1
+            next_due = _next_followup_due(watch.first_seen_at, int(watch.check_step), now)
+            watch.next_check_at = next_due
+            watch.status = "completed" if next_due is None else "watching"
+        await session.commit()
+        return "unknown"
+
+
+async def mark_radar_followup_error(watch_id: int, step: int, error_text: str) -> None:
+    """Release a failed processing lease and retry later without inventing evidence."""
+    now = utcnow()
+    async with SessionLocal() as session:
+        watch = await session.get(VintedRadarWatch, int(watch_id))
+        if watch is None or int(watch.check_step or 0) != int(step):
+            return
+        reason = str(error_text or "worker_error")[:80]
+        watch.last_outcome = reason
+        watch.lease_until = None
+        if reason == "source_item_missing":
+            watch.status = "failed"
+            watch.next_check_at = None
+        else:
+            retries = int(watch.retry_count or 0) + 1
+            if retries <= VINTED_RADAR_FOLLOWUP_RETRIES_PER_STEP:
+                watch.retry_count = retries
+                watch.status = "watching"
+                watch.next_check_at = now + timedelta(minutes=VINTED_RADAR_FOLLOWUP_RETRY_MINUTES)
+            else:
+                watch.retry_count = 0
+                watch.check_step = int(watch.check_step or 0) + 1
+                next_due = _next_followup_due(watch.first_seen_at, int(watch.check_step), now)
+                watch.next_check_at = next_due
+                watch.status = "completed" if next_due is None else "watching"
+        watch.updated_at = now
+        await session.commit()
 
 
 async def scan_progress_snapshot(scan_id: int) -> dict[str, Any] | None:

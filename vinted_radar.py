@@ -11,13 +11,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Iterable
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from db import SessionLocal
-from models import AppSetting, VintedMetricHistory, VintedScan, VintedScanCategory, VintedScanItem
+from models import AppSetting, VintedMetricHistory, VintedRadarWatch, VintedScan, VintedScanCategory, VintedScanItem
 from vinted_lab import (
-    VINTED_QUEUE, balanced_catalog_segments_from_tree, cancel_scan, create_scan, enqueue_scan,
-    fetch_catalog_tree, leaf_catalogs_from_tree, recalc_scan,
+    VINTED_QUEUE, VINTED_RADAR_FOLLOWUP_OFFSETS_MINUTES, balanced_catalog_segments_from_tree,
+    cancel_scan, create_scan, enqueue_scan, fetch_catalog_tree, leaf_catalogs_from_tree, recalc_scan,
 )
 
 log = logging.getLogger("vinted-radar")
@@ -37,6 +37,19 @@ VINTED_RADAR_SCOPE = "balanced_market_segments_v1"
 VINTED_RADAR_MIN_LEAF_CATEGORIES = 20
 VINTED_RADAR_TARGET_SEGMENTS = 120
 VINTED_RADAR_MAX_SEGMENTS = 150
+
+# v4.23.10: discovery and follow-up are separate lanes. The full catalog keeps its
+# one-hour market cadence; a bounded promising subset receives targeted +30/+60/
+# +120/+180 minute favourite-count checkpoints on the existing Metrics Worker fleet.
+VINTED_RADAR_FOLLOWUP_ENABLED = str(os.getenv("VINTED_RADAR_FOLLOWUP_ENABLED", "1")).strip().lower() not in {"0", "false", "no", "off"}
+VINTED_RADAR_FOLLOWUP_DISCOVERY_LOOKBACK_MINUTES = max(30, min(180, int(os.getenv("VINTED_RADAR_FOLLOWUP_DISCOVERY_LOOKBACK_MINUTES", "90") or 90)))
+VINTED_RADAR_FOLLOWUP_MIN_DISCOVERY_SCORE = max(20, min(90, int(os.getenv("VINTED_RADAR_FOLLOWUP_MIN_DISCOVERY_SCORE", "42") or 42)))
+VINTED_RADAR_FOLLOWUP_MAX_NEW_PER_HOUR = max(100, min(5000, int(os.getenv("VINTED_RADAR_FOLLOWUP_MAX_NEW_PER_HOUR", "1500") or 1500)))
+VINTED_RADAR_FOLLOWUP_MAX_ACTIVE = max(200, min(10000, int(os.getenv("VINTED_RADAR_FOLLOWUP_MAX_ACTIVE", "4500") or 4500)))
+VINTED_RADAR_FOLLOWUP_SWEEP_LIMIT = max(25, min(1000, int(os.getenv("VINTED_RADAR_FOLLOWUP_SWEEP_LIMIT", "300") or 300)))
+VINTED_RADAR_FOLLOWUP_DISPATCH_BATCH = max(10, min(500, int(os.getenv("VINTED_RADAR_FOLLOWUP_DISPATCH_BATCH", "100") or 100)))
+VINTED_RADAR_FOLLOWUP_SEED_INTERVAL_SECONDS = max(60, min(900, int(os.getenv("VINTED_RADAR_FOLLOWUP_SEED_INTERVAL_SECONDS", "120") or 120)))
+VINTED_RADAR_FOLLOWUP_LEASE_SECONDS = max(120, min(1800, int(os.getenv("VINTED_RADAR_FOLLOWUP_LEASE_SECONDS", "360") or 360)))
 
 _TERMINAL_SCAN_STATES = {"completed", "partial", "failed", "cancelled"}
 _ACTIVE_SCAN_STATES = {"queued", "running", "metrics", "cancel_requested"}
@@ -272,6 +285,10 @@ class VintedRadarSnapshot:
     single_observation: int
     repeat_observation: int
     positive_movement: int
+    followup_samples: int
+    followup_active: int
+    followup_due: int
+    followup_completed: int
     history_items: int
     min_price_eur: float
     auto_enabled: bool
@@ -601,8 +618,332 @@ async def radar_overview() -> dict[str, Any]:
         "rising": None if snapshot is None else int(snapshot.rising),
         "deals": None if snapshot is None else int(snapshot.deals),
         "candidates": None if snapshot is None else int(snapshot.candidates),
+        "followup_active": None if snapshot is None else int(snapshot.followup_active),
+        "followup_due": None if snapshot is None else int(snapshot.followup_due),
+        "followup_completed": None if snapshot is None else int(snapshot.followup_completed),
         "cache_age_seconds": age_seconds,
     }
+
+
+def _coalesce_like_samples(samples: list[_Sample], *, min_gap_seconds: int = 600) -> list[_Sample]:
+    """Collapse catalog/follow-up observations that land almost at the same moment.
+
+    Without this, an hourly catalog sighting and an exact follow-up five minutes later
+    could become the last two points and hide the real +30 -> +60 minute growth.
+    """
+    known = [sample for sample in samples if sample.item.catalog_favourite_count is not None]
+    if not known:
+        return []
+    result: list[_Sample] = [known[0]]
+    for sample in known[1:]:
+        if (sample.scan_created_at - result[-1].scan_created_at).total_seconds() < max(300, int(min_gap_seconds)):
+            result[-1] = sample
+        else:
+            result.append(sample)
+    return result
+
+
+def _discovery_absolute_like_points(likes: int | None) -> int:
+    value = max(0, int(likes or 0))
+    if value >= 20:
+        return 25
+    if value >= 10:
+        return 22
+    if value >= 5:
+        return 18
+    if value >= 3:
+        return 14
+    if value >= 1:
+        return 8
+    return 0
+
+
+def _discovery_percentile_points(likes: int | None, percentile: float) -> int:
+    if likes is None or int(likes) <= 0:
+        return 0
+    if percentile >= 0.95:
+        return 25
+    if percentile >= 0.90:
+        return 22
+    if percentile >= 0.75:
+        return 16
+    if percentile >= 0.50:
+        return 10
+    return 4
+
+
+def _discovery_freshness_points(age_minutes: float) -> int:
+    if age_minutes <= 30:
+        return 10
+    if age_minutes <= 60:
+        return 7
+    return 4
+
+
+
+async def _followup_stats() -> dict[str, int]:
+    now = utcnow()
+    async with SessionLocal() as session:
+        active = int((await session.execute(select(func.count(VintedRadarWatch.id)).where(
+            VintedRadarWatch.status.in_(("watching", "queued", "processing"))
+        ))).scalar_one() or 0)
+        due = int((await session.execute(select(func.count(VintedRadarWatch.id)).where(
+            VintedRadarWatch.status == "watching",
+            VintedRadarWatch.next_check_at.is_not(None),
+            VintedRadarWatch.next_check_at <= now,
+        ))).scalar_one() or 0)
+        completed = int((await session.execute(select(func.count(VintedRadarWatch.id)).where(
+            VintedRadarWatch.status == "completed"
+        ))).scalar_one() or 0)
+    return {"active": active, "due": due, "completed": completed}
+
+
+async def seed_followup_candidates() -> int:
+    """Select a bounded fresh subset for targeted Like-Momentum observation.
+
+    This is intentionally a *discovery* score, not the user-facing Vinted Score 100.
+    It spends follow-up capacity on fresh items with unusual visible interest, useful
+    pricing, scarcity or a small seller footprint without pretending that one sample
+    already proves demand.
+    """
+    if not VINTED_RADAR_FOLLOWUP_ENABLED or not VINTED_QUEUE.enabled:
+        return 0
+    cfg = await radar_config()
+    if not cfg.get("enabled"):
+        # Stopping AutoScan stops new discovery, but already-created watches continue.
+        return 0
+    now = utcnow()
+    cutoff = now - timedelta(minutes=VINTED_RADAR_FOLLOWUP_DISCOVERY_LOOKBACK_MINUTES)
+    async with SessionLocal() as session:
+        active = int((await session.execute(select(func.count(VintedRadarWatch.id)).where(
+            VintedRadarWatch.status.in_(("watching", "queued", "processing"))
+        ))).scalar_one() or 0)
+        recent_created = int((await session.execute(select(func.count(VintedRadarWatch.id)).where(
+            VintedRadarWatch.created_at >= now - timedelta(hours=1)
+        ))).scalar_one() or 0)
+        capacity = min(
+            VINTED_RADAR_FOLLOWUP_MAX_ACTIVE - active,
+            VINTED_RADAR_FOLLOWUP_MAX_NEW_PER_HOUR - recent_created,
+            VINTED_RADAR_FOLLOWUP_SWEEP_LIMIT,
+        )
+        if capacity <= 0:
+            return 0
+        # Keep the seed query bounded. The newest 20k >=40 EUR rows are enough to
+        # build local catalog percentiles while avoiding a seven-day full history scan.
+        rows = list((await session.execute(
+            select(
+                VintedScanItem.scan_id, VintedScanItem.item_id, VintedScanItem.catalog_id,
+                VintedScanItem.catalog_favourite_count, VintedScanItem.price_amount,
+                VintedScanItem.brand, VintedScanItem.seller_id, VintedScanItem.created_at,
+            )
+            .join(VintedScan, VintedScan.id == VintedScanItem.scan_id)
+            .where(
+                VintedScan.mode == "radar",
+                VintedScanItem.created_at >= cutoff,
+                VintedScanItem.price_amount.is_not(None),
+                VintedScanItem.price_amount >= VINTED_RADAR_MIN_PRICE_EUR,
+                VintedScanItem.visible.is_not(False),
+                VintedScanItem.promoted.is_not(True),
+                ~VintedScan.status.in_(("failed", "cancelled")),
+            )
+            .order_by(VintedScanItem.created_at.desc())
+            .limit(20000)
+        )).all())
+        if not rows:
+            return 0
+
+        # Latest fresh catalog observation per item.
+        latest: dict[int, Any] = {}
+        for row in rows:
+            item_id = int(row[1])
+            if item_id not in latest:
+                latest[item_id] = row
+        # Keep watch memory only for the learning horizon. This bounds both the table
+        # and the de-duplication set while preventing the same item from being re-seeded
+        # during its active/history window.
+        await session.execute(delete(VintedRadarWatch).where(
+            VintedRadarWatch.status.in_(("completed", "expired", "failed")),
+            VintedRadarWatch.updated_at < now - timedelta(days=VINTED_RADAR_HISTORY_DAYS + 1),
+        ))
+        watched = set((await session.execute(select(VintedRadarWatch.item_id).where(
+            VintedRadarWatch.updated_at >= now - timedelta(days=VINTED_RADAR_HISTORY_DAYS + 1)
+        ))).scalars().all())
+
+        catalog_likes: dict[int, list[int]] = {}
+        catalog_prices: dict[int, list[float]] = {}
+        brand_counts: dict[tuple[int, str], int] = {}
+        seller_counts: dict[int, int] = {}
+        for row in latest.values():
+            catalog = int(row[2] or 0)
+            likes = int(row[3]) if row[3] is not None else None
+            price = _safe_float(row[4])
+            brand = _norm(row[5])
+            seller = int(row[6]) if row[6] is not None else None
+            if catalog > 0 and likes is not None:
+                catalog_likes.setdefault(catalog, []).append(likes)
+            if catalog > 0 and price is not None and price >= VINTED_RADAR_MIN_PRICE_EUR:
+                catalog_prices.setdefault(catalog, []).append(price)
+            if catalog > 0 and brand:
+                brand_counts[(catalog, brand)] = brand_counts.get((catalog, brand), 0) + 1
+            if seller:
+                seller_counts[seller] = seller_counts.get(seller, 0) + 1
+
+        ranked: list[tuple[int, int, datetime, Any]] = []
+        for item_id, row in latest.items():
+            if item_id in watched:
+                continue
+            catalog = int(row[2] or 0)
+            if catalog <= 0:
+                continue
+            likes = int(row[3]) if row[3] is not None else None
+            price = _safe_float(row[4])
+            brand = _norm(row[5])
+            seller = int(row[6]) if row[6] is not None else None
+            observed_at: datetime = row[7]
+            age_minutes = max(0.0, (now - observed_at).total_seconds() / 60.0)
+            like_pct = _percentile(likes, catalog_likes.get(catalog, []))
+            prices = catalog_prices.get(catalog, [])
+            median = _median(prices) if len(prices) >= VINTED_RADAR_MIN_PRICE_PEERS else None
+            edge = None
+            if price is not None and median is not None and median > 0:
+                edge = (price - median) / median * 100.0
+            score = (
+                _discovery_absolute_like_points(likes)
+                + _discovery_percentile_points(likes, like_pct)
+                + _price_edge_points(edge)
+                + _scarcity_points(brand_counts.get((catalog, brand), 0), brand)
+                + _seller_points(seller_counts.get(seller, 0) if seller else 0, seller)
+                + _discovery_freshness_points(age_minutes)
+            )
+            score = max(0, min(100, int(score)))
+            if score < VINTED_RADAR_FOLLOWUP_MIN_DISCOVERY_SCORE:
+                continue
+            ranked.append((score, int(likes or 0), observed_at, row))
+
+        ranked.sort(key=lambda x: (-x[0], -x[1], -x[2].timestamp()))
+        inserted = 0
+        for score, _likes_sort, observed_at, row in ranked[:capacity]:
+            scan_id, item_id = int(row[0]), int(row[1])
+            baseline_likes = int(row[3]) if row[3] is not None else None
+            due = observed_at + timedelta(minutes=int(VINTED_RADAR_FOLLOWUP_OFFSETS_MINUTES[0]))
+            session.add(VintedRadarWatch(
+                item_id=item_id,
+                source_scan_id=scan_id,
+                discovery_score=int(score),
+                baseline_likes=baseline_likes,
+                last_likes=baseline_likes,
+                first_seen_at=observed_at,
+                status="watching",
+                check_step=0,
+                checks=0,
+                exact_samples=0,
+                retry_count=0,
+                next_check_at=due,
+                created_at=now,
+                updated_at=now,
+            ))
+            inserted += 1
+        if inserted:
+            await session.commit()
+            log.info("Vinted Radar follow-up seeded=%s active_before=%s recent_hour=%s", inserted, active, recent_created)
+        return inserted
+
+
+async def dispatch_due_followups() -> int:
+    """Lease due watches in PostgreSQL and place only those checkpoints on Metrics Redis."""
+    if not VINTED_RADAR_FOLLOWUP_ENABLED or not VINTED_QUEUE.enabled:
+        return 0
+    now = utcnow()
+    async with SessionLocal() as session:
+        # Retention is independent from AutoScan state so stopping discovery for days
+        # cannot leave an ever-growing watch table behind.
+        await session.execute(delete(VintedRadarWatch).where(
+            VintedRadarWatch.status.in_(("completed", "expired", "failed")),
+            VintedRadarWatch.updated_at < now - timedelta(days=VINTED_RADAR_HISTORY_DAYS + 1),
+        ))
+        # Crash self-heal: a lost worker/Redis message becomes eligible again after lease.
+        stale = list((await session.execute(select(VintedRadarWatch).where(
+            VintedRadarWatch.status.in_(("queued", "processing")),
+            VintedRadarWatch.lease_until.is_not(None),
+            VintedRadarWatch.lease_until < now,
+        ).limit(VINTED_RADAR_FOLLOWUP_DISPATCH_BATCH))).scalars().all())
+        for watch in stale:
+            watch.status = "watching"
+            watch.lease_until = None
+            watch.next_check_at = now
+            watch.updated_at = now
+        # Watches are only useful during the 24h Live horizon.
+        expired = list((await session.execute(select(VintedRadarWatch).where(
+            VintedRadarWatch.status.in_(("watching", "queued", "processing")),
+            VintedRadarWatch.first_seen_at < now - timedelta(hours=VINTED_RADAR_LIVE_HOURS),
+        ).limit(VINTED_RADAR_FOLLOWUP_DISPATCH_BATCH))).scalars().all())
+        for watch in expired:
+            watch.status = "expired"
+            watch.next_check_at = None
+            watch.lease_until = None
+            watch.updated_at = now
+        # Commit retention and any state repair before leasing new work.
+        await session.commit()
+
+        due = list((await session.execute(select(VintedRadarWatch).where(
+            VintedRadarWatch.status == "watching",
+            VintedRadarWatch.next_check_at.is_not(None),
+            VintedRadarWatch.next_check_at <= now,
+        ).order_by(VintedRadarWatch.next_check_at.asc()).limit(VINTED_RADAR_FOLLOWUP_DISPATCH_BATCH))).scalars().all())
+        if not due:
+            return 0
+        payloads: list[tuple[int, int, int, int]] = []
+        for watch in due:
+            watch.status = "queued"
+            watch.lease_until = now + timedelta(seconds=VINTED_RADAR_FOLLOWUP_LEASE_SECONDS)
+            watch.updated_at = now
+            payloads.append((int(watch.id), int(watch.source_scan_id), int(watch.item_id), int(watch.check_step or 0)))
+        await session.commit()
+
+    queued = 0
+    failed_ids: list[int] = []
+    for watch_id, scan_id, item_id, step in payloads:
+        try:
+            result = await VINTED_QUEUE.enqueue_radar_followup(
+                watch_id=watch_id, scan_id=scan_id, item_id=item_id, step=step,
+            )
+            if result in {"duplicate", ""}:
+                # Existing marker/message owns the lease; do not create a second one.
+                continue
+            queued += 1
+        except Exception:
+            failed_ids.append(watch_id)
+            log.exception("Vinted Radar follow-up enqueue failed watch=%s step=%s", watch_id, step)
+    if failed_ids:
+        async with SessionLocal() as session:
+            rows = list((await session.execute(select(VintedRadarWatch).where(VintedRadarWatch.id.in_(failed_ids)))).scalars().all())
+            for watch in rows:
+                watch.status = "watching"
+                watch.lease_until = None
+                watch.next_check_at = utcnow() + timedelta(minutes=2)
+                watch.updated_at = utcnow()
+            await session.commit()
+    return queued
+
+
+_followup_last_seed_mono = 0.0
+
+
+async def maintain_followup_lane() -> dict[str, int]:
+    """One cheap scheduler tick: seed occasionally, dispatch due checkpoints always."""
+    global _followup_last_seed_mono
+    if not VINTED_RADAR_FOLLOWUP_ENABLED:
+        return {"seeded": 0, "queued": 0}
+    seeded = 0
+    now_mono = time.monotonic()
+    if now_mono - _followup_last_seed_mono >= VINTED_RADAR_FOLLOWUP_SEED_INTERVAL_SECONDS:
+        _followup_last_seed_mono = now_mono
+        try:
+            seeded = await seed_followup_candidates()
+        except Exception:
+            log.exception("Vinted Radar follow-up discovery sweep failed")
+    queued = await dispatch_due_followups()
+    return {"seeded": int(seeded), "queued": int(queued)}
 
 
 def _sample_rate(a: _Sample, b: _Sample) -> tuple[int | None, float | None, float | None]:
@@ -653,7 +994,7 @@ def _status_for(
     return "baseline"
 
 
-def _score_snapshot_rows(rows: list[Any], now: datetime) -> tuple[list[VintedRadarEntry], int, dict[str, int]]:
+def _score_snapshot_rows(rows: list[Any], followup_rows: list[Any], now: datetime) -> tuple[list[VintedRadarEntry], int, dict[str, int]]:
     """CPU-heavy Radar scoring, intentionally executed outside the asyncio loop.
 
     Rows contain only scalar columns.  Keeping SQLAlchemy ORM objects and percentile /
@@ -687,6 +1028,39 @@ def _score_snapshot_rows(rows: list[Any], now: datetime) -> tuple[list[VintedRad
             _Sample(scan_id=item.scan_id, scan_created_at=scan_created_at, item=item)
         )
 
+    # Targeted follow-up samples are identity-bound favourites from Metrics Worker.
+    # They reuse catalog metadata but add measurements even after the listing has
+    # shifted beyond the first 15 newest-first pages.
+    followup_count = 0
+    for row in followup_rows:
+        item_id = int(row[1])
+        samples = grouped.get(item_id)
+        if not samples:
+            continue
+        base = samples[-1].item
+        fav = int(row[3]) if row[3] is not None else None
+        if fav is None:
+            continue
+        synthetic = _RadarItem(
+            id=-int(row[0]),
+            scan_id=int(row[2]),
+            item_id=item_id,
+            catalog_id=base.catalog_id,
+            catalog_favourite_count=fav,
+            price_amount=base.price_amount,
+            brand=base.brand,
+            seller_id=base.seller_id,
+            title=base.title,
+            url=base.url,
+            category_name=base.category_name,
+            currency=base.currency,
+            size=base.size,
+            condition=base.condition,
+            seller_login=base.seller_login,
+        )
+        samples.append(_Sample(scan_id=int(row[2]), scan_created_at=row[4], item=synthetic))
+        followup_count += 1
+
     # First pass: time-series primitives independent from peer statistics.
     primitives: dict[int, dict[str, Any]] = {}
     for item_id, samples in grouped.items():
@@ -699,7 +1073,7 @@ def _score_snapshot_rows(rows: list[Any], now: datetime) -> tuple[list[VintedRad
         latest = radar_samples[-1]
         latest_seen = latest.scan_created_at
         current_likes = latest.item.catalog_favourite_count
-        known = [sample for sample in radar_samples if sample.item.catalog_favourite_count is not None]
+        known = _coalesce_like_samples(radar_samples)
         prev_likes: int | None = None
         like_delta: int | None = None
         sample_hours: float | None = None
@@ -872,6 +1246,7 @@ def _score_snapshot_rows(rows: list[Any], now: datetime) -> tuple[list[VintedRad
     counts["single_observation"] = sum(1 for entry in entries if entry.sample_count < 2)
     counts["repeat_observation"] = sum(1 for entry in entries if entry.sample_count >= 2)
     counts["positive_movement"] = sum(1 for entry in entries if entry.has_confirmed_movement)
+    counts["followup_samples"] = int(followup_count)
     return entries, len(primitives), counts
 
 
@@ -915,8 +1290,23 @@ async def _build_snapshot() -> VintedRadarSnapshot:
             )
             .order_by(VintedScanItem.created_at.asc(), VintedScanItem.id.asc())
         )).all())
+        followup_rows = list((await session.execute(
+            select(
+                VintedMetricHistory.id,
+                VintedMetricHistory.item_id,
+                VintedMetricHistory.scan_id,
+                VintedMetricHistory.favourite_count,
+                VintedMetricHistory.measured_at,
+            ).where(
+                VintedMetricHistory.measured_at >= history_cutoff,
+                VintedMetricHistory.identity_ok.is_(True),
+                VintedMetricHistory.favourite_count.is_not(None),
+                VintedMetricHistory.source.like("radar_followup%"),
+            ).order_by(VintedMetricHistory.measured_at.asc(), VintedMetricHistory.id.asc())
+        )).all())
 
-    entries, history_items, counts = await asyncio.to_thread(_score_snapshot_rows, rows, now)
+    entries, history_items, counts = await asyncio.to_thread(_score_snapshot_rows, rows, followup_rows, now)
+    followup_stats = await _followup_stats() if VINTED_RADAR_FOLLOWUP_ENABLED else {"active": 0, "due": 0, "completed": 0}
     cfg = await radar_config()
     last_scan_at = cfg.get("last_scan_at")
     next_scan_at = last_scan_at + timedelta(minutes=int(cfg["interval_minutes"])) if cfg["enabled"] and last_scan_at else None
@@ -932,6 +1322,10 @@ async def _build_snapshot() -> VintedRadarSnapshot:
         single_observation=counts["single_observation"],
         repeat_observation=counts["repeat_observation"],
         positive_movement=counts["positive_movement"],
+        followup_samples=counts.get("followup_samples", 0),
+        followup_active=int(followup_stats.get("active", 0)),
+        followup_due=int(followup_stats.get("due", 0)),
+        followup_completed=int(followup_stats.get("completed", 0)),
         history_items=history_items,
         min_price_eur=float(VINTED_RADAR_MIN_PRICE_EUR),
         auto_enabled=bool(cfg["enabled"]),

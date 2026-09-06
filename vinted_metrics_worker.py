@@ -11,11 +11,15 @@ from db import init_db
 from vinted_browser_metrics import VintedBrowserMetricClient
 from vinted_lab import (
     VINTED_QUEUE,
+    claim_radar_followup_processing,
     load_metric_item,
+    load_radar_followup_item,
     make_worker_id,
     mark_metric_error,
     mark_metric_processing,
+    mark_radar_followup_error,
     save_metric_sample,
+    save_radar_followup_sample,
 )
 from vinted_probe import DEFAULT_BASE_URL, VintedItem
 from vinted_session_store import load_vinted_session_json, session_fingerprint
@@ -49,7 +53,71 @@ async def _heartbeat(worker_id: str, state: dict[str, Any], provider: VintedBrow
         await asyncio.sleep(5)
 
 
+async def _process_radar_followup(provider: VintedBrowserMetricClient, fields: dict[str, str], state: dict[str, Any], slot: int) -> None:
+    watch_id = int(fields.get("watch_id") or 0)
+    step = int(fields.get("step") or 0)
+    if watch_id <= 0:
+        return
+    if not await claim_radar_followup_processing(watch_id, step):
+        return
+    loaded = await load_radar_followup_item(watch_id)
+    if loaded is None:
+        await mark_radar_followup_error(watch_id, step, "source_item_missing")
+        return
+    _watch, row = loaded
+
+    active_slots = dict(state.get("active_slots") or {})
+    active_slots[str(slot)] = f"followup:{row.item_id}"
+    state["active_slots"] = active_slots
+    state["active"] = len(active_slots)
+    started = time.monotonic()
+    try:
+        item = VintedItem(
+            item_id=int(row.item_id),
+            title=row.title or "",
+            url=row.url or f"{provider.base_url}/items/{row.item_id}",
+            price_amount=row.price_amount,
+            currency=row.currency or "",
+            brand=row.brand or "",
+            size=row.size or "",
+            condition=row.condition or "",
+            seller_id=row.seller_id,
+            seller_login=row.seller_login or "",
+            catalog_id=row.catalog_id,
+            promoted=row.promoted,
+            visible=row.visible,
+            catalog_view_count=row.catalog_view_count,
+            catalog_favourite_count=row.catalog_favourite_count,
+        )
+        sample = await provider.fetch_item_detail(item)
+        result = await save_radar_followup_sample(watch_id, step, sample)
+        state["followup_processed"] = int(state.get("followup_processed", 0)) + 1
+        if result == "exact":
+            state["followup_exact"] = int(state.get("followup_exact", 0)) + 1
+        else:
+            state["followup_unknown"] = int(state.get("followup_unknown", 0)) + 1
+        state["last_followup_outcome"] = str(sample.outcome or result)[:80]
+    except Exception as exc:
+        await mark_radar_followup_error(watch_id, step, type(exc).__name__)
+        state["followup_errors"] = int(state.get("followup_errors", 0)) + 1
+        log.warning("Vinted Radar follow-up failed watch=%s step=%s slot=%s: %s", watch_id, step, slot, exc)
+    finally:
+        try:
+            await VINTED_QUEUE.clear_radar_followup_marker(watch_id, step)
+        except Exception:
+            pass
+        active_slots = dict(state.get("active_slots") or {})
+        active_slots.pop(str(slot), None)
+        state["active_slots"] = active_slots
+        state["active"] = len(active_slots)
+        state["last_ms"] = int((time.monotonic() - started) * 1000)
+        state.update(provider.health_snapshot())
+
+
 async def _process_task(provider: VintedBrowserMetricClient, fields: dict[str, str], state: dict[str, Any], slot: int) -> None:
+    if str(fields.get("purpose") or "") == "radar_followup":
+        await _process_radar_followup(provider, fields, state, slot)
+        return
     scan_id = int(fields.get("scan_id") or 0)
     item_id = int(fields.get("item_id") or 0)
     if scan_id <= 0 or item_id <= 0:
@@ -152,6 +220,10 @@ async def main() -> None:
         "exact_total": 0,
         "unknown_total": 0,
         "errors": 0,
+        "followup_processed": 0,
+        "followup_exact": 0,
+        "followup_unknown": 0,
+        "followup_errors": 0,
         "concurrency": pool_size,
         "session_configured": provider.configured,
         "session_source": "env" if env_session else ("admin-db" if db_session else "missing"),

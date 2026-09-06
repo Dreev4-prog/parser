@@ -29,7 +29,7 @@ def test_radar_ui_uses_cached_snapshot_and_background_singleflight():
 def test_radar_scoring_is_off_event_loop_and_cache_is_longer():
     radar = (ROOT / "vinted_radar.py").read_text(encoding="utf-8")
     assert 'os.getenv("VINTED_RADAR_CACHE_SECONDS", "120")' in radar
-    assert "await asyncio.to_thread(_score_snapshot_rows, rows, now)" in radar
+    assert "await asyncio.to_thread(_score_snapshot_rows, rows, followup_rows, now)" in radar
     assert "request_radar_snapshot_refresh" in radar
     assert "_refresh_task" in radar
     assert "select(\n                VintedScanItem.id," in radar

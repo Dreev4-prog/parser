@@ -163,6 +163,7 @@ from vinted_radar import (
     disable_radar as disable_vinted_radar,
     enable_radar as enable_vinted_radar,
     get_radar_entry as get_vinted_radar_entry,
+    maintain_followup_lane as maintain_vinted_radar_followup_lane,
     maybe_start_due_round as maybe_start_vinted_radar_round,
     resolve_all_market_categories as resolve_vinted_radar_categories,
 )
@@ -12811,6 +12812,8 @@ async def _vinted_radar_screen(filter_name: str = "all", page: int = 0) -> tuple
             auto_line += f" · следующий примерно через <b>{max(0, seconds // 60)} мин.</b>"
     else:
         auto_line = "⏸ AutoScan: <b>выключен</b>"
+        if int(snapshot.followup_active or 0) > 0:
+            auto_line += f" · 🎯 уже выбранные Follow-up продолжаются: <b>{int(snapshot.followup_active)}</b>"
 
     lines = [
         "<b>📡 Vinted Radar 1.0</b>",
@@ -12842,6 +12845,7 @@ async def _vinted_radar_screen(filter_name: str = "all", page: int = 0) -> tuple
         "",
         f"💶 Порог Radar: <b>от {floor_text} EUR</b> · дешёвый мусор ниже порога не участвует в baseline/Score",
         f"🧪 Воронка наблюдений: 1 замер <b>{snapshot.single_observation}</b> · повторно замечены <b>{snapshot.repeat_observation}</b> · реальный рост ❤️ <b>{snapshot.positive_movement}</b>",
+        f"🎯 Follow-up Lane: под наблюдением <b>{snapshot.followup_active}</b> · ждут сейчас <b>{snapshot.followup_due}</b> · точечных замеров <b>{snapshot.followup_samples}</b>",
         f"🔥 HOT: <b>{snapshot.hot}</b> · 📈 Rising: <b>{snapshot.rising}</b> · 💎 Deals: <b>{snapshot.deals}</b>",
         f"👀 Candidates: <b>{snapshot.candidates}</b> · без сигнала: <b>{snapshot.baselines}</b>",
         f"Eligible Live: <b>{snapshot.live_total}</b> · learning pool: <b>{snapshot.history_items}</b>",
@@ -12852,7 +12856,7 @@ async def _vinted_radar_screen(filter_name: str = "all", page: int = 0) -> tuple
         lines.extend([
             "",
             "Пока подтверждённых сигналов нет.",
-            "<i>Первый замер ❤️ — только baseline. Для Rising/HOT нужен следующий Radar-круг и реальный рост лайков.</i>",
+            "<i>Первый замер ❤️ — только baseline. Rising/HOT появляется после реального роста: следующий полный круг или точечный Follow-up checkpoint.</i>",
         ])
     else:
         for entry in chunk:
@@ -13305,6 +13309,12 @@ async def vinted_radar_autoscan_scheduler() -> None:
                 log.info(
                     "Vinted Radar 1.0 AutoScan queued | scan=%s categories=%s pages=%s",
                     scan.id, scan.total_categories, scan.pages_per_category,
+                )
+            followup = await maintain_vinted_radar_followup_lane()
+            if int(followup.get("seeded", 0) or 0) or int(followup.get("queued", 0) or 0):
+                log.info(
+                    "Vinted Radar Follow-up tick | seeded=%s queued=%s",
+                    int(followup.get("seeded", 0) or 0), int(followup.get("queued", 0) or 0),
                 )
         except asyncio.CancelledError:
             raise

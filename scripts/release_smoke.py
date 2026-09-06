@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.23.9", "VERSION=4.23.9")
+    check((ROOT / "VERSION").read_text().strip() == "4.23.10", "VERSION=4.23.10")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -155,6 +155,17 @@ def main() -> int:
           "Vinted Deals require a real price cohort plus demand evidence")
     check('Воронка наблюдений' in bot and 'snapshot.positive_movement' in bot,
           "Vinted Radar UI exposes repeat-observation demand coverage")
+    check('class VintedRadarWatch(Base):' in models and '__tablename__ = "vinted_radar_watches"' in models,
+          "Vinted Radar durable follow-up watch table present")
+    check('VINTED_RADAR_FOLLOWUP_OFFSETS_MINUTES = (30, 60, 120, 180)' in lab and 'enqueue_radar_followup' in lab,
+          "Vinted follow-up checkpoints use the isolated Metrics fleet")
+    check('maintain_followup_lane as maintain_vinted_radar_followup_lane' in bot and 'await maintain_vinted_radar_followup_lane()' in bot,
+          "Vinted follow-up maintenance is wired into the persistent Radar scheduler")
+    check('VintedMetricHistory.source.like("radar_followup%")' in vinted_radar and '_coalesce_like_samples' in vinted_radar,
+          "identity-bound follow-up likes feed Like Momentum without near-duplicate intervals")
+    metrics_worker = (ROOT / 'vinted_metrics_worker.py').read_text(encoding='utf-8')
+    check('purpose") or "") == "radar_followup"' in metrics_worker and 'save_radar_followup_sample' in metrics_worker,
+          "Vinted Metrics Worker executes targeted Radar follow-ups")
     view_manager = (ROOT / 'view_manager.py').read_text(encoding='utf-8')
     check('deadline_seconds: float | None = None' in view_manager and 'preserving completed shards' in view_manager,
           "remote view deadlines preserve completed shards")
@@ -174,7 +185,7 @@ def main() -> int:
     check('RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES = _radar_env_int("RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES", 16' in bot,
           "idle page prefetch is capped below the full 20-page category burst")
 
-    print("\nDT Parser 4.23.9 Vinted Radar Demand Quality release smoke: PASS")
+    print("\nDT Parser 4.23.10 Vinted Radar Follow-up Lane release smoke: PASS")
     return 0
 
 

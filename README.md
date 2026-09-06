@@ -1,5 +1,17 @@
 # DT PARSER
 
+## v4.23.10 — Vinted Radar Follow-up Lane
+
+- Full-market Radar keeps discovering fresh >=40 EUR inventory on the existing 60-minute cadence.
+- A separate bounded discovery sweep selects promising fresh items for targeted follow-up instead of hoping they remain inside the first 15 newest-first pages.
+- Promising items receive identity-bound favourite-count checkpoints at **+30 / +60 / +120 / +180 minutes** on the existing Vinted Metrics Worker fleet.
+- Follow-up samples are merged into Like Momentum without weakening HOT/RISING: first observation is still baseline-only and only real positive like growth can unlock demand states.
+- Near-simultaneous catalog/follow-up observations are coalesced so a duplicate measurement cannot hide a real earlier growth interval.
+- Stopping Vinted Radar AutoScan stops **new discovery**, while already-selected follow-up watches finish their short observation schedule.
+- The Radar screen shows Follow-up active/due/sample telemetry.
+
+See `RELEASE_4_23_10.md`.
+
 ## v4.23.9 — Vinted Radar Demand Quality
 
 - Vinted Radar baseline/Score now has a hard default floor of **40 EUR**; lower-price rows are excluded from the scoring query immediately.

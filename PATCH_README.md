@@ -1,24 +1,25 @@
-# v4.23.9 GitHub patch — Vinted Radar Demand Quality
+# v4.23.10 GitHub patch — Vinted Radar Follow-up Lane
 
-Apply **on top of v4.23.8** and preserve all paths from this archive.
+Apply **on top of v4.23.9** and preserve all paths from this archive.
 
 After push/redeploy:
 
-- redeploy **Parser / Bot** — required;
-- Vinted Scan Worker code is unchanged;
-- Vinted Metrics / Session workers are unchanged;
+- redeploy **Parser / Bot** — required (scheduler, discovery, Radar scoring/UI);
+- redeploy **all Vinted Metrics Worker replicas** — required (targeted follow-up execution);
+- Vinted Scan Worker algorithm is unchanged, but same-commit redeploy is recommended;
+- Vinted Session Worker is unchanged;
 - Kleinanzeigen Page / Date / View / Radar workers are unchanged.
 
-No manual SQL migration and no new required Railway variables.
+`init_db()` creates the additive `vinted_radar_watches` table automatically. No manual SQL migration is required.
 
-Main changes:
+Production defaults:
 
-1. Vinted Radar baseline/Score ignores listings below **40 EUR**;
-2. Like Momentum uses the actual item/page observation timestamp, not the full-round start time;
-3. current peer percentiles use only current 24h Live items, not expired 7-day history;
-4. Price Edge requires a stronger peer cohort and Deals need real demand evidence;
-5. Radar UI shows the observation funnel: one sample -> repeated -> positive like movement.
+- full-market discovery: every **60 min**;
+- follow-up checkpoints: **+30 / +60 / +120 / +180 min**;
+- discovery lookback: **90 min**;
+- minimum discovery score: **42/100** (watch-selection only, not user-facing Vinted Score);
+- maximum new watches/hour: **1500**;
+- maximum active watches: **4500**;
+- existing watches continue to finish when AutoScan is stopped; no new watches are seeded while AutoScan is off.
 
-Optional overrides exist for `VINTED_RADAR_MIN_PRICE_EUR` and `VINTED_RADAR_MIN_PRICE_PEERS`, but the production defaults are 40 EUR and 8 peers.
-
-See `RELEASE_4_23_9.md` and `AUDIT_4_23_9_VINTED_DEMAND.md`.
+Optional tuning variables are documented in `RELEASE_4_23_10.md`; no new required Railway variable exists.

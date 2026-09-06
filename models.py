@@ -868,3 +868,34 @@ class VintedMetricHistory(Base):
     source: Mapped[str] = mapped_column(String(80), default="")
     outcome: Mapped[str] = mapped_column(String(80), default="")
     identity_ok: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
+
+class VintedRadarWatch(Base):
+    """Durable targeted Like-Momentum follow-up for one promising Radar item.
+
+    Full-market catalog scans discover candidates.  This table keeps the small
+    subset that deserves +30/+60/+120/+180 minute identity-bound rechecks so a
+    fast-moving item does not disappear from the first 15 catalog pages before DT
+    can measure its real like velocity.
+    """
+
+    __tablename__ = "vinted_radar_watches"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    item_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    source_scan_id: Mapped[int] = mapped_column(Integer, index=True)
+    discovery_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    baseline_likes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_likes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    status: Mapped[str] = mapped_column(String(24), default="watching", index=True)
+    check_step: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    checks: Mapped[int] = mapped_column(Integer, default=0)
+    exact_samples: Mapped[int] = mapped_column(Integer, default=0)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_check_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    last_outcome: Mapped[str] = mapped_column(String(80), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
