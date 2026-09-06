@@ -12837,11 +12837,14 @@ async def _vinted_radar_screen(filter_name: str = "all", page: int = 0) -> tuple
             ])
             if int(ps.get("recovery", 0) or 0):
                 lines.append(f"↻ Recovery: <b>+{int(ps.get('recovery', 0) or 0)}</b> стр.")
+    floor_text = f"{snapshot.min_price_eur:g}"
     lines.extend([
         "",
+        f"💶 Порог Radar: <b>от {floor_text} EUR</b> · дешёвый мусор ниже порога не участвует в baseline/Score",
+        f"🧪 Воронка наблюдений: 1 замер <b>{snapshot.single_observation}</b> · повторно замечены <b>{snapshot.repeat_observation}</b> · реальный рост ❤️ <b>{snapshot.positive_movement}</b>",
         f"🔥 HOT: <b>{snapshot.hot}</b> · 📈 Rising: <b>{snapshot.rising}</b> · 💎 Deals: <b>{snapshot.deals}</b>",
-        f"👀 Candidates: <b>{snapshot.candidates}</b> · baseline: <b>{snapshot.baselines}</b>",
-        f"Live товаров: <b>{snapshot.live_total}</b> · история: <b>{snapshot.history_items}</b>",
+        f"👀 Candidates: <b>{snapshot.candidates}</b> · без сигнала: <b>{snapshot.baselines}</b>",
+        f"Eligible Live: <b>{snapshot.live_total}</b> · learning pool: <b>{snapshot.history_items}</b>",
         "",
         f"<b>{html.escape(_vinted_radar_filter_name(filter_name))}</b> · стр. {page + 1}/{pages}",
     ])
@@ -12929,7 +12932,7 @@ async def _vinted_radar_item_screen(item_id: int) -> tuple[str, InlineKeyboardMa
         f"⚡ Acceleration: <b>{accel}</b>",
         f"⏱ В Radar: <b>{_vinted_radar_age(entry.age_hours)}</b> · замеров: <b>{entry.sample_count}</b>",
         "",
-        f"💶 Цена: <b>{price}</b> · медиана похожих: <b>{median}</b>",
+        f"💶 Цена: <b>{price}</b> · медиана похожих: <b>{median}</b> · peers: <b>{entry.price_peer_count}</b>",
         f"💸 Price Edge: <b>{edge}</b>",
         f"💎 Похожих по бренду в Live: <b>{entry.scarcity_count}</b>",
         f"👤 Объявлений этого продавца в Live: <b>{entry.seller_active_count}</b>",

@@ -27,6 +27,8 @@ VINTED_RADAR_LIVE_HOURS = max(6, min(48, int(os.getenv("VINTED_RADAR_LIVE_HOURS"
 VINTED_RADAR_HISTORY_DAYS = max(2, min(30, int(os.getenv("VINTED_RADAR_HISTORY_DAYS", "7") or 7)))
 VINTED_RADAR_INTERVAL_MINUTES = max(15, min(360, int(os.getenv("VINTED_RADAR_INTERVAL_MINUTES", "60") or 60)))
 VINTED_RADAR_CACHE_SECONDS = max(30, min(300, int(os.getenv("VINTED_RADAR_CACHE_SECONDS", "120") or 120)))
+VINTED_RADAR_MIN_PRICE_EUR = max(0.0, min(5000.0, float(os.getenv("VINTED_RADAR_MIN_PRICE_EUR", "40") or 40)))
+VINTED_RADAR_MIN_PRICE_PEERS = max(4, min(30, int(os.getenv("VINTED_RADAR_MIN_PRICE_PEERS", "8") or 8)))
 VINTED_RADAR_PAGES_PER_CATEGORY = 15
 # v4.23.3: the DE catalog contains thousands of terminal ids. Radar keeps complete
 # market coverage by partitioning the tree into a bounded set of non-overlapping
@@ -242,6 +244,7 @@ class VintedRadarEntry:
     acceleration: float | None
     price_median: float | None
     price_edge_pct: float | None
+    price_peer_count: int
     like_percentile: float
     scarcity_count: int
     seller_active_count: int
@@ -266,7 +269,11 @@ class VintedRadarSnapshot:
     deals: int
     candidates: int
     baselines: int
+    single_observation: int
+    repeat_observation: int
+    positive_movement: int
     history_items: int
+    min_price_eur: float
     auto_enabled: bool
     auto_interval_minutes: int
     last_scan_id: int | None
@@ -621,14 +628,25 @@ def _median(values: Iterable[float]) -> float | None:
     return float(statistics.median(clean))
 
 
-def _status_for(score: int, sample_count: int, like_delta: int | None, price_edge_pct: float | None) -> str:
+def _status_for(
+    score: int, sample_count: int, like_delta: int | None, price_edge_pct: float | None,
+    *, likes: int | None, like_percentile: float, price_peer_count: int,
+) -> str:
     movement = sample_count >= 2 and like_delta is not None and like_delta > 0
-    strong_deal = price_edge_pct is not None and price_edge_pct <= -25.0
+    # A cheap price by itself is not demand.  Deal needs a statistically useful
+    # price cohort plus either confirmed movement or at least above-median visible
+    # interest on the first catalog observation.
+    strong_deal = (
+        price_edge_pct is not None
+        and price_edge_pct <= -25.0
+        and int(price_peer_count) >= VINTED_RADAR_MIN_PRICE_PEERS
+    )
+    deal_interest = movement or (likes is not None and likes >= 2 and like_percentile >= 0.50)
     if movement and score >= 75:
         return "hot"
     if movement and score >= 58:
         return "rising"
-    if strong_deal and score >= 40:
+    if strong_deal and deal_interest and score >= 40:
         return "deal"
     if score >= 35:
         return "candidate"
@@ -644,6 +662,9 @@ def _score_snapshot_rows(rows: list[Any], now: datetime) -> tuple[list[VintedRad
     """
     grouped: dict[int, list[_Sample]] = {}
     for row in rows:
+        row_price = _safe_float(row[5])
+        if row_price is None or row_price < VINTED_RADAR_MIN_PRICE_EUR:
+            continue
         item = _RadarItem(
             id=int(row[0]),
             scan_id=int(row[1]),
@@ -701,7 +722,9 @@ def _score_snapshot_rows(rows: list[Any], now: datetime) -> tuple[list[VintedRad
             "last_seen": latest_seen,
             "current_age": current_age,
             "sample_age": sample_age,
-            "bucket": _age_bucket(min(sample_age, 23.999)),
+            # Peer normalization must compare products by how long DT has known them
+            # now, not by the duration between their first/last successful snapshots.
+            "bucket": _age_bucket(min(current_age, 23.999)),
             "likes": int(current_likes) if current_likes is not None else None,
             "previous_likes": prev_likes,
             "like_delta": like_delta,
@@ -722,23 +745,30 @@ def _score_snapshot_rows(rows: list[Any], now: datetime) -> tuple[list[VintedRad
     price_groups: dict[tuple[int, str], list[float]] = {}
     catalog_prices: dict[int, list[float]] = {}
     for item in live_latest:
-        key = (int(item.catalog_id or 0), _norm(item.brand))
+        catalog = int(item.catalog_id or 0)
+        key = (catalog, _norm(item.brand))
         if key[1]:
             brand_counts[key] = brand_counts.get(key, 0) + 1
         if item.seller_id:
             seller_counts[int(item.seller_id)] = seller_counts.get(int(item.seller_id), 0) + 1
         price = _safe_float(item.price_amount)
-        if price is not None and price > 0:
-            catalog_prices.setdefault(int(item.catalog_id or 0), []).append(price)
+        # Unknown catalog ids must not collapse into one artificial mega-market.
+        if catalog > 0 and price is not None and price >= VINTED_RADAR_MIN_PRICE_EUR:
+            catalog_prices.setdefault(catalog, []).append(price)
             if key[1]:
                 price_groups.setdefault(key, []).append(price)
 
     likes_ref: dict[tuple[int, str], list[int]] = {}
     velocity_ref: dict[tuple[int, str], list[float]] = {}
     brand_velocity_ref: dict[str, list[float]] = {}
-    for primitive in primitives.values():
+    # Only current Live items belong in current peer percentiles.  The previous
+    # implementation let expired 7-day learning rows vote in today's P50/P90.
+    for item_id in live_ids:
+        primitive = primitives[item_id]
         latest_item = primitive["latest"].item
         catalog = int(latest_item.catalog_id or 0)
+        if catalog <= 0:
+            continue
         bucket = str(primitive["bucket"])
         likes = primitive["likes"]
         velocity = primitive["velocity"]
@@ -764,11 +794,18 @@ def _score_snapshot_rows(rows: list[Any], now: datetime) -> tuple[list[VintedRad
         velocity_pct = _percentile(velocity, velocity_ref.get((catalog, bucket), []))
 
         price = _safe_float(item.price_amount)
-        brand_price_peers = price_groups.get((catalog, brand), []) if brand else []
-        peers = brand_price_peers if len(brand_price_peers) >= 4 else catalog_prices.get(catalog, [])
-        price_median = _median(peers) if len(peers) >= 4 else None
+        brand_price_peers = price_groups.get((catalog, brand), []) if catalog > 0 and brand else []
+        catalog_price_peers = catalog_prices.get(catalog, []) if catalog > 0 else []
+        if len(brand_price_peers) >= VINTED_RADAR_MIN_PRICE_PEERS:
+            peers = brand_price_peers
+        elif len(catalog_price_peers) >= VINTED_RADAR_MIN_PRICE_PEERS:
+            peers = catalog_price_peers
+        else:
+            peers = []
+        price_peer_count = len(peers)
+        price_median = _median(peers) if price_peer_count >= VINTED_RADAR_MIN_PRICE_PEERS else None
         price_edge_pct = None
-        if price is not None and price > 0 and price_median is not None and price_median > 0:
+        if price is not None and price >= VINTED_RADAR_MIN_PRICE_EUR and price_median is not None and price_median > 0:
             price_edge_pct = (price - price_median) / price_median * 100.0
 
         scarcity_count = brand_counts.get((catalog, brand), 0) if brand else 0
@@ -788,7 +825,10 @@ def _score_snapshot_rows(rows: list[Any], now: datetime) -> tuple[list[VintedRad
         score = max(0, min(100, sum(components.values())))
         if int(primitive["sample_count"]) < 2:
             score = min(score, 59)
-        status = _status_for(score, int(primitive["sample_count"]), primitive["like_delta"], price_edge_pct)
+        status = _status_for(
+            score, int(primitive["sample_count"]), primitive["like_delta"], price_edge_pct,
+            likes=likes, like_percentile=like_pct, price_peer_count=price_peer_count,
+        )
         entries.append(VintedRadarEntry(
             item_id=int(item_id),
             scan_id=int(latest_sample.scan_id),
@@ -815,6 +855,7 @@ def _score_snapshot_rows(rows: list[Any], now: datetime) -> tuple[list[VintedRad
             acceleration=primitive["acceleration"],
             price_median=price_median,
             price_edge_pct=price_edge_pct,
+            price_peer_count=price_peer_count,
             like_percentile=like_pct,
             scarcity_count=scarcity_count,
             seller_active_count=seller_active,
@@ -828,6 +869,9 @@ def _score_snapshot_rows(rows: list[Any], now: datetime) -> tuple[list[VintedRad
     status_order = {"hot": 0, "rising": 1, "deal": 2, "candidate": 3, "baseline": 4}
     entries.sort(key=lambda entry: (status_order.get(entry.status, 9), -entry.score, -(entry.like_velocity or 0.0), -(entry.likes or 0)))
     counts = {name: sum(1 for entry in entries if entry.status == name) for name in ("hot", "rising", "deal", "candidate", "baseline")}
+    counts["single_observation"] = sum(1 for entry in entries if entry.sample_count < 2)
+    counts["repeat_observation"] = sum(1 for entry in entries if entry.sample_count >= 2)
+    counts["positive_movement"] = sum(1 for entry in entries if entry.has_confirmed_movement)
     return entries, len(primitives), counts
 
 
@@ -854,15 +898,22 @@ async def _build_snapshot() -> VintedRadarSnapshot:
                 VintedScanItem.size,
                 VintedScanItem.condition,
                 VintedScanItem.seller_login,
-                VintedScan.created_at,
+                # Actual page-persist time is the catalog measurement timestamp.
+                # Using VintedScan.created_at made every item in a multi-hour full-market
+                # round look as if it had been measured at the round start.
+                VintedScanItem.created_at,
             )
             .join(VintedScan, VintedScan.id == VintedScanItem.scan_id)
             .where(
                 VintedScan.mode == "radar",
-                VintedScan.created_at >= history_cutoff,
+                VintedScanItem.created_at >= history_cutoff,
                 ~VintedScan.status.in_(("failed", "cancelled")),
+                VintedScanItem.price_amount.is_not(None),
+                VintedScanItem.price_amount >= VINTED_RADAR_MIN_PRICE_EUR,
+                VintedScanItem.visible.is_not(False),
+                VintedScanItem.promoted.is_not(True),
             )
-            .order_by(VintedScan.created_at.asc(), VintedScanItem.id.asc())
+            .order_by(VintedScanItem.created_at.asc(), VintedScanItem.id.asc())
         )).all())
 
     entries, history_items, counts = await asyncio.to_thread(_score_snapshot_rows, rows, now)
@@ -878,7 +929,11 @@ async def _build_snapshot() -> VintedRadarSnapshot:
         deals=counts["deal"],
         candidates=counts["candidate"],
         baselines=counts["baseline"],
+        single_observation=counts["single_observation"],
+        repeat_observation=counts["repeat_observation"],
+        positive_movement=counts["positive_movement"],
         history_items=history_items,
+        min_price_eur=float(VINTED_RADAR_MIN_PRICE_EUR),
         auto_enabled=bool(cfg["enabled"]),
         auto_interval_minutes=int(cfg["interval_minutes"]),
         last_scan_id=cfg.get("last_scan_id"),

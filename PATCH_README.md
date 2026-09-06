@@ -1,21 +1,24 @@
-# v4.23.8 GitHub patch — First-Pass Recovery & Radar Self-Heal
+# v4.23.9 GitHub patch — Vinted Radar Demand Quality
 
-Apply **on top of v4.23.7** and preserve all paths from this archive.
+Apply **on top of v4.23.8** and preserve all paths from this archive.
 
 After push/redeploy:
 
 - redeploy **Parser / Bot** — required;
-- Page Worker / Date Worker / View Worker code is functionally unchanged by this patch;
-- Vinted Scan / Metrics / Session workers are unchanged.
+- Vinted Scan Worker code is unchanged;
+- Vinted Metrics / Session workers are unchanged;
+- Kleinanzeigen Page / Date / View / Radar workers are unchanged.
 
 No manual SQL migration and no new required Railway variables.
 
-Main fixes:
+Main changes:
 
-1. a normal user scan now performs one fresh-context checkpoint-aware recovery inside the first launch before showing a partial result;
-2. Radar page/view partials get one bounded inline self-heal pass before being stored as `допроверка`;
-3. transient HTTP/timeout pressure is shown as `🌐 transport`, not hidden under `другое`;
-4. Traffic Manager cooldown with zero users is displayed as Kleinanzeigen protection mode, not fake user priority;
-5. idle Page Worker prefetch is reduced from a whole 20-page burst to a safer rolling 16-page window.
+1. Vinted Radar baseline/Score ignores listings below **40 EUR**;
+2. Like Momentum uses the actual item/page observation timestamp, not the full-round start time;
+3. current peer percentiles use only current 24h Live items, not expired 7-day history;
+4. Price Edge requires a stronger peer cohort and Deals need real demand evidence;
+5. Radar UI shows the observation funnel: one sample -> repeated -> positive like movement.
 
-Accuracy gates are unchanged. See `RELEASE_4_23_8.md`.
+Optional overrides exist for `VINTED_RADAR_MIN_PRICE_EUR` and `VINTED_RADAR_MIN_PRICE_PEERS`, but the production defaults are 40 EUR and 8 peers.
+
+See `RELEASE_4_23_9.md` and `AUDIT_4_23_9_VINTED_DEMAND.md`.

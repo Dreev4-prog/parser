@@ -1,5 +1,15 @@
 # DT PARSER
 
+## v4.23.9 — Vinted Radar Demand Quality
+
+- Vinted Radar baseline/Score now has a hard default floor of **40 EUR**; lower-price rows are excluded from the scoring query immediately.
+- Like Momentum intervals use the actual catalog item persist timestamp instead of the full-market round start time.
+- Current peer percentiles use only the current 24h Live cohort; expired 7-day learning rows no longer distort today's normalization.
+- Price Edge requires a stronger cohort and Deal needs real interest, not just a cheap price.
+- Vinted Lab shows one-sample / repeated / positive-like-growth funnel so low HOT/RISING can be diagnosed as sampling coverage vs score quality.
+
+See `RELEASE_4_23_9.md`.
+
 ## v4.23.8 — First-Pass Recovery & Radar Self-Heal
 
 - Stable user scans now self-repair one structurally partial category pass with a fresh BrowserContext while reusing verified PostgreSQL checkpoints; the user should not need a second Telegram launch for a transient first-pass partial.

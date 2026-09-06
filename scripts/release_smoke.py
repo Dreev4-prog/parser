@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.23.8", "VERSION=4.23.8")
+    check((ROOT / "VERSION").read_text().strip() == "4.23.9", "VERSION=4.23.9")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -145,6 +145,16 @@ def main() -> int:
     check('VINTED_RADAR_SCOPE = "balanced_market_segments_v1"' in vinted_radar and 'VINTED_RADAR_TARGET_SEGMENTS = 120' in vinted_radar and 'VINTED_RADAR_MAX_SEGMENTS = 150' in vinted_radar, "Vinted Radar uses bounded balanced market segments")
     check('def balanced_catalog_segments_from_tree(' in lab and 'frontier[idx:idx + 1] = list(chosen.get("children") or [])' in lab, "Vinted market partition preserves non-overlapping tree coverage")
     check('item_catalog_id = _int(getattr(item, "catalog_id", None), 0) or int(catalog_id)' in lab, "Vinted Radar preserves precise item catalog id when available")
+    check('VINTED_RADAR_MIN_PRICE_EUR = max(0.0' in vinted_radar and 'VintedScanItem.price_amount >= VINTED_RADAR_MIN_PRICE_EUR' in vinted_radar,
+          "Vinted Radar enforces the 40 EUR baseline floor before scoring")
+    check('VintedScanItem.created_at,' in vinted_radar and '.order_by(VintedScanItem.created_at.asc(), VintedScanItem.id.asc())' in vinted_radar,
+          "Vinted Like Momentum uses real item observation timestamps")
+    check('Only current Live items belong in current peer percentiles' in vinted_radar and 'for item_id in live_ids:' in vinted_radar,
+          "Vinted current peer percentiles exclude expired learning rows")
+    check('deal_interest = movement or' in vinted_radar and 'price_peer_count >= VINTED_RADAR_MIN_PRICE_PEERS' in vinted_radar,
+          "Vinted Deals require a real price cohort plus demand evidence")
+    check('Воронка наблюдений' in bot and 'snapshot.positive_movement' in bot,
+          "Vinted Radar UI exposes repeat-observation demand coverage")
     view_manager = (ROOT / 'view_manager.py').read_text(encoding='utf-8')
     check('deadline_seconds: float | None = None' in view_manager and 'preserving completed shards' in view_manager,
           "remote view deadlines preserve completed shards")
@@ -164,7 +174,7 @@ def main() -> int:
     check('RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES = _radar_env_int("RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES", 16' in bot,
           "idle page prefetch is capped below the full 20-page category burst")
 
-    print("\nDT Parser 4.23.8 First-Pass Recovery & Radar Self-Heal release smoke: PASS")
+    print("\nDT Parser 4.23.9 Vinted Radar Demand Quality release smoke: PASS")
     return 0
 
 
