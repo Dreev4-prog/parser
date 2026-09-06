@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.23.5", "VERSION=4.23.5")
+    check((ROOT / "VERSION").read_text().strip() == "4.23.7", "VERSION=4.23.7")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -102,7 +102,8 @@ def main() -> int:
     check('lease_owner' in models and 'lease_until' in models, "Radar observation lease fields present")
     check('radar_v3_expire_observations' in radar and 'RadarObservation.expires_at > now' in radar, "Radar observation TTL enforced before claims")
     check('pg_advisory_xact_lock(hashtext(:key))' in radar, "Radar preservation guard serialized across Parser replicas")
-    check('autoscan_view_priority = "scan_inline"' in bot, "AutoScan exact views stay foreground")
+    check('autoscan_view_priority = "autoscan_idle" if idle_turbo else "scan_inline"' in bot and 'local_fallback_on_partial=False' in bot,
+          "AutoScan exact views use audited idle-burst priority with bounded partial recovery")
     check('def admin_radar_autoscan_loading_keyboard()' in bot and '▶️ Запустить AutoScan' in bot and '⏹ Остановить' in bot, "AutoScan controls visible on Radar loading screen")
     check('asyncio.shield(task)' in bot and 'dashboard snapshot timed out; UI continues with controls' in bot, "Radar dashboard timeout cannot trap UI on loading screen")
     page = (ROOT / 'page_manager.py').read_text(encoding='utf-8')
@@ -144,7 +145,13 @@ def main() -> int:
     check('VINTED_RADAR_SCOPE = "balanced_market_segments_v1"' in vinted_radar and 'VINTED_RADAR_TARGET_SEGMENTS = 120' in vinted_radar and 'VINTED_RADAR_MAX_SEGMENTS = 150' in vinted_radar, "Vinted Radar uses bounded balanced market segments")
     check('def balanced_catalog_segments_from_tree(' in lab and 'frontier[idx:idx + 1] = list(chosen.get("children") or [])' in lab, "Vinted market partition preserves non-overlapping tree coverage")
     check('item_catalog_id = _int(getattr(item, "catalog_id", None), 0) or int(catalog_id)' in lab, "Vinted Radar preserves precise item catalog id when available")
-    print("\nDT Parser 4.23.5 Vinted Lab Instant Navigation release smoke: PASS")
+    view_manager = (ROOT / 'view_manager.py').read_text(encoding='utf-8')
+    check('deadline_seconds: float | None = None' in view_manager and 'preserving completed shards' in view_manager,
+          "remote view deadlines preserve completed shards")
+    check('self.autoscan_idle_view_limit' in traffic and 'is_autoscan_idle' in traffic and 'idle_burst_ok' in traffic,
+          "Idle Turbo has a real traffic-manager burst lane")
+
+    print("\nDT Parser 4.23.7 Full Audit Hardening release smoke: PASS")
     return 0
 
 

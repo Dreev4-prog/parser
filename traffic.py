@@ -63,6 +63,14 @@ class AdaptiveTrafficManager:
         self.base_global_limit = _env_int("TRAFFIC_GLOBAL_CONCURRENCY", 9, 2, 32)
         self.background_during_scans = _env_int("TRAFFIC_BACKGROUND_VIEWS_DURING_SCANS", 1, 0, 6)
         self.reserved_scan_slots = _env_int("TRAFFIC_RESERVED_SCAN_SLOTS", 4, 0, 8)
+        # v4.23.7 Full Audit: AutoScan may borrow otherwise-idle *local* exact-view
+        # capacity. This is a hard ceiling, not a permanent base limit. The burst is
+        # permitted only while AutoScan is the sole registered scan job and there is
+        # no 403/429 penalty/cooldown; a foreground user immediately disables new
+        # burst leases while already-running short requests are allowed to finish.
+        self.autoscan_idle_view_limit = _env_int(
+            "RADAR_AUTOSCAN_IDLE_VIEW_CONCURRENCY", 8, 4, 12
+        )
 
         self.scan_min_interval = _env_float("TRAFFIC_SCAN_MIN_INTERVAL_SECONDS", 0.55, 0.0, 5.0)
         self.view_min_interval = _env_float("TRAFFIC_VIEW_MIN_INTERVAL_SECONDS", 0.20, 0.0, 2.0)
@@ -233,7 +241,9 @@ class AdaptiveTrafficManager:
         # an AutoScan round. Otherwise a +60m checkpoint could be delayed for hours.
         is_radar_checkpoint = priority == "radar_checkpoint" and kind in {"view", "browser"}
         is_background = priority in {"background", "radar_checkpoint"} and kind in {"view", "browser"}
+        is_autoscan_idle = priority == "autoscan_idle" and kind == "view"
         acquired = False
+        distributed_idle_burst = False
         try:
             while not acquired:
                 async with self._condition:
@@ -250,6 +260,19 @@ class AdaptiveTrafficManager:
 
                     cooldown_wait = max(0.0, self._cooldown_until - now)
                     spacing_wait = max(0.0, self._next_allowed[kind] - now)
+
+                    # AutoScan itself registers exactly one scan job. A real user
+                    # makes this counter >=2. Only the sole-AutoScan state can widen
+                    # the view lane, and never while refusal backoff is active.
+                    idle_burst_ok = bool(
+                        is_autoscan_idle
+                        and self._scan_jobs_active <= 1
+                        and self._penalty <= 0
+                        and cooldown_wait <= 0.0
+                    )
+                    if idle_burst_ok:
+                        per_kind_limit = max(per_kind_limit, self.autoscan_idle_view_limit)
+
                     background_ok = True
                     if is_background:
                         if self._background_pauses > 0 and not is_radar_checkpoint:
@@ -263,7 +286,13 @@ class AdaptiveTrafficManager:
                     # work while any scan job is alive. This prevents a large view
                     # checkpoint from filling every network slot just before a scan.
                     global_cap = global_limit
-                    if kind != "scan" and self._scan_jobs_active > 0:
+                    if idle_burst_ok:
+                        # During the exact-view phase AutoScan has no category-page
+                        # requests in flight, so unused global capacity can be loaned
+                        # to its short official-counter requests. Keep one extra slot
+                        # above the burst for bookkeeping/other light traffic.
+                        global_cap = max(global_cap, self.autoscan_idle_view_limit + 1)
+                    elif kind != "scan" and self._scan_jobs_active > 0:
                         global_cap = max(1, global_limit - self.reserved_scan_slots)
 
                     can_acquire = (
@@ -278,6 +307,7 @@ class AdaptiveTrafficManager:
                         if is_background:
                             self._background_view_active += 1
                         self._next_allowed[kind] = now + self._kind_interval(kind)
+                        distributed_idle_burst = bool(idle_burst_ok)
                         acquired = True
                         break
 
@@ -295,7 +325,10 @@ class AdaptiveTrafficManager:
             if DISTRIBUTED_WORKERS:
                 try:
                     distributed_token = await COORDINATOR.acquire_traffic(
-                        kind, interval_seconds=self._kind_interval(kind) / 2.0
+                        kind,
+                        interval_seconds=self._kind_interval(kind) / 2.0,
+                        per_limit_override=(self.autoscan_idle_view_limit if distributed_idle_burst else None),
+                        global_limit_override=(self.autoscan_idle_view_limit + 1 if distributed_idle_burst else None),
                     )
                 except asyncio.CancelledError:
                     raise

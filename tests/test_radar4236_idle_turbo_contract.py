@@ -36,7 +36,7 @@ def test_idle_turbo_borrows_view_and_page_capacity_without_parallel_categories()
 def test_large_exact_unknown_tail_gets_targeted_idle_repair_before_full_rescan():
     enrich = _block("async def enrich_autoscan_view_counts", "async def refresh_view_counts")
     assert "Radar AutoScan idle fleet repair" in enrich
-    assert "REMOTE_VIEW_MANAGER.fetch(unresolved" in enrich
+    assert "REMOTE_VIEW_MANAGER.fetch(" in enrich and "unresolved," in enrich
     assert "RADAR_AUTOSCAN_IDLE_REMOTE_RETRY_MAX" in enrich
     assert "RADAR_AUTOSCAN_IDLE_VIEW_REPAIR_MAX" in enrich
     assert "Radar AutoScan idle exact repair yielded to foreground user" in enrich

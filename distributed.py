@@ -346,7 +346,14 @@ class DistributedCoordinator:
         # to this worker process while still sharing the global concurrency tokens.
         return f"{REDIS_PREFIX}:traffic:cooldown:{socket.gethostname()}:{os.getpid()}"
 
-    async def acquire_traffic(self, kind: str, *, interval_seconds: float = 0.0) -> str:
+    async def acquire_traffic(
+        self,
+        kind: str,
+        *,
+        interval_seconds: float = 0.0,
+        per_limit_override: int | None = None,
+        global_limit_override: int | None = None,
+    ) -> str:
         """Acquire a short Redis lease shared by every parser-worker replica.
 
         Sorted-set leases self-heal after worker crashes. Global active-request
@@ -363,6 +370,16 @@ class DistributedCoordinator:
             "browser": DIST_TRAFFIC_BROWSER_LIMIT,
         }
         per_limit = limits[kind]
+        if per_limit_override is not None:
+            # v4.23.7: a caller that has independently proven an idle AutoScan
+            # window may borrow capacity, but never beyond the coordinator's hard
+            # supported maxima. All normal callers keep the original limits.
+            per_limit = max(per_limit, min(30, max(1, int(per_limit_override))))
+        effective_global_limit = DIST_TRAFFIC_GLOBAL_LIMIT
+        if global_limit_override is not None:
+            effective_global_limit = max(
+                effective_global_limit, min(40, max(2, int(global_limit_override)))
+            )
         interval_ms = max(0, int(float(interval_seconds) * 1000))
         token = uuid.uuid4().hex
         lua = r"""
@@ -408,7 +425,7 @@ class DistributedCoordinator:
                 now_ms,
                 now_ms + ttl_ms,
                 per_limit,
-                DIST_TRAFFIC_GLOBAL_LIMIT,
+                effective_global_limit,
                 token,
                 ttl_ms * 2,
                 interval_ms,

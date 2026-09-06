@@ -1,30 +1,14 @@
-# v4.23.6 GitHub patch
+# v4.23.7 GitHub patch — Full Audit Hardening
 
-Накладывать **поверх v4.23.5** с сохранением путей.
+Apply **on top of v4.23.6** and preserve all paths from this archive.
 
-## Что исправляет
+After push/redeploy:
 
-- DT Radar AutoScan заимствует свободную мощность, когда нет пользовательских сканов.
-- Page Worker prefetch для idle AutoScan расширяется до 20 страниц.
-- Exact views используют до x8 локальной concurrency в idle-режиме.
-- Большой UNKNOWN exact-tail сначала ремонтируется только по проблемным URL через View Worker fleet, а не отправляет категорию сразу на полный повтор.
-- Accurate idle-tail repair расширен до 32 URL маленькими chunks.
-- При появлении пользователя новые Turbo repair/prefetch операции прекращаются.
-- Добавлен breakdown причин `⚠️ допроверка`.
-- Старые failed_categories могут быть классифицированы после deploy без повторного полного круга.
+- redeploy **Parser / Bot** — required;
+- redeploy all **View Worker** replicas — recommended for one-version consistency;
+- Page Worker / Date Worker can remain running because their functional behavior is unchanged, though same-checkout redeploy is safe;
+- Vinted Scan / Metrics / Session workers do not need a restart specifically for this patch.
 
-## Не менялось
+No manual SQL migration and no new required Railway variables.
 
-- 99% exact coverage gate.
-- soft tail max 8.
-- UNKNOWN остаётся NULL.
-- 20 страниц TODAY на категорию.
-- DT Score / Organic правила.
-- пользовательские scan lanes / FIFO.
-- Vinted Lab / Vinted Radar логика v4.23.5.
-
-## Deploy
-
-Redeploy только **Parser / Bot**.
-
-Новых обязательных Railway Variables и ручных SQL-миграций нет.
+Main fixes: real idle x8 traffic borrowing, completed View Worker shard preservation on deadlines, and repaired full release QA. See `RELEASE_4_23_7.md` and `AUDIT_4_23_7_FULL.md`.

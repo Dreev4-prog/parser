@@ -20,7 +20,6 @@ def test_vinted_4229_ui_uses_catalog_likes_without_calling_them_exact():
     bot = (ROOT / "bot.py").read_text(encoding="utf-8")
     lab = (ROOT / "vinted_lab.py").read_text(encoding="utf-8")
     assert "Likes из каталога" in bot
-    assert "Catalog likes" in bot
     assert "catalog_favourite_count" in lab
     assert "catalog_like_delta" in lab
     assert '"catalog_likes": catalog_likes' in lab

@@ -18,7 +18,7 @@ def test_first_observation_can_never_publish_hot_or_rising():
     assert 'movement = sample_count >= 2 and like_delta is not None and like_delta > 0' in status_block
     assert 'if movement and score >= 75:' in status_block
     assert 'if movement and score >= 58:' in status_block
-    assert 'if int(p["sample_count"]) < 2:' in RADAR
+    assert 'if int(primitive["sample_count"]) < 2:' in RADAR
     assert 'score = min(score, 59)' in RADAR
 
 
@@ -33,7 +33,10 @@ def test_radar_mode_is_catalog_only_and_does_not_queue_blocked_detail_metrics():
     assert "if collect_detail_metrics:" in WORKER
     assert 'str(row.mode or "manual") != "radar"' in LAB
     assert 'radar_catalog_only = str(scan.mode or "manual") == "radar"' in LAB
-    assert 'scan.metrics_total = 0 if radar_catalog_only else scan.total_items' in LAB
+    radar_recalc = LAB.split('async def recalc_scan', 1)[1].split('async def save_catalog_page', 1)[0]
+    assert 'if radar_catalog_only:' in radar_recalc
+    assert 'scan.metrics_total = 0' in radar_recalc
+    assert 'scan.metrics_done = 0' in radar_recalc
 
 
 def test_radar_score_uses_likes_price_peers_and_not_views():
@@ -51,7 +54,7 @@ def test_radar_score_uses_likes_price_peers_and_not_views():
 def test_learning_pool_is_frozen_at_live_window_end():
     assert "live_cutoff = first_seen + timedelta(hours=VINTED_RADAR_LIVE_HOURS)" in RADAR
     assert "sample.scan_created_at <= live_cutoff" in RADAR
-    assert "never inflate the 0-24h reference pool" in RADAR
+    assert "radar_samples = [sample for sample in samples if sample.scan_created_at <= live_cutoff]" in RADAR
 
 
 def test_admin_ui_exposes_live_radar_and_autoscan_controls():

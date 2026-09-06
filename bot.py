@@ -3605,6 +3605,8 @@ async def fetch_exact_views_v438_compatible(
     concurrency: int,
     progress_cb=None,
     traffic_priority: str,
+    remote_deadline_seconds: float | None = None,
+    local_fallback_on_partial: bool = True,
 ) -> dict[str, ViewCountResult]:
     """Use the remote fleet first and locally recover only missing shards.
 
@@ -3625,7 +3627,10 @@ async def fetch_exact_views_v438_compatible(
                     await maybe
 
         remote = await REMOTE_VIEW_MANAGER.fetch(
-            urls, progress_cb=remote_progress, traffic_priority=traffic_priority,
+            urls,
+            progress_cb=remote_progress,
+            traffic_priority=traffic_priority,
+            deadline_seconds=remote_deadline_seconds,
         )
         if remote is not None:
             converted = {
@@ -3636,6 +3641,12 @@ async def fetch_exact_views_v438_compatible(
             }
             missing = [url for url in urls if url not in converted]
             if not missing:
+                return {url: converted[url] for url in urls if url in converted}
+            if not local_fallback_on_partial:
+                log.warning(
+                    "Dedicated view partial deadline remote=%s/%s missing=%s; returning healthy shards for targeted repair",
+                    len(converted), len(urls), len(missing),
+                )
                 return {url: converted[url] for url in urls if url in converted}
 
             log.warning(
@@ -3664,6 +3675,9 @@ async def fetch_exact_views_v438_compatible(
                     await maybe
             return {url: converted[url] for url in urls if url in converted}
 
+        if not local_fallback_on_partial:
+            log.warning("Dedicated view worker unavailable/deadline; returning empty exact set for bounded AutoScan salvage")
+            return {}
         log.warning("Dedicated view worker unavailable; using local v4.3.8 view path")
     return await parser.fetch_public_view_counts(
         urls, concurrency=concurrency, progress_cb=progress_cb,
@@ -3823,18 +3837,17 @@ async def enrich_autoscan_view_counts(
     url_to_id = {item.url: item.external_id for item in targets}
     total = len(urls)
     base_ready = int(live.views_ready or 0) if live is not None else 0
-    autoscan_view_priority = "scan_inline"
     normal_view_concurrency = max(1, min(RADAR_AUTOSCAN_SAFE_VIEW_CONCURRENCY, VIEW_COUNT_CONCURRENCY))
     idle_turbo = await _radar_autoscan_idle_turbo_available()
-    autoscan_view_concurrency = normal_view_concurrency
-    if idle_turbo:
-        autoscan_view_concurrency = max(
-            normal_view_concurrency,
-            min(
-                RADAR_AUTOSCAN_IDLE_VIEW_CONCURRENCY,
-                max(1, int(getattr(TRAFFIC, "base_view_limit", RADAR_AUTOSCAN_IDLE_VIEW_CONCURRENCY))),
-            ),
-        )
+    # v4.23.7: v4.23.6 advertised x8 but clamped the requested concurrency back
+    # to TRAFFIC.base_view_limit (normally 3), so Turbo was effectively a no-op.
+    # The traffic manager now owns the safety gate and permits this explicit
+    # priority to borrow up to the configured idle limit only while AutoScan is the
+    # sole scan job and no refusal cooldown is active.
+    autoscan_view_priority = "autoscan_idle" if idle_turbo else "scan_inline"
+    autoscan_view_concurrency = (
+        RADAR_AUTOSCAN_IDLE_VIEW_CONCURRENCY if idle_turbo else normal_view_concurrency
+    )
 
     async def fleet_progress(done: int, _total: int) -> None:
         if live is None:
@@ -3863,15 +3876,18 @@ async def enrich_autoscan_view_counts(
 
     try:
         if remote_ready:
-            combined = await asyncio.wait_for(
-                fetch_exact_views_v438_compatible(
-                    parser,
-                    urls,
-                    concurrency=autoscan_view_concurrency,
-                    progress_cb=fleet_progress,
-                    traffic_priority=autoscan_view_priority,
-                ),
-                timeout=RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS,
+            # The manager owns the deadline so completed shards survive it. The
+            # AutoScan path deliberately does not invoke the generic full local
+            # browser fallback here; missing URLs continue through the bounded
+            # direct/tail repair stages below.
+            combined = await fetch_exact_views_v438_compatible(
+                parser,
+                urls,
+                concurrency=autoscan_view_concurrency,
+                progress_cb=fleet_progress,
+                traffic_priority=autoscan_view_priority,
+                remote_deadline_seconds=RADAR_AUTOSCAN_VIEW_RECOVERY_TIMEOUT_SECONDS,
+                local_fallback_on_partial=False,
             )
         else:
             # Do not open hundreds of browser fallbacks inside Parser when the fleet
@@ -3951,9 +3967,10 @@ async def enrich_autoscan_view_counts(
             int(RADAR_AUTOSCAN_IDLE_REMOTE_RETRY_SECONDS),
         )
         try:
-            remote_retry = await asyncio.wait_for(
-                REMOTE_VIEW_MANAGER.fetch(unresolved, traffic_priority=autoscan_view_priority),
-                timeout=RADAR_AUTOSCAN_IDLE_REMOTE_RETRY_SECONDS,
+            remote_retry = await REMOTE_VIEW_MANAGER.fetch(
+                unresolved,
+                traffic_priority="autoscan_idle",
+                deadline_seconds=RADAR_AUTOSCAN_IDLE_REMOTE_RETRY_SECONDS,
             )
             if remote_retry:
                 for url, item in remote_retry.items():
@@ -3963,11 +3980,6 @@ async def enrich_autoscan_view_counts(
                             item.final_url, item.page_title, item.error,
                         )
                         remote_recovered += 1
-        except asyncio.TimeoutError:
-            log.warning(
-                "Radar AutoScan idle fleet repair timeout category=%s unresolved=%s",
-                (live.category_name if live is not None else "autoscan"), len(unresolved),
-            )
         except Exception:
             log.warning(
                 "Radar AutoScan idle fleet repair failed category=%s unresolved=%s",

@@ -465,6 +465,7 @@ class RemoteViewManager:
         *,
         progress_cb: Callable[[int, int], Awaitable[None] | None] | None = None,
         traffic_priority: str = "scan_inline",
+        deadline_seconds: float | None = None,
     ) -> dict[str, RemoteViewResult] | None:
         """Fetch exact views remotely, sharding large batches across replicas.
 
@@ -502,12 +503,22 @@ class RemoteViewManager:
             self.last_shard_workers = worker_count
             self.last_shard_at = time.time()
             self.last_shard_failed = 0
-            return await self._fetch_single_batch(
+            single = self._fetch_single_batch(
                 urls,
                 progress_cb=progress_cb,
                 traffic_priority=traffic_priority,
                 skip_alive_check=True,
             )
+            if deadline_seconds is None:
+                return await single
+            try:
+                return await asyncio.wait_for(single, timeout=max(0.1, float(deadline_seconds)))
+            except asyncio.TimeoutError:
+                log.warning(
+                    "Remote view single-batch deadline total=%s timeout=%.1fs; local fallback",
+                    len(urls), float(deadline_seconds),
+                )
+                return None
 
         natural_shards = max(2, math.ceil(len(urls) / VIEW_SHARD_SIZE))
         worker_shards = max(2, worker_count * VIEW_SHARDS_PER_WORKER)
@@ -571,9 +582,25 @@ class RemoteViewManager:
         shard_results: list[dict[str, RemoteViewResult] | None] = [None] * shard_count
         failed_shards = 0
         pending: set[asyncio.Task] = set(tasks)
+        deadline_at = (
+            time.monotonic() + max(0.1, float(deadline_seconds))
+            if deadline_seconds is not None else None
+        )
         try:
             while pending:
-                done_tasks, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                wait_timeout = None
+                if deadline_at is not None:
+                    wait_timeout = max(0.0, deadline_at - time.monotonic())
+                    if wait_timeout <= 0.0:
+                        break
+                done_tasks, still_pending = await asyncio.wait(
+                    pending,
+                    timeout=wait_timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                pending = set(still_pending)
+                if not done_tasks:
+                    break
                 for task in done_tasks:
                     index = task_index[task]
                     try:
@@ -599,6 +626,24 @@ class RemoteViewManager:
                         )
                         continue
                     shard_results[index] = result
+
+            # v4.23.7 Full Audit: an AutoScan watchdog must not throw away healthy
+            # shards merely because one or two siblings are slow. Cancel only the
+            # unfinished shard jobs and return the exact results already completed;
+            # the caller then salvages/retries only missing URLs.
+            if pending:
+                timed_out = len(pending)
+                failed_shards += timed_out
+                self.partial_shard_fallbacks_total += timed_out
+                log.warning(
+                    "Remote view shard deadline parent=%s completed=%s/%s pending=%s timeout=%s; preserving completed shards",
+                    parent_job_id[:10], shard_count - timed_out, shard_count, timed_out,
+                    (f"{float(deadline_seconds):.1f}s" if deadline_seconds is not None else "cancel"),
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                pending.clear()
         except asyncio.CancelledError:
             for task in pending:
                 task.cancel()

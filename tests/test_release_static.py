@@ -13,7 +13,7 @@ class ReleaseStaticTests(unittest.TestCase):
             ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
     def test_release_version(self):
-        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.23.5")
+        self.assertEqual((ROOT / "VERSION").read_text().strip(), "4.23.7")
 
     def test_radar3_autoscan_is_today_only_and_baseline_only(self):
         bot = (ROOT / "bot.py").read_text(encoding="utf-8")
@@ -125,7 +125,8 @@ class ViewWorkerFailFastStaticTests(unittest.TestCase):
 class AutoScanForegroundTrafficStaticTests(unittest.TestCase):
     def test_autoscan_exact_views_are_foreground_not_background(self):
         source = (ROOT / "bot.py").read_text(encoding="utf-8")
-        self.assertIn('autoscan_view_priority = "scan_inline"', source)
+        self.assertIn('autoscan_view_priority = "autoscan_idle" if idle_turbo else "scan_inline"', source)
+        self.assertIn('local_fallback_on_partial=False', source)
 
 
 def test_foreground_radar_detail_gate_never_infers_background_from_policy():
