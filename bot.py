@@ -129,7 +129,8 @@ from radar import (
     get_radar_product, is_radar_favorite, list_radar_products, radar_categories, radar_stats,
     purge_nonorganic_analytics, record_autoscan_hot_detailed, record_user_scan_radar3_baselines, radar_v3_category_allowed,
     record_verified_velocity_signals, refresh_radar_scores, verify_listing_organic_now,
-    prepare_radar_v3_once, repair_radar_v3_historical_scores_once, repair_radar_v3_live_retention_once, radar_v3_due_external_ids, radar_v3_claim_due_external_ids, radar_v3_release_claims, radar_v3_record_refreshed, radar_v3_expire_observations, radar_v3_expire_stale_products, radar_v3_rollover_successful_category,
+    prepare_radar_v3_once, repair_radar_v3_historical_scores_once, repair_radar_v3_live_retention_once, radar_v3_due_external_ids, radar_v3_claim_due_external_ids, radar_v3_release_claims, radar_v3_record_refreshed, radar_v3_expire_observations, radar_v3_expire_stale_products, radar_v3_rollover_successful_category, repair_radar_v3_depth_retirement_once,
+    radar_v3_checkpoint_telemetry, radar_v3_prune_checkpoint_events,
     search_radar_products, toggle_radar_favorite,
 )
 from page_manager import (
@@ -4577,6 +4578,8 @@ async def radar_maintenance_scheduler() -> None:
         restored_live = await repair_radar_v3_live_retention_once()
         if restored_live:
             log.info("DT Radar 3.2 startup live-retention restore=%s", restored_live)
+        # No legacy depth-retirement resurrection: History lacks a reliable
+        # retirement cause. Only fresh verified demand may reactivate it.
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -4585,6 +4588,10 @@ async def radar_maintenance_scheduler() -> None:
         try:
             if not await foreground_busy():
                 await bump_resurrection_integrity_sweep_once()
+                await _radar3_checkpoint_safe_snapshot(timeout_seconds=0.5)
+                pruned = await radar_v3_prune_checkpoint_events()
+                if pruned:
+                    log.info("DT Radar checkpoint telemetry retention pruned=%s", pruned)
             await asyncio.sleep(3600)
         except asyncio.CancelledError:
             raise
@@ -5463,15 +5470,84 @@ async def _radar_autoscan_text() -> tuple[str, dict]:
         + "\n<b>🧪 Radar-наблюдения</b>\n"
         + "Подробная воронка Candidate / Early / Strong / Hot, Confidence, Acceleration и категории вынесены в <b>📊 Аналитика Radar</b>.\n"
         + "Так тяжёлая статистика больше не может заблокировать управление AutoScan.\n\n"
+        + (f"⏱ Контрольные замеры: due <b>{int(_radar3_checkpoint_cache.get('due') or 0)}</b> · "
+           f"старейшее ожидание <b>{_radar3_checkpoint_cache.get('oldest_due_seconds', 0)//60}м</b>\n\n"
+           if _radar3_checkpoint_cache and _radar3_checkpoint_cache.get('oldest_due_seconds') is not None else "")
         + f"Последний круг: <b>{html.escape(last_line)}</b>\n"
         + f"Следующий ежедневный: <b>{html.escape(_radar_autoscan_next_run_text(state))}</b>"
     )
     return text, state
 
 
+_radar3_checkpoint_cache: dict | None = None
+_radar3_checkpoint_cache_at = 0.0
+_radar3_checkpoint_task: asyncio.Task | None = None
+
+
+async def _radar3_checkpoint_safe_snapshot(timeout_seconds: float = 2.0) -> dict:
+    """Single-flight 30s cache; a slow PostgreSQL aggregate never blocks controls."""
+    global _radar3_checkpoint_cache, _radar3_checkpoint_cache_at, _radar3_checkpoint_task
+    now = time.monotonic()
+    if _radar3_checkpoint_cache is not None and now - _radar3_checkpoint_cache_at < 30.0:
+        return dict(_radar3_checkpoint_cache)
+    task = _radar3_checkpoint_task
+    if task is None or task.done():
+        async def refresh():
+            global _radar3_checkpoint_cache, _radar3_checkpoint_cache_at
+            value = await radar_v3_checkpoint_telemetry()
+            _radar3_checkpoint_cache = dict(value)
+            _radar3_checkpoint_cache_at = time.monotonic()
+            return value
+        task = asyncio.create_task(refresh(), name="dt-radar-checkpoint-telemetry")
+        task.add_done_callback(_consume_detached_radar_task)
+        _radar3_checkpoint_task = task
+    try:
+        return dict(await asyncio.wait_for(asyncio.shield(task), timeout=max(0.1, float(timeout_seconds))))
+    except Exception as exc:
+        log.warning("DT Radar checkpoint telemetry unavailable: %s", type(exc).__name__)
+        return {**(_radar3_checkpoint_cache or {}), "stale": True}
+
+
+def _radar3_checkpoint_text(stats: dict) -> str:
+    """Measured coverage and queue health, never synthetic Score counts."""
+    if not stats:
+        return "🕒 Очередь замеров: статистика загружается; повтори через несколько секунд."
+    def count(key):
+        return int(stats.get(key) or 0)
+    def duration(value):
+        if value is None:
+            return "—"
+        seconds = max(0, int(value))
+        if seconds >= 3600:
+            return f"{seconds // 3600}ч {(seconds % 3600) // 60}м"
+        return f"{seconds // 60}м {seconds % 60}с"
+    lag50 = duration(stats.get("lag_p50_seconds"))
+    lag95 = duration(stats.get("lag_p95_seconds"))
+    stale = "⚠️ Последняя сохранённая статистика.\n" if stats.get("stale") else ""
+    return (
+        "<b>⏱ Контрольные замеры</b>\n" + stale
+        + f"Назначено на будущее: <b>{count('scheduled')}</b> · готовы сейчас: <b>{count('due')}</b>\n"
+        + f"↳ В работе/lease: <b>{count('leased')}</b> · просрочены >15м: <b>{count('late_15m')}</b> · >60м: <b>{count('late_60m')}</b>\n"
+        + f"Старейшее ожидание: <b>{duration(stats.get('oldest_due_seconds'))}</b> · истекли до cleanup: <b>{count('expired_pending_cleanup')}</b>\n"
+        + f"Фактическая задержка p50 / p95: <b>{lag50} / {lag95}</b>\n\n"
+        + "<b>🧪 Воронка baseline за последние 24ч</b>\n"
+        + f"Создано циклов: <b>{count('cohort_baselines')}</b> · ≥1 точный повтор: <b>{count('cohort_measured_once')}</b> · ≥2: <b>{count('cohort_measured_twice')}</b>\n"
+        + f"Есть положительный прирост: <b>{count('cohort_growth')}</b> · остановлено как слабые: <b>{count('cohort_quiet')}</b>\n"
+        + f"Журнал с версии 4.23.11: baseline <b>{count('baseline_events_24h')}</b> · точных повторов <b>{count('measured_events_24h')}</b> · положительных интервалов <b>{count('positive_events_24h')}</b>\n"
+        + f"Истекли до 1-го / до 2-го замера: <b>{count('expired_before_first_24h')} / {count('expired_below_two_24h')}</b>\n"
+        + "<i>Истечение без двух замеров не равно ошибке: часть слабых наблюдений завершается штатно. "
+        + "Задержки считаются по фактически принятым exact-замерам. "
+        + "Журнал не восстанавливает выдуманные замеры до обновления.</i>"
+    )
+
+
 async def _radar3_analytics_text() -> str:
     """Deep Radar analytics. It is intentionally isolated from the live control panel."""
-    radar3 = await _radar3_dashboard_safe_snapshot(timeout_seconds=3.0)
+    radar3, checkpoint_stats = await asyncio.gather(
+        _radar3_dashboard_safe_snapshot(timeout_seconds=3.0),
+        _radar3_checkpoint_safe_snapshot(timeout_seconds=2.0),
+    )
+    checkpoint_text = _radar3_checkpoint_text(checkpoint_stats)
     category_lines = list(radar3.get("category_lines") or [])
     category_text = "\n".join(category_lines[:10]) if category_lines else "Пока подтверждённых категорий нет"
     if not any(k in radar3 for k in ("active", "early", "strong", "hot")):
@@ -5479,7 +5555,7 @@ async def _radar3_analytics_text() -> str:
             "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\n"
             "⚠️ Глубокая статистика сейчас считается или PostgreSQL занят.\n"
             "Live Status и AutoScan при этом продолжают работать независимо.\n\n"
-            + category_text
+            + category_text + "\n\n" + checkpoint_text
         )
     return (
         "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\n"
@@ -5498,7 +5574,7 @@ async def _radar3_analytics_text() -> str:
         f"Суммарный DT-observed прирост: <b>+{int(radar3.get('total_delta') or 0)}</b>\n\n"
         f"🟡 Early: <b>{int(radar3.get('early') or 0)}</b> · 📈 Strong: <b>{int(radar3.get('strong') or 0)}</b> · 🔥 Hot: <b>{int(radar3.get('hot') or 0)}</b>\n\n"
         "<b>🗂 Категории с живым спросом</b>\n"
-        + category_text + "\n\n"
+        + category_text + "\n\n" + checkpoint_text + "\n\n"
         "<i>Radar 3.2: &lt;3/ч — шум. Дальше объявление сравнивается только со своей категорией: "
         "P90 Candidate · P95 Early/Score · P98 Strong · P99 Hot при подтверждении. "
         "DT Score = 50% позиция в категории + 25% устойчивость + 15% ускорение + 10% повторяемость.</i>"
@@ -6231,23 +6307,9 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
             if result is not None and result.date_complete and not failure_kind:
                 state["successful"] = int(state.get("successful") or 0) + 1
                 issue_streak = 0
-                try:
-                    rollover_retired = await radar_v3_rollover_successful_category(
-                        cat.key, result.matched_ids or []
-                    )
-                    if rollover_retired:
-                        log.info(
-                            "DT Radar AutoScan category freshness rollover round=%s category=%s retired=%s",
-                            state.get("round_id"), cat.name, rollover_retired,
-                        )
-                except Exception:
-                    # Category scanning and evidence collection already succeeded;
-                    # a DB-only catalogue rollover must never downgrade that scan to
-                    # a parser failure. The 24h hard cap remains the safe fallback.
-                    log.exception(
-                        "DT Radar AutoScan category freshness rollover failed round=%s category=%s",
-                        state.get("round_id"), cat.name,
-                    )
+                # v4.23.11: absence from the first 20 pages is not an availability
+                # verdict. No category rollover may shorten a confirmed Live signal.
+                # The independent 24h expiry and strict organic gate remain active.
             else:
                 state["failed"] = int(state.get("failed") or 0) + 1
                 if failure_kind == "system":

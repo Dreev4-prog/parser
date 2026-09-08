@@ -1,3 +1,9 @@
+# DT Parser v4.23.11 — Radar Live & Checkpoint Visibility
+
+See `RELEASE_4_23_11.md`. Bounded category absence no longer retires confirmed Live signals; durable exact-checkpoint analytics expose real coverage and queue lag.
+
+---
+
 # DT PARSER
 
 ## v4.23.10 — Vinted Radar Follow-up Lane

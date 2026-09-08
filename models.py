@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint, Index
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -495,6 +495,34 @@ class RadarObservation(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class RadarCheckpointEvent(Base):
+    """Small durable audit of accepted exact checkpoints and expired watches.
+
+    One key represents one event in one baseline cycle. Raw page payloads, URLs,
+    cookies and untrusted approximate counters are never stored here.
+    """
+
+    __tablename__ = "radar_checkpoint_events"
+    __table_args__ = (
+        UniqueConstraint("external_id", "baseline_at", "checkpoint_no", "event_type",
+                         name="uq_radar_checkpoint_event_cycle"),
+        Index("ix_radar_checkpoint_events_cycle", "baseline_at", "external_id", "checkpoint_no"),
+        Index("ix_radar_checkpoint_events_kind_time", "event_type", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    external_id: Mapped[str] = mapped_column(String(64), index=True)
+    category_key: Mapped[str] = mapped_column(String(80), default="", index=True)
+    baseline_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    checkpoint_no: Mapped[int] = mapped_column(Integer, default=0)
+    event_type: Mapped[str] = mapped_column(String(16), index=True)
+    scheduled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    measured_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    delay_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    delta_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 class RadarLifecycleWatch(Base):

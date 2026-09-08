@@ -12,6 +12,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import case, delete, func, or_, select, text, update
 
 from db import DATABASE_BACKEND, SessionLocal
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from categories import CATEGORIES
 from early_winner import FeatureRow, listing_age_minutes, opportunity_family_key, score_initial_rows
 from filters import price_bounds
@@ -37,6 +39,7 @@ from models import (
     RadarProduct,
     RadarProductListing,
     RadarObservation,
+    RadarCheckpointEvent,
     RadarSnapshot,
     ScanListing,
     UserScan,
@@ -52,6 +55,8 @@ RADAR_UNIFIED_48H_REPAIR_SETTING = "dt_radar_v4200_unified_48h_repair_v2"
 RADAR_V3_RESET_SETTING = "dt_radar_v3_observed_demand_reset_v6_radar32_two_pass_clean"
 RADAR_V3_HISTORY_SCORE_REPAIR_SETTING = "dt_radar_v3_history_score_repair_v1"
 RADAR_V3_LIVE_RETENTION_REPAIR_SETTING = "dt_radar_v3_live_retention_24h_repair_v1"
+RADAR_V3_DEPTH_REPAIR_SETTING = "dt_radar_v42311_depth_retirement_repair_v1"
+RADAR_V3_CHECKPOINT_AUDIT_DAYS = 7
 RADAR_V3_FIRST_CHECK_MINUTES = 60
 RADAR_V3_NEXT_CHECK_MINUTES = 60
 RADAR_V3_EARLY_CHECK_MINUTES = 45
@@ -59,8 +64,8 @@ RADAR_V3_STRONG_CHECK_MINUTES = 30
 RADAR_V3_MAX_OBSERVATION_HOURS = 6
 # v4.21.16: observation remains a six-hour evidence window, but a confirmed
 # product may stay visible in the live catalogue for up to one day.  A later
-# successful AutoScan of the same category can retire products that are no
-# longer present in the freshly verified category set before this hard cap.
+# bounded category scans cannot prove a listing disappeared. Only the age of
+# the last confirmed demand signal determines the normal Live expiry.
 RADAR_V3_LIVE_RETENTION_HOURS = 24
 # Radar 3.2: category-adaptive demand. Absolute thresholds are now only a
 # safety floor; ranking/status is decided relative to the live category cohort.
@@ -103,6 +108,147 @@ RADAR_LIFECYCLE_CONFIRM_MINUTES = 3
 RADAR_LIFECYCLE_UNKNOWN_RETRY_MINUTES = 5
 RADAR_LIFECYCLE_MAX_MINUTES = max(RADAR_LIFECYCLE_CHECK_MINUTES)
 RADAR_FAST_SOLD_MAX_SECONDS = RADAR_LIFECYCLE_MAX_MINUTES * 60
+
+
+# v4.23.11: append-only, bounded observation telemetry. Every accepted exact
+# checkpoint is written in the same transaction as its evidence row. A retry
+# cannot manufacture another sample, because the key includes the baseline cycle
+# and monotonically increasing checkpoint number.
+def _radar_checkpoint_event_values(obs: RadarObservation, event_type: str, *,
+                                   scheduled_at: datetime | None = None,
+                                   measured_at: datetime | None = None,
+                                   delta_views: int | None = None,
+                                   now: datetime | None = None) -> dict:
+    if event_type not in {"baseline", "measured", "expired", "quiet"}:
+        raise ValueError("Unsupported Radar checkpoint event type")
+    now = now or datetime.utcnow()
+    due = scheduled_at if scheduled_at is not None else obs.next_check_at
+    number = int(obs.checkpoint_count or 0)
+    if event_type == "baseline":
+        number = 0
+    return dict(
+        external_id=str(obs.external_id), category_key=str(obs.category_key or ""),
+        baseline_at=obs.baseline_at, checkpoint_no=number, event_type=event_type,
+        scheduled_at=due, measured_at=measured_at,
+        delay_seconds=(max(0.0, (measured_at - due).total_seconds())
+                       if measured_at is not None and due is not None and event_type == "measured" else None),
+        delta_views=(max(0, int(delta_views)) if delta_views is not None else None),
+        created_at=now,
+    )
+
+
+async def _insert_radar_checkpoint_events(session, values: list[dict]) -> None:
+    if not values:
+        return
+    dialect = session.get_bind().dialect.name
+    if dialect not in {"postgresql", "sqlite"}:
+        raise RuntimeError("Radar checkpoint telemetry requires PostgreSQL or SQLite")
+    insert_fn = pg_insert if dialect == "postgresql" else sqlite_insert
+    for offset in range(0, len(values), 100):
+        stmt = insert_fn(RadarCheckpointEvent).values(values[offset:offset + 100])
+        await session.execute(stmt.on_conflict_do_nothing(constraint="uq_radar_checkpoint_event_cycle")
+                              if dialect == "postgresql" else stmt.on_conflict_do_nothing(
+                                  index_elements=["external_id", "baseline_at", "checkpoint_no", "event_type"]))
+
+
+async def radar_v3_checkpoint_telemetry() -> dict:
+    """Read-only queue health and a truthful, cycle-based 24h funnel.
+
+    The cohort uses the append-only event journal, not mutable observation rows.
+    No historic checkpoints are invented, and all aggregates are DB-side.
+    """
+    now = datetime.utcnow()
+    start = now - timedelta(hours=24)
+    active = ["baseline", "candidate", "observed", "confirmed"]
+    live = or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now)
+    due = [RadarObservation.status.in_(active), RadarObservation.next_check_at.is_not(None),
+           RadarObservation.next_check_at <= now, live]
+    async with SessionLocal() as session:
+        backlog = (await session.execute(select(
+            func.count(RadarObservation.id).filter(*due),
+            func.min(RadarObservation.next_check_at).filter(*due),
+            func.count(RadarObservation.id).filter(*due, RadarObservation.lease_until > now),
+            func.count(RadarObservation.id).filter(*due, RadarObservation.next_check_at <= now - timedelta(minutes=15)),
+            func.count(RadarObservation.id).filter(*due, RadarObservation.next_check_at <= now - timedelta(minutes=60)),
+            func.count(RadarObservation.id).filter(RadarObservation.status.in_(active),
+                                                  RadarObservation.next_check_at > now, live),
+            func.count(RadarObservation.id).filter(RadarObservation.status.in_(active), RadarObservation.expires_at <= now),
+        ))).one()
+        # Each baseline cycle is counted once, including cycles that have since
+        # become quiet/expired or have been replaced by a new baseline.
+        cycle = select(
+            RadarCheckpointEvent.external_id, RadarCheckpointEvent.baseline_at,
+            func.max(case((RadarCheckpointEvent.event_type == "measured", RadarCheckpointEvent.checkpoint_no), else_=0)).label("checks"),
+            func.max(case((RadarCheckpointEvent.event_type == "measured", RadarCheckpointEvent.delta_views > 0), else_=0)).label("growth"),
+            func.max(case((RadarCheckpointEvent.event_type == "quiet", 1), else_=0)).label("quiet"),
+            func.max(case((RadarCheckpointEvent.event_type == "expired", 1), else_=0)).label("expired"),
+            func.max(case((RadarCheckpointEvent.event_type == "baseline", 1), else_=0)).label("has_baseline"),
+        ).where(
+            RadarCheckpointEvent.baseline_at >= start,
+            RadarCheckpointEvent.baseline_at <= now,
+        ).group_by(RadarCheckpointEvent.external_id, RadarCheckpointEvent.baseline_at).subquery()
+        cohort = (await session.execute(select(
+            func.count().label("cycles"),
+            func.count().filter(cycle.c.checks >= 1),
+            func.count().filter(cycle.c.checks >= 2),
+            func.count().filter(cycle.c.growth > 0),
+            func.count().filter(cycle.c.quiet > 0),
+            func.count().filter(cycle.c.expired > 0, cycle.c.checks == 0),
+            func.count().filter(cycle.c.expired > 0, cycle.c.checks < 2),
+        ).select_from(cycle).where(cycle.c.has_baseline > 0))).one()
+        event_counts = (await session.execute(select(
+            func.count(RadarCheckpointEvent.id).filter(RadarCheckpointEvent.event_type == "baseline"),
+            func.count(RadarCheckpointEvent.id).filter(RadarCheckpointEvent.event_type == "measured"),
+            func.count(RadarCheckpointEvent.id).filter(RadarCheckpointEvent.event_type == "measured", RadarCheckpointEvent.delta_views > 0),
+        ).where(RadarCheckpointEvent.created_at >= start))).one()
+        delays = [RadarCheckpointEvent.event_type == "measured", RadarCheckpointEvent.created_at >= start,
+                  RadarCheckpointEvent.delay_seconds.is_not(None)]
+        if session.get_bind().dialect.name == "postgresql":
+            p50, p95 = (await session.execute(select(
+                func.percentile_cont(0.50).within_group(RadarCheckpointEvent.delay_seconds),
+                func.percentile_cont(0.95).within_group(RadarCheckpointEvent.delay_seconds),
+            ).where(*delays))).one()
+        else:
+            # SQLite is a local development/test fallback. Production uses
+            # PostgreSQL ordered-set aggregates, never Python-sorts all events.
+            values = sorted(float(x) for x in (await session.execute(
+                select(RadarCheckpointEvent.delay_seconds).where(*delays))).scalars().all())
+            def percentile(q):
+                if not values:
+                    return None
+                pos = (len(values) - 1) * q
+                lo = int(pos); hi = min(len(values) - 1, lo + 1)
+                return values[lo] + (values[hi] - values[lo]) * (pos - lo)
+            p50, p95 = percentile(.50), percentile(.95)
+    oldest = backlog[1]
+    return {
+        "as_of": now, "due": int(backlog[0] or 0),
+        "oldest_due_seconds": max(0, int((now-oldest).total_seconds())) if oldest else None,
+        "leased": int(backlog[2] or 0), "late_15m": int(backlog[3] or 0),
+        "late_60m": int(backlog[4] or 0), "scheduled": int(backlog[5] or 0),
+        "expired_pending_cleanup": int(backlog[6] or 0),
+        "cohort_baselines": int(cohort[0] or 0), "cohort_measured_once": int(cohort[1] or 0),
+        "cohort_measured_twice": int(cohort[2] or 0), "cohort_growth": int(cohort[3] or 0),
+        "cohort_quiet": int(cohort[4] or 0),
+        "expired_before_first_24h": int(cohort[5] or 0),
+        "expired_below_two_24h": int(cohort[6] or 0),
+        "baseline_events_24h": int(event_counts[0] or 0), "measured_events_24h": int(event_counts[1] or 0),
+        "positive_events_24h": int(event_counts[2] or 0),
+        "lag_p50_seconds": float(p50) if p50 is not None else None,
+        "lag_p95_seconds": float(p95) if p95 is not None else None,
+    }
+
+
+async def radar_v3_prune_checkpoint_events(limit: int = 25000) -> int:
+    """Small DB-only retention batch; never deletes original observations/history."""
+    cutoff = datetime.utcnow() - timedelta(days=RADAR_V3_CHECKPOINT_AUDIT_DAYS)
+    async with SessionLocal() as session:
+        ids = select(RadarCheckpointEvent.id).where(RadarCheckpointEvent.created_at < cutoff).order_by(
+            RadarCheckpointEvent.id.asc()).limit(max(1, min(25000, int(limit))))
+        result = await session.execute(delete(RadarCheckpointEvent).where(RadarCheckpointEvent.id.in_(ids)))
+        await session.commit()
+        return int(result.rowcount or 0)
+
 
 _radar_lock = asyncio.Lock()
 # v4.15.8: foreground Radar admission and background integrity/checkpoint work
@@ -1212,9 +1358,12 @@ async def record_autoscan_hot_detailed(
                     existing.next_check_at = measured_at + timedelta(minutes=RADAR_V3_FIRST_CHECK_MINUTES)
                     existing.expires_at = measured_at + timedelta(hours=RADAR_V3_MAX_OBSERVATION_HOURS)
                     existing.updated_at = now
+                    await _insert_radar_checkpoint_events(session, [
+                        _radar_checkpoint_event_values(existing, "baseline",
+                            measured_at=measured_at, now=now)])
                     seeded += 1
                 continue
-            session.add(RadarObservation(
+            new_obs = RadarObservation(
                 external_id=ext, category_key=str(category_key),
                 product_key=radar_product_key(listing),
                 baseline_views=raw, baseline_at=measured_at,
@@ -1224,7 +1373,10 @@ async def record_autoscan_hot_detailed(
                 next_check_at=measured_at + timedelta(minutes=RADAR_V3_FIRST_CHECK_MINUTES),
                 expires_at=measured_at + timedelta(hours=RADAR_V3_MAX_OBSERVATION_HOURS),
                 created_at=now, updated_at=now,
-            ))
+            )
+            session.add(new_obs)
+            await _insert_radar_checkpoint_events(session, [
+                _radar_checkpoint_event_values(new_obs, "baseline", measured_at=measured_at, now=now)])
             seeded += 1
         if seeded:
             await session.commit()
@@ -1306,11 +1458,14 @@ async def record_user_scan_radar3_baselines(scan_id: int) -> int:
                     existing.next_check_at = measured_at + timedelta(minutes=RADAR_V3_FIRST_CHECK_MINUTES)
                     existing.expires_at = measured_at + timedelta(hours=RADAR_V3_MAX_OBSERVATION_HOURS)
                     existing.updated_at = now
+                    await _insert_radar_checkpoint_events(session, [
+                        _radar_checkpoint_event_values(existing, "baseline",
+                            measured_at=measured_at, now=now)])
                     seeded += 1
                 continue
             if ext in existing_map:
                 continue
-            session.add(RadarObservation(
+            new_obs = RadarObservation(
                 external_id=ext, category_key=str(listing.category_key or "unknown"),
                 product_key=radar_product_key(listing),
                 baseline_views=raw, baseline_at=measured_at,
@@ -1320,7 +1475,10 @@ async def record_user_scan_radar3_baselines(scan_id: int) -> int:
                 next_check_at=measured_at + timedelta(minutes=RADAR_V3_FIRST_CHECK_MINUTES),
                 expires_at=measured_at + timedelta(hours=RADAR_V3_MAX_OBSERVATION_HOURS),
                 created_at=now, updated_at=now,
-            ))
+            )
+            session.add(new_obs)
+            await _insert_radar_checkpoint_events(session, [
+                _radar_checkpoint_event_values(new_obs, "baseline", measured_at=measured_at, now=now)])
             existing_map[ext] = True
             seeded += 1
         if seeded:
@@ -1447,6 +1605,7 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
         return 0
     now = datetime.utcnow()
     prepared: list[tuple[Listing, RadarObservation, int, float, float]] = []
+    audit_events: list[dict] = []
 
     # PASS 1 — persist raw DT measurements only. Keep the lease until PASS 2 so a
     # second replica cannot claim/reclassify the same observation mid-flight.
@@ -1458,7 +1617,8 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
                 Listing.external_id.in_(ids), Listing.view_count.is_not(None),
                 Listing.is_promoted.is_(False), Listing.is_price_reduced.is_(False),
                 ~_registry_dirty_exists(Listing.external_id),
-            )
+                RadarObservation.status.in_(["baseline", "candidate", "observed", "confirmed"]),
+            ).with_for_update(of=RadarObservation)
         )).all()
         for listing, obs in pairs:
             if not radar_v3_category_allowed(str(obs.category_key or listing.category_key or "")):
@@ -1468,9 +1628,11 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
                 continue
             measured_at = listing.views_checked_at or now
             if obs.expires_at and measured_at > obs.expires_at:
+                expired_due_at = obs.next_check_at
                 obs.status, obs.next_check_at = "expired", None
                 obs.lease_owner, obs.lease_until = "", None
                 obs.updated_at = now
+                audit_events.append(_radar_checkpoint_event_values(obs, "expired", scheduled_at=expired_due_at, now=now))
                 continue
             if measured_at <= obs.last_measured_at:
                 continue
@@ -1490,8 +1652,12 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
             obs.current_vph = float(vph)
             obs.acceleration_ratio = float(accel)
             obs.peak_vph = max(float(obs.peak_vph or 0.0), float(vph))
+            audit_events.append(_radar_checkpoint_event_values(
+                obs, "measured", scheduled_at=obs.next_check_at,
+                measured_at=measured_at, delta_views=interval_delta, now=now))
             obs.updated_at = now
             prepared.append((listing, obs, interval_delta, float(vph), previous_vph))
+        await _insert_radar_checkpoint_events(session, audit_events)
         await session.commit()
 
     if not prepared:
@@ -1544,6 +1710,8 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
             obs.lease_owner, obs.lease_until = "", None
             if not candidate:
                 obs.status, obs.next_check_at = "quiet", None
+                await _insert_radar_checkpoint_events(session, [
+                    _radar_checkpoint_event_values(obs, "quiet", measured_at=obs.last_measured_at, now=now)])
             elif strong:
                 obs.status = "confirmed"
                 obs.next_check_at = obs.last_measured_at + timedelta(minutes=RADAR_V3_STRONG_CHECK_MINUTES)
@@ -1647,21 +1815,24 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
 
 
 async def radar_v3_expire_observations() -> int:
-    """Expire active observation rows whose DT-owned measurement window ended."""
+    """Expire timed-out watches and persist the number of missed checkpoints."""
     now = datetime.utcnow()
     async with SessionLocal() as session:
-        result = await session.execute(
-            update(RadarObservation)
-            .where(
-                RadarObservation.status.in_(["baseline", "candidate", "observed", "confirmed"]),
-                RadarObservation.expires_at.is_not(None),
-                RadarObservation.expires_at <= now,
-            )
-            .values(
-                status="expired", next_check_at=None, lease_owner="", lease_until=None, updated_at=now
-            )
-            .execution_options(synchronize_session=False)
-        )
+        rows = list((await session.execute(select(RadarObservation).where(
+            RadarObservation.status.in_(["baseline", "candidate", "observed", "confirmed"]),
+            RadarObservation.expires_at.is_not(None), RadarObservation.expires_at <= now,
+            # A worker that measured before expiry may still be returning its
+            # exact result. Respect its bounded lease before terminal cleanup.
+            or_(RadarObservation.lease_until.is_(None), RadarObservation.lease_until <= now),
+        ).order_by(RadarObservation.id.asc()).limit(5000).with_for_update(skip_locked=True))).scalars().all())
+        if not rows:
+            return 0
+        await _insert_radar_checkpoint_events(session, [
+            _radar_checkpoint_event_values(obs, "expired", now=now) for obs in rows])
+        ids = [obs.id for obs in rows]
+        result = await session.execute(update(RadarObservation).where(RadarObservation.id.in_(ids)).values(
+            status="expired", next_check_at=None, lease_owner="", lease_until=None, updated_at=now
+        ).execution_options(synchronize_session=False))
         await session.commit()
         return int(result.rowcount or 0)
 
@@ -1671,9 +1842,8 @@ async def radar_v3_expire_stale_products(max_age_hours: int = RADAR_V3_LIVE_RETE
 
     Radar 3.2 observes demand for six hours, but a confirmed product can remain in
     the live catalogue for up to 24 hours so the Radar does not drain between
-    daily AutoScan passes.  A successful AutoScan category rollover may retire a
-    product earlier when that product family is absent from the newly verified
-    category set.  History keeps the last confirmed Score/Peak for auditability.
+    daily AutoScan passes. A bounded category pass cannot shorten that lifetime.
+    History keeps the last confirmed Score/Peak for auditability.
     """
     cutoff = datetime.utcnow() - timedelta(hours=max(1, int(max_age_hours)))
     now = datetime.utcnow()
@@ -1701,73 +1871,24 @@ async def radar_v3_rollover_successful_category(
     category_key: str,
     matched_ids: list[str] | tuple[str, ...] | set[str],
 ) -> int:
-    """Retire stale live families after a *successful* AutoScan category pass.
+    """Compatibility hook: a bounded search is not an availability verdict.
 
-    The new category pass is treated as the freshness boundary.  Product families
-    represented by a clean listing in the just-verified result set stay live while
-    their new six-hour observation is (re)measured.  Older live families that are
-    no longer present are moved to History immediately instead of lingering until
-    the 24-hour hard cap.  No product/snapshot/history row is deleted and the last
-    confirmed Score is preserved.
-
-    The caller must invoke this only after the category has completed with exact
-    views and without a category failure.  This function is intentionally DB-only
-    and creates no additional Kleinanzeigen traffic.
+    Missing from the first 20 pages means only "outside observed depth". It is
+    never evidence of a sale, disappearance or cooling. The six-hour observation
+    window and 24-hour last-confirmed-signal expiry remain authoritative.
     """
-    category_key = str(category_key or "").strip()
-    if not category_key:
-        return 0
-    ids = list(dict.fromkeys(str(x).strip() for x in matched_ids if str(x).strip()))[:5000]
-    now = datetime.utcnow()
-    current_product_keys: set[str] = set()
-    async with SessionLocal() as session:
-        if ids:
-            current_product_keys = {
-                str(value) for value in (await session.execute(
-                    select(RadarObservation.product_key)
-                    .join(Listing, Listing.external_id == RadarObservation.external_id)
-                    .where(
-                        RadarObservation.external_id.in_(ids),
-                        RadarObservation.category_key == category_key,
-                        Listing.category_key == category_key,
-                        Listing.is_promoted.is_(False),
-                        Listing.is_price_reduced.is_(False),
-                        Listing.view_count.is_not(None),
-                        ~_registry_dirty_exists(Listing.external_id),
-                    )
-                )).scalars().all()
-                if str(value or "").strip()
-            }
+    return 0
 
-        conditions = [
-            RadarProduct.category_key == category_key,
-            RadarProduct.latest_source == "radar3_observed",
-            RadarProduct.status != "historical",
-        ]
-        if current_product_keys:
-            conditions.append(RadarProduct.product_key.notin_(sorted(current_product_keys)))
-        result = await session.execute(
-            update(RadarProduct)
-            .where(*conditions)
-            .values(
-                status="historical",
-                current_score=case(
-                    (RadarProduct.current_score > 0, RadarProduct.current_score),
-                    else_=RadarProduct.last_signal_score,
-                ),
-                radar_rank=0.0,
-                updated_at=now,
-            )
-            .execution_options(synchronize_session=False)
-        )
-        await session.commit()
-        retired = int(result.rowcount or 0)
-    if retired:
-        log.info(
-            "DT Radar 3.2 category rollover category=%s retained_keys=%s retired=%s",
-            category_key, len(current_product_keys), retired,
-        )
-    return retired
+
+async def repair_radar_v3_depth_retirement_once() -> int:
+    """Retired compatibility hook. No historical evidence is resurrected.
+
+    Older rows do not identify whether History resulted from depth, genuine
+    disappearance or another lifecycle decision. Guessing would be unsafe.
+    Future bounded scans no longer retire products; existing History can return
+    only through the normal fresh, strict Organic Gate and observed demand path.
+    """
+    return 0
 
 
 async def repair_radar_v3_historical_scores_once() -> int:

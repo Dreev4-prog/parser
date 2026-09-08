@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.23.10", "VERSION=4.23.10")
+    check((ROOT / "VERSION").read_text().strip() == "4.23.11", "VERSION=4.23.11")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -71,11 +71,11 @@ def main() -> int:
     check('current_score=0' not in expire_block and 'else_=RadarProduct.last_signal_score' in expire_block,
           "24h live expiry preserves confirmed Score between AutoScan passes")
     rollover_block = radar.split('async def radar_v3_rollover_successful_category', 1)[1].split('async def repair_radar_v3_historical_scores_once', 1)[0]
-    check('RadarProduct.product_key.notin_' in rollover_block and 'status="historical"' in rollover_block,
-          "successful category pass retires live families absent from the fresh verified set")
+    check('return 0' in rollover_block and 'status="historical"' not in rollover_block,
+          "bounded category absence cannot retire confirmed Live families")
     autoscan_runner = bot.split('async def _run_radar_autoscan_round_inner', 1)[1].split('async def _run_radar_autoscan_round', 1)[0]
-    check('radar_v3_rollover_successful_category' in autoscan_runner and 'result.matched_ids or []' in autoscan_runner,
-          "category freshness rollover is wired into successful AutoScan completion")
+    check('radar_v3_rollover_successful_category(' not in autoscan_runner,
+          "obsolete depth-based retirement is removed from AutoScan completion")
     check('RADAR_V3_HISTORY_SCORE_REPAIR_SETTING' in radar and 'repair_radar_v3_historical_scores_once()' in bot,
           "pre-4.21.14 zeroed historical scores are repaired once")
     live_restore = radar.split('async def repair_radar_v3_live_retention_once', 1)[1].split('async def prepare_radar_v3_once', 1)[0]
@@ -185,7 +185,7 @@ def main() -> int:
     check('RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES = _radar_env_int("RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES", 16' in bot,
           "idle page prefetch is capped below the full 20-page category burst")
 
-    print("\nDT Parser 4.23.10 Vinted Radar Follow-up Lane release smoke: PASS")
+    print("\nDT Parser 4.23.11 Radar Live & Checkpoint Visibility release smoke: PASS")
     return 0
 
 
