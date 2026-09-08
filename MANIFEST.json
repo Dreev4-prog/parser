@@ -1,28 +1,33 @@
 {
-  "base": "4.23.11",
-  "target": "4.23.12",
-  "source": "local reconstructed repository",
-  "files": {
+  "base": "4.23.12",
+  "target": "4.23.13",
+  "scope": "public Radar UI only",
+  "changed_files": [
+    "VERSION",
+    "bot.py",
+    "scripts/release_smoke.py",
+    "tests/test_release_static.py",
+    "tests/test_radar42114_startup_contract.py",
+    "tests/test_radar42313_simple_ui.py",
+    "PATCH_README.md",
+    "RELEASE_4_23_13.md"
+  ],
+  "sha256": {
+    "VERSION": "e114beb894971ddbb5681454edbe9a42e1e1439a2cd24c15465e14514b7a07de",
+    "bot.py": "d7206c39f685b0f8e7d9c6083cf8a43116706ba123c4f594a73f8db7175b2acb",
+    "scripts/release_smoke.py": "29af0df7a370604813950d6e268083c5a52117f967cb54607153e0f1b57fb383",
+    "tests/test_release_static.py": "e3481274deec648dbc697485477d79e60faaecd91acfb34f6e633164bac9a81c",
+    "tests/test_radar42114_startup_contract.py": "d980fd4687257b49b9e1167c00d5d24e7a6edadd867375868a65ed72174abfb3",
+    "tests/test_radar42313_simple_ui.py": "c8ac3aefd58ec726e0b42f31430cac70c1ebacc7162b08ee0214d20a03ed86bd",
+    "PATCH_README.md": "93e084bd7663f3b3ebcde31e474962f05fe85e4ca095177961320260ec7d737d",
+    "RELEASE_4_23_13.md": "561d9e9cc008ce0e9383ed9a1c15ff8c465ebda5c75225e718c55d188aa97a5c"
+  },
+  "base_sha256": {
     "VERSION": "57f1d5f48f3ee2919c59113d70e573be8697ab438c26b4af2055bbe90049ce65",
-    "README.md": "1c96d5e82bada831e8e963d3b5042ab35c60ed475dd25d313167f649cc6fa6d5",
-    "PATCH_README.md": "c58b3097072e7d30c2b94bf30d2e32c4140e3571762e6fd4bed190a57275cd71",
-    "RELEASE_4_23_12.md": "6eb7b435583cefb97b815f86f8b12822abaaa08c56596a0e5b302b2b90011b51",
-    "VALIDATION_4_23_12.md": "702c7a3fa254e0cac92fc39f2272e4622d38214bf033c7b007ea7175314b9ee4",
     "bot.py": "e5e8d0ba5cc0f8f42bf2f5f5e4920dba650c83ebe25239b440fd1bc29711fcdc",
-    "db.py": "9be5ff86d4163b807761709e1babdc30405dda810996a98ff009f02d313ef1b7",
-    "models.py": "082aed62d6d1efceaa50ec22421a94d118be7b11fbc4d9daef5e6604e1334247",
-    "radar.py": "6eac642b66561f556fe423bd0af3861d3652b3dde701d62cfbe4fb743d371493",
-    "radar_quality.py": "58460fd014ac4571d4b920ff39e21a99f618b7313c5e57d70ad42ff88b182bad",
-    "lifecycle_worker.py": "5c1ce9d9d2b42bc2285c50b0336e4d2dbd6afd2f0e42078d2ed7ee0500bbfa1b",
     "scripts/release_smoke.py": "d5b3388757eb5deb2cd741f4647b77370867dc95f26d293c1c9c3a86560f534e",
-    "tests/test_radar318_full_audit_contract.py": "01ec98ed378108e88e99b0d2cc660b50fc2b4ab9e351dfe2c3f89d6f3c411f30",
-    "tests/test_radar3_contract.py": "6627064af87e6c2d3b81f176200bcc06664474a6cf94502ab90e6a56cf218ca3",
-    "tests/test_radar3_demand_gate_contract.py": "afbe7167e911e9cfdef52904b5eb7bb3444800e11ca769a952b25d161329dbac",
-    "tests/test_radar42114_startup_contract.py": "8ccada4f68d6e50c7e9a09f0025f1d101a6ba85a67898923669b86105b596250",
-    "tests/test_radar42116_live_retention_contract.py": "4981a6dfef2324f8aaedbf5160fb4d6bf1a41a75070cff5b42e02d02e3909409",
-    "tests/test_radar42311_live_checkpoint_behavior.py": "db6230864cefcb26740168eeac0841a20df00c24611fd58f674399a464bcbd1e",
-    "tests/test_radar42312_demand_behavior.py": "3120e430b0870c9440d6f2b0cddac488eabaab9ff8eed84966d570cdbedb3269",
     "tests/test_release_static.py": "89947ed52451b905c8410c10ee8866c858a7efec3d873bd5407ed2d0adc9d0e9",
-    "tests/test_vinted_4230_radar10_contract.py": "13edf8560a199f33a0f21bbff28b1c011703b3cace34dc6f64fe0ccf7d2a65ab"
+    "tests/test_radar42114_startup_contract.py": "8ccada4f68d6e50c7e9a09f0025f1d101a6ba85a67898923669b86105b596250",
+    "PATCH_README.md": "c58b3097072e7d30c2b94bf30d2e32c4140e3571762e6fd4bed190a57275cd71"
   }
 }

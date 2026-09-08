@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.23.12", "VERSION=4.23.12")
+    check((ROOT / "VERSION").read_text().strip() == "4.23.13", "VERSION=4.23.13")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -185,7 +185,7 @@ def main() -> int:
     check('RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES = _radar_env_int("RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES", 16' in bot,
           "idle page prefetch is capped below the full 20-page category burst")
 
-    print("\nDT Parser 4.23.12 Radar 48H Demand Quality release smoke: PASS")
+    print("\nDT Parser 4.23.13 Radar Simple UI release smoke: PASS")
     return 0
 
 

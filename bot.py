@@ -1303,6 +1303,8 @@ def _radar_context_back(data: dict | None) -> tuple[str, str]:
         return f"radarsearchpage:{page}", "⬅️ К результатам"
     if kind == "list":
         mode = str(data.get("radar_context_mode") or "hot")
+        if mode == "hot48":
+            mode = "alltime"
         return f"radarlist:{mode}:{page}", "⬅️ К списку"
     return "radar_home", "⬅️ DT Radar"
 
@@ -1344,8 +1346,6 @@ def radar_best_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔥 Горячие", callback_data="radarlist:hot:0"),
          InlineKeyboardButton(text="🚀 Набирают", callback_data="radarlist:rising:0")],
         [InlineKeyboardButton(text="⚡ Быстро исчезли" + ("" if full else " · 🔒"), callback_data=fast_cb)],
-        [InlineKeyboardButton(text="🕘 Сильные за 48 часов" + ("" if full else " · 🔒"),
-                              callback_data="radarlist:hot48:0" if full else "radar_locked:records")],
     ]
     if full:
         rows.append([InlineKeyboardButton(text="🏆 Рекорды Radar", callback_data="radarlist:alltime:0")])
@@ -1430,8 +1430,6 @@ def radar_list_keyboard(
         if len(title) > 32:
             title = title[:31].rstrip() + "…"
         shown_score = int(product.peak_score or 0) if mode == "alltime" else int(product.current_score or 0)
-        if mode == "hot48":
-            icon = "🕘"
         rows.append([InlineKeyboardButton(
             text=f"{icon} {shown_score} · {title}",
             callback_data=f"radaritem:{int(product.id)}",
@@ -16330,8 +16328,7 @@ async def _radar_home_text(user_id: int | None = None) -> str:
             "Посмотри, как Radar отбирает сильные товары из тысяч объявлений.\n\n"
             f"🎁 <b>Бесплатно:</b> первые {FREE_RADAR_PREVIEW_LIMIT} находок в каждом режиме «Лучшие сейчас».\n"
             "🔒 Поиск, Категории, Мой Radar и полные ленты открываются с подпиской.\n\n"
-            f"В каталоге за 48ч: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих сейчас · 🚀 <b>{stats.rising}</b> набирают · ⚡ <b>{stats.fast_sold}</b> Fast Sold.\n"
-            f"🕘 Сильные за 48ч: <b>{stats.recent_hot_48h}</b> · исторические сигналы отмечены отдельно.\n\n"
+            f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих сейчас · 🚀 <b>{stats.rising}</b> набирают · ⚡ <b>{stats.fast_sold}</b> Fast Sold.\n"
             "👁 <b>Observed Score</b> строится только на росте просмотров, который DT увидел после своего baseline."
         )
     return (
@@ -16341,8 +16338,7 @@ async def _radar_home_text(user_id: int | None = None) -> str:
         "🔎 <b>Поиск</b> — если уже знаешь название товара\n"
         "🗂 <b>Категории</b> — если хочешь посмотреть по разделам\n"
         "⭐ <b>Мой Radar</b> — сохранённые товары\n\n"
-        f"В каталоге за 48ч: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих сейчас · 🚀 <b>{stats.rising}</b> набирают · ⚡ <b>{stats.fast_sold}</b> Fast Sold.\n"
-            f"🕘 Сильные за 48ч: <b>{stats.recent_hot_48h}</b> · исторические сигналы отмечены отдельно.\n\n"
+        f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих сейчас · 🚀 <b>{stats.rising}</b> набирают · ⚡ <b>{stats.fast_sold}</b> Fast Sold.\n"
         "👁 <b>Observed Score</b>: первый счётчик не оценивается; Radar верит только собственным повторным замерам DT."
     )
 
@@ -16351,6 +16347,8 @@ async def _radar_list_payload(
     user_id: int, mode: str, page: int, category_key: str | None = None, *, preview: bool = False,
     price_filter: str = "any",
 ):
+    if mode == "hot48":
+        mode = "alltime"
     if preview:
         page = 0
         rows, total = await list_radar_products(
@@ -16363,19 +16361,13 @@ async def _radar_list_payload(
         )
     titles = {
         "hot": "🔥 Горячие сейчас",
-        "hot48": "🕘 Сильные за 48 часов",
         "rising": "🚀 Набирают обороты",
         "ai": "🚀 Набирают обороты",
         "fastsold": "⚡ Быстро исчезли",
         "alltime": "🏆 Рекорды Radar",
         "favorites": "⭐ Мой Radar",
     }
-    if mode == "hot48" and not preview:
-        lines_hint = False
-    elif mode == "alltime" and not category_key and not preview:
-        lines_hint = True
-    else:
-        lines_hint = False
+    lines_hint = mode == "alltime" and not category_key and not preview
     if category_key:
         cat = CATEGORIES.get(category_key)
         if cat is not None and cat.group in GROUPS:
@@ -16392,13 +16384,6 @@ async def _radar_list_payload(
             "В кнопке показывается 🏆 Peak Score; live-категории и поиск историю не смешивают.",
             "",
         ]
-    if mode == "hot48" and not preview:
-        lines += ["<i>Здесь сохранены реальные сильные сигналы за последние 48 часов. "
-                  "Это история наблюдений, а не обещание, что спрос растёт прямо сейчас. "
-                  "Свежие HOT/Rising остаются в отдельных режимах.</i>", ""]
-        hot_infos = await get_radar_recent_hot_infos([int(product.id) for product in rows])
-    else:
-        hot_infos = {}
     fast_infos = {}
     if mode == "fastsold" and rows and not preview:
         fast_infos = await get_fast_sold_infos([int(product.id) for product in rows])
@@ -16456,16 +16441,6 @@ async def _radar_list_payload(
                         f"🏆 Peak <b>{max(int(product.peak_score or 0), int(info.peak_score or 0))}</b>\n"
                         f"📂 {html.escape(cat_name)}"
                     )
-                    continue
-            if mode == "hot48":
-                hot_info = hot_infos.get(int(product.id))
-                if hot_info:
-                    hot_at, hot_score = hot_info
-                    lines.append(f"🕘 <b>{index}. {html.escape(str(product.title or 'Товар')[:70])}</b>\n"
-                        f"🏆 Сильный сигнал: <b>{hot_score}/100</b> · {html.escape(_radar_freshness(hot_at))}\n"
-                        f"Сейчас: <b>{html.escape(RADAR_STATUS_LABEL.get(str(product.status or ''), 'Stable'))}</b> · "
-                        f"📡 последний замер {html.escape(_radar_freshness(product.last_signal_at))}\n"
-                        f"📂 {html.escape(cat_name)} · 💶 {html.escape(_radar_product_price_text(product))}")
                     continue
             score_line = (
                 f"🕒 Последний Score <b>{int(product.current_score or 0)}</b>/100 · Peak <b>{int(product.peak_score or 0)}</b> · "
@@ -16541,7 +16516,7 @@ async def _radar_product_payload(
         signal_age = max(0.0, (datetime.utcnow()-(product.last_signal_at or datetime.utcnow())).total_seconds()/3600.0)
         if signal_age > 6:
             lines += ["", "🕘 <b>Исторический сильный сигнал</b> — текущий рост не подтверждён новым замером. "
-                      "Товар сохраняется в каталоге до 48 часов; Peak Score не означает актуальный HOT."]
+                      "Последний сильный сигнал сохранён в истории; текущий спрос требует свежего подтверждения."]
     if fast_info is not None:
         lines += [
             "",
@@ -16554,7 +16529,9 @@ async def _radar_product_payload(
             lines.append(f"👀 Последний известный замер: <b>{int(fast_info.last_views)}</b>")
         lines.append("ℹ️ Kleinanzeigen не всегда сообщает, было ли объявление продано или снято продавцом.")
     if product.latest_reason:
-        lines += ["", f"💡 <b>Почему в Radar:</b> {html.escape(str(product.latest_reason)[:500])}"]
+        reason = str(product.latest_reason)
+        reason = re.sub(r"^Unified 48H:\s*", "Подтверждённый спрос: ", reason)
+        lines += ["", f"💡 <b>Почему в Radar:</b> {html.escape(reason[:500])}"]
     if snapshots:
         lines += ["", "<b>Последние изменения рейтинга:</b>"]
         for snap in snapshots[:5]:
@@ -16632,6 +16609,8 @@ async def _render_radar_context(message: Message, user_id: int, state: FSMContex
             return
     if kind == "list":
         mode = str(data.get("radar_context_mode") or "hot")
+        if mode == "hot48":
+            mode = "alltime"
         if mode in {"hot", "rising", "ai", "fastsold", "alltime", "favorites"}:
             text, markup = await _radar_list_payload(user_id, mode, page)
             await _edit_or_answer(message, text, reply_markup=markup)
@@ -16893,11 +16872,14 @@ async def radar_list_handler(callback: CallbackQuery, state: FSMContext) -> None
     if mode == "ai":
         # Compatibility for old inline messages after legacy AI Picks retirement.
         mode = "rising"
+    elif mode == "hot48":
+        # Retired extra feed: preserve old buttons through the existing history.
+        mode = "alltime"
     try:
         page = max(0, int(parts[2])) if len(parts) > 2 else 0
     except Exception:
         page = 0
-    if mode not in {"hot", "hot48", "rising", "ai", "fastsold", "alltime", "favorites"}:
+    if mode not in {"hot", "rising", "ai", "fastsold", "alltime", "favorites"}:
         mode = "hot"
     full = allowed(callback.from_user.id)
     if not full:
