@@ -417,6 +417,7 @@ class RadarProduct(Base):
     # v4.15.6 signal rebuilds them, even after their old links were sweep-checked.
     bump_sweep_verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     last_signal_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    current_signal_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     last_signal_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
     current_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
     peak_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
@@ -486,6 +487,11 @@ class RadarObservation(Base):
     strong_checkpoints: Mapped[int] = mapped_column(Integer, default=0, index=True)
     consecutive_strong: Mapped[int] = mapped_column(Integer, default=0, index=True)
     status: Mapped[str] = mapped_column(String(24), default="baseline", index=True)
+    rollback_count: Mapped[int] = mapped_column(Integer, default=0)
+    rollback_last_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rollback_first_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    provenance_reset_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rollback_last_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     next_check_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     # v4.21.1: cross-replica claim. Only one Parser replica may refresh one
     # Radar observation at a time. The lease is deliberately short and expires
@@ -535,7 +541,10 @@ class RadarLifecycleWatch(Base):
     __tablename__ = "radar_lifecycle_watches"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    product_id: Mapped[int] = mapped_column(index=True)
+    product_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    product_key: Mapped[str] = mapped_column(String(600), default="", index=True)
+    enrollment_source: Mapped[str] = mapped_column(String(24), default="strong")
+    strong_qualified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     external_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     category_key: Mapped[str] = mapped_column(String(80), default="", index=True)
     title: Mapped[str] = mapped_column(String(500), default="")
@@ -564,6 +573,17 @@ class RadarLifecycleWatch(Base):
     lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class RadarLifecycleEvent(Base):
+    __tablename__ = "radar_lifecycle_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_key: Mapped[str] = mapped_column(String(180), unique=True)
+    external_id: Mapped[str] = mapped_column(String(64), index=True)
+    product_key: Mapped[str] = mapped_column(String(600), default="")
+    event_type: Mapped[str] = mapped_column(String(32), index=True)
+    reason: Mapped[str] = mapped_column(String(80), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 class RadarSnapshot(Base):

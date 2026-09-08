@@ -1,9 +1,5 @@
-# v4.23.11 — Radar Live & Checkpoint Visibility
+# v4.23.12 GitHub patch — Radar 48H Demand Quality
 
-Apply on top of **v4.23.10**, preserving archive paths. This is a Kleinanzeigen Radar 3.2-only patch.
+Apply **on top of v4.23.11**, preserving paths. This is a Kleinanzeigen Radar-only patch. Do not use it as a replacement for an entire repository.
 
-Replace the files in this archive and push to GitHub. Redeploy **Parser / Bot**. Other workers are functionally unchanged; if Railway automatically redeploys them from the same commit, that is fine. No new required variables and no manual SQL migration. The new `radar_checkpoint_events` table is created automatically by the existing serialized `init_db()` path.
-
-Do not delete existing Radar data, reset the database or clear Redis. Old History is deliberately not bulk-restored. See `RELEASE_4_23_11.md` for precise semantics and validation limits.
-
-After deployment, open Admin → Radar → Analytics. Check the new checkpoint funnel and queue lag. Baseline history starts with this version, so early counts may be incomplete until real new cycles have been observed. The AutoScan screen shows only a cached queue summary and must remain responsive.
+Required: redeploy Parser / Bot and all Lifecycle Worker replicas from the same commit after the additive migration completes. Other workers are functionally unchanged. No manual SQL or new required Railway variables. Back up PostgreSQL first. Do not reset the database, clear Redis, or bulk-restore History. See RELEASE_4_23_12.md for the 48h/6h distinction, evidence safeguards, deployment order, rollback limitations, and validation scope.

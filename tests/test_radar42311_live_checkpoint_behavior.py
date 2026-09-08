@@ -18,6 +18,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 import pytest
 
 from models import Base, RadarCheckpointEvent, RadarObservation, RadarProduct, RadarSnapshot
+from radar_quality import ACTIVE_OBSERVATION_STATUSES
 
 ROOT = Path(__file__).resolve().parents[1]
 RADAR = (ROOT / "radar.py").read_text()
@@ -71,9 +72,10 @@ def environment():
     ns = dict(datetime=datetime, timedelta=timedelta, select=select, update=update, delete=delete,
         func=func, case=case, or_=or_, text=text, pg_insert=pg_insert, sqlite_insert=sqlite_insert,
         RadarCheckpointEvent=RadarCheckpointEvent, RadarObservation=RadarObservation,
-        RadarProduct=RadarProduct, RADAR_V3_CHECKPOINT_AUDIT_DAYS=7, RADAR_V3_LIVE_RETENTION_HOURS=24,
+        RadarProduct=RadarProduct, RADAR_V3_CHECKPOINT_AUDIT_DAYS=7, RADAR_V3_LIVE_RETENTION_HOURS=48,
+        ACTIVE_OBSERVATION_STATUSES=ACTIVE_OBSERVATION_STATUSES,
         SessionLocal=lambda: AsyncSyncSession(engine), log=logging.getLogger("test-radar"))
-    names = ["_radar_checkpoint_event_values", "_insert_radar_checkpoint_events", "radar_v3_checkpoint_telemetry",
+    names = ["_radar_checkpoint_event_values", "_insert_radar_checkpoint_events", "_radar_exploration_count", "radar_v3_checkpoint_telemetry",
              "radar_v3_prune_checkpoint_events", "radar_v3_expire_observations", "radar_v3_expire_stale_products",
              "radar_v3_rollover_successful_category", "repair_radar_v3_depth_retirement_once"]
     funcs = load_functions(names, ns)
@@ -100,7 +102,7 @@ def test_depth_absence_does_not_retire_and_age_expiry_preserves_score(environmen
             RadarProduct(product_key="recent", category_key="el_handy", status="hot", latest_source="radar3_observed",
                 last_signal_at=now-timedelta(hours=3), current_score=91, peak_score=94, radar_rank=92),
             RadarProduct(product_key="old", category_key="el_handy", status="rising", latest_source="radar3_observed",
-                last_signal_at=now-timedelta(hours=25), current_score=82, last_signal_score=82, peak_score=95, radar_rank=85),
+                last_signal_at=now-timedelta(hours=49), current_score=82, last_signal_score=82, peak_score=95, radar_rank=85),
             RadarProduct(product_key="other", category_key="el_handy", status="hot", latest_source="scan_hot",
                 last_signal_at=now-timedelta(days=2), current_score=75, radar_rank=80),
         ])

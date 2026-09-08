@@ -510,6 +510,44 @@ async def init_db() -> None:
                 ))
             else:
                 await conn.execute(text(f"ALTER TABLE ai_early_winner_candidates ADD COLUMN {column_name} {sql_type}"))
+        # Retention time and the selected current evidence are independent.
+        product_columns = await conn.run_sync(lambda c: _table_columns(c, "radar_products"))
+        if product_columns and "current_signal_at" not in product_columns:
+            if _IS_POSTGRES:
+                await conn.execute(text("ALTER TABLE radar_products ADD COLUMN IF NOT EXISTS current_signal_at TIMESTAMP"))
+            else:
+                await conn.execute(text("ALTER TABLE radar_products ADD COLUMN current_signal_at TIMESTAMP"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_radar_products_current_signal_at ON radar_products (current_signal_at)"))
+        if product_columns and "current_signal_at" not in product_columns:
+            # One-time schema backfill only. A later NULL means the current
+            # evidence was explicitly invalidated and must not be resurrected.
+            await conn.execute(text("UPDATE radar_products SET current_signal_at = last_signal_at WHERE current_signal_at IS NULL AND latest_source = 'radar3_observed' AND status != 'historical'"))
+        # v4.23.12: early availability watches can exist before a product is scored.
+        # This is additive and serialized by the existing migration lock.
+        if _IS_POSTGRES:
+            await conn.execute(text("ALTER TABLE radar_lifecycle_watches ALTER COLUMN product_id DROP NOT NULL"))
+        lifecycle_columns = await conn.run_sync(lambda c: _table_columns(c, "radar_lifecycle_watches"))
+        for name, sql_type in {
+            "product_key": "VARCHAR(600) DEFAULT ''",
+            "enrollment_source": "VARCHAR(24) DEFAULT 'strong'",
+            "strong_qualified_at": "TIMESTAMP",
+        }.items():
+            if name in lifecycle_columns:
+                continue
+            if _IS_POSTGRES:
+                await conn.execute(text(f"ALTER TABLE radar_lifecycle_watches ADD COLUMN IF NOT EXISTS {name} {sql_type}"))
+            else:
+                await conn.execute(text(f"ALTER TABLE radar_lifecycle_watches ADD COLUMN {name} {sql_type}"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_radar_lifecycle_watches_product_key ON radar_lifecycle_watches (product_key)"))
+        if _IS_POSTGRES:
+            await conn.execute(text("""CREATE TABLE IF NOT EXISTS radar_lifecycle_events (
+                id SERIAL PRIMARY KEY, event_key VARCHAR(180) NOT NULL UNIQUE,
+                external_id VARCHAR(64) NOT NULL, product_key VARCHAR(600) NOT NULL DEFAULT '',
+                event_type VARCHAR(32) NOT NULL, reason VARCHAR(80) NOT NULL DEFAULT '',
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"""))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_radar_lifecycle_events_created_at ON radar_lifecycle_events (created_at)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_radar_lifecycle_events_event_type ON radar_lifecycle_events (event_type)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_radar_lifecycle_events_external_id ON radar_lifecycle_events (external_id)"))
         # v4.21.1 Radar 3.0 cross-replica observation leases. This prevents two
         # Parser replicas from refreshing/writing the same RadarObservation batch
         # at the same time (and removes a source of PostgreSQL lock cycles).
@@ -525,6 +563,11 @@ async def init_db() -> None:
             "consecutive_scored": "INTEGER DEFAULT 0",
             "strong_checkpoints": "INTEGER DEFAULT 0",
             "consecutive_strong": "INTEGER DEFAULT 0",
+            "rollback_count": "INTEGER DEFAULT 0",
+            "rollback_last_views": "INTEGER",
+            "rollback_first_at": "TIMESTAMP",
+            "provenance_reset_at": "TIMESTAMP",
+            "rollback_last_at": "TIMESTAMP",
         }.items():
             if not radar_observation_columns or column_name in radar_observation_columns:
                 continue

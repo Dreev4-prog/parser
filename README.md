@@ -1,3 +1,9 @@
+# DT Parser v4.23.12 — Radar 48H Demand Quality
+
+See `RELEASE_4_23_12.md`. Confirmed Live retention is 48h; current HOT/Rising still requires fresh evidence. Bounded exploration, rollback-safe counters, consistent category quantiles, truthful baseline counts and early availability checks improve demand coverage without inventing signals.
+
+---
+
 # DT Parser v4.23.11 — Radar Live & Checkpoint Visibility
 
 See `RELEASE_4_23_11.md`. Bounded category absence no longer retires confirmed Live signals; durable exact-checkpoint analytics expose real coverage and queue lag.

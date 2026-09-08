@@ -129,6 +129,8 @@ from radar import (
     get_radar_product, is_radar_favorite, list_radar_products, radar_categories, radar_stats,
     purge_nonorganic_analytics, record_autoscan_hot_detailed, record_user_scan_radar3_baselines, radar_v3_category_allowed,
     record_verified_velocity_signals, refresh_radar_scores, verify_listing_organic_now,
+    lifecycle_diagnostics, get_radar_recent_hot_infos, repair_radar_lifecycle_qualification_once,
+    repair_radar_v3_quality_once,
     prepare_radar_v3_once, repair_radar_v3_historical_scores_once, repair_radar_v3_live_retention_once, radar_v3_due_external_ids, radar_v3_claim_due_external_ids, radar_v3_release_claims, radar_v3_record_refreshed, radar_v3_expire_observations, radar_v3_expire_stale_products, radar_v3_rollover_successful_category, repair_radar_v3_depth_retirement_once,
     radar_v3_checkpoint_telemetry, radar_v3_prune_checkpoint_events,
     search_radar_products, toggle_radar_favorite,
@@ -1342,6 +1344,8 @@ def radar_best_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔥 Горячие", callback_data="radarlist:hot:0"),
          InlineKeyboardButton(text="🚀 Набирают", callback_data="radarlist:rising:0")],
         [InlineKeyboardButton(text="⚡ Быстро исчезли" + ("" if full else " · 🔒"), callback_data=fast_cb)],
+        [InlineKeyboardButton(text="🕘 Сильные за 48 часов" + ("" if full else " · 🔒"),
+                              callback_data="radarlist:hot48:0" if full else "radar_locked:records")],
     ]
     if full:
         rows.append([InlineKeyboardButton(text="🏆 Рекорды Radar", callback_data="radarlist:alltime:0")])
@@ -1426,6 +1430,8 @@ def radar_list_keyboard(
         if len(title) > 32:
             title = title[:31].rstrip() + "…"
         shown_score = int(product.peak_score or 0) if mode == "alltime" else int(product.current_score or 0)
+        if mode == "hot48":
+            icon = "🕘"
         rows.append([InlineKeyboardButton(
             text=f"{icon} {shown_score} · {title}",
             callback_data=f"radaritem:{int(product.id)}",
@@ -4576,6 +4582,8 @@ async def radar_maintenance_scheduler() -> None:
         await prepare_radar_v3_once()
         await repair_radar_v3_historical_scores_once()
         restored_live = await repair_radar_v3_live_retention_once()
+        await repair_radar_lifecycle_qualification_once()
+        await repair_radar_v3_quality_once()
         if restored_live:
             log.info("DT Radar 3.2 startup live-retention restore=%s", restored_live)
         # No legacy depth-retirement resurrection: History lacks a reliable
@@ -4634,7 +4642,7 @@ async def radar_v3_observation_scheduler() -> None:
                 continue
             async with radar_v3_view_refresh_lock:
                 requested, updated, failed = await refresh_view_counts(rows, None, force=True, max_age_seconds=0, traffic_priority="radar_checkpoint")
-            saved = await radar_v3_record_refreshed([str(x.external_id) for x in rows])
+            saved = await radar_v3_record_refreshed([str(x.external_id) for x in rows], owner=owner)
             # Successful observations release their own lease while being recorded;
             # failed/unchanged rows are released here for a clean retry next poll.
             released = await radar_v3_release_claims(owner, ids)
@@ -4708,6 +4716,9 @@ def _radar_autoscan_default_state() -> dict:
         "view_tail_deferred": 0,
         "view_tail_categories": 0,
         "radar_candidates": 0,
+        "radar_baseline_rearmed": 0,
+        "radar_baseline_existing": 0,
+        "radar_baseline_count_version": 2,
         "radar_high_baseline_pending": 0,
         "radar_high_baseline_verified": 0,
         "radar_detail_checked": 0,
@@ -4880,6 +4891,10 @@ def _radar_autoscan_normalize_state(raw: dict | None) -> dict:
     state["total"] = len(keys)
     state["current_index"] = max(0, min(len(keys), int(state.get("current_index") or 0)))
 
+    if "radar_baseline_count_version" not in raw_state:
+        state["radar_baseline_count_version"] = 1
+    for key in ("radar_baseline_rearmed", "radar_baseline_existing"):
+        state[key] = max(0, int(state.get(key) or 0))
     for key in (
         "processed", "successful", "failed", "skipped_nonproduct", "pages_verified",
         "listings_seen", "new_listings", "radar_saved", "views_requested", "views_verified",
@@ -4985,6 +5000,9 @@ def _radar_autoscan_new_round(state: dict, mode: str) -> dict:
         "view_tail_deferred": 0,
         "view_tail_categories": 0,
         "radar_candidates": 0,
+        "radar_baseline_rearmed": 0,
+        "radar_baseline_existing": 0,
+        "radar_baseline_count_version": 2,
         "radar_high_baseline_pending": 0,
         "radar_high_baseline_verified": 0,
         "radar_detail_checked": 0,
@@ -5082,6 +5100,9 @@ def _radar_autoscan_retry_round(state: dict) -> dict | None:
         "view_tail_deferred": 0,
         "view_tail_categories": 0,
         "radar_candidates": 0,
+        "radar_baseline_rearmed": 0,
+        "radar_baseline_existing": 0,
+        "radar_baseline_count_version": 2,
         "radar_high_baseline_pending": 0,
         "radar_high_baseline_verified": 0,
         "radar_detail_checked": 0,
@@ -5532,13 +5553,56 @@ def _radar3_checkpoint_text(stats: dict) -> str:
         + f"Фактическая задержка p50 / p95: <b>{lag50} / {lag95}</b>\n\n"
         + "<b>🧪 Воронка baseline за последние 24ч</b>\n"
         + f"Создано циклов: <b>{count('cohort_baselines')}</b> · ≥1 точный повтор: <b>{count('cohort_measured_once')}</b> · ≥2: <b>{count('cohort_measured_twice')}</b>\n"
-        + f"Есть положительный прирост: <b>{count('cohort_growth')}</b> · остановлено как слабые: <b>{count('cohort_quiet')}</b>\n"
+        + f"Есть положительный прирост: <b>{count('cohort_growth')}</b> · ещё исследуются: <b>{count('exploring')}</b>\n"
+        + f"Слабые завершённые: <b>{count('cohort_quiet')}</b> · после 1-го / ≥2 замеров: <b>{count('quiet_after_first_24h')} / {count('quiet_after_two_plus_24h')}</b>\n"
+        + f"Откаты счётчика / сбросы идентичности: <b>{count('cohort_rollback')} / {count('cohort_identity_reset')}</b>\n"
         + f"Журнал с версии 4.23.11: baseline <b>{count('baseline_events_24h')}</b> · точных повторов <b>{count('measured_events_24h')}</b> · положительных интервалов <b>{count('positive_events_24h')}</b>\n"
         + f"Истекли до 1-го / до 2-го замера: <b>{count('expired_before_first_24h')} / {count('expired_below_two_24h')}</b>\n"
         + "<i>Истечение без двух замеров не равно ошибке: часть слабых наблюдений завершается штатно. "
         + "Задержки считаются по фактически принятым exact-замерам. "
         + "Журнал не восстанавливает выдуманные замеры до обновления.</i>"
     )
+
+
+_radar_lifecycle_stats_cache: dict = {}
+_radar_lifecycle_stats_at = 0.0
+_radar_lifecycle_stats_task: asyncio.Task | None = None
+
+async def _radar_lifecycle_safe_snapshot() -> dict:
+    global _radar_lifecycle_stats_cache, _radar_lifecycle_stats_at, _radar_lifecycle_stats_task
+    now=time.monotonic()
+    if _radar_lifecycle_stats_cache and now-_radar_lifecycle_stats_at<30:
+        return dict(_radar_lifecycle_stats_cache)
+    if _radar_lifecycle_stats_task is None or _radar_lifecycle_stats_task.done():
+        async def refresh():
+            global _radar_lifecycle_stats_cache, _radar_lifecycle_stats_at
+            value=await asyncio.wait_for(lifecycle_diagnostics(), timeout=8)
+            _radar_lifecycle_stats_cache=dict(value)
+            _radar_lifecycle_stats_at=time.monotonic()
+            return value
+        _radar_lifecycle_stats_task=asyncio.create_task(refresh(),name="dt-radar-lifecycle-telemetry")
+        _radar_lifecycle_stats_task.add_done_callback(_consume_detached_radar_task)
+    try:
+        return dict(await asyncio.wait_for(asyncio.shield(_radar_lifecycle_stats_task),timeout=1.0))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return {**_radar_lifecycle_stats_cache,"stale":True}
+
+
+def _radar_lifecycle_text(stats: dict) -> str:
+    if not stats: return "⚡ Lifecycle: статистика загружается."
+    kinds=stats.get("events_24h") or {};statuses=stats.get("by_status") or {}
+    def n(key):return int(kinds.get(key) or 0)
+    age=stats.get("oldest_due_seconds")
+    return ("<b>⚡ Fast Sold · проверка доступности</b>\n"
+        f"Ранние/сильные наблюдения за 24ч: <b>{n('enrolled')}</b> · поздно для окна: <b>{n('skipped_late')}</b>\n"
+        f"Проверено доступными: <b>{n('active_checked')}</b> · неизвестно: <b>{n('unknown_checked')}</b> · исчезло: <b>{n('disappeared')}</b>\n"
+        f"В очереди сейчас: <b>{int(stats.get('due') or 0)}</b> · старейшее ожидание: <b>{'—' if age is None else str(int(age)//60)+'м'}</b>\n"
+        f"Активных ранних: <b>{int(statuses.get('early:watching') or 0)+int(statuses.get('early:confirming') or 0)}</b> · "
+        f"сильных: <b>{int(statuses.get('strong:watching') or 0)+int(statuses.get('strong:confirming') or 0)}</b>\n"
+        "<i>Исчезновение — подтверждённый прокси-сигнал, не доказанная продажа. "
+        "Раннее наблюдение само по себе не даёт Score или HOT.</i>")
 
 
 async def _radar3_analytics_text() -> str:
@@ -5548,6 +5612,7 @@ async def _radar3_analytics_text() -> str:
         _radar3_checkpoint_safe_snapshot(timeout_seconds=2.0),
     )
     checkpoint_text = _radar3_checkpoint_text(checkpoint_stats)
+    lifecycle_text = _radar_lifecycle_text(await _radar_lifecycle_safe_snapshot())
     category_lines = list(radar3.get("category_lines") or [])
     category_text = "\n".join(category_lines[:10]) if category_lines else "Пока подтверждённых категорий нет"
     if not any(k in radar3 for k in ("active", "early", "strong", "hot")):
@@ -5555,7 +5620,7 @@ async def _radar3_analytics_text() -> str:
             "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\n"
             "⚠️ Глубокая статистика сейчас считается или PostgreSQL занят.\n"
             "Live Status и AutoScan при этом продолжают работать независимо.\n\n"
-            + category_text + "\n\n" + checkpoint_text
+            + category_text + "\n\n" + checkpoint_text + "\n\n" + lifecycle_text
         )
     return (
         "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\n"
@@ -5574,7 +5639,7 @@ async def _radar3_analytics_text() -> str:
         f"Суммарный DT-observed прирост: <b>+{int(radar3.get('total_delta') or 0)}</b>\n\n"
         f"🟡 Early: <b>{int(radar3.get('early') or 0)}</b> · 📈 Strong: <b>{int(radar3.get('strong') or 0)}</b> · 🔥 Hot: <b>{int(radar3.get('hot') or 0)}</b>\n\n"
         "<b>🗂 Категории с живым спросом</b>\n"
-        + category_text + "\n\n" + checkpoint_text + "\n\n"
+        + category_text + "\n\n" + checkpoint_text + "\n\n" + lifecycle_text + "\n\n"
         "<i>Radar 3.2: &lt;3/ч — шум. Дальше объявление сравнивается только со своей категорией: "
         "P90 Candidate · P95 Early/Score · P98 Strong · P99 Hot при подтверждении. "
         "DT Score = 50% позиция в категории + 25% устойчивость + 15% ускорение + 10% повторяемость.</i>"
@@ -5828,7 +5893,8 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
             f"✅ delta verified <b>{int(summary.get('radar_high_baseline_verified') or 0)}</b>"
             if int(summary.get('radar_high_baseline_pending') or 0) or int(summary.get('radar_high_baseline_verified') or 0) else ""
         )
-        + f"\n📡 Radar 3.0 baseline создано: <b>{int(summary.get('radar_candidates') or 0)}</b>"
+        + f"\n📡 Radar 3.0 {('baseline создано' if int(summary.get('radar_baseline_count_version') or 1) >= 2 else 'baseline обработано (старый счётчик)')}: <b>{int(summary.get('radar_candidates') or 0)}</b>"
+        + (f" · повторно открыто <b>{int(summary.get('radar_baseline_rearmed') or 0)}</b> · уже были <b>{int(summary.get('radar_baseline_existing') or 0)}</b>" if int(summary.get('radar_baseline_count_version') or 1) >= 2 else "")
         + "\n⏱ Первый счётчик не оценивается; сигналы появятся только после повторных замеров DT"
         + f"\n🛡 Organic: <b>{int(summary['radar_organic_passed'])}</b> · TOP/Promo <b>{int(summary['radar_promoted_blocked'])}</b> · снижение <b>{int(summary['radar_reduced_blocked'])}</b> · unknown <b>{int(summary['radar_unknown_blocked'])}</b>"
         + (f"\n↳ unknown: {_radar_unknown_reason_text(summary.get('radar_unknown_reasons'))}" if int(summary.get('radar_unknown_blocked') or 0) else "")
@@ -6283,7 +6349,9 @@ async def _run_radar_autoscan_round_inner(bot: Bot) -> None:
                     state["view_tail_categories"] = int(state.get("view_tail_categories") or 0) + 1
                 state["radar_saved"] = int(state.get("radar_saved") or 0) + max(0, int(radar_saved or 0))
             if radar_stats is not None:
-                state["radar_candidates"] = int(state.get("radar_candidates") or 0) + int(radar_stats.eligible_with_views or 0)
+                state["radar_candidates"] = int(state.get("radar_candidates") or 0) + int(radar_stats.baseline_created or 0)
+                state["radar_baseline_rearmed"] = int(state.get("radar_baseline_rearmed") or 0) + int(radar_stats.baseline_rearmed or 0)
+                state["radar_baseline_existing"] = int(state.get("radar_baseline_existing") or 0) + int(radar_stats.baseline_existing or 0)
                 state["radar_high_baseline_pending"] = int(state.get("radar_high_baseline_pending") or 0) + int(radar_stats.high_baseline_pending or 0)
                 state["radar_high_baseline_verified"] = int(state.get("radar_high_baseline_verified") or 0) + int(radar_stats.high_baseline_verified or 0)
                 state["radar_detail_checked"] = int(state.get("radar_detail_checked") or 0) + int(radar_stats.detail_checked or 0)
@@ -16262,7 +16330,8 @@ async def _radar_home_text(user_id: int | None = None) -> str:
             "Посмотри, как Radar отбирает сильные товары из тысяч объявлений.\n\n"
             f"🎁 <b>Бесплатно:</b> первые {FREE_RADAR_PREVIEW_LIMIT} находок в каждом режиме «Лучшие сейчас».\n"
             "🔒 Поиск, Категории, Мой Radar и полные ленты открываются с подпиской.\n\n"
-            f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих · 🚀 <b>{stats.rising}</b> набирают · ⚡ <b>{stats.fast_sold}</b> Fast Sold.\n\n"
+            f"В каталоге за 48ч: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих сейчас · 🚀 <b>{stats.rising}</b> набирают · ⚡ <b>{stats.fast_sold}</b> Fast Sold.\n"
+            f"🕘 Сильные за 48ч: <b>{stats.recent_hot_48h}</b> · исторические сигналы отмечены отдельно.\n\n"
             "👁 <b>Observed Score</b> строится только на росте просмотров, который DT увидел после своего baseline."
         )
     return (
@@ -16272,7 +16341,8 @@ async def _radar_home_text(user_id: int | None = None) -> str:
         "🔎 <b>Поиск</b> — если уже знаешь название товара\n"
         "🗂 <b>Категории</b> — если хочешь посмотреть по разделам\n"
         "⭐ <b>Мой Radar</b> — сохранённые товары\n\n"
-        f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих · 🚀 <b>{stats.rising}</b> набирают · ⚡ <b>{stats.fast_sold}</b> Fast Sold.\n\n"
+        f"В каталоге за 48ч: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих сейчас · 🚀 <b>{stats.rising}</b> набирают · ⚡ <b>{stats.fast_sold}</b> Fast Sold.\n"
+            f"🕘 Сильные за 48ч: <b>{stats.recent_hot_48h}</b> · исторические сигналы отмечены отдельно.\n\n"
         "👁 <b>Observed Score</b>: первый счётчик не оценивается; Radar верит только собственным повторным замерам DT."
     )
 
@@ -16293,13 +16363,16 @@ async def _radar_list_payload(
         )
     titles = {
         "hot": "🔥 Горячие сейчас",
+        "hot48": "🕘 Сильные за 48 часов",
         "rising": "🚀 Набирают обороты",
         "ai": "🚀 Набирают обороты",
         "fastsold": "⚡ Быстро исчезли",
         "alltime": "🏆 Рекорды Radar",
         "favorites": "⭐ Мой Radar",
     }
-    if mode == "alltime" and not category_key and not preview:
+    if mode == "hot48" and not preview:
+        lines_hint = False
+    elif mode == "alltime" and not category_key and not preview:
         lines_hint = True
     else:
         lines_hint = False
@@ -16319,6 +16392,13 @@ async def _radar_list_payload(
             "В кнопке показывается 🏆 Peak Score; live-категории и поиск историю не смешивают.",
             "",
         ]
+    if mode == "hot48" and not preview:
+        lines += ["<i>Здесь сохранены реальные сильные сигналы за последние 48 часов. "
+                  "Это история наблюдений, а не обещание, что спрос растёт прямо сейчас. "
+                  "Свежие HOT/Rising остаются в отдельных режимах.</i>", ""]
+        hot_infos = await get_radar_recent_hot_infos([int(product.id) for product in rows])
+    else:
+        hot_infos = {}
     fast_infos = {}
     if mode == "fastsold" and rows and not preview:
         fast_infos = await get_fast_sold_infos([int(product.id) for product in rows])
@@ -16376,6 +16456,16 @@ async def _radar_list_payload(
                         f"🏆 Peak <b>{max(int(product.peak_score or 0), int(info.peak_score or 0))}</b>\n"
                         f"📂 {html.escape(cat_name)}"
                     )
+                    continue
+            if mode == "hot48":
+                hot_info = hot_infos.get(int(product.id))
+                if hot_info:
+                    hot_at, hot_score = hot_info
+                    lines.append(f"🕘 <b>{index}. {html.escape(str(product.title or 'Товар')[:70])}</b>\n"
+                        f"🏆 Сильный сигнал: <b>{hot_score}/100</b> · {html.escape(_radar_freshness(hot_at))}\n"
+                        f"Сейчас: <b>{html.escape(RADAR_STATUS_LABEL.get(str(product.status or ''), 'Stable'))}</b> · "
+                        f"📡 последний замер {html.escape(_radar_freshness(product.last_signal_at))}\n"
+                        f"📂 {html.escape(cat_name)} · 💶 {html.escape(_radar_product_price_text(product))}")
                     continue
             score_line = (
                 f"🕒 Последний Score <b>{int(product.current_score or 0)}</b>/100 · Peak <b>{int(product.peak_score or 0)}</b> · "
@@ -16447,6 +16537,11 @@ async def _radar_product_payload(
         f"📡 Последний сигнал: <b>{html.escape(_moscow_text(product.last_signal_at))}</b>",
         f"🕐 Свежесть: <b>{html.escape(_radar_freshness(product.last_signal_at))}</b>",
     ]
+    if str(product.latest_source or "") == "radar3_observed":
+        signal_age = max(0.0, (datetime.utcnow()-(product.last_signal_at or datetime.utcnow())).total_seconds()/3600.0)
+        if signal_age > 6:
+            lines += ["", "🕘 <b>Исторический сильный сигнал</b> — текущий рост не подтверждён новым замером. "
+                      "Товар сохраняется в каталоге до 48 часов; Peak Score не означает актуальный HOT."]
     if fast_info is not None:
         lines += [
             "",
@@ -16802,7 +16897,7 @@ async def radar_list_handler(callback: CallbackQuery, state: FSMContext) -> None
         page = max(0, int(parts[2])) if len(parts) > 2 else 0
     except Exception:
         page = 0
-    if mode not in {"hot", "rising", "ai", "fastsold", "alltime", "favorites"}:
+    if mode not in {"hot", "hot48", "rising", "ai", "fastsold", "alltime", "favorites"}:
         mode = "hot"
     full = allowed(callback.from_user.id)
     if not full:

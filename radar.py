@@ -26,6 +26,12 @@ from radar_ranking import (
     RADAR_48H_MAX_AGE_MINUTES, RadarRankEvidence, classify_radar_signal, demand_gate_for_age,
 )
 from traffic import TRAFFIC
+from radar_quality import (
+    ACTIVE_OBSERVATION_STATUSES, SCORABLE_OBSERVATION_STATUSES,
+    EXPLORATION_BATCH_LIMIT, EXPLORATION_INTERVAL_MINUTES, ROLLBACK_RETRY_MINUTES,
+    cohort_position, cohort_thresholds, qualifies_velocity, next_exploration_at,
+    rollback_transition,
+)
 from models import (
     AIEarlyWinnerCandidate,
     AIEarlyWinnerEvent,
@@ -36,6 +42,7 @@ from models import (
     ListingIntegrity,
     RadarFavorite,
     RadarLifecycleWatch,
+    RadarLifecycleEvent,
     RadarProduct,
     RadarProductListing,
     RadarObservation,
@@ -66,7 +73,10 @@ RADAR_V3_MAX_OBSERVATION_HOURS = 6
 # product may stay visible in the live catalogue for up to one day.  A later
 # bounded category scans cannot prove a listing disappeared. Only the age of
 # the last confirmed demand signal determines the normal Live expiry.
-RADAR_V3_LIVE_RETENTION_HOURS = 24
+RADAR_V3_LIVE_RETENTION_HOURS = 48
+RADAR_V3_CURRENT_SIGNAL_HOURS = 6
+RADAR_V3_QUALITY_REPAIR_SETTING = "dt_radar_v42312_quality_repair_v1"
+RADAR_V3_LIVE_48H_REPAIR_SETTING = "dt_radar_v42312_live_48h_repair_v1"
 # Radar 3.2: category-adaptive demand. Absolute thresholds are now only a
 # safety floor; ranking/status is decided relative to the live category cohort.
 RADAR_V3_NOISE_FLOOR_VPH = 3.0
@@ -103,6 +113,10 @@ RADAR_DETAIL_FINAL_RETRY_SECONDS = 2.5
 # absolute checkpoints after first discovery. A disappearance is never accepted
 # from one miss: a second direct detail-page check confirms it a few minutes later.
 RADAR_LIFECYCLE_MIN_SCORE = 72
+RADAR_LIFECYCLE_EARLY_GLOBAL_CAP = 300
+RADAR_LIFECYCLE_EARLY_CATEGORY_CAP = 8
+RADAR_LIFECYCLE_EARLY_MIN_VIEWS = 15
+RADAR_LIFECYCLE_EARLY_MAX_INITIAL_VIEWS = 399
 RADAR_LIFECYCLE_CHECK_MINUTES = (15, 30, 60, 120, 180)
 RADAR_LIFECYCLE_CONFIRM_MINUTES = 3
 RADAR_LIFECYCLE_UNKNOWN_RETRY_MINUTES = 5
@@ -119,7 +133,7 @@ def _radar_checkpoint_event_values(obs: RadarObservation, event_type: str, *,
                                    measured_at: datetime | None = None,
                                    delta_views: int | None = None,
                                    now: datetime | None = None) -> dict:
-    if event_type not in {"baseline", "measured", "expired", "quiet"}:
+    if event_type not in {"baseline", "measured", "expired", "quiet", "rollback", "identity_reset"}:
         raise ValueError("Unsupported Radar checkpoint event type")
     now = now or datetime.utcnow()
     due = scheduled_at if scheduled_at is not None else obs.next_check_at
@@ -132,7 +146,7 @@ def _radar_checkpoint_event_values(obs: RadarObservation, event_type: str, *,
         scheduled_at=due, measured_at=measured_at,
         delay_seconds=(max(0.0, (measured_at - due).total_seconds())
                        if measured_at is not None and due is not None and event_type == "measured" else None),
-        delta_views=(max(0, int(delta_views)) if delta_views is not None else None),
+        delta_views=(int(delta_views) if delta_views is not None else None),
         created_at=now,
     )
 
@@ -151,6 +165,12 @@ async def _insert_radar_checkpoint_events(session, values: list[dict]) -> None:
                                   index_elements=["external_id", "baseline_at", "checkpoint_no", "event_type"]))
 
 
+async def _radar_exploration_count() -> int:
+    async with SessionLocal() as session:
+        return int((await session.execute(select(func.count(RadarObservation.id)).where(
+            RadarObservation.status == "exploring"))).scalar_one() or 0)
+
+
 async def radar_v3_checkpoint_telemetry() -> dict:
     """Read-only queue health and a truthful, cycle-based 24h funnel.
 
@@ -159,7 +179,7 @@ async def radar_v3_checkpoint_telemetry() -> dict:
     """
     now = datetime.utcnow()
     start = now - timedelta(hours=24)
-    active = ["baseline", "candidate", "observed", "confirmed"]
+    active = list(ACTIVE_OBSERVATION_STATUSES)
     live = or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now)
     due = [RadarObservation.status.in_(active), RadarObservation.next_check_at.is_not(None),
            RadarObservation.next_check_at <= now, live]
@@ -182,6 +202,8 @@ async def radar_v3_checkpoint_telemetry() -> dict:
             func.max(case((RadarCheckpointEvent.event_type == "measured", RadarCheckpointEvent.delta_views > 0), else_=0)).label("growth"),
             func.max(case((RadarCheckpointEvent.event_type == "quiet", 1), else_=0)).label("quiet"),
             func.max(case((RadarCheckpointEvent.event_type == "expired", 1), else_=0)).label("expired"),
+            func.max(case((RadarCheckpointEvent.event_type == "rollback", 1), else_=0)).label("rollback"),
+            func.max(case((RadarCheckpointEvent.event_type == "identity_reset", 1), else_=0)).label("identity_reset"),
             func.max(case((RadarCheckpointEvent.event_type == "baseline", 1), else_=0)).label("has_baseline"),
         ).where(
             RadarCheckpointEvent.baseline_at >= start,
@@ -195,6 +217,10 @@ async def radar_v3_checkpoint_telemetry() -> dict:
             func.count().filter(cycle.c.quiet > 0),
             func.count().filter(cycle.c.expired > 0, cycle.c.checks == 0),
             func.count().filter(cycle.c.expired > 0, cycle.c.checks < 2),
+            func.count().filter(cycle.c.rollback > 0),
+            func.count().filter(cycle.c.identity_reset > 0),
+            func.count().filter(cycle.c.quiet > 0, cycle.c.checks == 1),
+            func.count().filter(cycle.c.quiet > 0, cycle.c.checks >= 2),
         ).select_from(cycle).where(cycle.c.has_baseline > 0))).one()
         event_counts = (await session.execute(select(
             func.count(RadarCheckpointEvent.id).filter(RadarCheckpointEvent.event_type == "baseline"),
@@ -230,6 +256,11 @@ async def radar_v3_checkpoint_telemetry() -> dict:
         "cohort_baselines": int(cohort[0] or 0), "cohort_measured_once": int(cohort[1] or 0),
         "cohort_measured_twice": int(cohort[2] or 0), "cohort_growth": int(cohort[3] or 0),
         "cohort_quiet": int(cohort[4] or 0),
+        "exploring": int((await _radar_exploration_count()) or 0),
+        "cohort_rollback": int(cohort[7] or 0),
+        "cohort_identity_reset": int(cohort[8] or 0),
+        "quiet_after_first_24h": int(cohort[9] or 0),
+        "quiet_after_two_plus_24h": int(cohort[10] or 0),
         "expired_before_first_24h": int(cohort[5] or 0),
         "expired_below_two_24h": int(cohort[6] or 0),
         "baseline_events_24h": int(event_counts[0] or 0), "measured_events_24h": int(event_counts[1] or 0),
@@ -274,7 +305,53 @@ def _visible_product_association_exists(product_id_expr):
     All current callers are RadarProduct queries, so the certification predicate
     must bind directly to the outer RadarProduct row (not an uncorrelated EXISTS).
     """
-    return RadarProduct.organic_verified_at.is_not(None) & _clean_product_association_exists(product_id_expr)
+    return (RadarProduct.organic_verified_at.is_not(None)
+            & _clean_product_association_exists(product_id_expr)
+            & ~select(RadarProductListing.id).where(
+                RadarProductListing.product_id == product_id_expr,
+                _radar_provenance_pending(RadarProductListing.external_id),
+            ).exists())
+
+
+def _active_radar_listing_exists(external_id_expr):
+    """A confirmed disappearance excludes only that listing, not its family."""
+    return select(Listing.external_id).where(
+        Listing.external_id == external_id_expr,
+        Listing.is_active.is_(True), _clean_listing_exists(Listing.external_id),
+        ~select(RadarLifecycleWatch.id).where(
+            RadarLifecycleWatch.external_id == Listing.external_id,
+            RadarLifecycleWatch.status == "disappeared",
+        ).exists(),
+    ).exists()
+
+
+def _live_radar_product_exists(product_id_expr):
+    return select(RadarProductListing.id).join(
+        Listing, Listing.external_id == RadarProductListing.external_id).where(
+        RadarProductListing.product_id == product_id_expr,
+        Listing.is_active.is_(True), _clean_listing_exists(Listing.external_id),
+        ~select(RadarLifecycleWatch.id).where(
+            RadarLifecycleWatch.external_id == Listing.external_id,
+            RadarLifecycleWatch.status == "disappeared",
+        ).exists(),
+    ).exists()
+
+
+def _recent_hot_snapshot_exists(product_id_expr, now: datetime):
+    return select(RadarSnapshot.id).where(
+        RadarSnapshot.product_id == product_id_expr,
+        RadarSnapshot.source == "radar3_observed",
+        RadarSnapshot.demand_status == "hot",
+        RadarSnapshot.recorded_at >= now-timedelta(hours=RADAR_V3_LIVE_RETENTION_HOURS),
+        _active_radar_listing_exists(RadarSnapshot.external_id),
+        ~_radar_provenance_pending(RadarSnapshot.external_id),
+        # A reset starts a new demand history; earlier snapshots are not current proof.
+        ~select(RadarObservation.id).where(
+            RadarObservation.external_id == RadarSnapshot.external_id,
+            RadarObservation.provenance_reset_at.is_not(None),
+            RadarSnapshot.recorded_at < RadarObservation.provenance_reset_at,
+        ).exists(),
+    ).exists()
 
 
 async def _lock_integrity_external_id(session, external_id: str) -> None:
@@ -306,7 +383,7 @@ def _clean_listing_exists(external_id_expr):
         Listing.is_promoted.is_(False),
         Listing.is_price_reduced.is_(False),
         ~_registry_dirty_exists(Listing.external_id),
-    ).exists()
+    ).correlate_except(Listing).exists()
 
 
 def _clean_product_association_exists(product_id_expr):
@@ -529,6 +606,9 @@ async def verify_listing_organic_now(
 @dataclass(frozen=True)
 class RadarAdmissionStats:
     eligible_with_views: int = 0
+    baseline_created: int = 0
+    baseline_rearmed: int = 0
+    baseline_existing: int = 0
     high_baseline_pending: int = 0
     high_baseline_verified: int = 0
     reserve_considered: int = 0
@@ -558,12 +638,13 @@ class RadarStats:
     categories: int
     signals: int
     fast_sold: int = 0
+    recent_hot_48h: int = 0
 
 
 @dataclass(frozen=True)
 class LifecycleJob:
     id: int
-    product_id: int
+    product_id: int | None
     external_id: str
     url: str
     first_seen_at: datetime
@@ -767,13 +848,16 @@ def _snapshot_live_evidence(snapshot: RadarSnapshot, now: datetime):
     if recorded_at is not None:
         elapsed_minutes = max(0.0, (now - recorded_at).total_seconds() / 60.0)
     effective_age = max(0.0, float(getattr(snapshot, "demand_age_minutes", 0.0) or 0.0)) + elapsed_minutes
+    if str(getattr(snapshot, "source", "") or "") == "lifecycle":
+        return RadarRankEvidence("historical", 0.0, 0, 1.0, 0.0, False)
     if str(getattr(snapshot, "source", "") or "") == "radar3_observed":
-        # Radar 3.2 evidence is live, not a 48-hour trophy. Active remeasurement
-        # still ends after six hours, but the confirmed catalogue result may stay
-        # visible for the separate 24-hour retention window between AutoScan passes.
+        # 48h is catalog retention, not proof of current demand. Historical peak
+        # remains available, while the current HOT/Rising feed needs fresh evidence.
         if elapsed_minutes > float(RADAR_V3_LIVE_RETENTION_HOURS * 60):
             return RadarRankEvidence("historical", 0.0, 0, 1.0, 0.0, False)
         status = str(getattr(snapshot, "demand_status", "stable") or "stable")
+        if elapsed_minutes > RADAR_V3_CURRENT_SIGNAL_HOURS * 60:
+            status = "stable"
         return RadarRankEvidence(status, float(getattr(snapshot, "radar_rank", 0.0) or 0.0), 0, 1.0, 0.0, True)
     return classify_radar_signal(
         dt_score=int(snapshot.score or 0),
@@ -791,77 +875,225 @@ def _next_lifecycle_checkpoint(first_seen_at: datetime, now: datetime) -> tuple[
     return None
 
 
+async def _lifecycle_event(session, external_id: str, event_type: str, *,
+                           key: str, product_key: str = "", reason: str = "", now: datetime | None = None) -> None:
+    """Append-only, idempotent lifecycle decisions without any secret/raw payload."""
+    values = dict(event_key=key[:180], external_id=str(external_id),
+                  product_key=str(product_key or "")[:600], event_type=event_type[:32],
+                  reason=reason[:80], created_at=now or datetime.utcnow())
+    bind = session.get_bind()
+    insert_stmt = pg_insert(RadarLifecycleEvent) if bind.dialect.name == "postgresql" else sqlite_insert(RadarLifecycleEvent)
+    await session.execute(insert_stmt.values(**values).on_conflict_do_nothing(index_elements=["event_key"]))
+
+
+async def _maybe_queue_early_lifecycle(session, listing: Listing, now: datetime,
+                                       *, budget: dict) -> bool:
+    """A bounded availability-only sample, never a baseline/Score admission."""
+    ext = str(listing.external_id)
+    first_seen = listing.first_seen_at or now
+    if (not listing.is_active or not listing.url or
+            not radar_v3_category_allowed(str(listing.category_key or "")) or
+            not (RADAR_LIFECYCLE_EARLY_MIN_VIEWS <= int(listing.view_count or 0) <= RADAR_LIFECYCLE_EARLY_MAX_INITIAL_VIEWS) or
+            not (0 <= (now-first_seen).total_seconds() <= 3600) or
+            (listing.posted_date_msk and listing.posted_date_msk != datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat())):
+        return False
+    if budget["total"] >= RADAR_LIFECYCLE_EARLY_GLOBAL_CAP or budget["category"] >= RADAR_LIFECYCLE_EARLY_CATEGORY_CAP:
+        return False
+    # This helper is called from the shared serialized baseline transaction.
+    # Strong watches and already checked external IDs are never replaced.
+    if (await session.execute(select(RadarLifecycleWatch.id).where(
+        RadarLifecycleWatch.external_id == ext).limit(1))).scalar_one_or_none() is not None:
+        return False
+    allowed, _ = await _strict_organic_gate(session, ext)
+    if not allowed:
+        return False
+    checkpoint = _next_lifecycle_checkpoint(first_seen, now)
+    if checkpoint is None:
+        return False
+    step, due = checkpoint
+    session.add(RadarLifecycleWatch(
+        product_id=None, product_key=radar_product_key(listing), enrollment_source="early",
+        external_id=ext, category_key=str(listing.category_key or ""),
+        title=str(listing.identity_label or listing.title or "")[:500], url=str(listing.url)[:1200],
+        first_seen_at=first_seen, radar_started_at=now, last_seen_at=listing.last_seen_at or now,
+        status="watching", tier="E", score=0, peak_score=0,
+        last_views=int(listing.view_count or 0), last_price_eur=listing.price_eur,
+        check_step=step, next_check_at=due, created_at=now, updated_at=now,
+    ))
+    await _lifecycle_event(session, ext, "enrolled", key=f"early:{ext}",
+                           product_key=radar_product_key(listing), reason="early", now=now)
+    budget["total"] += 1
+    budget["category"] += 1
+    return True
+
+
 async def _maybe_queue_lifecycle_watch(
     session, *, product: RadarProduct, listing: Listing, score: int, now: datetime,
     demand_status: str = "historical",
 ) -> None:
-    """Enroll a fresh strong listing in the durable Lifecycle queue.
-
-    The helper runs inside the same transaction as the Radar signal. Existing
-    watches are only refreshed; disappeared/expired history is never resurrected.
-    """
-    if int(score or 0) < RADAR_LIFECYCLE_MIN_SCORE:
+    if int(score or 0) < RADAR_LIFECYCLE_MIN_SCORE or str(demand_status or "") not in {"hot", "rising"}:
         return
-    if str(demand_status or "") not in {"hot", "rising"}:
+    if not listing.is_active or not str(listing.url or "").strip():
         return
-    if not bool(listing.is_active) or not str(listing.url or "").strip():
-        return
+    ext = str(listing.external_id)
     first_seen = listing.first_seen_at or now
-    checkpoint = _next_lifecycle_checkpoint(first_seen, now)
-    if checkpoint is None:
-        return
     bind = session.get_bind()
-    if bind is not None and bind.dialect.name == "postgresql":
-        await session.execute(
-            text("SELECT pg_advisory_xact_lock(CAST(hashtext(:lifecycle_key) AS bigint))"),
-            {"lifecycle_key": f"lifecycle:{listing.external_id}"},
-        )
-    existing = (await session.execute(
-        select(RadarLifecycleWatch).where(
-            RadarLifecycleWatch.external_id == str(listing.external_id)
-        ).limit(1)
-    )).scalar_one_or_none()
-    tier = "A" if int(score or 0) >= 85 else "B"
+    if bind.dialect.name == "postgresql":
+        await session.execute(text("SELECT pg_advisory_xact_lock(CAST(hashtext(:key) AS bigint))"),
+                              {"key": f"lifecycle:{ext}"})
+    existing = (await session.execute(select(RadarLifecycleWatch).where(
+        RadarLifecycleWatch.external_id == ext).limit(1))).scalar_one_or_none()
     if existing is None:
-        step, next_check = checkpoint
-        session.add(RadarLifecycleWatch(
-            product_id=int(product.id),
-            external_id=str(listing.external_id),
+        checkpoint = _next_lifecycle_checkpoint(first_seen, now)
+        if checkpoint is None:
+            await _lifecycle_event(session, ext, "skipped_late", key=f"late:{ext}",
+                                   product_key=radar_product_key(listing), reason="strong_after_3h", now=now)
+            return
+        step, due = checkpoint
+        existing = RadarLifecycleWatch(
+            product_id=int(product.id), product_key=radar_product_key(listing),
+            enrollment_source="strong", strong_qualified_at=now, external_id=ext,
             category_key=str(listing.category_key or ""),
             title=str(listing.identity_label or listing.title or "")[:500],
-            url=str(listing.url or "")[:1200],
-            first_seen_at=first_seen,
-            radar_started_at=now,
-            last_seen_at=listing.last_seen_at or now,
-            status="watching",
-            tier=tier,
-            score=int(score or 0),
-            peak_score=int(score or 0),
+            url=str(listing.url or "")[:1200], first_seen_at=first_seen,
+            radar_started_at=now, last_seen_at=listing.last_seen_at or now,
+            status="watching", tier="A" if score>=85 else "B",
+            score=int(score), peak_score=int(score),
             last_views=(int(listing.view_count) if listing.view_count is not None else None),
-            last_price_eur=listing.price_eur,
-            check_step=int(step),
-            next_check_at=next_check,
-            created_at=now,
-            updated_at=now,
-        ))
-        log.info(
-            "DT Radar Lifecycle queued external_id=%s product=%s score=%s next=%s",
-            listing.external_id, product.id, score, next_check.isoformat(timespec="seconds"),
+            last_price_eur=listing.price_eur, check_step=step, next_check_at=due,
+            created_at=now, updated_at=now,
         )
+        session.add(existing)
+        await _lifecycle_event(session, ext, "enrolled", key=f"strong:{ext}",
+                               product_key=radar_product_key(listing), reason="strong", now=now)
         return
-    if str(existing.status or "") in {"disappeared", "expired"}:
+    if str(existing.status or "") in {"disappeared", "expired", "excluded"}:
+        # A later score does not retrospectively establish demand before a sale.
         return
-    existing.product_id = int(product.id)
+    if existing.product_id is None:
+        existing.product_id = int(product.id)
+        existing.strong_qualified_at = now
+        await _lifecycle_event(session, ext, "strong_linked", key=f"strong-link:{ext}",
+                               product_key=radar_product_key(listing), reason="early_watch", now=now)
+    if existing.strong_qualified_at is None:
+        existing.strong_qualified_at = now
+    existing.product_key = radar_product_key(listing)
     existing.category_key = str(listing.category_key or existing.category_key or "")
     existing.title = str(listing.identity_label or listing.title or existing.title or "")[:500]
     existing.url = str(listing.url or existing.url or "")[:1200]
     existing.score = max(int(existing.score or 0), int(score or 0))
     existing.peak_score = max(int(existing.peak_score or 0), int(score or 0))
-    existing.tier = "A" if int(existing.peak_score or 0) >= 85 else "B"
-    existing.last_views = max(int(existing.last_views or 0), int(listing.view_count or 0)) if listing.view_count is not None else existing.last_views
-    existing.last_price_eur = listing.price_eur if listing.price_eur is not None else existing.last_price_eur
+    existing.tier = "A" if existing.peak_score>=85 else "B"
+    if listing.view_count is not None:
+        existing.last_views = max(int(existing.last_views or 0), int(listing.view_count))
+    if listing.price_eur is not None:
+        existing.last_price_eur = int(listing.price_eur)
     existing.last_seen_at = max(existing.last_seen_at or now, listing.last_seen_at or now)
     existing.updated_at = now
+
+
+def _observed_signal_matches(obs: RadarObservation | None, recorded_at: datetime,
+                             view_count: int | None) -> bool:
+    """Reject stale/detached signals after another checkpoint or provenance reset."""
+    return bool(obs is not None
+        and str(obs.status) in {"observed", "confirmed"}
+        and int(obs.checkpoint_count or 0) >= 1
+        and obs.last_measured_at == recorded_at
+        and view_count is not None and int(obs.last_views or 0) == int(view_count)
+        and (obs.provenance_reset_at is None or recorded_at >= obs.provenance_reset_at))
+
+
+async def _refresh_family_from_snapshots(session, product: RadarProduct, now: datetime) -> None:
+    """Select current demand only from available, provenance-safe members.
+
+    The family retention clock and the selected demand clock are independent.
+    Availability is not demand: this function never creates a snapshot or
+    increments a score. Peak Score and the last valid retention clock survive
+    a family-wide disappearance for historical reporting.
+    """
+# Product-level live score is based on the newest signal for each
+    # distinct listing, then takes the strongest currently observed listing.
+    # A later lower AI checkpoint can therefore cool one listing, while a
+    # second independently strong listing can keep the product family hot.
+    await session.flush()
+    recent_snapshots = list((await session.execute(
+        select(RadarSnapshot)
+        .where(
+            RadarSnapshot.product_id == int(product.id),
+            RadarSnapshot.recorded_at >= now - timedelta(hours=48),
+        )
+        .order_by(RadarSnapshot.recorded_at.desc(), RadarSnapshot.id.desc())
+        .limit(300)
+    )).scalars().all())
+    latest_by_listing: dict[str, RadarSnapshot] = {}
+    for snap in recent_snapshots:
+        ext = str(snap.external_id or f"snapshot:{snap.id}")
+        if ext not in latest_by_listing:
+            latest_by_listing[ext] = snap
+    provenance_rows = (await session.execute(select(
+        RadarObservation.external_id, RadarObservation.status,
+        RadarObservation.provenance_reset_at,
+    ).where(RadarObservation.external_id.in_(list(latest_by_listing))))).all()
+    provenance = {str(ext): (str(status), reset_at) for ext, status, reset_at in provenance_rows}
+    unsafe_ids = {ext for ext, (status, _) in provenance.items()
+                  if status in {"rollback_pending", "identity_reset"}}
+    valid_listing_ids = set((await session.execute(select(Listing.external_id).where(
+        Listing.external_id.in_(list(latest_by_listing)), Listing.is_active.is_(True),
+        _clean_listing_exists(Listing.external_id),
+        ~select(RadarLifecycleWatch.id).where(
+            RadarLifecycleWatch.external_id == Listing.external_id,
+            RadarLifecycleWatch.status == "disappeared",
+        ).exists(),
+    ))).scalars().all())
+    live_ranked = []
+    for snap in latest_by_listing.values():
+        if str(snap.external_id) not in valid_listing_ids or snap.source == "lifecycle":
+            continue
+        ext = str(snap.external_id)
+        if ext in unsafe_ids: continue
+        _, reset_at = provenance.get(ext, ("", None))
+        if snap.source == "radar3_observed" and reset_at and snap.recorded_at < reset_at:
+            continue
+        live_evidence = _snapshot_live_evidence(snap, now)
+        if live_evidence.admitted:
+            live_ranked.append((snap, live_evidence))
+    if live_ranked:
+        strongest_ranked, strongest_evidence = max(
+            live_ranked,
+            key=lambda pair: (
+                2 if pair[1].status == "hot" else 1 if pair[1].status == "rising" else 0,
+                float(pair[1].radar_rank), int(pair[0].score or 0),
+                int(pair[0].confidence or 0), pair[0].recorded_at,
+            ),
+        )
+        product.last_signal_score = int(strongest_ranked.score or 0)
+        product.current_signal_at = strongest_ranked.recorded_at
+        product.last_signal_at = max(snap.recorded_at for snap, _ in live_ranked)
+        product.radar_rank = float(strongest_evidence.radar_rank)
+        product.demand_views = int(getattr(strongest_ranked, "demand_views", 0) or 0)
+        product.demand_age_minutes = float(getattr(strongest_ranked, "demand_age_minutes", 0.0) or 0.0)
+        product.demand_gate = int(strongest_evidence.demand_gate if strongest_evidence.demand_gate < 10**9 else 0)
+        product.status = str(strongest_evidence.status)
+        product.confidence = int(strongest_ranked.confidence or 0)
+        product.opportunity_type = str(strongest_ranked.opportunity_type or "spark")[:32]
+        product.representative_external_id = str(strongest_ranked.external_id or product.representative_external_id)
+        product.latest_source = str(strongest_ranked.source or "")[:32]
+        product.last_ai_candidate_id = strongest_ranked.candidate_id
+        try:
+            strongest_reasons = json.loads(strongest_ranked.reasons_json or "[]")
+            product.latest_reason = str(strongest_reasons[0] if isinstance(strongest_reasons, list) and strongest_reasons else "")[:800]
+        except Exception:
+            product.latest_reason = ""
+        product.current_score = _effective_score(product, now)
+    else:
+        product.current_signal_at = None
+        product.last_signal_score = 0
+        product.current_score = 0
+        product.radar_rank = 0.0
+        product.demand_views = 0
+        product.demand_age_minutes = 0.0
+        product.demand_gate = 0
+        product.status = "historical"
 
 
 async def _upsert_signal(
@@ -903,6 +1135,20 @@ async def _upsert_signal(
             )
             return None
     now = recorded_at or datetime.utcnow()
+    if not bool(getattr(listing, "is_active", True)):
+        return None
+    async with SessionLocal() as availability_session:
+        if (await availability_session.execute(select(RadarLifecycleWatch.id).where(
+            RadarLifecycleWatch.external_id == str(listing.external_id),
+            RadarLifecycleWatch.status == "disappeared",
+        ).limit(1))).scalar_one_or_none() is not None:
+            return None
+    if source == "radar3_observed":
+        async with SessionLocal() as provenance_session:
+            provenance = (await provenance_session.execute(select(RadarObservation).where(
+                RadarObservation.external_id == str(listing.external_id)).limit(1))).scalar_one_or_none()
+            if not _observed_signal_matches(provenance, now, view_count):
+                return None
     score = _clamp_score(score)
     confidence = _clamp_score(confidence)
     if demand_views is None or demand_age_minutes is None:
@@ -946,6 +1192,14 @@ async def _upsert_signal(
             # is not enough to admit a signal. The shared integrity advisory lock
             # closes the cross-process race with parser-side sticky flag writes.
             allowed, gate_reason = await _strict_organic_gate(session, str(listing.external_id or ""))
+            if allowed and str(source) == "radar3_observed":
+                provenance_query = select(RadarObservation).where(
+                    RadarObservation.external_id == str(listing.external_id)).limit(1)
+                if session.get_bind().dialect.name == "postgresql":
+                    provenance_query = provenance_query.with_for_update()
+                current_provenance = (await session.execute(provenance_query)).scalar_one_or_none()
+                if not _observed_signal_matches(current_provenance, now, view_count):
+                    allowed, gate_reason = False, "unverified_counter_provenance"
             if not allowed:
                 log.warning(
                     "Strict Organic Radar Gate blocked source=%s external_id=%s reason=%s",
@@ -990,6 +1244,7 @@ async def _upsert_signal(
                     organic_verified_at=live_detail_verified_at or datetime.utcnow(),
                     bump_sweep_verified_at=live_detail_verified_at or datetime.utcnow(),
                     last_signal_at=now,
+                    current_signal_at=now,
                     last_signal_score=score,
                     current_score=score,
                     peak_score=score,
@@ -1129,61 +1384,8 @@ async def _upsert_signal(
                 product.max_price_eur = price if product.max_price_eur is None else max(int(product.max_price_eur), price)
             product.peak_score = max(int(product.peak_score or 0), score)
 
-            # Product-level live score is based on the newest signal for each
-            # distinct listing, then takes the strongest currently observed listing.
-            # A later lower AI checkpoint can therefore cool one listing, while a
-            # second independently strong listing can keep the product family hot.
             await session.flush()
-            recent_snapshots = list((await session.execute(
-                select(RadarSnapshot)
-                .where(
-                    RadarSnapshot.product_id == int(product.id),
-                    RadarSnapshot.recorded_at >= now - timedelta(hours=48),
-                )
-                .order_by(RadarSnapshot.recorded_at.desc(), RadarSnapshot.id.desc())
-                .limit(300)
-            )).scalars().all())
-            latest_by_listing: dict[str, RadarSnapshot] = {}
-            for snap in recent_snapshots:
-                ext = str(snap.external_id or f"snapshot:{snap.id}")
-                if ext not in latest_by_listing:
-                    latest_by_listing[ext] = snap
-            live_ranked = []
-            for snap in latest_by_listing.values():
-                live_evidence = _snapshot_live_evidence(snap, now)
-                if live_evidence.admitted:
-                    live_ranked.append((snap, live_evidence))
-            if live_ranked:
-                strongest_ranked, strongest_evidence = max(
-                    live_ranked,
-                    key=lambda pair: (float(pair[1].radar_rank), int(pair[0].score or 0), int(pair[0].confidence or 0)),
-                )
-                product.last_signal_score = int(strongest_ranked.score or 0)
-                product.last_signal_at = strongest_ranked.recorded_at
-                product.radar_rank = float(strongest_evidence.radar_rank)
-                product.demand_views = int(getattr(strongest_ranked, "demand_views", 0) or 0)
-                product.demand_age_minutes = float(getattr(strongest_ranked, "demand_age_minutes", 0.0) or 0.0)
-                product.demand_gate = int(strongest_evidence.demand_gate if strongest_evidence.demand_gate < 10**9 else 0)
-                product.status = str(strongest_evidence.status)
-                product.confidence = int(strongest_ranked.confidence or 0)
-                product.opportunity_type = str(strongest_ranked.opportunity_type or "spark")[:32]
-                product.representative_external_id = str(strongest_ranked.external_id or listing.external_id)
-                product.latest_source = str(strongest_ranked.source or "")[:32]
-                product.last_ai_candidate_id = strongest_ranked.candidate_id
-                try:
-                    strongest_reasons = json.loads(strongest_ranked.reasons_json or "[]")
-                    product.latest_reason = str(strongest_reasons[0] if isinstance(strongest_reasons, list) and strongest_reasons else "")[:800]
-                except Exception:
-                    product.latest_reason = ""
-                product.current_score = _effective_score(product, now)
-            else:
-                product.last_signal_score = 0
-                product.current_score = 0
-                product.radar_rank = 0.0
-                product.demand_views = 0
-                product.demand_age_minutes = 0.0
-                product.demand_gate = 0
-                product.status = "historical"
+            await _refresh_family_from_snapshots(session, product, datetime.utcnow())
             product.updated_at = now
             await _maybe_queue_lifecycle_watch(
                 session, product=product, listing=listing, score=score, now=now, demand_status=demand_status
@@ -1311,7 +1513,12 @@ async def record_autoscan_hot_detailed(
         return RadarAdmissionStats()
     now = datetime.utcnow()
     seeded = 0
+    rearmed = 0
+    already = 0
     async with SessionLocal() as session:
+        if session.get_bind().dialect.name == "postgresql":
+            await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                                  {"key": "radar3-user-scan-baseline-seed"})
         rows = list((await session.execute(select(Listing).where(
             Listing.external_id.in_(ids),
             Listing.category_key == str(category_key),
@@ -1320,48 +1527,52 @@ async def record_autoscan_hot_detailed(
             Listing.view_count.is_not(None),
             ~_registry_dirty_exists(Listing.external_id),
         ))).scalars().all())
-        existing_rows = list((await session.execute(
-            select(RadarObservation).where(RadarObservation.external_id.in_(ids))
-        )).scalars().all())
+        existing_query = select(RadarObservation).where(RadarObservation.external_id.in_(ids))
+        if session.get_bind().dialect.name == "postgresql":
+            existing_query = existing_query.with_for_update()
+        existing_rows = list((await session.execute(existing_query)).scalars().all())
         existing_map = {str(x.external_id): x for x in existing_rows}
+        early_total = int((await session.execute(select(func.count(RadarLifecycleWatch.id)).where(
+            RadarLifecycleWatch.enrollment_source == "early",
+            RadarLifecycleWatch.status.in_(["watching", "confirming"]),
+        ))).scalar_one() or 0)
+        early_categories = {str(cat):int(count) for cat,count in (await session.execute(select(
+            RadarLifecycleWatch.category_key, func.count(RadarLifecycleWatch.id)).where(
+            RadarLifecycleWatch.enrollment_source == "early",
+            RadarLifecycleWatch.status.in_(["watching", "confirming"]),
+        ).group_by(RadarLifecycleWatch.category_key))).all()}
         for listing in rows:
             ext = str(listing.external_id)
             measured_at = listing.views_checked_at or listing.last_seen_at or now
             raw = max(0, int(listing.view_count or 0))
             existing = existing_map.get(ext)
             if existing is not None:
+                if measured_at <= (existing.last_measured_at or datetime.min):
+                    already += 1
+                    continue
                 # A completed/quiet observation may be re-armed by a later Radar
                 # circle, but an active observation is never rebased mid-flight.
                 old_enough = (now - (existing.updated_at or existing.last_measured_at or now)).total_seconds() >= 3 * 3600
-                if str(existing.status or "") in {"quiet", "expired"} and old_enough:
-                    existing.baseline_views = raw
-                    existing.baseline_at = measured_at
-                    existing.last_views = raw
-                    existing.last_measured_at = measured_at
-                    existing.checkpoint_count = 0
-                    existing.positive_checkpoints = 0
-                    existing.consecutive_positive = 0
-                    existing.total_delta = 0
-                    existing.current_vph = 0.0
-                    existing.previous_vph = 0.0
-                    existing.peak_vph = 0.0
-                    existing.velocity_percentile = 0.0
-                    existing.acceleration_ratio = 0.0
-                    existing.confidence = 0
-                    existing.scored_checkpoints = 0
-                    existing.consecutive_scored = 0
-                    existing.strong_checkpoints = 0
-                    existing.consecutive_strong = 0
-                    existing.lease_owner = ""
-                    existing.lease_until = None
-                    existing.status = "baseline"
-                    existing.next_check_at = measured_at + timedelta(minutes=RADAR_V3_FIRST_CHECK_MINUTES)
-                    existing.expires_at = measured_at + timedelta(hours=RADAR_V3_MAX_OBSERVATION_HOURS)
-                    existing.updated_at = now
-                    await _insert_radar_checkpoint_events(session, [
-                        _radar_checkpoint_event_values(existing, "baseline",
-                            measured_at=measured_at, now=now)])
-                    seeded += 1
+                if (str(existing.status or "") in {"quiet", "expired"} and old_enough
+                        and (existing.lease_until is None or existing.lease_until <= now)):
+                    if raw < int(existing.last_views or 0):
+                        existing.status = "rollback_pending"
+                        existing.rollback_first_at = existing.rollback_last_at = measured_at
+                        existing.rollback_last_views = raw
+                        existing.rollback_count = 0
+                        existing.next_check_at = now + timedelta(minutes=ROLLBACK_RETRY_MINUTES)
+                        existing.expires_at = max(existing.expires_at or now, now + timedelta(hours=1))
+                        existing.updated_at = now
+                        await _insert_radar_checkpoint_events(session, [
+                            _radar_checkpoint_event_values(existing, "identity_reset", now=now)])
+                        await _radar_quarantine_rollback(session, existing, now)
+                        already += 1
+                    else:
+                        await _radar_reset_observation_cycle(session, existing, raw, measured_at, now)
+                        await _radar_quarantine_rollback(session, existing, now)
+                        rearmed += 1
+                else:
+                    already += 1
                 continue
             new_obs = RadarObservation(
                 external_id=ext, category_key=str(category_key),
@@ -1378,10 +1589,15 @@ async def record_autoscan_hot_detailed(
             await _insert_radar_checkpoint_events(session, [
                 _radar_checkpoint_event_values(new_obs, "baseline", measured_at=measured_at, now=now)])
             seeded += 1
-        if seeded:
+            budget = {"total":early_total, "category":early_categories.get(str(listing.category_key or ""),0)}
+            if await _maybe_queue_early_lifecycle(session, listing, now, budget=budget):
+                early_total = budget["total"]
+                early_categories[str(listing.category_key or "")] = budget["category"]
+        if seeded or rearmed or already:
             await session.commit()
-    log.info("DT Radar 3.0 baselines round=%s category=%s rows=%s seeded=%s first_counter_votes=0", round_id, category_key, len(rows), seeded)
-    return RadarAdmissionStats(eligible_with_views=len(rows), admitted=0, saved=0)
+    log.info("DT Radar 3.0 baselines round=%s category=%s eligible=%s created=%s rearmed=%s existing=%s first_counter_votes=0", round_id, category_key, len(rows), seeded, rearmed, already)
+    return RadarAdmissionStats(eligible_with_views=len(rows), baseline_created=seeded,
+                               baseline_rearmed=rearmed, baseline_existing=already, admitted=0, saved=0)
 
 
 async def record_user_scan_radar3_baselines(scan_id: int) -> int:
@@ -1422,8 +1638,17 @@ async def record_user_scan_radar3_baselines(scan_id: int) -> int:
         existing_map = {}
         if ids:
             existing_map = {str(x.external_id): x for x in (await session.execute(
-                select(RadarObservation).where(RadarObservation.external_id.in_(ids))
+                select(RadarObservation).where(RadarObservation.external_id.in_(ids)).with_for_update()
             )).scalars().all()}
+        early_total = int((await session.execute(select(func.count(RadarLifecycleWatch.id)).where(
+            RadarLifecycleWatch.enrollment_source == "early",
+            RadarLifecycleWatch.status.in_(["watching", "confirming"]),
+        ))).scalar_one() or 0)
+        early_categories = {str(cat):int(count) for cat,count in (await session.execute(select(
+            RadarLifecycleWatch.category_key, func.count(RadarLifecycleWatch.id)).where(
+            RadarLifecycleWatch.enrollment_source == "early",
+            RadarLifecycleWatch.status.in_(["watching", "confirming"]),
+        ).group_by(RadarLifecycleWatch.category_key))).all()}
         for snap, listing in rows:
             if not radar_v3_category_allowed(str(listing.category_key or "")):
                 continue
@@ -1432,35 +1657,27 @@ async def record_user_scan_radar3_baselines(scan_id: int) -> int:
             raw = max(0, int(snap.initial_view_count or 0))
             existing = existing_map.get(ext)
             if isinstance(existing, RadarObservation):
+                if measured_at <= (existing.last_measured_at or datetime.min):
+                    continue
                 old_enough = (now - (existing.updated_at or existing.last_measured_at or now)).total_seconds() >= 3 * 3600
-                if str(existing.status or "") in {"quiet", "expired"} and old_enough:
-                    existing.baseline_views = raw
-                    existing.baseline_at = measured_at
-                    existing.last_views = raw
-                    existing.last_measured_at = measured_at
-                    existing.checkpoint_count = 0
-                    existing.positive_checkpoints = 0
-                    existing.consecutive_positive = 0
-                    existing.total_delta = 0
-                    existing.current_vph = 0.0
-                    existing.previous_vph = 0.0
-                    existing.peak_vph = 0.0
-                    existing.velocity_percentile = 0.0
-                    existing.acceleration_ratio = 0.0
-                    existing.confidence = 0
-                    existing.scored_checkpoints = 0
-                    existing.consecutive_scored = 0
-                    existing.strong_checkpoints = 0
-                    existing.consecutive_strong = 0
-                    existing.lease_owner = ""
-                    existing.lease_until = None
-                    existing.status = "baseline"
-                    existing.next_check_at = measured_at + timedelta(minutes=RADAR_V3_FIRST_CHECK_MINUTES)
-                    existing.expires_at = measured_at + timedelta(hours=RADAR_V3_MAX_OBSERVATION_HOURS)
-                    existing.updated_at = now
-                    await _insert_radar_checkpoint_events(session, [
-                        _radar_checkpoint_event_values(existing, "baseline",
-                            measured_at=measured_at, now=now)])
+                if (str(existing.status or "") in {"quiet", "expired"} and old_enough
+                        and (existing.lease_until is None or existing.lease_until <= now)):
+                    if measured_at <= (existing.last_measured_at or datetime.min):
+                        continue
+                    if raw < int(existing.last_views or 0):
+                        existing.status = "rollback_pending"
+                        existing.rollback_first_at = existing.rollback_last_at = measured_at
+                        existing.rollback_last_views = raw
+                        existing.rollback_count = 0
+                        existing.next_check_at = now + timedelta(minutes=ROLLBACK_RETRY_MINUTES)
+                        existing.expires_at = max(existing.expires_at or now, now + timedelta(hours=1))
+                        existing.updated_at = now
+                        await _insert_radar_checkpoint_events(session, [
+                            _radar_checkpoint_event_values(existing, "identity_reset", now=now)])
+                        await _radar_quarantine_rollback(session, existing, now)
+                        continue
+                    await _radar_reset_observation_cycle(session, existing, raw, measured_at, now)
+                    await _radar_quarantine_rollback(session, existing, now)
                     seeded += 1
                 continue
             if ext in existing_map:
@@ -1481,9 +1698,35 @@ async def record_user_scan_radar3_baselines(scan_id: int) -> int:
                 _radar_checkpoint_event_values(new_obs, "baseline", measured_at=measured_at, now=now)])
             existing_map[ext] = True
             seeded += 1
+            budget = {"total":early_total, "category":early_categories.get(str(listing.category_key or ""),0)}
+            if await _maybe_queue_early_lifecycle(session, listing, now, budget=budget):
+                early_total = budget["total"]
+                early_categories[str(listing.category_key or "")] = budget["category"]
         if seeded:
             await session.commit()
     return seeded
+
+
+async def repair_radar_v3_quality_once() -> int:
+    """Re-arm eligible legacy quiet cycles, preserving baseline and measured history."""
+    now = datetime.utcnow()
+    async with SessionLocal() as session:
+        if session.get_bind().dialect.name == "postgresql":
+            await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                                  {"key": RADAR_V3_QUALITY_REPAIR_SETTING})
+        marker = await session.get(AppSetting, RADAR_V3_QUALITY_REPAIR_SETTING)
+        if marker is not None and str(marker.value or "") == "done": return 0
+        result = await session.execute(update(RadarObservation).where(
+            RadarObservation.status == "quiet", RadarObservation.next_check_at.is_(None),
+            RadarObservation.expires_at > now,
+            RadarObservation.checkpoint_count >= 1,
+        ).values(status="exploring", next_check_at=now, updated_at=now))
+        if marker is None:
+            session.add(AppSetting(key=RADAR_V3_QUALITY_REPAIR_SETTING, value="done", updated_at=now))
+        else:
+            marker.value, marker.updated_at = "done", now
+        await session.commit()
+        return int(result.rowcount or 0)
 
 
 async def radar_v3_due_external_ids(limit: int = 1000) -> list[str]:
@@ -1494,7 +1737,7 @@ async def radar_v3_due_external_ids(limit: int = 1000) -> list[str]:
             select(RadarObservation.external_id).where(
                 RadarObservation.next_check_at.is_not(None),
                 RadarObservation.next_check_at <= now,
-                RadarObservation.status.in_(["baseline", "candidate", "observed", "confirmed"]),
+                RadarObservation.status.in_(ACTIVE_OBSERVATION_STATUSES),
                 or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now),
                 or_(RadarObservation.lease_until.is_(None), RadarObservation.lease_until < now),
             ).order_by(RadarObservation.next_check_at.asc()).limit(max(1, int(limit)))
@@ -1502,75 +1745,53 @@ async def radar_v3_due_external_ids(limit: int = 1000) -> list[str]:
 
 
 async def radar_v3_claim_due_external_ids(owner: str, limit: int = 1000, lease_minutes: int = 20) -> list[str]:
-    """Atomically claim due observations for one Parser replica.
+    """Claim real due work fairly; exploratory watches cannot starve hot signals.
 
-    PostgreSQL FOR UPDATE SKIP LOCKED makes concurrent replicas choose disjoint
-    rows instead of waiting on each other. The committed lease survives the
-    network refresh and automatically expires if a replica dies mid-batch.
+    PostgreSQL row locks/leases survive worker failures. Quotas apply only to
+    low-priority exploration; rollback recovery and strong observations take
+    precedence. Expired rows are never claimed merely because the queue is late.
     """
     owner = str(owner or "radar3")[:120]
     now = datetime.utcnow()
     lease_until = now + timedelta(minutes=max(5, int(lease_minutes)))
+    limit = max(1, int(limit))
+    exploration_limit = min(EXPLORATION_BATCH_LIMIT, max(1, limit // 8))
     async with SessionLocal() as session:
-        stmt = (
-            select(RadarObservation)
-            .where(
-                RadarObservation.next_check_at.is_not(None),
-                RadarObservation.next_check_at <= now,
-                RadarObservation.status.in_(["baseline", "candidate", "observed", "confirmed"]),
-                or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now),
-                or_(RadarObservation.lease_until.is_(None), RadarObservation.lease_until < now),
-            )
-            .order_by(RadarObservation.next_check_at.asc(), RadarObservation.id.asc())
-            .limit(max(1, int(limit)))
-            .with_for_update(skip_locked=True)
-        )
-        rows = list((await session.execute(stmt)).scalars().all())
-        for row in rows:
-            row.lease_owner = owner
-            row.lease_until = lease_until
-            row.updated_at = now
-        await session.commit()
+        common = [RadarObservation.next_check_at.is_not(None),
+                  RadarObservation.next_check_at <= now,
+                  or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now),
+                  or_(RadarObservation.lease_until.is_(None), RadarObservation.lease_until < now)]
+        async def claim(statuses, take, exclude_ids=()):
+            if take <= 0: return []
+            query = select(RadarObservation).where(*common, RadarObservation.status.in_(statuses))
+            if exclude_ids:
+                query = query.where(RadarObservation.id.notin_(exclude_ids))
+            query = query.order_by(
+                RadarObservation.next_check_at.asc(), RadarObservation.id.asc()).limit(take)
+            if session.get_bind().dialect.name == "postgresql":
+                query = query.with_for_update(skip_locked=True)
+            rows = list((await session.execute(query)).scalars().all())
+            for row in rows:
+                row.lease_owner, row.lease_until, row.updated_at = owner, lease_until, now
+            return rows
+        primary = await claim(["rollback_pending", "confirmed", "observed", "candidate", "baseline"],
+                              max(0, limit-exploration_limit))
+        exploration = await claim(["exploring"], exploration_limit)
+        # Unused exploration capacity is returned to the ordinary queue.
+        already_claimed = [int(row.id) for row in primary + exploration]
+        extra = await claim(["rollback_pending", "confirmed", "observed", "candidate", "baseline"],
+                            max(0, limit-len(primary)-len(exploration)), exclude_ids=already_claimed)
+        rows = primary + exploration + extra
+        if rows: await session.commit()
         return [str(row.external_id) for row in rows]
 
 
 def _percentile_rank(value: float, peers: list[float]) -> float:
-    vals = sorted(float(x) for x in peers if x >= 0)
-    if not vals:
-        return 0.0
-    if len(vals) == 1:
-        return 0.5
-    below = sum(1 for x in vals if x < value)
-    equal = sum(1 for x in vals if x == value)
-    return max(0.0, min(1.0, (below + 0.5 * equal) / len(vals)))
+    return cohort_position(value, peers).percentile
+
 
 def _radar32_thresholds(peers: list[float]) -> dict[str, float]:
-    """Return live category thresholds with a small absolute noise floor.
-
-    Until a category has enough observations, thresholds deliberately stay
-    conservative so a tiny cohort cannot manufacture a P99 signal.
-    """
-    vals = sorted(float(x) for x in peers if float(x) >= RADAR_V3_NOISE_FLOOR_VPH)
-    def q(p: float) -> float:
-        if not vals:
-            return RADAR_V3_NOISE_FLOOR_VPH
-        idx = max(0, min(len(vals) - 1, int(round((len(vals) - 1) * p))))
-        return float(vals[idx])
-    if len(vals) < RADAR_V3_MIN_CATEGORY_PEERS:
-        return {
-            "candidate": max(RADAR_V3_NOISE_FLOOR_VPH, 8.0),
-            "early": max(RADAR_V3_NOISE_FLOOR_VPH, 15.0),
-            "strong": max(RADAR_V3_NOISE_FLOOR_VPH, 30.0),
-            "hot": max(RADAR_V3_NOISE_FLOOR_VPH, 60.0),
-            "peer_count": len(vals),
-        }
-    return {
-        "candidate": max(RADAR_V3_NOISE_FLOOR_VPH, q(RADAR_V3_CANDIDATE_PERCENTILE)),
-        "early": max(RADAR_V3_NOISE_FLOOR_VPH, q(RADAR_V3_EARLY_PERCENTILE)),
-        "strong": max(RADAR_V3_NOISE_FLOOR_VPH, q(RADAR_V3_STRONG_PERCENTILE)),
-        "hot": max(RADAR_V3_NOISE_FLOOR_VPH, q(RADAR_V3_HOT_PERCENTILE)),
-        "peer_count": len(vals),
-    }
+    return cohort_thresholds(peers)
 
 
 async def radar_v3_release_claims(owner: str, external_ids: list[str] | tuple[str, ...] | set[str]) -> int:
@@ -1592,7 +1813,51 @@ async def radar_v3_release_claims(owner: str, external_ids: list[str] | tuple[st
         return int(result.rowcount or 0)
 
 
-async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | set[str]) -> int:
+def _radar_provenance_pending(external_id_expr):
+    return select(RadarObservation.id).where(
+        RadarObservation.external_id == external_id_expr,
+        RadarObservation.status.in_(["rollback_pending", "identity_reset"]),
+    ).exists()
+
+
+async def _radar_quarantine_rollback(session, obs: RadarObservation, now: datetime) -> None:
+    """Hide questionable live evidence without deleting snapshots or favorites."""
+    await session.execute(update(RadarProduct).where(
+        RadarProduct.product_key == str(obs.product_key),
+        RadarProduct.latest_source == "radar3_observed",
+    ).values(status="stable", radar_rank=0.0,
+             latest_reason="Счётчик изменился: повторная проверка достоверности", updated_at=now))
+
+
+async def _radar_reset_observation_cycle(session, obs: RadarObservation, raw: int,
+                                         measured_at: datetime, now: datetime,
+                                         *, reason: str = "rearmed") -> None:
+    """Start a new explicit cycle; no old interval is carried into the new score."""
+    if reason == "identity_reset":
+        await _insert_radar_checkpoint_events(session, [
+            _radar_checkpoint_event_values(obs, "identity_reset", measured_at=measured_at, now=now)])
+    for field in ("checkpoint_count", "positive_checkpoints", "consecutive_positive", "total_delta",
+                  "confidence", "scored_checkpoints", "consecutive_scored", "strong_checkpoints",
+                  "consecutive_strong", "rollback_count"):
+        setattr(obs, field, 0)
+    for field in ("current_vph", "previous_vph", "peak_vph", "velocity_percentile", "acceleration_ratio"):
+        setattr(obs, field, 0.0)
+    obs.baseline_views = obs.last_views = raw
+    obs.baseline_at = obs.last_measured_at = measured_at
+    # Every explicit new cycle invalidates earlier current-demand evidence.
+    obs.provenance_reset_at = measured_at
+    obs.rollback_first_at = obs.rollback_last_at = None
+    obs.rollback_last_views = None
+    obs.lease_owner, obs.lease_until = "", None
+    obs.status = "baseline"
+    obs.next_check_at = measured_at + timedelta(minutes=RADAR_V3_FIRST_CHECK_MINUTES)
+    obs.expires_at = measured_at + timedelta(hours=RADAR_V3_MAX_OBSERVATION_HOURS)
+    obs.updated_at = now
+    await _insert_radar_checkpoint_events(session, [
+        _radar_checkpoint_event_values(obs, "baseline", measured_at=measured_at, now=now)])
+
+
+async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | set[str], *, owner: str | None = None) -> int:
     """Radar 3.2 category-adaptive observed demand, evaluated in two passes.
 
     Pass 1 persists every fresh DT-measured velocity in the batch without assigning
@@ -1606,6 +1871,24 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
     now = datetime.utcnow()
     prepared: list[tuple[Listing, RadarObservation, int, float, float]] = []
     audit_events: list[dict] = []
+    # Network work happens outside the DB write transaction. Pending rollbacks
+    # cannot certify a new cycle without the fresh strict identity/organic gate.
+    rollback_gate: dict[str, bool] = {}
+    async with SessionLocal() as session:
+        pending_rows = list((await session.execute(select(Listing).join(
+            RadarObservation, RadarObservation.external_id == Listing.external_id).where(
+            Listing.external_id.in_(ids), RadarObservation.status.in_(["rollback_pending", "identity_reset"]),
+        ))).scalars().all())
+        for listing in pending_rows: session.expunge(listing)
+    for listing in pending_rows:
+        try:
+            allowed, _, _ = await _live_detail_organic_gate(listing, force_priority="radar_checkpoint")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Radar rollback identity check failed external_id=%s", listing.external_id)
+            allowed = False
+        rollback_gate[str(listing.external_id)] = bool(allowed)
 
     # PASS 1 — persist raw DT measurements only. Keep the lease until PASS 2 so a
     # second replica cannot claim/reclassify the same observation mid-flight.
@@ -1617,7 +1900,8 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
                 Listing.external_id.in_(ids), Listing.view_count.is_not(None),
                 Listing.is_promoted.is_(False), Listing.is_price_reduced.is_(False),
                 ~_registry_dirty_exists(Listing.external_id),
-                RadarObservation.status.in_(["baseline", "candidate", "observed", "confirmed"]),
+                RadarObservation.status.in_(ACTIVE_OBSERVATION_STATUSES),
+                *([RadarObservation.lease_owner == str(owner)[:120]] if owner is not None else []),
             ).with_for_update(of=RadarObservation)
         )).all()
         for listing, obs in pairs:
@@ -1637,7 +1921,44 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
             if measured_at <= obs.last_measured_at:
                 continue
             current = max(0, int(listing.view_count or 0))
-            interval_delta = max(0, current - int(obs.last_views or 0))
+            trusted_anchor = int(obs.last_views or 0)
+            if current < trusted_anchor or str(obs.status) in {"rollback_pending", "identity_reset"}:
+                if str(obs.status) in {"rollback_pending", "identity_reset"} and not rollback_gate.get(str(obs.external_id), False):
+                    obs.next_check_at = now + timedelta(minutes=ROLLBACK_RETRY_MINUTES)
+                    obs.lease_owner, obs.lease_until = "", None
+                    obs.updated_at = now
+                    continue
+                old_low = obs.rollback_last_views
+                transition, recoveries, new_low = rollback_transition(
+                    trusted_anchor, current, old_low, int(obs.rollback_count or 0))
+                if str(obs.status) not in {"rollback_pending", "identity_reset"}:
+                    obs.rollback_first_at = obs.rollback_last_at = measured_at
+                    obs.rollback_count = 0
+                    obs.rollback_last_views = current
+                    obs.status = "rollback_pending"
+                    obs.next_check_at = now + timedelta(minutes=ROLLBACK_RETRY_MINUTES)
+                    obs.lease_owner, obs.lease_until = "", None
+                    obs.updated_at = now
+                    audit_events.append(_radar_checkpoint_event_values(
+                        obs, "rollback", measured_at=measured_at,
+                        delta_views=current-trusted_anchor, now=now))
+                    await _radar_quarantine_rollback(session, obs, now)
+                    continue
+                if obs.rollback_last_at and measured_at < obs.rollback_last_at + timedelta(minutes=5):
+                    obs.next_check_at = obs.rollback_last_at + timedelta(minutes=ROLLBACK_RETRY_MINUTES)
+                    obs.lease_owner, obs.lease_until = "", None
+                    continue
+                if transition == "recovered":
+                    await _radar_reset_observation_cycle(session, obs, current, measured_at, now,
+                                                         reason="identity_reset")
+                    continue
+                obs.rollback_count, obs.rollback_last_views = recoveries, new_low
+                obs.rollback_last_at = measured_at
+                obs.next_check_at = now + timedelta(minutes=ROLLBACK_RETRY_MINUTES)
+                obs.lease_owner, obs.lease_until = "", None
+                obs.updated_at = now
+                continue
+            interval_delta = current - trusted_anchor
             hours = max(1 / 60, (measured_at - obs.last_measured_at).total_seconds() / 3600.0)
             vph = interval_delta / hours
             previous_vph = float(obs.current_vph or 0.0)
@@ -1674,7 +1995,7 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
                 select(RadarObservation.current_vph).where(
                     RadarObservation.category_key == category_key,
                     RadarObservation.checkpoint_count >= 1,
-                    RadarObservation.status.notin_(["expired", "excluded"]),
+                    RadarObservation.status.notin_(["expired", "excluded", "rollback_pending", "identity_reset"]),
                     or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now),
                     RadarObservation.updated_at >= now - timedelta(hours=6),
                 )
@@ -1684,23 +2005,29 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
 
     evaluated: list[tuple[Listing, RadarObservation, int, float, float, float, dict[str, float], bool]] = []
     async with SessionLocal() as session:
-        obs_map = {str(x.external_id): x for x in (await session.execute(
-            select(RadarObservation).where(RadarObservation.external_id.in_([str(obs.external_id) for _, obs, *_ in prepared]))
-        )).scalars().all()}
+        obs_query = select(RadarObservation).where(
+            RadarObservation.external_id.in_([str(obs.external_id) for _, obs, *_ in prepared]))
+        if session.get_bind().dialect.name == "postgresql":
+            obs_query = obs_query.with_for_update()
+        obs_map = {str(x.external_id): x for x in (await session.execute(obs_query)).scalars().all()}
         for listing, old_obs, interval_delta, vph, previous_vph in prepared:
             obs = obs_map.get(str(old_obs.external_id))
-            if obs is None:
+            if (obs is None or obs.baseline_at != old_obs.baseline_at
+                    or obs.last_measured_at != old_obs.last_measured_at
+                    or int(obs.last_views or 0) != int(old_obs.last_views or 0)
+                    or str(obs.status) in {"rollback_pending", "identity_reset", "expired", "excluded"}):
+                continue
+            if owner is not None and str(obs.lease_owner or "") != str(owner)[:120]:
                 continue
             category_key = str(obs.category_key or listing.category_key or "")
             cohort = cohort_by_category.get(category_key, [float(vph)])
             thresholds = thresholds_by_category.get(category_key) or _radar32_thresholds(cohort)
             pct = _percentile_rank(float(vph), cohort)
-            positive = vph >= RADAR_V3_NOISE_FLOOR_VPH
-            candidate = positive and vph >= thresholds["candidate"] and pct >= RADAR_V3_CANDIDATE_PERCENTILE
-            early = positive and vph >= thresholds["early"] and pct >= RADAR_V3_EARLY_PERCENTILE
-            strong = positive and vph >= thresholds["strong"] and pct >= RADAR_V3_STRONG_PERCENTILE
-            hot_interval = positive and vph >= thresholds["hot"] and pct >= RADAR_V3_HOT_PERCENTILE
-
+            candidate = qualifies_velocity(vph, cohort, "candidate", thresholds)
+            early = qualifies_velocity(vph, cohort, "early", thresholds)
+            strong = qualifies_velocity(vph, cohort, "strong", thresholds)
+            hot_interval = qualifies_velocity(vph, cohort, "hot", thresholds)
+            # A weak first interval is not a terminal demand verdict.
             obs.consecutive_positive = int(obs.consecutive_positive or 0) + 1 if candidate else 0
             obs.scored_checkpoints = int(obs.scored_checkpoints or 0) + (1 if early else 0)
             obs.consecutive_scored = int(obs.consecutive_scored or 0) + 1 if early else 0
@@ -1709,9 +2036,11 @@ async def radar_v3_record_refreshed(external_ids: list[str] | tuple[str, ...] | 
             obs.velocity_percentile = float(pct)
             obs.lease_owner, obs.lease_until = "", None
             if not candidate:
-                obs.status, obs.next_check_at = "quiet", None
-                await _insert_radar_checkpoint_events(session, [
-                    _radar_checkpoint_event_values(obs, "quiet", measured_at=obs.last_measured_at, now=now)])
+                next_due = next_exploration_at(obs.last_measured_at, obs.expires_at, int(obs.checkpoint_count or 0))
+                obs.status, obs.next_check_at = ("exploring", next_due) if next_due else ("quiet", None)
+                if next_due is None:
+                    await _insert_radar_checkpoint_events(session, [
+                        _radar_checkpoint_event_values(obs, "quiet", measured_at=obs.last_measured_at, now=now)])
             elif strong:
                 obs.status = "confirmed"
                 obs.next_check_at = obs.last_measured_at + timedelta(minutes=RADAR_V3_STRONG_CHECK_MINUTES)
@@ -1819,7 +2148,7 @@ async def radar_v3_expire_observations() -> int:
     now = datetime.utcnow()
     async with SessionLocal() as session:
         rows = list((await session.execute(select(RadarObservation).where(
-            RadarObservation.status.in_(["baseline", "candidate", "observed", "confirmed"]),
+            RadarObservation.status.in_((*ACTIVE_OBSERVATION_STATUSES, "quiet")),
             RadarObservation.expires_at.is_not(None), RadarObservation.expires_at <= now,
             # A worker that measured before expiry may still be returning its
             # exact result. Respect its bounded lease before terminal cleanup.
@@ -1944,7 +2273,9 @@ async def repair_radar_v3_live_retention_once() -> int:
     History remains untouched and this repair is idempotent across replicas.
     """
     now = datetime.utcnow()
-    live_cutoff = now - timedelta(hours=RADAR_V3_LIVE_RETENTION_HOURS)
+    # The legacy 24h repair is already installed. Do not reinterpret historical
+    # rows under a new 48h policy: old History may contain genuine disappearances.
+    live_cutoff = now - timedelta(hours=24)
     old_ttl_cutoff = now - timedelta(hours=RADAR_V3_MAX_OBSERVATION_HOURS)
     restored = 0
     async with SessionLocal() as session:
@@ -2221,7 +2552,8 @@ async def claim_due_lifecycle_watches(
                 (RadarLifecycleWatch.lease_until.is_(None)) | (RadarLifecycleWatch.lease_until < now),
                 _clean_listing_exists(RadarLifecycleWatch.external_id),
             )
-            .order_by(RadarLifecycleWatch.next_check_at.asc(), RadarLifecycleWatch.id.asc())
+            .order_by(case((RadarLifecycleWatch.product_id.is_not(None), 0), else_=1),
+                      RadarLifecycleWatch.next_check_at.asc(), RadarLifecycleWatch.id.asc())
             .limit(max(1, min(100, int(limit))))
         )
         bind = session.get_bind()
@@ -2235,7 +2567,7 @@ async def claim_due_lifecycle_watches(
             row.lease_until = lease_until
             row.updated_at = now
             jobs.append(LifecycleJob(
-                id=int(row.id), product_id=int(row.product_id),
+                id=int(row.id), product_id=(int(row.product_id) if row.product_id is not None else None),
                 external_id=str(row.external_id), url=str(row.url or ""),
                 first_seen_at=row.first_seen_at, last_seen_at=row.last_seen_at,
                 status=str(row.status or "watching"), score=int(row.score or 0),
@@ -2253,7 +2585,8 @@ def _lifecycle_reason(lifetime_seconds: int) -> str:
 
 
 async def complete_lifecycle_check(
-    watch_id: int, active: bool | None, *, error_text: str | None = None, checked_at: datetime | None = None
+    watch_id: int, active: bool | None, *, error_text: str | None = None, checked_at: datetime | None = None,
+    owner: str | None = None
 ) -> str:
     """Persist one direct availability result. Returns the new watch status."""
     now = checked_at or datetime.utcnow()
@@ -2265,6 +2598,10 @@ async def complete_lifecycle_check(
         watch = (await session.execute(query)).scalar_one_or_none()
         if watch is None:
             return "missing"
+        if watch.product_id is not None and watch.strong_qualified_at is None and watch.enrollment_source == "strong":
+            watch.strong_qualified_at = watch.radar_started_at
+        if owner is not None and str(watch.lease_owner or "") != str(owner)[:120]:
+            return "stale_lease"
         if str(watch.status or "") not in {"watching", "confirming"}:
             watch.lease_owner = ""
             watch.lease_until = None
@@ -2315,6 +2652,9 @@ async def complete_lifecycle_check(
 
         if active is True:
             watch.status = "watching"
+            await _lifecycle_event(session, watch.external_id, "active_checked",
+                key=f"active:{watch.id}:{int(watch.checks or 0)}", product_key=watch.product_key,
+                reason="direct", now=now)
             watch.last_result = "active"
             watch.consecutive_missing = 0
             watch.first_missing_at = None
@@ -2359,8 +2699,14 @@ async def complete_lifecycle_check(
                 if listing is not None:
                     listing.is_active = False
                     listing.disappeared_at = disappeared_at
-                product = await session.get(RadarProduct, int(watch.product_id))
-                if product is not None:
+                await _lifecycle_event(session, watch.external_id, "disappeared",
+                    key=f"disappeared:{watch.id}", product_key=watch.product_key,
+                    reason="two_direct_checks", now=now)
+                product = (await session.get(RadarProduct, int(watch.product_id))
+                           if watch.product_id is not None else None)
+                if (product is not None and watch.strong_qualified_at
+                        and watch.strong_qualified_at <= disappeared_at
+                        and int(watch.peak_score or 0) >= RADAR_LIFECYCLE_MIN_SCORE):
                     reason = _lifecycle_reason(lifetime_seconds)
                     duplicate = (await session.execute(
                         select(RadarSnapshot.id).where(
@@ -2384,9 +2730,13 @@ async def complete_lifecycle_check(
                             recorded_at=now,
                         ))
                         product.signal_count = int(product.signal_count or 0) + 1
-                    product.latest_reason = reason[:800]
-                    product.latest_source = "lifecycle"
-                    product.last_signal_at = max(product.last_signal_at or now, now)
+                    # A disappeared representative must not keep an old HOT
+                    # visible while other family members are being reselected.
+                    # The maintenance lane recomputes from their valid snapshots.
+                    if str(product.representative_external_id) == str(watch.external_id):
+                        product.status = "stable"
+                        product.radar_rank = 0.0
+                        product.current_signal_at = None
                     product.updated_at = now
                 log.info(
                     "DT Radar Fast Sold confirmed external_id=%s product=%s lifetime=%ss checks=%s",
@@ -2395,6 +2745,9 @@ async def complete_lifecycle_check(
 
         else:
             watch.last_result = "unknown"
+            await _lifecycle_event(session, watch.external_id, "unknown_checked",
+                key=f"unknown:{watch.id}:{int(watch.checks or 0)}", product_key=watch.product_key,
+                reason="provider_unknown", now=now)
             # Refusals/timeouts never count as disappearance. Retry gently. If the
             # 3-hour horizon has already passed, one small grace period is enough.
             elapsed_minutes = max(0.0, (now - watch.first_seen_at).total_seconds() / 60.0)
@@ -2417,6 +2770,9 @@ async def get_fast_sold_infos(product_ids: list[int] | tuple[int, ...]) -> dict[
             select(RadarLifecycleWatch).where(
                 RadarLifecycleWatch.product_id.in_(ids),
                 RadarLifecycleWatch.status == "disappeared",
+                RadarLifecycleWatch.strong_qualified_at.is_not(None),
+                RadarLifecycleWatch.strong_qualified_at <= RadarLifecycleWatch.disappeared_at,
+                RadarLifecycleWatch.peak_score >= RADAR_LIFECYCLE_MIN_SCORE,
                 RadarLifecycleWatch.lifetime_seconds.is_not(None),
                 RadarLifecycleWatch.lifetime_seconds <= RADAR_FAST_SOLD_MAX_SECONDS,
                 _clean_listing_exists(RadarLifecycleWatch.external_id),
@@ -2444,6 +2800,46 @@ async def get_fast_sold_info(product_id: int) -> FastSoldInfo | None:
     return (await get_fast_sold_infos([int(product_id)])).get(int(product_id))
 
 
+async def repair_radar_lifecycle_qualification_once() -> int:
+    key = "dt_radar_v42312_lifecycle_qualification_v1"
+    async with SessionLocal() as session:
+        if session.get_bind().dialect.name == "postgresql":
+            await session.execute(text("SELECT pg_advisory_xact_lock(CAST(hashtext(:key) AS bigint))"), {"key": key})
+        marker = await session.get(AppSetting, key)
+        if marker and marker.value == "done": return 0
+        result = await session.execute(update(RadarLifecycleWatch).where(
+            RadarLifecycleWatch.product_id.is_not(None),
+            RadarLifecycleWatch.strong_qualified_at.is_(None),
+            RadarLifecycleWatch.enrollment_source == "strong",
+            RadarLifecycleWatch.peak_score >= RADAR_LIFECYCLE_MIN_SCORE,
+        ).values(strong_qualified_at=RadarLifecycleWatch.radar_started_at))
+        if marker is None: session.add(AppSetting(key=key, value="done"))
+        else: marker.value="done"
+        await session.commit()
+        return int(result.rowcount or 0)
+
+
+async def lifecycle_diagnostics() -> dict:
+    """Small DB-side health aggregates; never traverse full listing/view history."""
+    now=datetime.utcnow();start=now-timedelta(hours=24)
+    async with SessionLocal() as session:
+        rows=(await session.execute(select(
+            RadarLifecycleWatch.enrollment_source, RadarLifecycleWatch.status,
+            func.count(RadarLifecycleWatch.id)).group_by(
+            RadarLifecycleWatch.enrollment_source,RadarLifecycleWatch.status))).all()
+        events=(await session.execute(select(RadarLifecycleEvent.event_type,
+            func.count(RadarLifecycleEvent.id)).where(RadarLifecycleEvent.created_at>=start).group_by(
+            RadarLifecycleEvent.event_type))).all()
+        queue=(await session.execute(select(func.count(RadarLifecycleWatch.id),
+            func.min(RadarLifecycleWatch.next_check_at)).where(
+            RadarLifecycleWatch.status.in_(["watching","confirming"]),
+            RadarLifecycleWatch.next_check_at<=now))).one()
+    return {"by_status":{f"{source}:{status}":int(n) for source,status,n in rows},
+            "events_24h":{str(kind):int(n) for kind,n in events},
+            "due":int(queue[0] or 0),
+            "oldest_due_seconds":max(0,int((now-queue[1]).total_seconds())) if queue[1] else None}
+
+
 async def lifecycle_queue_stats() -> dict[str, int]:
     async with SessionLocal() as session:
         rows = (await session.execute(
@@ -2465,7 +2861,28 @@ async def refresh_radar_scores() -> int:
                     (RadarProduct.status != "historical") | (RadarProduct.current_score > 25)
                 )
             )).scalars().all())
+            product_ids = [int(product.id) for product in products]
+            active_product_ids = set((await session.execute(select(RadarProductListing.product_id).where(
+                RadarProductListing.product_id.in_(product_ids),
+                _clean_listing_exists(RadarProductListing.external_id),
+                ~select(RadarLifecycleWatch.id).where(
+                    RadarLifecycleWatch.external_id == RadarProductListing.external_id,
+                    RadarLifecycleWatch.status == "disappeared",
+                ).exists(),
+            ).join(Listing, Listing.external_id == RadarProductListing.external_id).where(
+                Listing.is_active.is_(True)))).scalars().all()) if product_ids else set()
+            selected_valid_ids = set((await session.execute(select(RadarProduct.id).where(
+                RadarProduct.id.in_(product_ids),
+                _active_radar_listing_exists(RadarProduct.representative_external_id),
+                ~_radar_provenance_pending(RadarProduct.representative_external_id),
+            ))).scalars().all()) if product_ids else set()
             for product in products:
+                if (str(product.status or "") != "historical" and
+                        str(product.latest_source or "") == "radar3_observed" and
+                        (int(product.id) not in selected_valid_ids or product.current_signal_at is None)):
+                    await _refresh_family_from_snapshots(session, product, now)
+                    product.updated_at = now
+                    changed += 1
                 new_score = _effective_score(product, now)
                 signal_age_hours = (
                     max(0.0, (now - product.last_signal_at).total_seconds() / 3600.0)
@@ -2478,13 +2895,18 @@ async def refresh_radar_scores() -> int:
                     # because its preserved Score is high. A fresh checkpoint is
                     # the only valid path back into Early/Strong/Hot.
                     new_score = _clamp_score(int(product.last_signal_score or product.current_score or 0))
-                    if str(product.status or "") == "historical" or signal_age_hours > RADAR_V3_LIVE_RETENTION_HOURS:
+                    current_age_hours = max(0.0, (now - (product.current_signal_at or product.last_signal_at)).total_seconds() / 3600.0)
+                    if (str(product.status or "") == "historical"
+                            or signal_age_hours > RADAR_V3_LIVE_RETENTION_HOURS
+                            or int(product.id) not in active_product_ids):
                         new_status = "historical"
                         new_rank = 0.0
                     else:
                         new_status = str(product.status or "stable")
+                        if current_age_hours > RADAR_V3_CURRENT_SIGNAL_HOURS:
+                            new_status = "stable"
                         new_rank = float(product.radar_rank or 0.0)
-                elif signal_age_hours > 48.0:
+                elif signal_age_hours > 48.0 or int(product.id) not in active_product_ids:
                     new_status = "historical"
                     new_rank = 0.0
                 else:
@@ -2516,44 +2938,65 @@ async def refresh_radar_scores() -> int:
 
 
 async def radar_stats() -> RadarStats:
+    now = datetime.utcnow()
     async with SessionLocal() as session:
-        # v4.15.3 read gate: even if cleanup is milliseconds behind a new sticky
-        # flag, public/admin Radar counters must only expose product families with
-        # at least one currently DB-confirmed organic association.
         visible = _visible_product_association_exists(RadarProduct.id)
-        visible_product_ids = select(RadarProduct.id).where(visible)
-        total = int((await session.execute(
-            select(func.count(RadarProduct.id)).where(visible, RadarProduct.status != "historical")
-        )).scalar_one() or 0)
-        hot = int((await session.execute(select(func.count(RadarProduct.id)).where(
-            visible, RadarProduct.status == "hot"
-        ))).scalar_one() or 0)
-        rising = int((await session.execute(select(func.count(RadarProduct.id)).where(
-            visible, RadarProduct.status == "rising"
-        ))).scalar_one() or 0)
-        ai_picks = int((await session.execute(select(func.count(RadarProduct.id)).where(
-            visible,
-            RadarProduct.status.in_(["hot", "rising"]),
+        active = [visible, _live_radar_product_exists(RadarProduct.id),
+                  RadarProduct.status != "historical",
+                  or_(RadarProduct.latest_source != "radar3_observed",
+                      RadarProduct.last_signal_at >= now-timedelta(hours=RADAR_V3_LIVE_RETENTION_HOURS))]
+        fresh = or_(RadarProduct.latest_source != "radar3_observed",
+                    func.coalesce(RadarProduct.current_signal_at, RadarProduct.last_signal_at)
+                    >= now-timedelta(hours=RADAR_V3_CURRENT_SIGNAL_HOURS))
+        async def count(*conditions):
+            return int((await session.execute(select(func.count(RadarProduct.id)).where(*conditions))).scalar_one() or 0)
+        total = await count(*active)
+        hot = await count(*active, fresh, RadarProduct.status == "hot")
+        rising = await count(*active, fresh, RadarProduct.status == "rising")
+        ai_picks = await count(*active, fresh, RadarProduct.status.in_(["hot", "rising"]),
             RadarProduct.opportunity_type.in_(["hot_product", "hidden_gem", "emerging"]),
-            RadarProduct.confidence >= 55,
-        ))).scalar_one() or 0)
-        categories = int((await session.execute(select(func.count(func.distinct(RadarProduct.category_key))).where(
-            visible, RadarProduct.status != "historical"
-        ))).scalar_one() or 0)
+            RadarProduct.confidence >= 55)
+        categories = int((await session.execute(select(func.count(func.distinct(RadarProduct.category_key))).where(*active))).scalar_one() or 0)
+        visible_ids = select(RadarProduct.id).where(visible)
         signals = int((await session.execute(select(func.count(RadarSnapshot.id)).where(
-            RadarSnapshot.product_id.in_(visible_product_ids),
-            _clean_listing_exists(RadarSnapshot.external_id),
-        ))).scalar_one() or 0)
-        fast_sold = int((await session.execute(
-            select(func.count(func.distinct(RadarLifecycleWatch.product_id))).where(
-                RadarLifecycleWatch.product_id.in_(visible_product_ids),
-                _clean_listing_exists(RadarLifecycleWatch.external_id),
-                RadarLifecycleWatch.status == "disappeared",
-                RadarLifecycleWatch.lifetime_seconds.is_not(None),
-                RadarLifecycleWatch.lifetime_seconds <= RADAR_FAST_SOLD_MAX_SECONDS,
-            )
-        )).scalar_one() or 0)
-    return RadarStats(total, hot, rising, ai_picks, categories, signals, fast_sold)
+            RadarSnapshot.product_id.in_(visible_ids), _clean_listing_exists(RadarSnapshot.external_id)))).scalar_one() or 0)
+        recent_hot_48h = await count(*active, _recent_hot_snapshot_exists(RadarProduct.id, now))
+        fast_sold = int((await session.execute(select(func.count(func.distinct(RadarLifecycleWatch.product_id))).where(
+            RadarLifecycleWatch.product_id.in_(visible_ids),
+            RadarLifecycleWatch.status == "disappeared",
+            RadarLifecycleWatch.strong_qualified_at.is_not(None),
+            RadarLifecycleWatch.strong_qualified_at <= RadarLifecycleWatch.disappeared_at,
+            RadarLifecycleWatch.peak_score >= RADAR_LIFECYCLE_MIN_SCORE,
+            RadarLifecycleWatch.lifetime_seconds.is_not(None),
+            RadarLifecycleWatch.lifetime_seconds <= RADAR_FAST_SOLD_MAX_SECONDS,
+            _clean_listing_exists(RadarLifecycleWatch.external_id)))).scalar_one() or 0)
+    return RadarStats(total, hot, rising, ai_picks, categories, signals, fast_sold, recent_hot_48h)
+
+
+async def get_radar_recent_hot_infos(product_ids: list[int] | tuple[int, ...]) -> dict[int, tuple[datetime, int]]:
+    ids=list(dict.fromkeys(int(x) for x in product_ids if int(x)>0))
+    if not ids: return {}
+    now=datetime.utcnow()
+    async with SessionLocal() as session:
+        rows=(await session.execute(select(RadarSnapshot).where(
+            RadarSnapshot.product_id.in_(ids), RadarSnapshot.source == "radar3_observed",
+            RadarSnapshot.demand_status == "hot",
+            RadarSnapshot.recorded_at >= now-timedelta(hours=RADAR_V3_LIVE_RETENTION_HOURS),
+            _active_radar_listing_exists(RadarSnapshot.external_id),
+            ~_radar_provenance_pending(RadarSnapshot.external_id),
+        ).order_by(RadarSnapshot.recorded_at.desc(),RadarSnapshot.id.desc()))).scalars().all()
+        reset_rows=(await session.execute(select(RadarObservation.external_id,
+            RadarObservation.provenance_reset_at).where(
+            RadarObservation.external_id.in_([str(x.external_id) for x in rows]),
+            RadarObservation.provenance_reset_at.is_not(None)))).all()
+        reset_at={str(ext):at for ext,at in reset_rows}
+    result={}
+    for row in rows:
+        if row.product_id in result: continue
+        cutoff=reset_at.get(str(row.external_id))
+        if cutoff and row.recorded_at<cutoff: continue
+        result[int(row.product_id)]=(row.recorded_at,int(row.score or 0))
+    return result
 
 
 async def list_radar_products(
@@ -2574,6 +3017,11 @@ async def list_radar_products(
         query = select(RadarProduct)
         count_query = select(func.count(RadarProduct.id))
         conditions = [_visible_product_association_exists(RadarProduct.id)]
+        if mode not in {"alltime", "fastsold", "favorites"}:
+            conditions.extend([RadarProduct.status != "historical",
+                or_(RadarProduct.latest_source != "radar3_observed",
+                    RadarProduct.last_signal_at >= datetime.utcnow()-timedelta(hours=RADAR_V3_LIVE_RETENTION_HOURS)),
+                _live_radar_product_exists(RadarProduct.id)])
         if category_key:
             conditions.append(RadarProduct.category_key == category_key)
         price_lo, price_hi = price_bounds(price_filter)
@@ -2599,11 +3047,20 @@ async def list_radar_products(
                 .where(*price_conditions)
                 .exists()
             )
-        if mode == "hot":
-            conditions.append(RadarProduct.status == "hot")
+        if mode == "hot48":
+            conditions.append(_recent_hot_snapshot_exists(RadarProduct.id, datetime.utcnow()))
+            order = (RadarProduct.last_signal_at.desc(), RadarProduct.peak_score.desc())
+        elif mode == "hot":
+            conditions.extend([RadarProduct.status == "hot",
+                or_(RadarProduct.latest_source != "radar3_observed",
+                    func.coalesce(RadarProduct.current_signal_at, RadarProduct.last_signal_at)
+                    >= datetime.utcnow()-timedelta(hours=RADAR_V3_CURRENT_SIGNAL_HOURS))])
             order = (RadarProduct.radar_rank.desc(), RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
         elif mode == "rising":
-            conditions.append(RadarProduct.status == "rising")
+            conditions.extend([RadarProduct.status == "rising",
+                or_(RadarProduct.latest_source != "radar3_observed",
+                    func.coalesce(RadarProduct.current_signal_at, RadarProduct.last_signal_at)
+                    >= datetime.utcnow()-timedelta(hours=RADAR_V3_CURRENT_SIGNAL_HOURS))])
             order = (RadarProduct.radar_rank.desc(), RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
         elif mode == "ai":
             conditions.extend([
@@ -2615,6 +3072,9 @@ async def list_radar_products(
         elif mode == "fastsold":
             fast_product_ids = select(RadarLifecycleWatch.product_id).where(
                 RadarLifecycleWatch.status == "disappeared",
+                RadarLifecycleWatch.strong_qualified_at.is_not(None),
+                RadarLifecycleWatch.strong_qualified_at <= RadarLifecycleWatch.disappeared_at,
+                RadarLifecycleWatch.peak_score >= RADAR_LIFECYCLE_MIN_SCORE,
                 RadarLifecycleWatch.lifetime_seconds.is_not(None),
                 RadarLifecycleWatch.lifetime_seconds <= RADAR_FAST_SOLD_MAX_SECONDS,
                 _clean_listing_exists(RadarLifecycleWatch.external_id),

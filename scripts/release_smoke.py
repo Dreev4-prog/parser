@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.23.11", "VERSION=4.23.11")
+    check((ROOT / "VERSION").read_text().strip() == "4.23.12", "VERSION=4.23.12")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -44,8 +44,8 @@ def main() -> int:
           "first exact counter is baseline-only and cannot publish")
     check('RADAR_V3_FIRST_CHECK_MINUTES = 60' in radar and 'radar_v3_observation_scheduler' in bot,
           "first DT-owned remeasurement scheduled after 60 minutes")
-    check('RADAR_V3_MAX_OBSERVATION_HOURS = 6' in radar and 'RADAR_V3_LIVE_RETENTION_HOURS = 24' in radar,
-          "Radar evidence window stays 6h while live catalogue retention is 24h")
+    check('RADAR_V3_MAX_OBSERVATION_HOURS = 6' in radar and 'RADAR_V3_LIVE_RETENTION_HOURS = 48' in radar,
+          "Radar evidence window stays 6h while live catalogue retention is 48h")
     check('RADAR_V3_NOISE_FLOOR_VPH = 3.0' in radar and 'RADAR_V3_CANDIDATE_PERCENTILE = 0.90' in radar and 'RADAR_V3_EARLY_PERCENTILE = 0.95' in radar and 'RADAR_V3_STRONG_PERCENTILE = 0.98' in radar,
           "Radar 3.2 uses category-adaptive P90/P95/P98 with 3/h noise floor")
     refresh_block = radar.split('async def radar_v3_record_refreshed', 1)[1].split('async def radar_v3_expire_observations', 1)[0]
@@ -69,7 +69,7 @@ def main() -> int:
           "legacy historical backfill disabled and maintenance is non-destructive")
     expire_block = radar.split('async def radar_v3_expire_stale_products', 1)[1].split('async def repair_radar_v3_historical_scores_once', 1)[0]
     check('current_score=0' not in expire_block and 'else_=RadarProduct.last_signal_score' in expire_block,
-          "24h live expiry preserves confirmed Score between AutoScan passes")
+          "48h live expiry preserves confirmed Score between AutoScan passes")
     rollover_block = radar.split('async def radar_v3_rollover_successful_category', 1)[1].split('async def repair_radar_v3_historical_scores_once', 1)[0]
     check('return 0' in rollover_block and 'status="historical"' not in rollover_block,
           "bounded category absence cannot retire confirmed Live families")
@@ -185,7 +185,7 @@ def main() -> int:
     check('RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES = _radar_env_int("RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES", 16' in bot,
           "idle page prefetch is capped below the full 20-page category burst")
 
-    print("\nDT Parser 4.23.11 Radar Live & Checkpoint Visibility release smoke: PASS")
+    print("\nDT Parser 4.23.12 Radar 48H Demand Quality release smoke: PASS")
     return 0
 
 

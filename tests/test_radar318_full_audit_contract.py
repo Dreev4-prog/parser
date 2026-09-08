@@ -30,20 +30,20 @@ def test_expiry_update_is_not_nested_inside_where():
 
 def test_rearm_clears_all_context_score_state():
     block = RADAR.split('async def record_autoscan_hot_detailed', 1)[1].split('async def record_user_scan_radar3_baselines', 1)[0]
-    for token in (
-        'existing.previous_vph = 0.0', 'existing.velocity_percentile = 0.0',
-        'existing.acceleration_ratio = 0.0', 'existing.confidence = 0',
-        'existing.scored_checkpoints = 0', 'existing.consecutive_scored = 0',
-        'existing.strong_checkpoints = 0', 'existing.consecutive_strong = 0',
-    ):
-        assert token in block
+    # All reset paths call one shared function, including the provenance reset.
+    assert '_radar_reset_observation_cycle(session, existing, raw, measured_at, now)' in block
+    reset = RADAR.split('async def _radar_reset_observation_cycle', 1)[1].split('async def radar_v3_record_refreshed', 1)[0]
+    for token in ('"previous_vph"', '"velocity_percentile"', '"acceleration_ratio"',
+                  '"confidence"', '"scored_checkpoints"', '"consecutive_scored"',
+                  '"strong_checkpoints"', '"consecutive_strong"', 'obs.provenance_reset_at'):
+        assert token in reset
 
 
 def test_context_cohort_and_family_exclude_expired_or_excluded_rows():
     block = RADAR.split('async def radar_v3_record_refreshed', 1)[1].split('async def radar_v3_expire_observations', 1)[0]
     assert block.count('or_(RadarObservation.expires_at.is_(None), RadarObservation.expires_at > now)') >= 2
     # Category cohort intentionally keeps quiet measured rows to avoid survivor bias.
-    assert 'RadarObservation.status.notin_(["expired", "excluded"])' in block
+    assert 'RadarObservation.status.notin_(["expired", "excluded", "rollback_pending", "identity_reset"])' in block
     # Product-family confirmation remains restricted to live scored evidence.
     assert 'RadarObservation.status.in_(["observed", "confirmed"])' in block
 

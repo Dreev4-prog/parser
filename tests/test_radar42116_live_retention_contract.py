@@ -5,9 +5,9 @@ RADAR = (ROOT / "radar.py").read_text(encoding="utf-8")
 BOT = (ROOT / "bot.py").read_text(encoding="utf-8")
 
 
-def test_observation_window_stays_six_hours_but_live_retention_is_24h():
+def test_observation_window_stays_six_hours_but_live_retention_is_48h():
     assert "RADAR_V3_MAX_OBSERVATION_HOURS = 6" in RADAR
-    assert "RADAR_V3_LIVE_RETENTION_HOURS = 24" in RADAR
+    assert "RADAR_V3_LIVE_RETENTION_HOURS = 48" in RADAR
     seed = RADAR.split("async def record_autoscan_hot_detailed", 1)[1].split(
         "async def record_user_scan_radar3_baselines", 1
     )[0]
@@ -55,7 +55,9 @@ def test_first_startup_restores_only_recent_old_ttl_history():
     assert "RADAR_V3_LIVE_RETENTION_REPAIR_SETTING" in RADAR
     assert "RadarProduct.last_signal_at >= live_cutoff" in block
     assert "RadarProduct.last_signal_at < old_ttl_cutoff" in block
-    assert "RADAR_V3_LIVE_RETENTION_HOURS" in block
+    # The original one-time 6->24h repair remains pinned to its historic window.
+    # It must not reinterpret old History under the new 48h policy.
+    assert 'live_cutoff = now - timedelta(hours=24)' in block
     assert "RADAR_V3_MAX_OBSERVATION_HOURS" in block
     assert "RadarSnapshot.source == \"radar3_observed\"" in block
     assert '{"stable", "rising", "hot"}' in block

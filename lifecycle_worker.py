@@ -79,7 +79,7 @@ class LifecycleWorker:
                 )
             try:
                 new_status = await complete_lifecycle_check(
-                    job.id, result, error_text=error_text,
+                    job.id, result, error_text=error_text, owner=self.worker_id,
                 )
                 self.checked += 1
                 if result is True:

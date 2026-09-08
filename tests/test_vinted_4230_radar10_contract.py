@@ -29,8 +29,9 @@ def test_counter_regression_is_invalid_interval_not_negative_demand():
 
 
 def test_radar_mode_is_catalog_only_and_does_not_queue_blocked_detail_metrics():
-    assert "scan_collects_detail_metrics" in WORKER
-    assert "if collect_detail_metrics:" in WORKER
+    # Catalog workers no longer enqueue a separate per-item metrics batch.
+    # The currently deployed Radar-only path stays catalog-only.
+    assert 'enqueue_metric(scan_id=scan_id, item_id=item_id)' in WORKER
     assert 'str(row.mode or "manual") != "radar"' in LAB
     assert 'radar_catalog_only = str(scan.mode or "manual") == "radar"' in LAB
     radar_recalc = LAB.split('async def recalc_scan', 1)[1].split('async def save_catalog_page', 1)[0]

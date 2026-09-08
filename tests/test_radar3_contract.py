@@ -36,11 +36,11 @@ class Radar3ObservedDemandContractTests(unittest.TestCase):
         start = RADAR.index('async def radar_v3_record_refreshed(')
         end = RADAR.index('async def radar_v3_expire_stale_products(', start)
         src = RADAR[start:end]
-        self.assertIn('RADAR_V3_CANDIDATE_PERCENTILE', src)
+        self.assertIn('qualifies_velocity(vph, cohort, "candidate", thresholds)', src)
         self.assertIn('RADAR_V3_EARLY_PERCENTILE', src)
-        self.assertIn('RADAR_V3_STRONG_PERCENTILE', src)
-        self.assertIn('pct >= RADAR_V3_EARLY_PERCENTILE', src)
-        self.assertIn('pct >= RADAR_V3_STRONG_PERCENTILE', src)
+        self.assertIn('qualifies_velocity(vph, cohort, "hot", thresholds)', src)
+        self.assertIn('qualifies_velocity(vph, cohort, "early", thresholds)', src)
+        self.assertIn('qualifies_velocity(vph, cohort, "strong", thresholds)', src)
         self.assertIn('Initial counter is baseline-only and contributed 0 points', src)
 
     def test_startup_guard_is_non_destructive(self):
@@ -66,7 +66,7 @@ class Radar3ObservedDemandContractTests(unittest.TestCase):
         self.assertIn('radar_v3_claim_due_external_ids', RADAR)
         self.assertIn('.with_for_update(skip_locked=True)', RADAR)
         self.assertIn('RadarObservation.lease_until', RADAR)
-        self.assertIn('row.lease_owner = owner', RADAR)
+        self.assertIn('row.lease_owner, row.lease_until, row.updated_at = owner, lease_until, now', RADAR)
         self.assertIn('radar_v3_release_claims', RADAR)
         self.assertIn('radar_v3_claim_due_external_ids(owner, limit=250)', BOT)
 

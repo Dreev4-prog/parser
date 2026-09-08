@@ -21,14 +21,15 @@ def test_only_category_qualified_rows_can_publish_score():
     block = _block()
     assert 'if str(obs.status) not in {"observed", "confirmed"}:' in block
     assert "continue" in block
-    assert 'obs.status, obs.next_check_at = "quiet", None' in block
+    assert 'next_exploration_at(' in block
+    assert '("exploring", next_due) if next_due else ("quiet", None)' in block
     assert 'obs.status = "candidate"' in block
 
 
 def test_strong_is_category_relative_not_global_60_vph():
     block = _block()
-    assert 'pct >= RADAR_V3_STRONG_PERCENTILE' in block
-    assert 'vph >= thresholds["strong"]' in block
+    assert 'qualifies_velocity(vph, cohort, "strong", thresholds)' in block
+    assert 'qualifies_velocity(vph, cohort, "hot", thresholds)' in block
     assert 'demand_status, stage = "rising", "confirmed"' in block
     assert "RADAR_V3_STRONG_VPH" not in RADAR
 
