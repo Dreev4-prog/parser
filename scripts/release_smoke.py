@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.23.13", "VERSION=4.23.13")
+    check((ROOT / "VERSION").read_text().strip() == "4.23.14", "VERSION=4.23.14")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -99,6 +99,13 @@ def main() -> int:
     launcher = (ROOT / 'service_launcher.py').read_text(encoding='utf-8')
     check('"ai-worker": "retired_ai_worker.py"' in launcher, "legacy AI service is inert")
     check('.with_for_update(skip_locked=True)' in radar and 'radar_v3_claim_due_external_ids' in radar, "cross-replica Radar claims use SKIP LOCKED")
+    check('radar_v3_filter_claimed_refreshable' in radar and 'excluded_claims=' in bot,
+          "unrefreshable Radar checkpoint claims are retired instead of retried forever")
+    checkpoint_telemetry = radar.split('async def radar_v3_checkpoint_telemetry', 1)[1].split('async def radar_v3_prune_checkpoint_events', 1)[0]
+    check('RadarCheckpointEvent.delta_views > 0,' in checkpoint_telemetry and '), 1), else_=0)).label("growth")' in checkpoint_telemetry,
+          "checkpoint growth aggregate is integer-safe on PostgreSQL")
+    check('radar_v3_current_product_breakdown()' in bot and 'RADAR_V3_CURRENT_SIGNAL_HOURS' in radar.split('async def radar_v3_current_product_breakdown', 1)[1].split('async def ', 1)[0],
+          "Radar dashboard product totals use current public visibility rules")
     check('lease_owner' in models and 'lease_until' in models, "Radar observation lease fields present")
     check('radar_v3_expire_observations' in radar and 'RadarObservation.expires_at > now' in radar, "Radar observation TTL enforced before claims")
     check('pg_advisory_xact_lock(hashtext(:key))' in radar, "Radar preservation guard serialized across Parser replicas")
@@ -185,7 +192,7 @@ def main() -> int:
     check('RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES = _radar_env_int("RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES", 16' in bot,
           "idle page prefetch is capped below the full 20-page category burst")
 
-    print("\nDT Parser 4.23.13 Radar Simple UI release smoke: PASS")
+    print("\nDT Parser 4.23.14 Radar Checkpoint Runtime Fix release smoke: PASS")
     return 0
 
 

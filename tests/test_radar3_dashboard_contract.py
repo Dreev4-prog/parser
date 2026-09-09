@@ -22,6 +22,15 @@ def test_dashboard_groups_live_growth_by_category():
     assert 'RadarObservation.category_key' in block
     assert 'func.sum(RadarObservation.total_delta)' in block
     assert '.group_by(RadarObservation.category_key)' in block
-    assert 'RadarProduct.category_key' in block
-    assert 'RadarProduct.status' in block
+    assert 'radar_v3_current_product_breakdown()' in block
     assert 'RadarProduct.demand_status' not in block
+
+
+def test_dashboard_product_counts_use_public_current_filters():
+    radar = Path(__file__).resolve().parents[1].joinpath('radar.py').read_text(encoding='utf-8')
+    block = radar.split('async def radar_v3_current_product_breakdown', 1)[1].split(
+        'async def ', 1)[0]
+    assert '_visible_product_association_exists' in block
+    assert '_live_radar_product_exists' in block
+    assert 'RADAR_V3_LIVE_RETENTION_HOURS' in block
+    assert 'RADAR_V3_CURRENT_SIGNAL_HOURS' in block

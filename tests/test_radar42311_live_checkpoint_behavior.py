@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import logging
 
-from sqlalchemy import create_engine, select, update, delete, func, case, or_, text
+from sqlalchemy import and_, create_engine, select, update, delete, func, case, or_, text
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert, dialect as pg_dialect
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -70,7 +70,7 @@ def environment():
     with Session(engine) as s:
         assert s.scalar(select(func.count()).select_from(RadarObservation)) == 1
     ns = dict(datetime=datetime, timedelta=timedelta, select=select, update=update, delete=delete,
-        func=func, case=case, or_=or_, text=text, pg_insert=pg_insert, sqlite_insert=sqlite_insert,
+        func=func, case=case, and_=and_, or_=or_, text=text, pg_insert=pg_insert, sqlite_insert=sqlite_insert,
         RadarCheckpointEvent=RadarCheckpointEvent, RadarObservation=RadarObservation,
         RadarProduct=RadarProduct, RADAR_V3_CHECKPOINT_AUDIT_DAYS=7, RADAR_V3_LIVE_RETENTION_HOURS=48,
         ACTIVE_OBSERVATION_STATUSES=ACTIVE_OBSERVATION_STATUSES,
@@ -243,3 +243,10 @@ def test_postgresql_event_upsert_compiles_without_network():
     sql=str(stmt.compile(dialect=pg_dialect()))
     assert "ON CONFLICT ON CONSTRAINT uq_radar_checkpoint_event_cycle DO NOTHING" in sql
     assert "radar_checkpoint_events" in sql
+
+
+def test_checkpoint_growth_case_uses_one_integer_result():
+    block = RADAR.split('async def radar_v3_checkpoint_telemetry', 1)[1].split(
+        'async def radar_v3_prune_checkpoint_events', 1)[0]
+    assert 'RadarCheckpointEvent.delta_views > 0,' in block
+    assert '), 1), else_=0)).label("growth")' in block

@@ -131,7 +131,8 @@ from radar import (
     record_verified_velocity_signals, refresh_radar_scores, verify_listing_organic_now,
     lifecycle_diagnostics, get_radar_recent_hot_infos, repair_radar_lifecycle_qualification_once,
     repair_radar_v3_quality_once,
-    prepare_radar_v3_once, repair_radar_v3_historical_scores_once, repair_radar_v3_live_retention_once, radar_v3_due_external_ids, radar_v3_claim_due_external_ids, radar_v3_release_claims, radar_v3_record_refreshed, radar_v3_expire_observations, radar_v3_expire_stale_products, radar_v3_rollover_successful_category, repair_radar_v3_depth_retirement_once,
+    prepare_radar_v3_once, repair_radar_v3_historical_scores_once, repair_radar_v3_live_retention_once, radar_v3_due_external_ids, radar_v3_claim_due_external_ids, radar_v3_filter_claimed_refreshable, radar_v3_release_claims, radar_v3_record_refreshed, radar_v3_expire_observations, radar_v3_expire_stale_products, radar_v3_rollover_successful_category, repair_radar_v3_depth_retirement_once,
+    radar_v3_current_product_breakdown,
     radar_v3_checkpoint_telemetry, radar_v3_prune_checkpoint_events,
     search_radar_products, toggle_radar_favorite,
 )
@@ -4631,11 +4632,25 @@ async def radar_v3_observation_scheduler() -> None:
             if not ids:
                 await asyncio.sleep(30)
                 continue
+            refreshable_ids, excluded = await radar_v3_filter_claimed_refreshable(owner, ids)
+            if not refreshable_ids:
+                log.info(
+                    "DT Radar 3.0 observation batch due=%s requested=0 updated=0 failed=0 "
+                    "signals=0 released_claims=0 excluded_claims=%s",
+                    len(ids), excluded,
+                )
+                await asyncio.sleep(10)
+                continue
             async with SessionLocal() as session:
-                rows = list((await session.execute(select(Listing).where(Listing.external_id.in_(ids)))).scalars().all())
+                rows = list((await session.execute(
+                    select(Listing).where(Listing.external_id.in_(refreshable_ids))
+                )).scalars().all())
             if not rows:
-                released = await radar_v3_release_claims(owner, ids)
-                log.warning("DT Radar 3.0 claimed rows missing listings due=%s released=%s", len(ids), released)
+                released = await radar_v3_release_claims(owner, refreshable_ids)
+                log.warning(
+                    "DT Radar 3.0 claimed rows disappeared after validation due=%s released=%s excluded=%s",
+                    len(refreshable_ids), released, excluded,
+                )
                 await asyncio.sleep(30)
                 continue
             async with radar_v3_view_refresh_lock:
@@ -4643,8 +4658,12 @@ async def radar_v3_observation_scheduler() -> None:
             saved = await radar_v3_record_refreshed([str(x.external_id) for x in rows], owner=owner)
             # Successful observations release their own lease while being recorded;
             # failed/unchanged rows are released here for a clean retry next poll.
-            released = await radar_v3_release_claims(owner, ids)
-            log.info("DT Radar 3.0 observation batch due=%s requested=%s updated=%s failed=%s signals=%s released_claims=%s", len(ids), requested, updated, failed, saved, released)
+            released = await radar_v3_release_claims(owner, refreshable_ids)
+            log.info(
+                "DT Radar 3.0 observation batch due=%s requested=%s updated=%s failed=%s "
+                "signals=%s released_claims=%s excluded_claims=%s",
+                len(ids), requested, updated, failed, saved, released, excluded,
+            )
             await asyncio.sleep(10)
         except asyncio.CancelledError:
             raise
@@ -5263,19 +5282,6 @@ async def _radar3_dashboard_snapshot() -> dict:
         (active, baseline, due, any_growth, candidate, observed, strong_intervals,
          persistent, accelerating, high_confidence, quiet, total_delta) = [int(x or 0) for x in obs]
 
-        products = (await session.execute(select(
-            func.count(RadarProduct.id).filter(
-                RadarProduct.latest_source == "radar3_observed", RadarProduct.status == "stable"
-            ),
-            func.count(RadarProduct.id).filter(
-                RadarProduct.latest_source == "radar3_observed", RadarProduct.status == "rising"
-            ),
-            func.count(RadarProduct.id).filter(
-                RadarProduct.latest_source == "radar3_observed", RadarProduct.status == "hot"
-            ),
-        ))).one()
-        early, strong, hot = [int(x or 0) for x in products]
-
         category_rows = list((await session.execute(
             select(
                 RadarObservation.category_key,
@@ -5293,14 +5299,10 @@ async def _radar3_dashboard_snapshot() -> dict:
             .order_by(func.coalesce(func.max(RadarObservation.velocity_percentile), 0.0).desc(), func.coalesce(func.avg(RadarObservation.current_vph), 0.0).desc())
             .limit(12)
         )).all())
-        signal_rows = list((await session.execute(
-            select(RadarProduct.category_key, RadarProduct.status, func.count(RadarProduct.id))
-            .where(
-                RadarProduct.latest_source == "radar3_observed",
-                RadarProduct.status.in_(["stable", "rising", "hot"]),
-            )
-            .group_by(RadarProduct.category_key, RadarProduct.status)
-        )).all())
+    product_counts, signal_rows = await radar_v3_current_product_breakdown()
+    early = int(product_counts.get("stable") or 0)
+    strong = int(product_counts.get("rising") or 0)
+    hot = int(product_counts.get("hot") or 0)
 
     signal_map: dict[str, dict[str, int]] = {}
     for key, status, count in signal_rows:

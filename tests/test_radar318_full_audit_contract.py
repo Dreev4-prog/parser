@@ -9,9 +9,11 @@ DB = (ROOT / 'db.py').read_text(encoding='utf-8')
 def test_dashboard_uses_real_radar_product_status_column():
     block = BOT.split('async def _radar3_dashboard_snapshot', 1)[1].split('async def _radar3_dashboard_safe_snapshot', 1)[0]
     assert 'RadarProduct.demand_status' not in block
-    assert 'RadarProduct.status == "stable"' in block
-    assert 'RadarProduct.status == "rising"' in block
-    assert 'RadarProduct.status == "hot"' in block
+    assert 'radar_v3_current_product_breakdown()' in block
+    helper = RADAR.split('async def radar_v3_current_product_breakdown', 1)[1].split('async def ', 1)[0]
+    assert 'RadarProduct.status == "stable"' in helper
+    assert 'RadarProduct.status == "rising"' in helper
+    assert 'RadarProduct.status == "hot"' in helper
 
 
 def test_radar_panel_acknowledges_before_lightweight_live_state():

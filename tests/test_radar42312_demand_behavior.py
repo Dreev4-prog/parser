@@ -88,7 +88,8 @@ def env():
     names=['_radar_checkpoint_event_values','_insert_radar_checkpoint_events',
         '_radar_exploration_count','_radar_quarantine_rollback','_radar_reset_observation_cycle',
         '_radar32_thresholds','_percentile_rank','_observed_signal_matches',
-        'radar_v3_record_refreshed','radar_v3_claim_due_external_ids','radar_v3_release_claims',
+        'radar_v3_record_refreshed','radar_v3_claim_due_external_ids',
+        'radar_v3_filter_claimed_refreshable','radar_v3_release_claims',
         '_next_lifecycle_checkpoint','_lifecycle_event','_maybe_queue_early_lifecycle',
         '_maybe_queue_lifecycle_watch','_lifecycle_reason','complete_lifecycle_check',
         '_snapshot_live_evidence','radar_v3_expire_stale_products']
@@ -210,6 +211,30 @@ def test_claims_are_unique_and_exploration_has_bounded_quota(env):
     assert not set(claimed).intersection(run(f.radar_v3_claim_due_external_ids('owner-b',limit=8)))
     assert run(f.radar_v3_release_claims('wrong-owner',claimed))==0
     assert run(f.radar_v3_release_claims('owner-a',claimed))==8
+
+
+def test_claim_filter_excludes_rows_that_can_never_be_refreshed(env):
+    engine,f,_,_=env
+    now=datetime.utcnow().replace(microsecond=0)
+    clean=listing('clean',now)
+    promoted=listing('promoted',now);promoted.is_promoted=True
+    missing_url=listing('missing-url',now);missing_url.url=''
+    observations=[]
+    for ext in ('clean','promoted','missing-url','missing-listing'):
+        row=observation(ext,now-timedelta(hours=1))
+        row.lease_owner='owner';row.lease_until=now+timedelta(minutes=10)
+        observations.append(row)
+    with Session(engine) as s:
+        s.add_all([clean,promoted,missing_url,*observations]);s.commit()
+    refreshable,excluded=run(f.radar_v3_filter_claimed_refreshable(
+        'owner',['clean','promoted','missing-url','missing-listing']))
+    assert refreshable==['clean'] and excluded==3
+    with Session(engine) as s:
+        rows={row.external_id:row for row in s.scalars(select(RadarObservation))}
+        assert rows['clean'].status=='baseline' and rows['clean'].lease_owner=='owner'
+        for ext in ('promoted','missing-url','missing-listing'):
+            assert rows[ext].status=='excluded'
+            assert rows[ext].next_check_at is None and rows[ext].lease_owner==''
 
 
 def test_48h_retention_is_distinct_from_current_hot(env):

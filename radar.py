@@ -9,7 +9,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import case, delete, func, or_, select, text, update
+from sqlalchemy import and_, case, delete, func, or_, select, text, update
 
 from db import DATABASE_BACKEND, SessionLocal
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -199,7 +199,10 @@ async def radar_v3_checkpoint_telemetry() -> dict:
         cycle = select(
             RadarCheckpointEvent.external_id, RadarCheckpointEvent.baseline_at,
             func.max(case((RadarCheckpointEvent.event_type == "measured", RadarCheckpointEvent.checkpoint_no), else_=0)).label("checks"),
-            func.max(case((RadarCheckpointEvent.event_type == "measured", RadarCheckpointEvent.delta_views > 0), else_=0)).label("growth"),
+            func.max(case((and_(
+                RadarCheckpointEvent.event_type == "measured",
+                RadarCheckpointEvent.delta_views > 0,
+            ), 1), else_=0)).label("growth"),
             func.max(case((RadarCheckpointEvent.event_type == "quiet", 1), else_=0)).label("quiet"),
             func.max(case((RadarCheckpointEvent.event_type == "expired", 1), else_=0)).label("expired"),
             func.max(case((RadarCheckpointEvent.event_type == "rollback", 1), else_=0)).label("rollback"),
@@ -1786,6 +1789,57 @@ async def radar_v3_claim_due_external_ids(owner: str, limit: int = 1000, lease_m
         return [str(row.external_id) for row in rows]
 
 
+async def radar_v3_filter_claimed_refreshable(
+    owner: str,
+    external_ids: list[str] | tuple[str, ...] | set[str],
+) -> tuple[list[str], int]:
+    """Remove permanently unrefreshable rows from a claimed checkpoint batch.
+
+    Missing listings, missing URLs and listings that became dirty/promoted/reduced
+    cannot produce a valid exact Radar checkpoint. Leaving their lease in the normal
+    retry path makes them the oldest due rows forever, wasting every later batch.
+    """
+    ids = list(dict.fromkeys(str(x).strip() for x in external_ids if str(x).strip()))
+    if not ids:
+        return [], 0
+    lease_owner = str(owner or "")[:120]
+    now = datetime.utcnow()
+    async with SessionLocal() as session:
+        refreshable_set = {str(x) for x in (await session.execute(
+            select(Listing.external_id).join(
+                RadarObservation, RadarObservation.external_id == Listing.external_id,
+            ).where(
+                Listing.external_id.in_(ids),
+                Listing.url.is_not(None),
+                Listing.url != "",
+                Listing.is_promoted.is_(False),
+                Listing.is_price_reduced.is_(False),
+                ~_registry_dirty_exists(Listing.external_id),
+                RadarObservation.status.in_(ACTIVE_OBSERVATION_STATUSES),
+                RadarObservation.lease_owner == lease_owner,
+            )
+        )).scalars().all()}
+        rejected = [external_id for external_id in ids if external_id not in refreshable_set]
+        excluded = 0
+        if rejected:
+            result = await session.execute(
+                update(RadarObservation).where(
+                    RadarObservation.external_id.in_(rejected),
+                    RadarObservation.status.in_(ACTIVE_OBSERVATION_STATUSES),
+                    RadarObservation.lease_owner == lease_owner,
+                ).values(
+                    status="excluded",
+                    next_check_at=None,
+                    lease_owner="",
+                    lease_until=None,
+                    updated_at=now,
+                ).execution_options(synchronize_session=False)
+            )
+            excluded = int(result.rowcount or 0)
+            await session.commit()
+        return [external_id for external_id in ids if external_id in refreshable_set], excluded
+
+
 def _percentile_rank(value: float, peers: list[float]) -> float:
     return cohort_position(value, peers).percentile
 
@@ -2971,6 +3025,37 @@ async def radar_stats() -> RadarStats:
             RadarLifecycleWatch.lifetime_seconds <= RADAR_FAST_SOLD_MAX_SECONDS,
             _clean_listing_exists(RadarLifecycleWatch.external_id)))).scalar_one() or 0)
     return RadarStats(total, hot, rising, ai_picks, categories, signals, fast_sold, recent_hot_48h)
+
+
+async def radar_v3_current_product_breakdown() -> tuple[dict[str, int], list[tuple[str, str, int]]]:
+    """Return current Radar 3.0 product counts using the public visibility rules."""
+    now = datetime.utcnow()
+    async with SessionLocal() as session:
+        visible = _visible_product_association_exists(RadarProduct.id)
+        current = [
+            RadarProduct.latest_source == "radar3_observed",
+            visible,
+            _live_radar_product_exists(RadarProduct.id),
+            RadarProduct.status != "historical",
+            RadarProduct.last_signal_at >= now - timedelta(hours=RADAR_V3_LIVE_RETENTION_HOURS),
+            func.coalesce(RadarProduct.current_signal_at, RadarProduct.last_signal_at)
+            >= now - timedelta(hours=RADAR_V3_CURRENT_SIGNAL_HOURS),
+        ]
+        counts = (await session.execute(select(
+            func.count(RadarProduct.id).filter(*current, RadarProduct.status == "stable"),
+            func.count(RadarProduct.id).filter(*current, RadarProduct.status == "rising"),
+            func.count(RadarProduct.id).filter(*current, RadarProduct.status == "hot"),
+        ))).one()
+        rows = list((await session.execute(
+            select(RadarProduct.category_key, RadarProduct.status, func.count(RadarProduct.id))
+            .where(*current, RadarProduct.status.in_(["stable", "rising", "hot"]))
+            .group_by(RadarProduct.category_key, RadarProduct.status)
+        )).all())
+    return {
+        "stable": int(counts[0] or 0),
+        "rising": int(counts[1] or 0),
+        "hot": int(counts[2] or 0),
+    }, [(str(key or "unknown"), str(status or ""), int(count or 0)) for key, status, count in rows]
 
 
 async def get_radar_recent_hot_infos(product_ids: list[int] | tuple[int, ...]) -> dict[int, tuple[datetime, int]]:
