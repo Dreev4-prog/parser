@@ -1604,110 +1604,15 @@ async def record_autoscan_hot_detailed(
 
 
 async def record_user_scan_radar3_baselines(scan_id: int) -> int:
-    """Seed Radar 3.0 from a completed *today* user scan without extra web requests.
+    """Compatibility no-op: only AutoScan may create shared Radar baselines.
 
-    ScanListing.initial_view_count/captured_at are authoritative baseline points.
-    User scans never publish a signal by themselves and duplicate adIds reuse the
-    existing RadarObservation instead of creating another observation.
+    User scans retain their saved exact counters and their separate opt-in
+    +3/+6/+12h observation plans. They cannot create, re-arm or mutate a shared
+    RadarObservation, even if an older caller invokes this function directly.
+    Existing Radar evidence is preserved and expires under the normal policy.
     """
-    now = datetime.utcnow()
-    today_msk = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
-    seeded = 0
-    async with SessionLocal() as session:
-        # Multiple users can finish scans containing the same adId at nearly the
-        # same moment. Serialize this very short DB-only seeding section so the
-        # unique RadarObservation.external_id constraint never becomes a race.
-        if DATABASE_BACKEND == "postgresql":
-            await session.execute(
-                text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-                {"key": "radar3-user-scan-baseline-seed"},
-            )
-        scan = await session.get(UserScan, int(scan_id))
-        if scan is None or str(scan.target_date or "") != today_msk or str(scan.status or "") not in {"done", "partial"}:
-            return 0
-        rows = list((await session.execute(
-            select(ScanListing, Listing)
-            .join(Listing, Listing.external_id == ScanListing.external_id)
-            .where(
-                ScanListing.scan_id == int(scan_id),
-                ScanListing.initial_view_count.is_not(None),
-                Listing.posted_date_msk == today_msk,
-                Listing.is_promoted.is_(False),
-                Listing.is_price_reduced.is_(False),
-                ~_registry_dirty_exists(Listing.external_id),
-            )
-        )).all())
-        ids = [str(listing.external_id) for _snap, listing in rows]
-        existing_map = {}
-        if ids:
-            existing_map = {str(x.external_id): x for x in (await session.execute(
-                select(RadarObservation).where(RadarObservation.external_id.in_(ids)).with_for_update()
-            )).scalars().all()}
-        early_total = int((await session.execute(select(func.count(RadarLifecycleWatch.id)).where(
-            RadarLifecycleWatch.enrollment_source == "early",
-            RadarLifecycleWatch.status.in_(["watching", "confirming"]),
-        ))).scalar_one() or 0)
-        early_categories = {str(cat):int(count) for cat,count in (await session.execute(select(
-            RadarLifecycleWatch.category_key, func.count(RadarLifecycleWatch.id)).where(
-            RadarLifecycleWatch.enrollment_source == "early",
-            RadarLifecycleWatch.status.in_(["watching", "confirming"]),
-        ).group_by(RadarLifecycleWatch.category_key))).all()}
-        for snap, listing in rows:
-            if not radar_v3_category_allowed(str(listing.category_key or "")):
-                continue
-            ext = str(listing.external_id)
-            measured_at = snap.captured_at or now
-            raw = max(0, int(snap.initial_view_count or 0))
-            existing = existing_map.get(ext)
-            if isinstance(existing, RadarObservation):
-                if measured_at <= (existing.last_measured_at or datetime.min):
-                    continue
-                old_enough = (now - (existing.updated_at or existing.last_measured_at or now)).total_seconds() >= 3 * 3600
-                if (str(existing.status or "") in {"quiet", "expired"} and old_enough
-                        and (existing.lease_until is None or existing.lease_until <= now)):
-                    if measured_at <= (existing.last_measured_at or datetime.min):
-                        continue
-                    if raw < int(existing.last_views or 0):
-                        existing.status = "rollback_pending"
-                        existing.rollback_first_at = existing.rollback_last_at = measured_at
-                        existing.rollback_last_views = raw
-                        existing.rollback_count = 0
-                        existing.next_check_at = now + timedelta(minutes=ROLLBACK_RETRY_MINUTES)
-                        existing.expires_at = max(existing.expires_at or now, now + timedelta(hours=1))
-                        existing.updated_at = now
-                        await _insert_radar_checkpoint_events(session, [
-                            _radar_checkpoint_event_values(existing, "identity_reset", now=now)])
-                        await _radar_quarantine_rollback(session, existing, now)
-                        continue
-                    await _radar_reset_observation_cycle(session, existing, raw, measured_at, now)
-                    await _radar_quarantine_rollback(session, existing, now)
-                    seeded += 1
-                continue
-            if ext in existing_map:
-                continue
-            new_obs = RadarObservation(
-                external_id=ext, category_key=str(listing.category_key or "unknown"),
-                product_key=radar_product_key(listing),
-                baseline_views=raw, baseline_at=measured_at,
-                last_views=raw, last_measured_at=measured_at,
-                checkpoint_count=0, positive_checkpoints=0, consecutive_positive=0,
-                total_delta=0, current_vph=0.0, peak_vph=0.0, status="baseline",
-                next_check_at=measured_at + timedelta(minutes=RADAR_V3_FIRST_CHECK_MINUTES),
-                expires_at=measured_at + timedelta(hours=RADAR_V3_MAX_OBSERVATION_HOURS),
-                created_at=now, updated_at=now,
-            )
-            session.add(new_obs)
-            await _insert_radar_checkpoint_events(session, [
-                _radar_checkpoint_event_values(new_obs, "baseline", measured_at=measured_at, now=now)])
-            existing_map[ext] = True
-            seeded += 1
-            budget = {"total":early_total, "category":early_categories.get(str(listing.category_key or ""),0)}
-            if await _maybe_queue_early_lifecycle(session, listing, now, budget=budget):
-                early_total = budget["total"]
-                early_categories[str(listing.category_key or "")] = budget["category"]
-        if seeded:
-            await session.commit()
-    return seeded
+    del scan_id
+    return 0
 
 
 async def repair_radar_v3_quality_once() -> int:

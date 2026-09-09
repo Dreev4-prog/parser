@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.23.14", "VERSION=4.23.14")
+    check((ROOT / "VERSION").read_text().strip() == "4.23.16", "VERSION=4.23.16")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -37,7 +37,8 @@ def main() -> int:
     check('RADAR_CONTEXT_ENABLED = False' in bot and 'RADAR_CONTEXT_DEPTH = 0' in bot, "yesterday Context retired")
     scheduler = bot.split('async def radar_autoscan_scheduler', 1)[1].split('async def send_smart_export', 1)[0]
     check('_radar_autoscan_new_context_round' not in scheduler, "scheduler cannot launch yesterday Context")
-    check('record_user_scan_radar3_baselines' in bot and 'record_user_scan_radar3_baselines' in radar, "today user scans feed Radar 3.0 baselines")
+    check('record_user_scan_radar3_baselines' not in bot and 'record_user_scan_radar3_baselines' in radar,
+          "user scans cannot feed the shared Radar baseline queue")
     check('class RadarObservation(Base):' in (ROOT / 'models.py').read_text(encoding='utf-8'),
           "Radar 3.0 observation table present")
     check('baseline_views=raw' in radar and 'admitted=0, saved=0' in radar,
@@ -53,9 +54,12 @@ def main() -> int:
           "Radar 3.2 category evaluation is two-pass and order-stable inside each batch")
     check('RADAR_V3_EXCLUDED_GROUPS' in radar and all(f'"{g}"' in radar.split('RADAR_V3_EXCLUDED_GROUPS',1)[1].split('})',1)[0] for g in ('auto','immobilien','jobs','services','kurse','hilfe')),
           "non-product groups are excluded by canonical Radar scope")
-    user_seed = radar.split('async def record_user_scan_radar3_baselines',1)[1].split('async def radar_v3_due_external_ids',1)[0]
-    check('radar_v3_category_allowed(str(listing.category_key or ""))' in user_seed and 'radar_v3_category_allowed' in bot.split('def _radar_autoscan_category_allowed',1)[1].split('def _radar_autoscan_categories',1)[0],
-          "AutoScan and user-scan baselines share the same Radar category policy")
+    user_seed = radar.split('async def record_user_scan_radar3_baselines',1)[1].split('async def repair_radar_v3_quality_once',1)[0]
+    autoscan_seed = radar.split('async def record_autoscan_hot_detailed',1)[1].split('async def record_user_scan_radar3_baselines',1)[0]
+    check('return 0' in user_seed and 'RadarObservation(' not in user_seed
+          and 'new_obs = RadarObservation(' in autoscan_seed
+          and 'radar_v3_category_allowed' in bot.split('def _radar_autoscan_category_allowed',1)[1].split('def _radar_autoscan_categories',1)[0],
+          "AutoScan is the sole shared Radar baseline source")
     check('RADAR_AUTOSCAN_POLICY_VERSION = 7' in bot and 'state = _radar_autoscan_default_state()' in bot and 'raw_state = {}' in bot,
           "policy upgrade discards old AutoScan telemetry/progress")
     check('if str(obs.status) not in {"observed", "confirmed"}:' in radar and 'continue' in radar,
@@ -192,7 +196,7 @@ def main() -> int:
     check('RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES = _radar_env_int("RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES", 16' in bot,
           "idle page prefetch is capped below the full 20-page category burst")
 
-    print("\nDT Parser 4.23.14 Radar Checkpoint Runtime Fix release smoke: PASS")
+    print("\nDT Parser 4.23.16 AutoScan-only Radar baseline protection: PASS")
     return 0
 
 

@@ -127,7 +127,7 @@ from radar import (
     RADAR_PAGE_SIZE, RADAR_SCAN_TOP_LIMIT, bump_resurrection_integrity_sweep_once,
     prepare_bump_resurrection_sweep_once, prepare_verified_organic_velocity_once, prepare_unified_48h_ranking_once, get_fast_sold_info, get_fast_sold_infos,
     get_radar_product, is_radar_favorite, list_radar_products, radar_categories, radar_stats,
-    purge_nonorganic_analytics, record_autoscan_hot_detailed, record_user_scan_radar3_baselines, radar_v3_category_allowed,
+    purge_nonorganic_analytics, record_autoscan_hot_detailed, radar_v3_category_allowed,
     record_verified_velocity_signals, refresh_radar_scores, verify_listing_organic_now,
     lifecycle_diagnostics, get_radar_recent_hot_infos, repair_radar_lifecycle_qualification_once,
     repair_radar_v3_quality_once,
@@ -2290,16 +2290,6 @@ async def backfill_recent_observation_plans() -> int:
     return len(rows)
 
 
-async def _safe_record_scan_hot(scan_id: int) -> None:
-    """Feed today's completed user scans into Radar 3.0 as baseline-only evidence."""
-    try:
-        seeded = await record_user_scan_radar3_baselines(int(scan_id))
-        if seeded:
-            log.info("DT Radar 3.0 user-scan baselines scan=%s seeded=%s", scan_id, seeded)
-    except Exception:
-        log.exception("DT Radar 3.0 user-scan baseline merge failed scan=%s", scan_id)
-
-
 async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None:
     if job.scan_id is None:
         return
@@ -2392,17 +2382,12 @@ async def finalize_user_scan(job: "ScanJob", *, cancelled: bool = False) -> None
             await session.commit()
 
     if not cancelled and job.incomplete_categories == 0:
-        # v4.10.0 DT Radar: every completed scan contributes its TOP real-view
-        # products to the global persistent knowledge base. This is DB-only and
-        # never performs additional Kleinanzeigen requests.
-        # Never hold the user's completion card on Radar bookkeeping. Missed
-        # background merges are recovered by the one-time/history backfill.
-        asyncio.create_task(
-            _safe_record_scan_hot(job.scan_id),
-            name=f"dt-radar-scan-{job.scan_id}",
-        )
+        # v4.23.16: user scans keep their own saved exact counters and optional
+        # +3/+6/+12h measurements, but they no longer seed the shared Radar queue.
+        # AutoScan is the sole Radar baseline source, so a deep user scan cannot
+        # delay Radar checkpoints or change the category cohort.
 
-        # v4.8.6: automatic view observations belong only to a fully confirmed
+        # Automatic user-scan observations belong only to a fully confirmed
         # snapshot. A partial scan must not start background view rounds behind
         # the integrity gate.
         await ensure_scan_observation_plan(job.scan_id, now)

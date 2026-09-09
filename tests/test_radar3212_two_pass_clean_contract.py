@@ -23,15 +23,15 @@ def test_canonical_scope_blocks_non_product_groups_everywhere():
     for group in ('auto', 'immobilien', 'jobs', 'services', 'kurse', 'hilfe'):
         assert f'"{group}"' in RADAR.split('RADAR_V3_EXCLUDED_GROUPS', 1)[1].split('})', 1)[0]
     auto = RADAR.split('async def record_autoscan_hot_detailed', 1)[1].split('async def record_user_scan_radar3_baselines', 1)[0]
-    user = RADAR.split('async def record_user_scan_radar3_baselines', 1)[1].split('async def radar_v3_due_external_ids', 1)[0]
+    user = RADAR.split('async def record_user_scan_radar3_baselines', 1)[1].split('async def repair_radar_v3_quality_once', 1)[0]
     assert 'radar_v3_category_allowed(str(category_key))' in auto
-    assert 'radar_v3_category_allowed(str(listing.category_key or ""))' in user
+    assert 'RadarObservation(' not in user and 'return 0' in user
     helper = BOT.split('def _radar_autoscan_category_allowed', 1)[1].split('def _radar_autoscan_categories', 1)[0]
     assert 'radar_v3_category_allowed' in helper
 
 
 def test_policy_upgrade_discards_old_telemetry_but_preserves_schedule_preferences():
-    assert 'RADAR_AUTOSCAN_POLICY_VERSION = 6' in BOT
+    assert 'RADAR_AUTOSCAN_POLICY_VERSION = 7' in BOT
     block = BOT.split('stored_policy = max(0, int(raw_state.get("policy_version") or 0))', 1)[1].split('legacy_active = False', 1)[0]
     assert 'state = _radar_autoscan_default_state()' in block
     assert 'daily_enabled = bool(state.get("daily_enabled"))' in block

@@ -1,101 +1,75 @@
-# DT Radar Core 2.0 — Architecture
+# DT Parser architecture
 
-## 1. Foreground priority
+This document describes the active v4.23.x system. Historical 15+15-page Context
+Radar and DT AI Lab designs are archived and are not runtime contracts.
 
-User scans always have priority. AutoScan pauses before a new category when foreground work is active/queued. While AutoScan owns foreground priority, parser-side background integrity/checkpoint browser/view traffic is paused so it cannot invert locks with the Detail Gate.
+## Runtime entrypoints
 
-A category has a bounded watchdog. Hard Stop cancels the in-flight AutoScan category, resets its browser context and keeps that category index for a clean resume.
+Railway starts `service_launcher.py`. It resolves the service role from
+`DT_SERVICE_ROLE` or the Railway service name and replaces itself with the matching
+Python entrypoint. The default role is `bot.py`.
 
-## 2. Fresh Layer — today
+The Telegram bot owns four FIFO user-scan lanes in stable single-service mode. A user
+scan accepts at most two categories. Each job receives an isolated browser context;
+the process may share one Chromium runtime.
 
-Every normal/manual/daily Fresh round scans up to 15 verified target-date pages per eligible product category.
+Optional Page, Date, View, Lifecycle and Vinted workers use dedicated entrypoints and
+queues. The old AI Worker role is intentionally routed to `retired_ai_worker.py` and
+does not score or publish anything.
 
-Pipeline:
+## User scan pipeline
 
-`Date/Page chronology -> card integrity -> exact views -> view provenance -> live Organic Gate -> unified 48H scoring -> Demand Gate -> Radar`
+The active scan path is:
 
-A category with incomplete exact views or unresolved higher-ranked Organic Gate evidence is fail-closed and goes to retry instead of fabricating a TOP.
+`category/date pages -> card integrity -> exact views -> PostgreSQL -> filters/export`
 
-## 3. Context Layer — yesterday
+Verified pages and date hints use versioned cache payloads. Cached listing IDs, URLs,
+page identity and category redirects are revalidated before reuse. Partial scans do
+not become a verified zero and are not stored as final shared cache results. One
+bounded fresh-context recovery pass reuses strong PostgreSQL checkpoints before the
+user sees a partial result.
 
-At most once per Moscow calendar day, after a completed manual/daily Fresh round, DT scans yesterday with the same 15-page cap and same integrity pipeline.
+## Kleinanzeigen Radar 3.2
 
-Context has two jobs:
+AutoScan reads up to 20 verified pages per eligible product category for today only.
+The first exact counter creates a baseline and contributes zero score. AutoScan is
+the sole source of shared Radar baselines. User scans retain their own saved exact
+counters and optional observation plans but cannot create or re-arm RadarObservation
+rows.
 
-1. enrich durable Listings/ViewHistory/PriceHistory evidence for Persistence, Repeatability, price profiles and demand history;
-2. allow genuinely proven yesterday listings to compete in the **same 48H Radar**.
+Radar then owns its measurements. Due observations are leased with PostgreSQL
+`FOR UPDATE SKIP LOCKED`, refreshed with exact counters and evaluated in a two-pass
+category cohort. The active evidence window is six hours; confirmed catalogue rows
+can remain visible for up to 48 hours, subject to current freshness and integrity
+rules.
 
-Context does not mean “trust yesterday's total”. A row with unknown provenance is withheld. A qualified yesterday row must have demand-safe views and pass the same age-aware Demand Gate/live Organic Gate as a today row.
+The live stages remain category-relative:
 
-## 4. View provenance
+- noise below 3 views/hour;
+- Candidate at P90;
+- Early/Score at P95;
+- Strong at P98;
+- Hot at P99 with confirmation requirements.
 
-First exact DT observation:
+Promotion, price reduction, dirty identity, missing URL and other unrefreshable rows
+are excluded rather than recycled through the checkpoint queue. First measurements,
+unknown counters and lifecycle disappearance never manufacture Score or Hot.
 
-- `0..399`: can be a trusted total only if the listing is genuinely fresh/clean; ambiguous older history remains baseline-only;
-- `>=400`: always an untrusted baseline.
+## Storage and isolation
 
-For a high baseline, two later clean exact measurements at least 30 minutes apart are required. Then:
+PostgreSQL is authoritative in production; SQLite is supported for local tests.
+Redis coordinates optional distributed worker streams and traffic limits, but the
+main stable parser remains usable in its pinned local-lane profile.
 
-`demand_views = current_exact_views - baseline_views`
+Kleinanzeigen and Vinted use separate worker queues and database tables. Vinted exact
+metrics remain fail-closed: missing or identity-mismatched values are UNKNOWN, not
+zero.
 
-The inherited total never votes in DT Score or the Demand Gate.
+## Safety contracts
 
-## 5. Relative age cohorts
-
-Relative View Velocity uses non-overlapping comparable-age cohorts:
-
-- `0–3h`
-- `3–6h`
-- `6–12h`
-- `12–24h`
-- `24–48h`
-
-A 2-hour listing and a 30-hour listing may both appear in the same public Radar, but each receives its Relative Velocity percentile from its own age cohort.
-
-## 6. Absolute Demand Gate
-
-Relative ranking alone is not proof of demand. The live classification layer requires cumulative **demand-safe** evidence:
-
-`30 / 40 / 60 / 80 / 100` views across the five age cohorts.
-
-- Hot = Score `>=72` + confidence `>=45` + 100% gate;
-- Strong = Score `>=65` + confidence `>=35` + 60% gate;
-- Early = Score `>=58` + 25% gate.
-
-Below Early, the signal has zero live Radar Rank.
-
-The gate is conservative over time: without a new view measurement, demand stays frozen while evidence age advances. This allows a stalled early signal to downgrade automatically.
-
-## 7. DT Demand Score and Radar Rank
-
-Public DT Score remains fixed and evidence-adaptive:
-
-- 40% Relative View Velocity
-- 20% Acceleration
-- 15% Persistence
-- 15% Repeatability
-- 10% Price Fit
-
-There are no extra signal-count/confirmation bonuses after the model.
-
-The internal ordering layer is separate:
-
-`Radar Rank = 70% DT Score + 20% Evidence Confidence + 10% Evidence Maturity`
-
-`RadarProduct.current_score` is the actual DT Score of its current representative signal; `peak_score` is historical.
-
-## 8. Organic Integrity
-
-Sticky exclusions remain for TOP, Hochschieben (including purple bump icon), paid Highlight/Galerie/sponsored markers, reduced/crossed-out prices and impossible same-ID resurfacing chronology.
-
-A positive dirty verdict purges that listing's Radar/AI/Lifecycle evidence. Unknown is never treated as organic.
-
-## 9. Aggregate product consistency
-
-A product family can contain multiple listings, but its live score/status/rank/confidence/reason are taken from one coherent current representative snapshot. Confidence from one listing is never blended with demand from another to manufacture Hot.
-
-Only admitted evidence inside the current 48H window may represent a live product. Historical snapshots remain available for audit/Peak history.
-
-## 10. Cache/runtime integrity
-
-Audited builds use `v4200-core2-audit3` for Page/Date/View runtime and parsed-card cache contracts. External ID, URL, final-page category/location and remote exact-view identity are revalidated at trust boundaries so stale/corrupt cross-service payloads fail closed.
+- schema changes are additive and startup migrations are serialized;
+- Radar startup maintenance does not delete Radar evidence tables;
+- public traffic has bounded concurrency, cooldowns and watchdogs;
+- exact-view results are bound to the requested listing identity;
+- generated artifacts, secrets and local databases are ignored by Git;
+- CI runs compilation, runtime-global analysis, release smoke checks and pytest.

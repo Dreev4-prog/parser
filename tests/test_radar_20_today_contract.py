@@ -26,10 +26,21 @@ def test_old_active_policy_round_is_not_resumed_after_upgrade():
     assert 'state["layer"] = "fresh"' in normalize
 
 
-def test_user_scans_seed_today_baselines_only():
-    assert 'record_user_scan_radar3_baselines' in BOT
-    assert 'today_msk = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()' in RADAR
-    assert 'str(scan.target_date or "") != today_msk' in RADAR
-    assert 'ScanListing.initial_view_count.is_not(None)' in RADAR
-    assert 'if ext in existing_map:' in RADAR
-    assert 'baseline_views=raw' in RADAR
+def test_user_scans_cannot_seed_shared_radar_baselines():
+    assert 'record_user_scan_radar3_baselines' not in BOT
+    block = RADAR.split('async def record_user_scan_radar3_baselines', 1)[1].split(
+        'async def repair_radar_v3_quality_once', 1
+    )[0]
+    assert 'return 0' in block
+    assert 'SessionLocal' not in block
+    assert 'RadarObservation(' not in block
+    assert '_radar_reset_observation_cycle' not in block
+
+
+def test_autoscan_remains_the_unrestricted_radar_baseline_source():
+    block = RADAR.split('async def record_autoscan_hot_detailed', 1)[1].split(
+        'async def record_user_scan_radar3_baselines', 1
+    )[0]
+    assert 'new_obs = RadarObservation(' in block
+    assert 'baseline_views=raw' in block
+    assert 'RADAR_V3_USER_SCAN' not in block

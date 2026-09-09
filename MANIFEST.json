@@ -1,46 +1,48 @@
 {
-  "base": "4.23.13",
-  "target": "4.23.14",
-  "scope": "Radar checkpoint telemetry, queue eligibility, and current dashboard counts",
-  "changed_files": [
-    "VERSION",
+  "base": "4.23.15",
+  "target": "4.23.16",
+  "scope": "AutoScan-only shared Radar baseline admission",
+  "runtime_changed_files": [
     "bot.py",
-    "radar.py",
-    "scripts/release_smoke.py",
-    "tests/test_radar318_full_audit_contract.py",
-    "tests/test_radar3_dashboard_contract.py",
-    "tests/test_radar42114_startup_contract.py",
-    "tests/test_radar42311_live_checkpoint_behavior.py",
-    "tests/test_radar42312_demand_behavior.py",
-    "tests/test_release_static.py",
-    "PATCH_README.md",
-    "RELEASE_4_23_14.md"
+    "radar.py"
   ],
-  "sha256": {
-    "VERSION": "ba46d21b924ba8c85962c062cd9e93dc3e87bcb36bcd1f80d932e390032c08f5",
-    "bot.py": "90526da649092c770e5a92a2fabdbab8a381a656c1b74feef29bdbbcfe41cb4d",
-    "radar.py": "083bf15bbc796f747e851aa97e7deaeff1be828517c294cd93f76504c3586001",
-    "scripts/release_smoke.py": "48156ae9377773004be61c6643af2fc9d2e58a844d11665c678b260ef2774cac",
-    "tests/test_radar318_full_audit_contract.py": "750a017cef4675b7f379f77da08ac6f1abede5c6bc104529e9bc01566a892ada",
-    "tests/test_radar3_dashboard_contract.py": "989c377d31578138393658b8866f872ef3176cf73396b12ccbf683e85a77af8a",
-    "tests/test_radar42114_startup_contract.py": "707d9248615c1c3238470e7b50f1398c54b0ecb776eabb7ea87488f7e54cb0de",
-    "tests/test_radar42311_live_checkpoint_behavior.py": "685da7453e46dd43d39b5ad8051b77e3b10d5a1194821f491667a59c504549eb",
-    "tests/test_radar42312_demand_behavior.py": "a64685eea12eeb6e2e7bdb13f88884ef6d406861f582ee5fa045a33486390d9d",
-    "tests/test_release_static.py": "5b1ab699734fef2bbb0b674aad6d77d84304f5fd7a52215038788d641548e262",
-    "PATCH_README.md": "682bd45c379ddd61e2b0093cde1287884ac1ea8b86db957c6459bdb22ba152fd",
-    "RELEASE_4_23_14.md": "172fad7a118b55ee11ab647f0a58c20e555c4017273fdd2b11c917f765eb1fa4"
+  "release_files": [
+    "VERSION",
+    "PATCH_README.md",
+    "README.md",
+    "RELEASE_4_23_16.md",
+    "scripts/release_smoke.py",
+    "docs/ARCHITECTURE.md",
+    "docs/DEPLOYMENT.md"
+  ],
+  "tests_changed_files": [
+    "tests/test_radar_20_today_contract.py",
+    "tests/test_radar3212_two_pass_clean_contract.py"
+  ],
+  "runtime_policy": {
+    "shared_radar_baseline_source": "AutoScan only",
+    "autoscan_new_limit": false,
+    "user_scan_radar_writes": false,
+    "existing_radar_data_preserved": true,
+    "database_migration_required": false
   },
-  "base_sha256": {
-    "VERSION": "e114beb894971ddbb5681454edbe9a42e1e1439a2cd24c15465e14514b7a07de",
-    "bot.py": "d7206c39f685b0f8e7d9c6083cf8a43116706ba123c4f594a73f8db7175b2acb",
-    "radar.py": "6eac642b66561f556fe423bd0af3861d3652b3dde701d62cfbe4fb743d371493",
-    "scripts/release_smoke.py": "29af0df7a370604813950d6e268083c5a52117f967cb54607153e0f1b57fb383",
-    "tests/test_radar318_full_audit_contract.py": "01ec98ed378108e88e99b0d2cc660b50fc2b4ab9e351dfe2c3f89d6f3c411f30",
-    "tests/test_radar3_dashboard_contract.py": "4375dd2ae699a30eb23a5c5bb4984a8e22dd7886fa790c4bb25841f7f6cab3ef",
-    "tests/test_radar42114_startup_contract.py": "d980fd4687257b49b9e1167c00d5d24e7a6edadd867375868a65ed72174abfb3",
-    "tests/test_radar42311_live_checkpoint_behavior.py": "db6230864cefcb26740168eeac0841a20df00c24611fd58f674399a464bcbd1e",
-    "tests/test_radar42312_demand_behavior.py": "3120e430b0870c9440d6f2b0cddac488eabaab9ff8eed84966d570cdbedb3269",
-    "tests/test_release_static.py": "e3481274deec648dbc697485477d79e60faaecd91acfb34f6e633164bac9a81c",
-    "PATCH_README.md": "93e084bd7663f3b3ebcde31e474962f05fe85e4ca095177961320260ec7d737d"
+  "verification": {
+    "pytest": "478 passed, 167 subtests passed",
+    "runtime_globals": "PASS",
+    "release_smoke": "PASS",
+    "compile": "PASS"
+  },
+  "sha256": {
+    "VERSION": "6512e23f8bcc58ffc40ded008264fd3a6f26fa831fdd75ce51e833e20f6af9b3",
+    "bot.py": "8b2b3e9c48bfb7f46205b60a20540ef480db2e788548ef16daa76cf39dac8637",
+    "radar.py": "e1ebc895a7aff56b9e66e5264afe60527b03b134a49c9b18bfb52a9f0cb53561",
+    "tests/test_radar_20_today_contract.py": "10b4495309d1f6d92ef17bd80a75a175d6c77d8b8449cfaa43da3679447d6fba",
+    "tests/test_radar3212_two_pass_clean_contract.py": "1f453e24e9c89d6a954adc52a0f89be95c369495eecc157e80077ae3806b7ef9",
+    "RELEASE_4_23_16.md": "d51c232d150a59f170b8e6e199ac3cf852176ea8cbd3b959070e7644e8f20896",
+    "scripts/release_smoke.py": "74f39602f0730e9c5ddd3c91489d6f7d500f3897707c259b3b62c4412e4069dc",
+    "docs/ARCHITECTURE.md": "5a78020c3878de78f226b7750b16a1d992a38546ce8d79c0350e9a87c4265706",
+    "docs/DEPLOYMENT.md": "a7175b67a132fef599b28c5542c61cab1d0bd88a798cc35034c24571c4159914",
+    "README.md": "1b87ffe842a5493c4a8f42644e018c16906521f9bccb35442e72f3d5eee446f9",
+    "PATCH_README.md": "4a086e29324b006f2d028e376660bdcaba511ca09227ae83fbbcb6bf32a61665"
   }
 }
