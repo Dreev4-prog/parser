@@ -242,6 +242,24 @@ class _SharedBrowserRuntime:
 _SHARED_BROWSER_FLEET = _SharedBrowserRuntime()
 
 
+def shared_browser_runtime_running() -> bool:
+    """Return whether this process currently owns a live shared Chromium.
+
+    The idle guard must distinguish an already-running browser from a runtime
+    that is merely enabled. Treat connection-inspection failures as stopped so
+    the next real request can recreate the browser through ``_ensure_browser``.
+    """
+    if not SHARED_BROWSER_RUNTIME:
+        return False
+    browser = _SHARED_BROWSER_FLEET._browser
+    if browser is None:
+        return False
+    try:
+        return bool(browser.is_connected())
+    except Exception:
+        return False
+
+
 async def shutdown_shared_browser_runtime() -> None:
     if SHARED_BROWSER_RUNTIME:
         await _SHARED_BROWSER_FLEET.close()
