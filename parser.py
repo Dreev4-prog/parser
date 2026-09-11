@@ -125,6 +125,13 @@ SCAN_PAGE_CHECKPOINT_TTL_SECONDS = max(60.0, min(3600.0, float(os.getenv("SCAN_P
 SHARED_BROWSER_RUNTIME = os.getenv("SHARED_BROWSER_RUNTIME", "0").strip().lower() in {
     "1", "true", "yes", "on",
 }
+# Release Chromium after a real period without browser work.  The lightweight
+# HTTP clients and Redis workers stay online, so the next job can recreate the
+# browser lazily without a redeploy or a lost queue item.
+BROWSER_IDLE_TIMEOUT_SECONDS = max(
+    60.0,
+    min(3600.0, float(os.getenv("BROWSER_IDLE_TIMEOUT_SECONDS", "900"))),
+)
 
 
 log = logging.getLogger("kleinanzeigen-parser")
@@ -148,8 +155,75 @@ class _SharedBrowserRuntime:
         self._playwright = None
         self._browser = None
         self._contexts_created = 0
+        self._generation = 0
+        self._last_used_at = 0.0
+        self._idle_task: asyncio.Task | None = None
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    def touch(self) -> None:
+        """Postpone idle shutdown after each real Chromium operation."""
+        self._last_used_at = time.monotonic()
+        current = asyncio.current_task()
+        task = self._idle_task
+        if task is not None and task is not current and not task.done():
+            task.cancel()
+        try:
+            self._idle_task = asyncio.create_task(
+                self._close_after_idle(self._last_used_at),
+                name="shared-chromium-idle-close",
+            )
+        except RuntimeError:
+            # No running loop means no browser can currently be doing async work.
+            self._idle_task = None
+
+    async def _close_after_idle(self, touched_at: float) -> None:
+        try:
+            await asyncio.sleep(BROWSER_IDLE_TIMEOUT_SECONDS)
+            # A newer browser operation always owns the replacement timer.
+            if touched_at != self._last_used_at:
+                return
+            async with self._lock:
+                if touched_at != self._last_used_at:
+                    return
+                if time.monotonic() - self._last_used_at < BROWSER_IDLE_TIMEOUT_SECONDS:
+                    return
+                closed = await self._close_locked()
+            if closed:
+                log.info(
+                    "Railway Chromium released after %.0fs idle",
+                    BROWSER_IDLE_TIMEOUT_SECONDS,
+                )
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self._idle_task is asyncio.current_task():
+                self._idle_task = None
+
+    async def _close_locked(self) -> bool:
+        had_runtime = self._browser is not None or self._playwright is not None
+        try:
+            if self._browser is not None:
+                await self._browser.close()
+        except Exception:
+            pass
+        self._browser = None
+        try:
+            if self._playwright is not None:
+                await self._playwright.stop()
+        except Exception:
+            pass
+        self._playwright = None
+        if had_runtime:
+            # Parser instances use this marker to discard BrowserContext/Page
+            # references invalidated when the shared Chromium process exits.
+            self._generation += 1
+        return had_runtime
 
     async def _ensure_browser(self):
+        self.touch()
         async with self._lock:
             browser = self._browser
             try:
@@ -193,6 +267,7 @@ class _SharedBrowserRuntime:
                 "Railway browser fleet runtime started | replica=%s",
                 os.getenv("RAILWAY_REPLICA_ID", "local"),
             )
+            self.touch()
             return self._browser
 
     async def new_context(self, *, storage_state=None):
@@ -224,19 +299,13 @@ class _SharedBrowserRuntime:
         raise RuntimeError(f"Could not create shared browser context: {last_error}")
 
     async def close(self) -> None:
+        current = asyncio.current_task()
+        idle_task = self._idle_task
+        if idle_task is not None and idle_task is not current and not idle_task.done():
+            idle_task.cancel()
+        self._idle_task = None
         async with self._lock:
-            try:
-                if self._browser is not None:
-                    await self._browser.close()
-            except Exception:
-                pass
-            self._browser = None
-            try:
-                if self._playwright is not None:
-                    await self._playwright.stop()
-            except Exception:
-                pass
-            self._playwright = None
+            await self._close_locked()
 
 
 _SHARED_BROWSER_FLEET = _SharedBrowserRuntime()
@@ -1513,7 +1582,10 @@ class KleinanzeigenParser:
         self._browser = None
         self._browser_context = None
         self._uses_shared_browser_runtime = False
+        self._shared_browser_generation: int | None = None
         self._browser_lock = asyncio.Lock()
+        self._browser_last_used_at = 0.0
+        self._browser_idle_task: asyncio.Task | None = None
         self._scan_page = None
         self._scan_page_lock = asyncio.Lock()
         self._direct_mode_lock = asyncio.Lock()
@@ -1546,6 +1618,10 @@ class KleinanzeigenParser:
         self._hybrid_browser_fallbacks = 0
 
     async def close(self) -> None:
+        idle_task = self._browser_idle_task
+        if idle_task is not None and idle_task is not asyncio.current_task() and not idle_task.done():
+            idle_task.cancel()
+        self._browser_idle_task = None
         try:
             if self._hybrid_request_context is not None:
                 await self._hybrid_request_context.dispose()
@@ -1579,7 +1655,50 @@ class KleinanzeigenParser:
         self._browser_context = None
         self._browser = None
         self._playwright = None
+        self._shared_browser_generation = None
         await self.client.aclose()
+
+    def _touch_browser_runtime(self) -> None:
+        """Keep Chromium alive only while this parser is receiving browser work."""
+        if SHARED_BROWSER_RUNTIME:
+            _SHARED_BROWSER_FLEET.touch()
+            return
+
+        self._browser_last_used_at = time.monotonic()
+        current = asyncio.current_task()
+        task = self._browser_idle_task
+        if task is not None and task is not current and not task.done():
+            task.cancel()
+        try:
+            self._browser_idle_task = asyncio.create_task(
+                self._close_owned_browser_after_idle(self._browser_last_used_at),
+                name="chromium-idle-close",
+            )
+        except RuntimeError:
+            self._browser_idle_task = None
+
+    async def _close_owned_browser_after_idle(self, touched_at: float) -> None:
+        try:
+            await asyncio.sleep(BROWSER_IDLE_TIMEOUT_SECONDS)
+            if touched_at != self._browser_last_used_at:
+                return
+            async with self._browser_lock:
+                if touched_at != self._browser_last_used_at:
+                    return
+                if time.monotonic() - self._browser_last_used_at < BROWSER_IDLE_TIMEOUT_SECONDS:
+                    return
+                running = self._browser is not None or self._browser_context is not None
+                await self._close_browser_runtime()
+            if running:
+                log.info(
+                    "Chromium released after %.0fs idle",
+                    BROWSER_IDLE_TIMEOUT_SECONDS,
+                )
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self._browser_idle_task is asyncio.current_task():
+                self._browser_idle_task = None
 
     async def _fetch_response(
         self, url: str, *, traffic_kind: str = "scan", traffic_priority: str = "high"
@@ -1698,6 +1817,15 @@ class KleinanzeigenParser:
         log.warning("Stable Reset: scan browser session recycled after persistent page failure")
 
     async def _ensure_scan_page(self):
+        self._touch_browser_runtime()
+        if (
+            SHARED_BROWSER_RUNTIME
+            and self._shared_browser_generation != _SHARED_BROWSER_FLEET.generation
+        ):
+            self._scan_page = None
+            self._browser_context = None
+            self._context_session_seeded = False
+            self._shared_browser_generation = None
         if self._scan_page is not None and not self._scan_page.is_closed():
             return self._scan_page
         context = await self._ensure_view_browser()
@@ -1818,6 +1946,8 @@ class KleinanzeigenParser:
         except Exception:
             pass
         self._browser_context = None
+        self._context_session_seeded = False
+        self._shared_browser_generation = None
         if not self._uses_shared_browser_runtime:
             try:
                 if self._browser is not None:
@@ -2186,9 +2316,26 @@ class KleinanzeigenParser:
         return None, None
 
     async def _ensure_view_browser(self):
+        self._touch_browser_runtime()
+        if (
+            SHARED_BROWSER_RUNTIME
+            and self._shared_browser_generation != _SHARED_BROWSER_FLEET.generation
+        ):
+            self._scan_page = None
+            self._browser_context = None
+            self._context_session_seeded = False
+            self._shared_browser_generation = None
         if self._browser_context is not None:
             return self._browser_context
         async with self._browser_lock:
+            if (
+                SHARED_BROWSER_RUNTIME
+                and self._shared_browser_generation != _SHARED_BROWSER_FLEET.generation
+            ):
+                self._scan_page = None
+                self._browser_context = None
+                self._context_session_seeded = False
+                self._shared_browser_generation = None
             if self._browser_context is not None:
                 return self._browser_context
             storage_state = None
@@ -2201,6 +2348,7 @@ class KleinanzeigenParser:
                     storage_state=storage_state
                 )
                 self._uses_shared_browser_runtime = True
+                self._shared_browser_generation = _SHARED_BROWSER_FLEET.generation
                 return self._browser_context
 
             if self._playwright is None:
