@@ -177,6 +177,12 @@ log = logging.getLogger("kleinanzeigen-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+# Vinted Lab is paused by default.  Its historical tables and implementation stay
+# intact so it can be restored later, but no UI entry, queue work or background
+# scheduler is active while the Railway Vinted workers are removed.
+VINTED_LAB_ENABLED = os.getenv("VINTED_LAB_ENABLED", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 
 # v4.9.0 Free Trial Launch. The promotion is intentionally a product/access
 # layer only: parser workers and scan algorithms remain untouched.
@@ -11017,7 +11023,7 @@ def payment_invoice_keyboard(payment: SubscriptionPayment) -> InlineKeyboardMark
 def admin_keyboard(ai_unread: int = 0, active_scans: int = 0) -> InlineKeyboardMarkup:
     active = max(0, int(active_scans or 0))
     parsing_label = "👀 Кто сейчас парсит" if active <= 0 else f"👀 Сейчас парсят · {active}"
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adminstats")],
         [InlineKeyboardButton(text="⚙️ Воркеры", callback_data="adminworkers"),
          InlineKeyboardButton(text=parsing_label, callback_data="adminactive")],
@@ -11028,12 +11034,16 @@ def admin_keyboard(ai_unread: int = 0, active_scans: int = 0) -> InlineKeyboardM
         [InlineKeyboardButton(text="🎁 Бесплатные сканы", callback_data="admintrial"),
          InlineKeyboardButton(text="👥 Рефералы", callback_data="adminreferral")],
         [InlineKeyboardButton(text="📡 DT Radar 3.0", callback_data="adminradarauto")],
-        [InlineKeyboardButton(text="🟣 Vinted Lab", callback_data="av:home")],
+    ]
+    if VINTED_LAB_ENABLED:
+        rows.append([InlineKeyboardButton(text="🟣 Vinted Lab", callback_data="av:home")])
+    rows.extend([
         [InlineKeyboardButton(text="🔎 Найти пользователя", callback_data="adminusersearch")],
         [InlineKeyboardButton(text="📨 Daily Radar", callback_data="admindailyradar"),
          InlineKeyboardButton(text="📣 Рассылка", callback_data="adminbroadcast")],
         [InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_back_keyboard() -> InlineKeyboardMarkup:
@@ -13146,6 +13156,11 @@ async def vinted_admin_lab_handler(callback: CallbackQuery) -> None:
     if not _is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
+    if not VINTED_LAB_ENABLED:
+        # Old Telegram messages may still contain an av:* callback after deploy.
+        # Refuse it before any Redis, PostgreSQL or Vinted operation is attempted.
+        await callback.answer("Vinted Lab временно отключён", show_alert=True)
+        return
     data = str(callback.data or "")
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else "home"
@@ -13417,6 +13432,9 @@ async def vinted_radar_autoscan_scheduler() -> None:
     participate in Live scoring only for their first 24h; older observations remain
     available to the seven-day learning/reference pool.
     """
+    if not VINTED_LAB_ENABLED:
+        log.info("Vinted Lab disabled; Radar scheduler will not start")
+        return
     while True:
         try:
             scan = await maybe_start_vinted_radar_round()
@@ -18786,7 +18804,10 @@ async def main() -> None:
     organic_velocity_task = asyncio.create_task(organic_velocity_scheduler(), name="verified-organic-velocity")
     radar_autoscan_task = asyncio.create_task(radar_autoscan_scheduler(bot), name="dt-radar-autoscan")
     radar_daily_digest_task = asyncio.create_task(radar_daily_digest_scheduler(bot), name="dt-radar-daily-digest")
-    vinted_radar_task = asyncio.create_task(vinted_radar_autoscan_scheduler(), name="vinted-radar-1-autoscan")
+    vinted_radar_task = (
+        asyncio.create_task(vinted_radar_autoscan_scheduler(), name="vinted-radar-1-autoscan")
+        if VINTED_LAB_ENABLED else None
+    )
     observation_tasks = [] if DISTRIBUTED_WORKERS else [
         asyncio.create_task(observation_scheduler(bot, i), name=f"view-observation-worker-{i}")
         for i in range(1, OBSERVATION_CONCURRENCY + 1)
@@ -18806,12 +18827,15 @@ async def main() -> None:
         organic_velocity_task.cancel()
         radar_autoscan_task.cancel()
         radar_daily_digest_task.cancel()
-        vinted_radar_task.cancel()
+        if vinted_radar_task is not None:
+            vinted_radar_task.cancel()
         for task in observation_tasks:
             task.cancel()
         for task in worker_tasks:
             task.cancel()
-        shutdown_tasks = [payment_task, subscription_task, archive_task, radar_task, radar_v3_observation_task, organic_velocity_task, radar_autoscan_task, radar_daily_digest_task, vinted_radar_task, *observation_tasks, *worker_tasks]
+        shutdown_tasks = [payment_task, subscription_task, archive_task, radar_task, radar_v3_observation_task, organic_velocity_task, radar_autoscan_task, radar_daily_digest_task, *observation_tasks, *worker_tasks]
+        if vinted_radar_task is not None:
+            shutdown_tasks.append(vinted_radar_task)
         if distributed_queue_ticker_task is not None:
             shutdown_tasks.insert(0, distributed_queue_ticker_task)
         if ticker_task is not None:
