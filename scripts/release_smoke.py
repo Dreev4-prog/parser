@@ -15,7 +15,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.23.16", "VERSION=4.23.16")
+    check((ROOT / "VERSION").read_text().strip() == "4.23.17", "VERSION=4.23.17")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -26,6 +26,21 @@ def main() -> int:
     radar = (ROOT / "radar.py").read_text(encoding="utf-8")
     velocity = (ROOT / "organic_velocity.py").read_text(encoding="utf-8")
     score = (ROOT / "early_winner.py").read_text(encoding="utf-8")
+    retention = (ROOT / "db_retention.py").read_text(encoding="utf-8")
+
+    check('async def database_retention_scheduler()' in bot
+          and 'run_database_retention_once()' in bot
+          and 'name="postgres-retention-scheduler"' in bot,
+          "main parser runs independent PostgreSQL retention")
+    check('RADAR_EVENT_RETENTION_DAYS' in retention
+          and 'STABLE_CACHE_RETENTION_HOURS' in retention
+          and 'VIEW_HISTORY_RETENTION_DAYS' in retention
+          and 'COLD_LISTING_RETENTION_DAYS' in retention,
+          "high-growth tables have bounded retention")
+    check(all(name in retention for name in (
+        'ScanListing', 'ScanViewHistory', 'RadarProductListing',
+        'RadarObservation', 'RadarLifecycleWatch', 'RadarSnapshot')),
+          "saved scans and Radar-linked listings are protected from cold cleanup")
 
     check('RADAR_AUTOSCAN_DEPTH = 20' in bot, "Radar AutoScan depth=20")
     home_block = bot.split('def main_keyboard(', 1)[1].split('def post_scan_keyboard(', 1)[0]
@@ -196,7 +211,7 @@ def main() -> int:
     check('RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES = _radar_env_int("RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES", 16' in bot,
           "idle page prefetch is capped below the full 20-page category burst")
 
-    print("\nDT Parser 4.23.16 AutoScan-only Radar baseline protection: PASS")
+    print("\nDT Parser 4.23.17 bounded PostgreSQL storage: PASS")
     return 0
 
 

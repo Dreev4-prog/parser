@@ -133,7 +133,7 @@ from radar import (
     repair_radar_v3_quality_once,
     prepare_radar_v3_once, repair_radar_v3_historical_scores_once, repair_radar_v3_live_retention_once, radar_v3_due_external_ids, radar_v3_claim_due_external_ids, radar_v3_filter_claimed_refreshable, radar_v3_release_claims, radar_v3_record_refreshed, radar_v3_expire_observations, radar_v3_expire_stale_products, radar_v3_rollover_successful_category, repair_radar_v3_depth_retirement_once,
     radar_v3_current_product_breakdown,
-    radar_v3_checkpoint_telemetry, radar_v3_prune_checkpoint_events,
+    radar_v3_checkpoint_telemetry,
     search_radar_products, toggle_radar_favorite,
 )
 from page_manager import (
@@ -146,6 +146,12 @@ from date_manager import (
 from stable_engine import (
     load_date_index, load_page_checkpoint, mark_category_job, record_page_failure,
     save_date_index, save_page_checkpoint,
+)
+from db_retention import (
+    DB_RETENTION_ENABLED,
+    DB_RETENTION_INTERVAL_SECONDS,
+    DB_RETENTION_STARTUP_DELAY_SECONDS,
+    run_database_retention_once,
 )
 from vinted_lab import (
     VINTED_QUEUE, cancel_scan as cancel_vinted_scan, create_scan as create_vinted_scan,
@@ -4587,15 +4593,32 @@ async def radar_maintenance_scheduler() -> None:
             if not await foreground_busy():
                 await bump_resurrection_integrity_sweep_once()
                 await _radar3_checkpoint_safe_snapshot(timeout_seconds=0.5)
-                pruned = await radar_v3_prune_checkpoint_events()
-                if pruned:
-                    log.info("DT Radar checkpoint telemetry retention pruned=%s", pruned)
             await asyncio.sleep(3600)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("DT Radar 3.0 maintenance loop error")
             await asyncio.sleep(300)
+
+
+async def database_retention_scheduler() -> None:
+    """Bound PostgreSQL growth independently of user scans and AutoScan traffic."""
+    if not DB_RETENTION_ENABLED:
+        log.warning("PostgreSQL retention scheduler disabled by DB_RETENTION_ENABLED=0")
+        return
+    await asyncio.sleep(DB_RETENTION_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            stats = await run_database_retention_once()
+            removed = sum(int(value or 0) for value in stats.values())
+            if removed:
+                log.info("PostgreSQL retention batch removed=%s details=%s", removed, stats)
+            await asyncio.sleep(DB_RETENTION_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("PostgreSQL retention batch failed")
+            await asyncio.sleep(DB_RETENTION_INTERVAL_SECONDS)
 
 
 async def radar_v3_observation_scheduler() -> None:
@@ -18799,6 +18822,9 @@ async def main() -> None:
         subscription_lifecycle_scheduler(bot), name="subscription-lifecycle-scheduler"
     )
     archive_task = asyncio.create_task(scan_archive_scheduler(), name="scan-archive-scheduler")
+    database_retention_task = asyncio.create_task(
+        database_retention_scheduler(), name="postgres-retention-scheduler"
+    )
     radar_task = asyncio.create_task(radar_maintenance_scheduler(), name="dt-radar-maintenance")
     radar_v3_observation_task = asyncio.create_task(radar_v3_observation_scheduler(), name="dt-radar-v3-observations")
     organic_velocity_task = asyncio.create_task(organic_velocity_scheduler(), name="verified-organic-velocity")
@@ -18822,6 +18848,7 @@ async def main() -> None:
         payment_task.cancel()
         subscription_task.cancel()
         archive_task.cancel()
+        database_retention_task.cancel()
         radar_task.cancel()
         radar_v3_observation_task.cancel()
         organic_velocity_task.cancel()
@@ -18833,7 +18860,7 @@ async def main() -> None:
             task.cancel()
         for task in worker_tasks:
             task.cancel()
-        shutdown_tasks = [payment_task, subscription_task, archive_task, radar_task, radar_v3_observation_task, organic_velocity_task, radar_autoscan_task, radar_daily_digest_task, *observation_tasks, *worker_tasks]
+        shutdown_tasks = [payment_task, subscription_task, archive_task, database_retention_task, radar_task, radar_v3_observation_task, organic_velocity_task, radar_autoscan_task, radar_daily_digest_task, *observation_tasks, *worker_tasks]
         if vinted_radar_task is not None:
             shutdown_tasks.append(vinted_radar_task)
         if distributed_queue_ticker_task is not None:

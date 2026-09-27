@@ -1,4 +1,4 @@
-# DT Parser v4.23.16 — AutoScan-only Radar baselines
+# DT Parser v4.23.17 — bounded PostgreSQL storage
 
 This protection release makes Radar AutoScan the only source of shared Radar
 baselines. Completed user scans still save their results, exact counters, exports

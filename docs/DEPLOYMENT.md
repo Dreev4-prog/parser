@@ -1,4 +1,4 @@
-# Deploy DT Parser v4.23.16 on Railway
+# Deploy DT Parser v4.23.17 on Railway
 
 ## Required variables
 
@@ -10,7 +10,7 @@ Configure real values in Railway Variables, never in Git:
 - `REDIS_URL` when distributed Page/Date/View or Vinted workers are enabled
 
 Start from `.env.example` for optional settings. Existing production variables can
-remain unchanged for v4.23.16.
+remain unchanged for v4.23.17.
 
 ## Start command
 
@@ -28,11 +28,11 @@ services may set an explicit role such as `page-worker`, `date-worker`, `view-wo
 Do not run the legacy AI service as an active scorer. If an old Railway AI service
 still exists, the launcher safely sends it to `retired_ai_worker.py`.
 
-## v4.23.16 rollout
+## v4.23.17 rollout
 
 1. Deploy the complete checkout to Parser / Bot.
 2. Do not delete PostgreSQL or Redis and do not reset Radar observations.
-3. Confirm the launcher log reports `version=4.23.16` and `target=bot.py`.
+3. Confirm the launcher log reports `version=4.23.17` and `target=bot.py`.
 4. Confirm the bot reaches its normal startup line and four local parser lanes.
 5. Open Radar analytics and verify checkpoint telemetry loads without SQL errors.
 6. Run a small user scan and confirm it completes or reports a truthful partial result.
@@ -53,5 +53,5 @@ python -m pytest -q
 
 ## Rollback
 
-Redeploy the previous complete checkout. v4.23.16 has no database migration and does
+Redeploy the previous complete checkout. v4.23.17 has no database migration and does
 not transform stored Radar data, so rollback does not require SQL or data restoration.

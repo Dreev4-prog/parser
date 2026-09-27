@@ -1,48 +1,50 @@
 {
-  "base": "4.23.15",
-  "target": "4.23.16",
-  "scope": "AutoScan-only shared Radar baseline admission",
+  "base": "4.23.16",
+  "target": "4.23.17",
+  "scope": "automatic bounded PostgreSQL retention",
   "runtime_changed_files": [
     "bot.py",
-    "radar.py"
+    "db_retention.py"
   ],
   "release_files": [
     "VERSION",
+    "INSTALL_RU.md",
     "PATCH_README.md",
     "README.md",
-    "RELEASE_4_23_16.md",
-    "scripts/release_smoke.py",
-    "docs/ARCHITECTURE.md",
-    "docs/DEPLOYMENT.md"
+    "RELEASE_4_23_17.md",
+    "docs/DEPLOYMENT.md",
+    "scripts/release_smoke.py"
   ],
   "tests_changed_files": [
-    "tests/test_radar_20_today_contract.py",
-    "tests/test_radar3212_two_pass_clean_contract.py"
+    "tests/test_db_retention.py"
   ],
   "runtime_policy": {
-    "shared_radar_baseline_source": "AutoScan only",
-    "autoscan_new_limit": false,
-    "user_scan_radar_writes": false,
-    "existing_radar_data_preserved": true,
+    "radar_event_retention_days": 7,
+    "stable_cache_retention_hours": 24,
+    "view_history_retention_days": 30,
+    "cold_listing_retention_days": 60,
+    "saved_scan_data_preserved": true,
+    "radar_linked_listings_preserved": true,
+    "listing_integrity_preserved": true,
+    "bounded_delete_batches": true,
     "database_migration_required": false
   },
   "verification": {
-    "pytest": "478 passed, 167 subtests passed",
-    "runtime_globals": "PASS",
-    "release_smoke": "PASS",
+    "targeted_pytest": "15 passed",
+    "bot_import": "PASS",
+    "postgresql_sql_compile": "PASS",
     "compile": "PASS"
   },
   "sha256": {
-    "VERSION": "6512e23f8bcc58ffc40ded008264fd3a6f26fa831fdd75ce51e833e20f6af9b3",
-    "bot.py": "8b2b3e9c48bfb7f46205b60a20540ef480db2e788548ef16daa76cf39dac8637",
-    "radar.py": "e1ebc895a7aff56b9e66e5264afe60527b03b134a49c9b18bfb52a9f0cb53561",
-    "tests/test_radar_20_today_contract.py": "10b4495309d1f6d92ef17bd80a75a175d6c77d8b8449cfaa43da3679447d6fba",
-    "tests/test_radar3212_two_pass_clean_contract.py": "1f453e24e9c89d6a954adc52a0f89be95c369495eecc157e80077ae3806b7ef9",
-    "RELEASE_4_23_16.md": "d51c232d150a59f170b8e6e199ac3cf852176ea8cbd3b959070e7644e8f20896",
-    "scripts/release_smoke.py": "74f39602f0730e9c5ddd3c91489d6f7d500f3897707c259b3b62c4412e4069dc",
-    "docs/ARCHITECTURE.md": "5a78020c3878de78f226b7750b16a1d992a38546ce8d79c0350e9a87c4265706",
-    "docs/DEPLOYMENT.md": "a7175b67a132fef599b28c5542c61cab1d0bd88a798cc35034c24571c4159914",
-    "README.md": "1b87ffe842a5493c4a8f42644e018c16906521f9bccb35442e72f3d5eee446f9",
-    "PATCH_README.md": "4a086e29324b006f2d028e376660bdcaba511ca09227ae83fbbcb6bf32a61665"
+    "VERSION": "cbd461d5e7b542caa89c193f3abd8b695179142ce915370e04b215b2291b789d",
+    "INSTALL_RU.md": "5167d33901d4384661ca1b075a1192a6b47100d2f45fd7686e16cfbc23cc1158",
+    "bot.py": "288d0598d0125e95fd2d62e7a36959eee1f3c62edb598981dc961172ecaafce7",
+    "db_retention.py": "c419645b04cc4ea8a91bc097815ecbefa82f7337cc06c850a3ea5f249829de43",
+    "RELEASE_4_23_17.md": "8c57898bb25476ac55c4d1b84d0adfd12bfeadcd51c98d82ebaf938fcceb5bac",
+    "README.md": "56eb8c139222a7e3253d0e75525e1c4f52d3200ec4e98470ff60ccc8c1e94e66",
+    "PATCH_README.md": "fdec4e2d82baa9f2062e00af344d891de7e0b315f770dc744453b3129b0d9b76",
+    "docs/DEPLOYMENT.md": "8fc689dc17e77cbd9d5f05f6719546f210c2f8c9925cab03b84518f7d682ce42",
+    "scripts/release_smoke.py": "865dca47c9b1c64c98a832f0b5aaba01f11c8e65c8543a6b09f73b83f02009da",
+    "tests/test_db_retention.py": "35abad62bfe4b4c7a693d0949443d34150bfda58f6875c34b8fa8f5f29dfc203"
   }
 }
