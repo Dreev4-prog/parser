@@ -2907,19 +2907,29 @@ async def radar_stats() -> RadarStats:
         fresh = or_(RadarProduct.latest_source != "radar3_observed",
                     func.coalesce(RadarProduct.current_signal_at, RadarProduct.last_signal_at)
                     >= now-timedelta(hours=RADAR_V3_CURRENT_SIGNAL_HOURS))
-        async def count(*conditions):
-            return int((await session.execute(select(func.count(RadarProduct.id)).where(*conditions))).scalar_one() or 0)
-        total = await count(*active)
-        hot = await count(*active, fresh, RadarProduct.status == "hot")
-        rising = await count(*active, fresh, RadarProduct.status == "rising")
-        ai_picks = await count(*active, fresh, RadarProduct.status.in_(["hot", "rising"]),
-            RadarProduct.opportunity_type.in_(["hot_product", "hidden_gem", "emerging"]),
-            RadarProduct.confidence >= 55)
-        categories = int((await session.execute(select(func.count(func.distinct(RadarProduct.category_key))).where(*active))).scalar_one() or 0)
+        # All public product counters share the same expensive visibility/live
+        # predicates. Evaluate them once instead of issuing five sequential scans.
+        summary = (await session.execute(select(
+            func.count(RadarProduct.id),
+            func.count(RadarProduct.id).filter(fresh, RadarProduct.status == "hot"),
+            func.count(RadarProduct.id).filter(fresh, RadarProduct.status == "rising"),
+            func.count(RadarProduct.id).filter(
+                fresh,
+                RadarProduct.status.in_(["hot", "rising"]),
+                RadarProduct.opportunity_type.in_(["hot_product", "hidden_gem", "emerging"]),
+                RadarProduct.confidence >= 55,
+            ),
+            func.count(func.distinct(RadarProduct.category_key)),
+        ).where(*active))).one()
+        total, hot, rising, ai_picks, categories = (int(value or 0) for value in summary)
         visible_ids = select(RadarProduct.id).where(visible)
         signals = int((await session.execute(select(func.count(RadarSnapshot.id)).where(
             RadarSnapshot.product_id.in_(visible_ids), _clean_listing_exists(RadarSnapshot.external_id)))).scalar_one() or 0)
-        recent_hot_48h = await count(*active, _recent_hot_snapshot_exists(RadarProduct.id, now))
+        recent_hot_48h = int((await session.execute(
+            select(func.count(RadarProduct.id)).where(
+                *active, _recent_hot_snapshot_exists(RadarProduct.id, now)
+            )
+        )).scalar_one() or 0)
         fast_sold = int((await session.execute(select(func.count(func.distinct(RadarLifecycleWatch.product_id))).where(
             RadarLifecycleWatch.product_id.in_(visible_ids),
             RadarLifecycleWatch.status == "disappeared",
