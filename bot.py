@@ -11259,7 +11259,7 @@ def admin_radar_funnel_keyboard(visitors: list[dict], page: int, pages: int) -> 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def admin_radar_autoscan_keyboard(state: dict) -> InlineKeyboardMarkup:
+def admin_radar_autoscan_keyboard(state: dict, *, live_screen: bool = False) -> InlineKeyboardMarkup:
     status = str(state.get("status") or "idle")
     daily_enabled = bool(state.get("daily_enabled"))
     skip_today = bool(state.get("skip_daily_if_completed_today", True))
@@ -11290,9 +11290,18 @@ def admin_radar_autoscan_keyboard(state: dict) -> InlineKeyboardMarkup:
         text=f"✅ Пропускать автокруг после ручного: {'ДА' if skip_today else 'НЕТ'}",
         callback_data="adminradarauto:skipday",
     )])
-    rows.append([InlineKeyboardButton(text="📊 Аналитика Radar", callback_data="adminradarauto:analytics")])
+    if live_screen:
+        rows.append([InlineKeyboardButton(
+            text="⬅️ Вся статистика Radar 3.0", callback_data="adminradarauto"
+        )])
+    else:
+        rows.append([InlineKeyboardButton(
+            text="🟢 Live-прогресс AutoScan", callback_data="adminradarauto:live"
+        )])
+    refresh_text = "🔄 Обновить Live" if live_screen else "🔄 Обновить статистику"
+    refresh_callback = "adminradarauto:live" if live_screen else "adminradarauto"
     rows.append([InlineKeyboardButton(text="📜 История кругов", callback_data="adminradarauto:history"),
-                 InlineKeyboardButton(text="🔄 Обновить Live", callback_data="adminradarauto")])
+                 InlineKeyboardButton(text=refresh_text, callback_data=refresh_callback)])
     rows.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -13841,16 +13850,19 @@ async def admin_radar_autoscan_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer()
-    # Live Status is deliberately lightweight: one AppSetting read, no Radar analytics.
-    # This screen must never wait for percentile/category aggregation.
+    # Radar 3.0 opens as one complete screen. Both reads are primary-key AppSetting
+    # lookups: the worker has already calculated the deep analytics snapshot.
     try:
-        text, state = await asyncio.wait_for(_radar_autoscan_text(), timeout=2.0)
+        state, text = await asyncio.gather(
+            asyncio.wait_for(load_radar_autoscan_state(), timeout=1.5),
+            asyncio.wait_for(_radar3_analytics_text(), timeout=1.5),
+        )
         await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
     except Exception as exc:
-        log.exception("DT Radar live status failed")
+        log.exception("DT Radar complete screen failed")
         await _edit_or_answer(
             callback.message,
-            "<b>📡 DT Radar 3.2 · ADAPTIVE LIVE</b>\n\n⚠️ Live Status временно недоступен. AutoScan продолжает работать в фоне.\n"
+            "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\n⚠️ Сохранённый снимок временно недоступен. AutoScan продолжает работать в Radar Worker.\n"
             f"Диагностика: <code>{html.escape(type(exc).__name__)}</code>",
             reply_markup=admin_radar_autoscan_loading_keyboard(),
         )
@@ -13862,14 +13874,46 @@ async def admin_radar_analytics_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer()
-    text = await _radar3_analytics_text()
-    await _edit_or_answer(
-        callback.message, text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Показать последний снимок", callback_data="adminradarauto:analytics")],
-            [InlineKeyboardButton(text="⬅️ Live Status", callback_data="adminradarauto")],
-        ]),
-    )
+    try:
+        state, text = await asyncio.gather(
+            asyncio.wait_for(load_radar_autoscan_state(), timeout=1.5),
+            asyncio.wait_for(_radar3_analytics_text(), timeout=1.5),
+        )
+        await _edit_or_answer(
+            callback.message, text,
+            reply_markup=admin_radar_autoscan_keyboard(state),
+        )
+    except Exception as exc:
+        log.exception("DT Radar saved analytics screen failed")
+        await _edit_or_answer(
+            callback.message,
+            "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\n"
+            "⚠️ Сохранённый снимок временно недоступен. Попробуйте обновить экран.\n"
+            f"Диагностика: <code>{html.escape(type(exc).__name__)}</code>",
+            reply_markup=admin_radar_autoscan_loading_keyboard(),
+        )
+
+
+@dp.callback_query(F.data == "adminradarauto:live")
+async def admin_radar_live_handler(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer()
+    try:
+        text, state = await asyncio.wait_for(_radar_autoscan_text(), timeout=2.0)
+        markup = admin_radar_autoscan_keyboard(state, live_screen=True)
+    except Exception as exc:
+        log.exception("DT Radar live progress failed")
+        text = (
+            "<b>📡 DT Radar 3.2 · LIVE-ПРОГРЕСС</b>\n\n"
+            "⚠️ Live-прогресс временно недоступен. Полная сохранённая статистика остаётся на главном экране Radar 3.0.\n"
+            f"Диагностика: <code>{html.escape(type(exc).__name__)}</code>"
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅️ Вся статистика Radar 3.0", callback_data="adminradarauto")
+        ]])
+    await _edit_or_answer(callback.message, text, reply_markup=markup)
 
 
 @dp.callback_query(F.data == "adminradarauto:start")

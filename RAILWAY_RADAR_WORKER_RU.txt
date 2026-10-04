@@ -1,4 +1,4 @@
-DT Parser 4.23.20 — отдельный Radar Worker в Railway
+DT Parser 4.23.21 — полный Radar 3.0 на первом экране
 
 1. Загрузите файлы патча в GitHub.
 2. Сначала добавьте в основной parser: RADAR_DEDICATED_WORKER=1
@@ -16,5 +16,6 @@ DT Parser 4.23.20 — отдельный Radar Worker в Railway
    Dedicated DT Radar Worker online
    Radar Worker deep analytics published
 
-Теперь Radar Worker делает сканирование и сохраняет полную статистику, а кнопка
-аналитики в боте мгновенно показывает последнюю готовую запись.
+Теперь Radar Worker делает сканирование и сохраняет полную статистику. При входе
+в DT Radar 3.0 бот сразу показывает последнюю полную готовую запись. Live-прогресс
+AutoScan открывается отдельной кнопкой и не заменяет основную статистику.

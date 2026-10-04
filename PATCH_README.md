@@ -1,11 +1,11 @@
-# v4.23.17 — automatic PostgreSQL retention
+# v4.23.21 — complete Radar 3.0 first screen
 
-Apply over v4.23.16 and redeploy the main `parser` service. The new maintenance
-scheduler starts automatically; no additional Railway worker or variable is
-required.
+Apply over v4.23.20. Create exactly one Railway service with role
+`radar-worker`, then set `RADAR_DEDICATED_WORKER=1` on the main parser service.
 
-It removes expired Radar audit events, disposable stable-page cache, old global
-view history and unreferenced cold listings in small batches. Saved user scans and
-all Radar-linked listings are preserved. No manual SQL is required.
+The worker owns AutoScan, checkpoint measurements, Radar maintenance and durable
+public/deep analytics snapshots. Telegram reads those saved snapshots instantly;
+it does not calculate analytics in a callback. Opening `DT Radar 3.0` now goes
+straight to the complete saved analytics screen; Live progress is secondary.
 
-See `RELEASE_4_23_17.md` for the default retention periods and optional overrides.
+See `RELEASE_4_23_21.md` and `RAILWAY_RADAR_WORKER_RU.txt`.
