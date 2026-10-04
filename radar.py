@@ -3002,7 +3002,7 @@ async def get_radar_recent_hot_infos(product_ids: list[int] | tuple[int, ...]) -
 async def list_radar_products(
     *, mode: str = "hot", category_key: str | None = None, page: int = 0,
     page_size: int = RADAR_PAGE_SIZE, user_id: int | None = None,
-    price_filter: str = "any",
+    price_filter: str = "any", exact_total: bool = True,
 ) -> tuple[list[RadarProduct], int]:
     """Return Radar products for the requested user-facing feed.
 
@@ -3123,16 +3123,28 @@ async def list_radar_products(
         if conditions:
             query = query.where(*conditions)
             count_query = count_query.where(*conditions)
-        total = int((await session.execute(count_query)).scalar_one() or 0)
-        rows = list((await session.execute(
-            query.order_by(*order).offset(page * page_size).limit(page_size)
-        )).scalars().all())
+        if exact_total:
+            total = int((await session.execute(count_query)).scalar_one() or 0)
+            rows = list((await session.execute(
+                query.order_by(*order).offset(page * page_size).limit(page_size)
+            )).scalars().all())
+        else:
+            # Interactive Telegram pages only need to know whether a next page
+            # exists. COUNT over the full live catalogue repeats the expensive
+            # visibility predicates and used to double every page's database
+            # work. Fetch one look-ahead row and return a navigation total.
+            page_rows = list((await session.execute(
+                query.order_by(*order).offset(page * page_size).limit(page_size + 1)
+            )).scalars().all())
+            has_more = len(page_rows) > page_size
+            rows = page_rows[:page_size]
+            total = page * page_size + len(rows) + (1 if has_more else 0)
         return rows, total
 
 
 async def search_radar_products(
     query_text: str, *, page: int = 0, page_size: int = RADAR_PAGE_SIZE,
-    price_filter: str = "any",
+    price_filter: str = "any", exact_total: bool = True,
 ) -> tuple[list[RadarProduct], int]:
     """Simple mass-market Radar search by product title/model."""
     clean = " ".join(str(query_text or "").split()).strip()[:80]
@@ -3166,15 +3178,25 @@ async def search_radar_products(
                 .where(*price_conditions)
                 .exists()
             )
-        total = int((await session.execute(
-            select(func.count(RadarProduct.id)).where(*conditions)
-        )).scalar_one() or 0)
-        rows = list((await session.execute(
+        query = (
             select(RadarProduct)
             .where(*conditions)
-            .order_by(RadarProduct.radar_rank.desc(), RadarProduct.current_score.desc(), RadarProduct.last_signal_at.desc())
-            .offset(page * page_size).limit(page_size)
-        )).scalars().all())
+            .order_by(
+                RadarProduct.radar_rank.desc(), RadarProduct.current_score.desc(),
+                RadarProduct.last_signal_at.desc(),
+            )
+            .offset(page * page_size)
+        )
+        if exact_total:
+            total = int((await session.execute(
+                select(func.count(RadarProduct.id)).where(*conditions)
+            )).scalar_one() or 0)
+            rows = list((await session.execute(query.limit(page_size))).scalars().all())
+        else:
+            page_rows = list((await session.execute(query.limit(page_size + 1))).scalars().all())
+            has_more = len(page_rows) > page_size
+            rows = page_rows[:page_size]
+            total = page * page_size + len(rows) + (1 if has_more else 0)
     return rows, total
 
 

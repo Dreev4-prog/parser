@@ -124,7 +124,7 @@ from parser import (
 )
 from view_manager import REMOTE_VIEW_MANAGER, REMOTE_VIEW_WORKER_ENABLED
 from radar import (
-    RADAR_PAGE_SIZE, RADAR_SCAN_TOP_LIMIT, RadarStats, bump_resurrection_integrity_sweep_once,
+    RADAR_PAGE_SIZE, RADAR_SCAN_TOP_LIMIT, bump_resurrection_integrity_sweep_once,
     prepare_bump_resurrection_sweep_once, prepare_verified_organic_velocity_once, prepare_unified_48h_ranking_once, get_fast_sold_info, get_fast_sold_infos,
     get_radar_product, is_radar_favorite, list_radar_products, radar_categories, radar_stats,
     purge_nonorganic_analytics, record_autoscan_hot_detailed, radar_v3_category_allowed,
@@ -1433,7 +1433,7 @@ def radar_preview_list_keyboard(
         )])
     if total > len(items):
         rows.append([InlineKeyboardButton(
-            text=f"🔒 Ещё {max(0, int(total) - len(items))} · открыть полный Radar",
+            text="🔒 Ещё товары · открыть полный Radar",
             callback_data="radar_upgrade:preview",
         )])
     else:
@@ -4617,13 +4617,27 @@ async def radar_maintenance_scheduler() -> None:
 
 
 async def database_retention_scheduler() -> None:
-    """Bound PostgreSQL growth independently of user scans and AutoScan traffic."""
+    """Bound PostgreSQL growth without competing with active scan traffic."""
     if not DB_RETENTION_ENABLED:
         log.warning("PostgreSQL retention scheduler disabled by DB_RETENTION_ENABLED=0")
         return
     await asyncio.sleep(DB_RETENTION_STARTUP_DELAY_SECONDS)
     while True:
         try:
+            running, queued = await _radar_foreground_counts()
+            traffic = await TRAFFIC.snapshot()
+            busy = bool(
+                running
+                or queued
+                or int(getattr(traffic, "scan_jobs_active", 0) or 0) > 0
+                or int(getattr(traffic, "background_pauses", 0) or 0) > 0
+            )
+            if busy:
+                # Retention is housekeeping, not user-facing work. A short retry
+                # preserves storage limits without making an active scan or Radar
+                # page share PostgreSQL with batches of DELETE statements.
+                await asyncio.sleep(min(300, DB_RETENTION_INTERVAL_SECONDS))
+                continue
             stats = await run_database_retention_once()
             removed = sum(int(value or 0) for value in stats.values())
             if removed:
@@ -16362,70 +16376,12 @@ def _radar_added_label(value: datetime | None) -> str:
         return "давно"
 
 
-RADAR_UI_STATS_CACHE_SECONDS = max(10.0, float(os.getenv("RADAR_UI_STATS_CACHE_SECONDS", "60")))
-RADAR_UI_STATS_COLD_WAIT_SECONDS = max(0.25, float(os.getenv("RADAR_UI_STATS_COLD_WAIT_SECONDS", "1.25")))
-_radar_ui_stats_cache: RadarStats | None = None
-_radar_ui_stats_cache_at = 0.0
-_radar_ui_stats_task: asyncio.Task | None = None
-
-
-async def _refresh_radar_ui_stats() -> RadarStats | None:
-    """Refresh the small public Radar summary without blocking Telegram navigation."""
-    global _radar_ui_stats_cache, _radar_ui_stats_cache_at
-    try:
-        value = await radar_stats()
-    except Exception:
-        log.exception("DT Radar UI statistics refresh failed")
-        return None
-    _radar_ui_stats_cache = value
-    _radar_ui_stats_cache_at = time.monotonic()
-    return value
-
-
-async def _radar_ui_stats_safe(timeout_seconds: float = RADAR_UI_STATS_COLD_WAIT_SECONDS) -> RadarStats | None:
-    """Return cached Radar counts immediately and refresh stale data in one background task.
-
-    A cold process waits only briefly for its first value. If PostgreSQL is busy,
-    the menu opens with an explicit loading line while the shared refresh keeps
-    running for the next request. Once a value exists it is always preferable to
-    freezing a Telegram callback for a newer aggregate.
-    """
-    global _radar_ui_stats_task
-    now = time.monotonic()
-    cached = _radar_ui_stats_cache
-    if cached is not None and now - _radar_ui_stats_cache_at < RADAR_UI_STATS_CACHE_SECONDS:
-        return cached
-
-    task = _radar_ui_stats_task
-    if task is None or task.done():
-        task = asyncio.create_task(_refresh_radar_ui_stats(), name="dt-radar-ui-stats")
-        task.add_done_callback(_consume_detached_radar_task)
-        _radar_ui_stats_task = task
-
-    if cached is not None:
-        return cached
-    try:
-        return await asyncio.wait_for(
-            asyncio.shield(task), timeout=max(0.1, float(timeout_seconds))
-        )
-    except asyncio.TimeoutError:
-        log.warning("DT Radar UI statistics are still loading; menu opened without counts")
-        return None
-    except Exception:
-        log.exception("DT Radar UI statistics unavailable")
-        return None
-
-
 async def _radar_home_text(user_id: int | None = None) -> str:
-    stats = await _radar_ui_stats_safe()
     full = bool(user_id is not None and allowed(int(user_id)))
-    if stats is None:
-        stats_line = "🕒 <b>Статистика обновляется в фоне.</b> Меню уже доступно."
-    else:
-        stats_line = (
-            f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих сейчас · "
-            f"🚀 <b>{stats.rising}</b> набирают · ⚡ <b>{stats.fast_sold}</b> Fast Sold."
-        )
+    # User navigation must not launch a full-catalogue aggregate. Exact counters
+    # remain available to the scheduled daily digest, while interactive pages
+    # query only the rows that they actually display.
+    stats_line = "⚡ <b>Ленты загружаются напрямую</b> без фонового пересчёта всей базы."
     if not full:
         return (
             "📡 <b>DT Radar</b>\n\n"
@@ -16456,12 +16412,13 @@ async def _radar_list_payload(
     if preview:
         page = 0
         rows, total = await list_radar_products(
-            mode=mode, category_key=None, page=0, page_size=FREE_RADAR_PREVIEW_LIMIT, user_id=None
+            mode=mode, category_key=None, page=0, page_size=FREE_RADAR_PREVIEW_LIMIT,
+            user_id=None, exact_total=False,
         )
     else:
         rows, total = await list_radar_products(
             mode=mode, category_key=category_key, page=page, user_id=user_id,
-            price_filter=price_filter if category_key else "any",
+            price_filter=price_filter if category_key else "any", exact_total=False,
         )
     titles = {
         "hot": "🔥 Горячие сейчас",
@@ -16559,11 +16516,10 @@ async def _radar_list_payload(
                 + f"🔁 сигналов: <b>{int(product.signal_count or 0)}</b> · объявлений: <b>{int(product.listing_count or 0)}</b>"
             )
     if preview:
-        hidden = max(0, int(total) - len(rows))
-        if hidden:
+        if int(total) > len(rows):
             lines += [
                 "",
-                f"🔒 Ещё <b>{hidden}</b> товаров в этом режиме доступны в полном DT Radar.",
+                "🔒 В этом режиме есть <b>ещё товары</b>, доступные в полном DT Radar.",
                 "Полный доступ открывает все результаты, 🔎 Поиск, 🗂 Категории и ⭐ Мой Radar.",
             ]
         trial = await get_trial_status(user_id)
@@ -16571,8 +16527,9 @@ async def _radar_list_payload(
             rows, mode=mode, total=total, trial_remaining=(trial.remaining if trial.eligible else 0)
         )
     if total:
-        pages = max(1, (total + RADAR_PAGE_SIZE - 1) // RADAR_PAGE_SIZE)
-        lines += ["", f"Страница <b>{page + 1}/{pages}</b> · всего <b>{total}</b>"]
+        has_more = int(total) > (page + 1) * RADAR_PAGE_SIZE
+        suffix = " · есть ещё" if has_more else ""
+        lines += ["", f"Страница <b>{page + 1}</b>{suffix}"]
     return "\n\n".join(lines), radar_list_keyboard(
         rows, mode=mode, page=page, total=total, category_key=category_key,
         price_filter=price_filter,
@@ -16656,13 +16613,17 @@ async def _radar_product_payload(
 async def _radar_preview_product_allowed(product_id: int, mode: str) -> bool:
     if mode not in {"hot", "rising", "ai"}:
         return False
-    rows, _total = await list_radar_products(mode=mode, page=0, page_size=FREE_RADAR_PREVIEW_LIMIT)
+    rows, _total = await list_radar_products(
+        mode=mode, page=0, page_size=FREE_RADAR_PREVIEW_LIMIT, exact_total=False
+    )
     return any(int(product.id) == int(product_id) for product in rows)
 
 
 async def _radar_search_payload(query: str, page: int = 0, *, price_filter: str = "any"):
     clean = " ".join(str(query or "").split())[:80]
-    rows, total = await search_radar_products(clean, page=page, price_filter=price_filter)
+    rows, total = await search_radar_products(
+        clean, page=page, price_filter=price_filter, exact_total=False
+    )
     lines = [
         f"🔎 <b>Поиск DT Radar</b>",
         f"Запрос: <b>{html.escape(clean)}</b>",
@@ -16684,8 +16645,9 @@ async def _radar_search_payload(query: str, page: int = 0, *, price_filter: str 
                 f"🕐 <b>{html.escape(_radar_freshness(product.last_signal_at))}</b>"
             )
     if total:
-        pages = max(1, (total + RADAR_PAGE_SIZE - 1) // RADAR_PAGE_SIZE)
-        lines += ["", f"Страница <b>{page + 1}/{pages}</b> · найдено <b>{total}</b>"]
+        has_more = int(total) > (page + 1) * RADAR_PAGE_SIZE
+        suffix = " · есть ещё" if has_more else ""
+        lines += ["", f"Страница <b>{page + 1}</b>{suffix}"]
     return "\n\n".join(lines), radar_search_keyboard(
         rows, page=page, total=total, price_filter=price_filter
     )
@@ -16734,7 +16696,6 @@ async def radar_locked(callback: CallbackQuery) -> None:
         )
         return
     await callback.answer()
-    stats = await _radar_ui_stats_safe()
     feature = ""
     if ":" in str(callback.data or ""):
         feature = str(callback.data or "").split(":", 1)[1]
@@ -16748,18 +16709,11 @@ async def radar_locked(callback: CallbackQuery) -> None:
     if free_radar_preview_allowed(callback.from_user.id):
         record_free_radar_event_background(callback.from_user.id, "locked_feature", feature=feature)
     title = labels.get(feature, "Полный DT Radar")
-    stats_text = (
-        f"📦 В Radar уже: <b>{stats.total}</b> товаров\n"
-        f"🔥 Горячих: <b>{stats.hot}</b> · 🚀 Набирают: <b>{stats.rising}</b>\n"
-        f"⚡ Быстро исчезли: <b>{stats.fast_sold}</b>\n\n"
-        if stats is not None else
-        "🕒 Статистика Radar обновляется в фоне.\n\n"
-    )
     text = (
         f"🔒 <b>{html.escape(title)}</b>\n\n"
         f"Эта функция доступна в полном DT Radar. Бесплатно можно посмотреть первые <b>{FREE_RADAR_PREVIEW_LIMIT}</b> "
         "реальных находок в каждом режиме «Лучшие сейчас».\n\n"
-        f"{stats_text}"
+        "⚡ Ленты открываются напрямую, без ожидания общего пересчёта статистики.\n\n"
         "💎 Полный доступ открывает все результаты, поиск, категории, сохранения и историю Radar."
     )
     await _edit_or_answer(callback.message, text, reply_markup=radar_locked_keyboard())
@@ -16806,21 +16760,17 @@ async def radar_command(message: Message) -> None:
 @dp.callback_query(F.data == "radarbest")
 async def radar_best_handler(callback: CallbackQuery) -> None:
     await callback.answer()
-    stats = await _radar_ui_stats_safe()
     full = allowed(callback.from_user.id)
     if not full and free_radar_preview_allowed(callback.from_user.id):
         record_free_radar_event_background(callback.from_user.id, "best_open")
-    hot_count = f"<b>{stats.hot}</b>" if stats is not None else "обновляется"
-    rising_count = f"<b>{stats.rising}</b>" if stats is not None else "обновляется"
-    fast_sold_count = f"<b>{stats.fast_sold}</b>" if stats is not None else "обновляется"
     if full:
         text = (
             "🔥 <b>Лучшие сейчас</b>\n\n"
             "Выбери, какие сильные товары хочешь посмотреть:\n\n"
-            f"🔥 Горячие: {hot_count}\n"
-            f"🚀 Набирают: {rising_count}\n"
+            "🔥 Горячие — сильный свежий рост\n"
+            "🚀 Набирают — подтверждённое ускорение\n"
             
-            f"⚡ Быстро исчезли: {fast_sold_count}\n\n"
+            "⚡ Быстро исчезли — проверенная недоступность\n\n"
             "⚡ «Быстро исчезли» — объявления, которые Radar видел активными и затем подтвердил недоступными в первые 3 часа.\n\n"
             "🏆 Рекорды Radar оставлены ниже как дополнительная история."
         )
@@ -16829,10 +16779,10 @@ async def radar_best_handler(callback: CallbackQuery) -> None:
             "🔥 <b>Лучшие сейчас</b>\n\n"
             "Мы уже отобрали сильные товары из DT Radar.\n"
             f"🎁 <b>Бесплатно покажем первые {FREE_RADAR_PREVIEW_LIMIT} находок</b> в выбранном режиме.\n\n"
-            f"🔥 Горячие: {hot_count}\n"
-            f"🚀 Набирают: {rising_count}\n"
+            "🔥 Горячие — сильный свежий рост\n"
+            "🚀 Набирают — подтверждённое ускорение\n"
             
-            f"⚡ Быстро исчезли: {fast_sold_count} · 🔒\n\n"
+            "⚡ Быстро исчезли · 🔒\n\n"
             "Выбери режим и посмотри реальные результаты Radar."
         )
     await _edit_or_answer(callback.message, text, reply_markup=radar_best_keyboard(callback.from_user.id))
@@ -16998,12 +16948,10 @@ async def radar_list_handler(callback: CallbackQuery, state: FSMContext) -> None
         if not free_radar_preview_allowed(callback.from_user.id) or mode not in {"hot", "rising", "ai"} or page != 0:
             await callback.answer("Доступно в полном DT Radar", show_alert=True)
             if callback.message:
-                stats = await _radar_ui_stats_safe()
-                total_text = f"<b>{stats.total}</b> товаров" if stats is not None else "статистика обновляется"
                 text = (
                     "🔒 <b>Полный DT Radar</b>\n\n"
                     f"Бесплатно доступны первые <b>{FREE_RADAR_PREVIEW_LIMIT}</b> находок в Горячих и Набирают.\n"
-                    f"В полной базе: {total_text}.\n\n"
+                    "В полной базе доступны все актуальные результаты и история.\n\n"
                     "💎 Подписка открывает все результаты, поиск, категории и Мой Radar."
                 )
                 await _edit_or_answer(callback.message, text, reply_markup=radar_locked_keyboard())
@@ -17056,8 +17004,8 @@ async def radar_preview_item_handler(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("radarcats:"))
 async def radar_categories_handler(callback: CallbackQuery) -> None:
-    items = await radar_categories()
     await callback.answer()
+    items = await radar_categories()
     text = (
         "🗂 <b>DT Radar · Категории</b>\n\n"
         "Сначала выбери <b>большой раздел</b>. Затем Radar покажет только его подкатегории.\n\n"
@@ -17073,6 +17021,7 @@ async def radar_group_handler(callback: CallbackQuery) -> None:
     if group is None:
         await callback.answer("Раздел не найден", show_alert=True)
         return
+    await callback.answer()
     items = await radar_categories()
     stats = _radar_category_stats(items)
     total = sum(
@@ -17085,7 +17034,6 @@ async def radar_group_handler(callback: CallbackQuery) -> None:
         for cat in categories_for_group(group_key)
         if not cat.is_group
     )
-    await callback.answer()
     text = (
         f"{group.icon} <b>{html.escape(group.name)}</b>\n\n"
         "Выбери нужную <b>подкатегорию</b>.\n"
@@ -17147,14 +17095,15 @@ async def radar_item_handler(callback: CallbackQuery, state: FSMContext) -> None
         product_id = int(callback.data.split(":", 1)[1])
     except Exception:
         await callback.answer("Товар не найден", show_alert=True); return
+    await callback.answer()
     data = await state.get_data()
     return_callback, return_text = _radar_context_back(data)
     text, markup = await _radar_product_payload(
         callback.from_user.id, product_id, return_callback=return_callback, return_text=return_text
     )
     if text is None:
-        await callback.answer("Товар не найден", show_alert=True); return
-    await callback.answer()
+        await _edit_or_answer(callback.message, "Товар не найден или уже недоступен.")
+        return
     await _edit_or_answer(callback.message, text, reply_markup=markup)
 
 
