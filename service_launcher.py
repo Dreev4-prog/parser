@@ -23,6 +23,8 @@ def _role() -> str:
         return "ai-worker"
     if explicit in {"lifecycleworker", "radarlifecycleworker", "fastsoldworker"}:
         return "lifecycle-worker"
+    if explicit in {"radarworker", "radarscanworker", "dtradarworker"}:
+        return "radar-worker"
     if explicit in {"vintedscanworker", "vintedcatalogworker", "vintedparserworker"}:
         return "vinted-scan-worker"
     if explicit in {"vintedmetricsworker", "vintedmetricworker"}:
@@ -58,6 +60,10 @@ def _role() -> str:
         ("lifecycle" in normalized or "fastsold" in normalized) and "worker" in normalized
     ):
         return "lifecycle-worker"
+    if normalized in {"radarworker", "radarscanworker", "dtradarworker"} or (
+        "radar" in normalized and "worker" in normalized
+    ):
+        return "radar-worker"
     if "vinted" in normalized and "worker" in normalized and ("session" in normalized or "login" in normalized or "auth" in normalized):
         return "vinted-session-worker"
     if "vinted" in normalized and "worker" in normalized and ("metric" in normalized or "metrics" in normalized):
@@ -94,6 +100,11 @@ def main() -> None:
         # Fast Sold uses PostgreSQL as its durable queue and direct lightweight
         # detail-page checks. Keep the worker on a small independent DB/traffic pool.
         os.environ.setdefault("DISTRIBUTED_WORKERS", "1")
+    if role == "radar-worker":
+        # Exactly one Railway service owns Radar crawling, checkpoints and the
+        # persisted public-statistics snapshot. It never starts Telegram polling.
+        os.environ["RADAR_DEDICATED_WORKER"] = "1"
+        os.environ.setdefault("DISTRIBUTED_WORKERS", "1")
     if role == "vinted-probe":
         # Vinted Probe is intentionally isolated from Kleinanzeigen Page/Date/View queues.
         os.environ.setdefault("DISTRIBUTED_WORKERS", "1")
@@ -114,6 +125,7 @@ def main() -> None:
         "date-worker": "date_worker.py",
         "ai-worker": "retired_ai_worker.py",
         "lifecycle-worker": "lifecycle_worker.py",
+        "radar-worker": "radar_worker.py",
         "vinted-probe": "vinted_probe_worker.py",
         "vinted-scan-worker": "vinted_scan_worker.py",
         "vinted-metrics-worker": "vinted_metrics_worker.py",

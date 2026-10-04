@@ -1,0 +1,20 @@
+DT Parser 4.23.20 — отдельный Radar Worker в Railway
+
+1. Загрузите файлы патча в GitHub.
+2. Сначала добавьте в основной parser: RADAR_DEDICATED_WORKER=1
+3. Дождитесь перезапуска parser и строки:
+   Dedicated Radar Worker mode: parser serves Telegram UI only
+4. Затем создайте ОДИН новый сервис из того же GitHub-репозитория.
+5. Назовите сервис "Radar Worker".
+6. Start Command оставьте таким же: python service_launcher.py
+7. Добавьте переменную: DT_SERVICE_ROLE=radar-worker
+8. Подключите к сервису те же ссылки DATABASE_URL и REDIS_URL.
+9. Добавьте BOT_TOKEN; ADMIN_IDS можно скопировать для уведомлений.
+10. Оставьте ровно 1 replica.
+11. Дождитесь в логах:
+   role=radar-worker target=radar_worker.py
+   Dedicated DT Radar Worker online
+   Radar Worker deep analytics published
+
+Теперь Radar Worker делает сканирование и сохраняет полную статистику, а кнопка
+аналитики в боте мгновенно показывает последнюю готовую запись.

@@ -43,9 +43,18 @@ os.environ["TRAFFIC_RECOVERY_QUIET_SECONDS"] = "10"
 # they keep using Redis exactly as before. Trial and paid scans share these same
 # four FIFO lanes.
 GUARANTEED_LOCAL_PARSER_LANES = 4
-os.environ["STABLE_SINGLE_SERVICE_MODE"] = "1"
-os.environ["MULTIUSER_STABLE_MODE"] = "1"
-os.environ["MULTIUSER_LOCAL_WORKERS"] = str(GUARANTEED_LOCAL_PARSER_LANES)
+_RADAR_WORKER_BOOTSTRAP = os.getenv("RADAR_DEDICATED_WORKER", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+if _RADAR_WORKER_BOOTSTRAP:
+    # radar_worker.py sets this marker before importing bot helpers. Keep Redis
+    # coordination enabled and never instantiate the main four user-scan lanes.
+    os.environ["STABLE_SINGLE_SERVICE_MODE"] = "0"
+    os.environ["MULTIUSER_STABLE_MODE"] = "0"
+else:
+    os.environ["STABLE_SINGLE_SERVICE_MODE"] = "1"
+    os.environ["MULTIUSER_STABLE_MODE"] = "1"
+    os.environ["MULTIUSER_LOCAL_WORKERS"] = str(GUARANTEED_LOCAL_PARSER_LANES)
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.enums import ParseMode
@@ -124,9 +133,10 @@ from parser import (
 )
 from view_manager import REMOTE_VIEW_MANAGER, REMOTE_VIEW_WORKER_ENABLED
 from radar import (
-    RADAR_PAGE_SIZE, RADAR_SCAN_TOP_LIMIT, bump_resurrection_integrity_sweep_once,
+    RADAR_PAGE_SIZE, RADAR_SCAN_TOP_LIMIT, RadarStats, bump_resurrection_integrity_sweep_once,
     prepare_bump_resurrection_sweep_once, prepare_verified_organic_velocity_once, prepare_unified_48h_ranking_once, get_fast_sold_info, get_fast_sold_infos,
-    get_radar_product, is_radar_favorite, list_radar_products, radar_categories, radar_stats,
+    get_radar_product, is_radar_favorite, list_radar_products, load_radar_stats_snapshot,
+    radar_categories, radar_stats, refresh_radar_stats_snapshot, save_radar_stats_snapshot,
     purge_nonorganic_analytics, record_autoscan_hot_detailed, radar_v3_category_allowed,
     record_verified_velocity_signals, refresh_radar_scores, verify_listing_organic_now,
     lifecycle_diagnostics, get_radar_recent_hot_infos, repair_radar_lifecycle_qualification_once,
@@ -187,6 +197,12 @@ ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 # intact so it can be restored later, but no UI entry, queue work or background
 # scheduler is active while the Railway Vinted workers are removed.
 VINTED_LAB_ENABLED = os.getenv("VINTED_LAB_ENABLED", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+# When enabled on the main parser service, all Radar crawling/checkpoint
+# background loops are owned by the single dedicated Railway Radar Worker.
+# Telegram controls and reads remain in this process.
+RADAR_DEDICATED_WORKER = os.getenv("RADAR_DEDICATED_WORKER", "0").strip().lower() in {
     "1", "true", "yes", "on",
 }
 
@@ -327,6 +343,20 @@ RADAR_DAILY_DIGEST_UI_METRICS_TIMEOUT_SECONDS = 8.0
 RADAR_DAILY_DIGEST_SEND_METRICS_TIMEOUT_SECONDS = 20.0
 RADAR_DAILY_DIGEST_RECIPIENTS_TIMEOUT_SECONDS = 8.0
 _RADAR_DAILY_DIGEST_SEND_LOCK = asyncio.Lock()
+
+# Exact public counters are calculated off the user path and persisted as one
+# AppSetting row. Every parser replica can then render the same complete snapshot
+# with a primary-key lookup instead of rescanning the Radar catalogue.
+RADAR_STATS_SNAPSHOT_INTERVAL_SECONDS = max(
+    300, int(os.getenv("RADAR_STATS_SNAPSHOT_INTERVAL_SECONDS", "900"))
+)
+RADAR_STATS_SNAPSHOT_REFRESH_TIMEOUT_SECONDS = max(
+    15.0, float(os.getenv("RADAR_STATS_SNAPSHOT_REFRESH_TIMEOUT_SECONDS", "45"))
+)
+RADAR_ANALYTICS_SNAPSHOT_SETTING_KEY = "dt_radar_deep_analytics_snapshot_v1"
+RADAR_ANALYTICS_SNAPSHOT_REFRESH_TIMEOUT_SECONDS = max(
+    30.0, float(os.getenv("RADAR_ANALYTICS_SNAPSHOT_REFRESH_TIMEOUT_SECONDS", "120"))
+)
 
 _radar_autoscan_guard = asyncio.Lock()
 # Serializes the actual round runner. The scheduler and a manual admin kick may race,
@@ -5648,22 +5678,24 @@ def _radar_lifecycle_text(stats: dict) -> str:
         "Раннее наблюдение само по себе не даёт Score или HOT.</i>")
 
 
-async def _radar3_analytics_text() -> str:
-    """Deep Radar analytics. It is intentionally isolated from the live control panel."""
-    radar3, checkpoint_stats = await asyncio.gather(
-        _radar3_dashboard_safe_snapshot(timeout_seconds=3.0),
-        _radar3_checkpoint_safe_snapshot(timeout_seconds=2.0),
-    )
+def _render_radar3_analytics_text(
+    radar3: dict, checkpoint_stats: dict, lifecycle_stats: dict,
+    *, updated_at: datetime | None = None,
+) -> str:
+    """Render one complete worker-produced analytics snapshot."""
     checkpoint_text = _radar3_checkpoint_text(checkpoint_stats)
-    lifecycle_text = _radar_lifecycle_text(await _radar_lifecycle_safe_snapshot())
+    lifecycle_text = _radar_lifecycle_text(lifecycle_stats)
     category_lines = list(radar3.get("category_lines") or [])
     category_text = "\n".join(category_lines[:10]) if category_lines else "Пока подтверждённых категорий нет"
+    updated_text = (
+        f"\n\n🕒 Снимок Radar Worker: <b>{html.escape(_moscow_text(updated_at))}</b>"
+        if updated_at is not None else ""
+    )
     if not any(k in radar3 for k in ("active", "early", "strong", "hot")):
         return (
             "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\n"
-            "⚠️ Глубокая статистика сейчас считается или PostgreSQL занят.\n"
-            "Live Status и AutoScan при этом продолжают работать независимо.\n\n"
-            + category_text + "\n\n" + checkpoint_text + "\n\n" + lifecycle_text
+            "⚠️ Сохранённый снимок пока неполный. Radar Worker обновит его автоматически.\n\n"
+            + category_text + "\n\n" + checkpoint_text + "\n\n" + lifecycle_text + updated_text
         )
     return (
         "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\n"
@@ -5686,6 +5718,63 @@ async def _radar3_analytics_text() -> str:
         "<i>Radar 3.2: &lt;3/ч — шум. Дальше объявление сравнивается только со своей категорией: "
         "P90 Candidate · P95 Early/Score · P98 Strong · P99 Hot при подтверждении. "
         "DT Score = 50% позиция в категории + 25% устойчивость + 15% ускорение + 10% повторяемость.</i>"
+        + updated_text
+    )
+
+
+async def save_radar_analytics_snapshot(text_value: str, updated_at: datetime | None = None) -> datetime:
+    updated_at = updated_at or datetime.utcnow()
+    async with SessionLocal() as session:
+        row = await session.get(AppSetting, RADAR_ANALYTICS_SNAPSHOT_SETTING_KEY)
+        if row is None:
+            session.add(AppSetting(
+                key=RADAR_ANALYTICS_SNAPSHOT_SETTING_KEY,
+                value=str(text_value),
+                updated_at=updated_at,
+            ))
+        else:
+            row.value = str(text_value)
+            row.updated_at = updated_at
+        await session.commit()
+    return updated_at
+
+
+async def load_radar_analytics_snapshot() -> tuple[str | None, datetime | None]:
+    async with SessionLocal() as session:
+        row = await session.get(AppSetting, RADAR_ANALYTICS_SNAPSHOT_SETTING_KEY)
+    if row is None or not str(row.value or "").strip():
+        return None, None
+    return str(row.value), row.updated_at
+
+
+async def refresh_radar_analytics_snapshot() -> tuple[str, datetime]:
+    """Heavy analytics are calculated only by the dedicated Radar Worker."""
+    radar3 = await _radar3_dashboard_snapshot()
+    checkpoint_stats = await radar_v3_checkpoint_telemetry()
+    lifecycle_stats = await lifecycle_diagnostics()
+    updated_at = datetime.utcnow()
+    text_value = _render_radar3_analytics_text(
+        radar3, checkpoint_stats, lifecycle_stats, updated_at=updated_at
+    )
+    await save_radar_analytics_snapshot(text_value, updated_at)
+    return text_value, updated_at
+
+
+async def _radar3_analytics_text() -> str:
+    """Read the worker-produced deep snapshot without aggregate queries."""
+    try:
+        text_value, _updated_at = await asyncio.wait_for(
+            load_radar_analytics_snapshot(), timeout=1.5
+        )
+    except Exception:
+        log.warning("DT Radar analytics snapshot read failed", exc_info=True)
+        text_value = None
+    if text_value:
+        return text_value
+    return (
+        "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\n"
+        "⏳ Первый полный снимок формирует отдельный Radar Worker.\n"
+        "После запуска сервиса статистика появится здесь автоматически и дальше будет открываться мгновенно."
     )
 
 
@@ -5890,6 +5979,29 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
     state["current_category_key"] = ""
     state["current_category_name"] = ""
     state = await save_radar_autoscan_state(state)
+    # The dedicated worker publishes one exact post-round snapshot. Telegram
+    # screens subsequently read a single AppSetting row and never repeat these
+    # aggregates in the user request path.
+    try:
+        snapshot, _snapshot_at = await asyncio.wait_for(
+            refresh_radar_stats_snapshot(),
+            timeout=RADAR_STATS_SNAPSHOT_REFRESH_TIMEOUT_SECONDS,
+        )
+        log.info(
+            "DT Radar public statistics published after round total=%s hot=%s rising=%s fast_sold=%s",
+            snapshot.total, snapshot.hot, snapshot.rising, snapshot.fast_sold,
+        )
+    except Exception:
+        log.warning("DT Radar post-round statistics snapshot failed", exc_info=True)
+    if RADAR_DEDICATED_WORKER:
+        try:
+            await asyncio.wait_for(
+                refresh_radar_analytics_snapshot(),
+                timeout=RADAR_ANALYTICS_SNAPSHOT_REFRESH_TIMEOUT_SECONDS,
+            )
+            log.info("DT Radar deep analytics published after completed round")
+        except Exception:
+            log.warning("DT Radar post-round deep analytics snapshot failed", exc_info=True)
     start_context_after_fresh = False
     icon = "✅" if failed == 0 else "⚠️"
     if mode == "retry":
@@ -13750,18 +13862,11 @@ async def admin_radar_analytics_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer()
-    await _edit_or_answer(
-        callback.message,
-        "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\nСчитаю глубокую статистику… ⏳\nLive AutoScan от этого не блокируется.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Live Status", callback_data="adminradarauto")]
-        ]),
-    )
     text = await _radar3_analytics_text()
     await _edit_or_answer(
         callback.message, text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить аналитику", callback_data="adminradarauto:analytics")],
+            [InlineKeyboardButton(text="🔄 Показать последний снимок", callback_data="adminradarauto:analytics")],
             [InlineKeyboardButton(text="⬅️ Live Status", callback_data="adminradarauto")],
         ]),
     )
@@ -14291,6 +14396,10 @@ async def radar_daily_digest_metrics() -> dict[str, int]:
         )).scalar_one() or 0)
 
     stats = await radar_stats()
+    try:
+        await save_radar_stats_snapshot(stats)
+    except Exception:
+        log.warning("Daily Radar could not publish public statistics snapshot", exc_info=True)
     return {
         "listings_seen": listings_seen,
         "new_listings": new_listings,
@@ -16376,12 +16485,55 @@ def _radar_added_label(value: datetime | None) -> str:
         return "давно"
 
 
+RADAR_PUBLIC_STATS_READ_CACHE_SECONDS = 30.0
+_radar_public_stats_cache: RadarStats | None = None
+_radar_public_stats_updated_at: datetime | None = None
+_radar_public_stats_loaded_at = 0.0
+
+
+async def _radar_public_stats_snapshot() -> tuple[RadarStats | None, datetime | None]:
+    """Read the worker-produced snapshot; never calculate aggregates in a callback."""
+    global _radar_public_stats_cache, _radar_public_stats_updated_at, _radar_public_stats_loaded_at
+    now = time.monotonic()
+    if (
+        _radar_public_stats_cache is not None
+        and now - _radar_public_stats_loaded_at < RADAR_PUBLIC_STATS_READ_CACHE_SECONDS
+    ):
+        return _radar_public_stats_cache, _radar_public_stats_updated_at
+    try:
+        stats, updated_at = await asyncio.wait_for(load_radar_stats_snapshot(), timeout=1.5)
+    except Exception:
+        log.warning("DT Radar statistics snapshot read failed", exc_info=True)
+        return _radar_public_stats_cache, _radar_public_stats_updated_at
+    if stats is not None:
+        _radar_public_stats_cache = stats
+        _radar_public_stats_updated_at = updated_at
+        _radar_public_stats_loaded_at = now
+    return stats, updated_at
+
+
+def _radar_stats_text(stats: RadarStats | None, updated_at: datetime | None) -> str:
+    if stats is None:
+        return (
+            "📊 <b>Статистика DT Radar</b>\n"
+            "Первый снимок формируется отдельным Radar Worker. После запуска сервиса он появится автоматически."
+        )
+    number = lambda value: f"{max(0, int(value or 0)):,}".replace(",", " ")
+    updated = _moscow_text(updated_at) if updated_at is not None else "—"
+    return (
+        "📊 <b>Полная статистика DT Radar</b>\n"
+        f"📦 Товаров: <b>{number(stats.total)}</b> · 🗂 категорий: <b>{number(stats.categories)}</b>\n"
+        f"🔥 HOT: <b>{number(stats.hot)}</b> · 🚀 набирают: <b>{number(stats.rising)}</b>\n"
+        f"⚡ Fast Sold: <b>{number(stats.fast_sold)}</b> · 📡 сигналов: <b>{number(stats.signals)}</b>\n"
+        f"🧠 AI Picks: <b>{number(stats.ai_picks)}</b> · 🔥 HOT за 48ч: <b>{number(stats.recent_hot_48h)}</b>\n"
+        f"🕒 Снимок обновлён: <b>{html.escape(updated)}</b>"
+    )
+
+
 async def _radar_home_text(user_id: int | None = None) -> str:
     full = bool(user_id is not None and allowed(int(user_id)))
-    # User navigation must not launch a full-catalogue aggregate. Exact counters
-    # remain available to the scheduled daily digest, while interactive pages
-    # query only the rows that they actually display.
-    stats_line = "⚡ <b>Ленты загружаются напрямую</b> без фонового пересчёта всей базы."
+    stats, updated_at = await _radar_public_stats_snapshot()
+    stats_line = _radar_stats_text(stats, updated_at)
     if not full:
         return (
             "📡 <b>DT Radar</b>\n\n"
@@ -16709,11 +16861,12 @@ async def radar_locked(callback: CallbackQuery) -> None:
     if free_radar_preview_allowed(callback.from_user.id):
         record_free_radar_event_background(callback.from_user.id, "locked_feature", feature=feature)
     title = labels.get(feature, "Полный DT Radar")
+    stats, updated_at = await _radar_public_stats_snapshot()
     text = (
         f"🔒 <b>{html.escape(title)}</b>\n\n"
         f"Эта функция доступна в полном DT Radar. Бесплатно можно посмотреть первые <b>{FREE_RADAR_PREVIEW_LIMIT}</b> "
         "реальных находок в каждом режиме «Лучшие сейчас».\n\n"
-        "⚡ Ленты открываются напрямую, без ожидания общего пересчёта статистики.\n\n"
+        f"{_radar_stats_text(stats, updated_at)}\n\n"
         "💎 Полный доступ открывает все результаты, поиск, категории, сохранения и историю Radar."
     )
     await _edit_or_answer(callback.message, text, reply_markup=radar_locked_keyboard())
@@ -16760,17 +16913,20 @@ async def radar_command(message: Message) -> None:
 @dp.callback_query(F.data == "radarbest")
 async def radar_best_handler(callback: CallbackQuery) -> None:
     await callback.answer()
+    stats, _updated_at = await _radar_public_stats_snapshot()
     full = allowed(callback.from_user.id)
     if not full and free_radar_preview_allowed(callback.from_user.id):
         record_free_radar_event_background(callback.from_user.id, "best_open")
+    hot_line = f"🔥 Горячие: <b>{int(stats.hot)}</b>" if stats is not None else "🔥 Горячие — сильный свежий рост"
+    rising_line = f"🚀 Набирают: <b>{int(stats.rising)}</b>" if stats is not None else "🚀 Набирают — подтверждённое ускорение"
+    fast_line = f"⚡ Быстро исчезли: <b>{int(stats.fast_sold)}</b>" if stats is not None else "⚡ Быстро исчезли — проверенная недоступность"
     if full:
         text = (
             "🔥 <b>Лучшие сейчас</b>\n\n"
             "Выбери, какие сильные товары хочешь посмотреть:\n\n"
-            "🔥 Горячие — сильный свежий рост\n"
-            "🚀 Набирают — подтверждённое ускорение\n"
-            
-            "⚡ Быстро исчезли — проверенная недоступность\n\n"
+            f"{hot_line}\n"
+            f"{rising_line}\n"
+            f"{fast_line}\n\n"
             "⚡ «Быстро исчезли» — объявления, которые Radar видел активными и затем подтвердил недоступными в первые 3 часа.\n\n"
             "🏆 Рекорды Radar оставлены ниже как дополнительная история."
         )
@@ -16779,10 +16935,9 @@ async def radar_best_handler(callback: CallbackQuery) -> None:
             "🔥 <b>Лучшие сейчас</b>\n\n"
             "Мы уже отобрали сильные товары из DT Radar.\n"
             f"🎁 <b>Бесплатно покажем первые {FREE_RADAR_PREVIEW_LIMIT} находок</b> в выбранном режиме.\n\n"
-            "🔥 Горячие — сильный свежий рост\n"
-            "🚀 Набирают — подтверждённое ускорение\n"
-            
-            "⚡ Быстро исчезли · 🔒\n\n"
+            f"{hot_line}\n"
+            f"{rising_line}\n"
+            f"{fast_line} · 🔒\n\n"
             "Выбери режим и посмотри реальные результаты Radar."
         )
     await _edit_or_answer(callback.message, text, reply_markup=radar_best_keyboard(callback.from_user.id))
@@ -18859,10 +19014,19 @@ async def main() -> None:
     database_retention_task = asyncio.create_task(
         database_retention_scheduler(), name="postgres-retention-scheduler"
     )
-    radar_task = asyncio.create_task(radar_maintenance_scheduler(), name="dt-radar-maintenance")
-    radar_v3_observation_task = asyncio.create_task(radar_v3_observation_scheduler(), name="dt-radar-v3-observations")
-    organic_velocity_task = asyncio.create_task(organic_velocity_scheduler(), name="verified-organic-velocity")
-    radar_autoscan_task = asyncio.create_task(radar_autoscan_scheduler(bot), name="dt-radar-autoscan")
+    radar_background_tasks: list[asyncio.Task] = []
+    if RADAR_DEDICATED_WORKER:
+        log.warning(
+            "Dedicated Radar Worker mode: parser serves Telegram UI only; "
+            "AutoScan/checkpoints/maintenance run in radar_worker.py"
+        )
+    else:
+        radar_background_tasks = [
+            asyncio.create_task(radar_maintenance_scheduler(), name="dt-radar-maintenance"),
+            asyncio.create_task(radar_v3_observation_scheduler(), name="dt-radar-v3-observations"),
+            asyncio.create_task(organic_velocity_scheduler(), name="verified-organic-velocity"),
+            asyncio.create_task(radar_autoscan_scheduler(bot), name="dt-radar-autoscan"),
+        ]
     radar_daily_digest_task = asyncio.create_task(radar_daily_digest_scheduler(bot), name="dt-radar-daily-digest")
     vinted_radar_task = (
         asyncio.create_task(vinted_radar_autoscan_scheduler(), name="vinted-radar-1-autoscan")
@@ -18883,10 +19047,8 @@ async def main() -> None:
         subscription_task.cancel()
         archive_task.cancel()
         database_retention_task.cancel()
-        radar_task.cancel()
-        radar_v3_observation_task.cancel()
-        organic_velocity_task.cancel()
-        radar_autoscan_task.cancel()
+        for task in radar_background_tasks:
+            task.cancel()
         radar_daily_digest_task.cancel()
         if vinted_radar_task is not None:
             vinted_radar_task.cancel()
@@ -18894,7 +19056,10 @@ async def main() -> None:
             task.cancel()
         for task in worker_tasks:
             task.cancel()
-        shutdown_tasks = [payment_task, subscription_task, archive_task, database_retention_task, radar_task, radar_v3_observation_task, organic_velocity_task, radar_autoscan_task, radar_daily_digest_task, *observation_tasks, *worker_tasks]
+        shutdown_tasks = [
+            payment_task, subscription_task, archive_task, database_retention_task,
+            radar_daily_digest_task, *radar_background_tasks, *observation_tasks, *worker_tasks,
+        ]
         if vinted_radar_task is not None:
             shutdown_tasks.append(vinted_radar_task)
         if distributed_queue_ticker_task is not None:

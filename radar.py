@@ -63,6 +63,7 @@ RADAR_V3_RESET_SETTING = "dt_radar_v3_observed_demand_reset_v6_radar32_two_pass_
 RADAR_V3_HISTORY_SCORE_REPAIR_SETTING = "dt_radar_v3_history_score_repair_v1"
 RADAR_V3_LIVE_RETENTION_REPAIR_SETTING = "dt_radar_v3_live_retention_24h_repair_v1"
 RADAR_V3_DEPTH_REPAIR_SETTING = "dt_radar_v42311_depth_retirement_repair_v1"
+RADAR_STATS_SNAPSHOT_SETTING = "dt_radar_public_stats_snapshot_v1"
 RADAR_V3_CHECKPOINT_AUDIT_DAYS = 7
 RADAR_V3_FIRST_CHECK_MINUTES = 60
 RADAR_V3_NEXT_CHECK_MINUTES = 60
@@ -2940,6 +2941,76 @@ async def radar_stats() -> RadarStats:
             RadarLifecycleWatch.lifetime_seconds <= RADAR_FAST_SOLD_MAX_SECONDS,
             _clean_listing_exists(RadarLifecycleWatch.external_id)))).scalar_one() or 0)
     return RadarStats(total, hot, rising, ai_picks, categories, signals, fast_sold, recent_hot_48h)
+
+
+def _radar_stats_snapshot_payload(stats: RadarStats) -> str:
+    return json.dumps({
+        "total": max(0, int(stats.total)),
+        "hot": max(0, int(stats.hot)),
+        "rising": max(0, int(stats.rising)),
+        "ai_picks": max(0, int(stats.ai_picks)),
+        "categories": max(0, int(stats.categories)),
+        "signals": max(0, int(stats.signals)),
+        "fast_sold": max(0, int(stats.fast_sold)),
+        "recent_hot_48h": max(0, int(stats.recent_hot_48h)),
+    }, ensure_ascii=False, separators=(",", ":"))
+
+
+async def save_radar_stats_snapshot(stats: RadarStats) -> datetime:
+    """Persist one exact Radar summary for constant-time UI reads."""
+    updated_at = datetime.utcnow()
+    values = {
+        "key": RADAR_STATS_SNAPSHOT_SETTING,
+        "value": _radar_stats_snapshot_payload(stats),
+        "updated_at": updated_at,
+    }
+    if DATABASE_BACKEND == "PostgreSQL":
+        statement = pg_insert(AppSetting).values(**values).on_conflict_do_update(
+            index_elements=[AppSetting.key],
+            set_={"value": values["value"], "updated_at": updated_at},
+        )
+    else:
+        statement = sqlite_insert(AppSetting).values(**values).on_conflict_do_update(
+            index_elements=[AppSetting.key],
+            set_={"value": values["value"], "updated_at": updated_at},
+        )
+    async with SessionLocal() as session:
+        await session.execute(statement)
+        await session.commit()
+    return updated_at
+
+
+async def load_radar_stats_snapshot() -> tuple[RadarStats | None, datetime | None]:
+    """Load the persisted summary using a primary-key lookup only."""
+    async with SessionLocal() as session:
+        row = await session.get(AppSetting, RADAR_STATS_SNAPSHOT_SETTING)
+    if row is None:
+        return None, None
+    try:
+        raw = json.loads(str(row.value or "{}"))
+        if not isinstance(raw, dict):
+            return None, None
+        stats = RadarStats(
+            total=max(0, int(raw.get("total") or 0)),
+            hot=max(0, int(raw.get("hot") or 0)),
+            rising=max(0, int(raw.get("rising") or 0)),
+            ai_picks=max(0, int(raw.get("ai_picks") or 0)),
+            categories=max(0, int(raw.get("categories") or 0)),
+            signals=max(0, int(raw.get("signals") or 0)),
+            fast_sold=max(0, int(raw.get("fast_sold") or 0)),
+            recent_hot_48h=max(0, int(raw.get("recent_hot_48h") or 0)),
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        log.warning("Invalid persisted Radar statistics snapshot", exc_info=True)
+        return None, None
+    return stats, row.updated_at
+
+
+async def refresh_radar_stats_snapshot() -> tuple[RadarStats, datetime]:
+    """Calculate exact counters once, then publish them as a cheap snapshot."""
+    stats = await radar_stats()
+    updated_at = await save_radar_stats_snapshot(stats)
+    return stats, updated_at
 
 
 async def radar_v3_current_product_breakdown() -> tuple[dict[str, int], list[tuple[str, str, int]]]:
