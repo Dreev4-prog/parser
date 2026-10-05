@@ -1,10 +1,12 @@
-# v4.23.22 — HOT and popular products on the first screen
+# v4.23.23 — full DT Radar 3.0 screen restored
 
-Apply over v4.23.21. The `DT Radar 3.0` entry now immediately reads the current
-HOT and popular/rising summary plus product names from `radar_products`.
+Apply over v4.23.22. Opening `DT Radar 3.0` as an administrator now immediately
+shows the complete saved Adaptive Analytics screen: the Radar funnel,
+Candidate/Early/Strong/HOT, live-demand categories, checkpoint coverage,
+baseline funnel and Fast Sold availability checks.
 
-If no dedicated worker snapshot exists, the screen stays useful and does not
-appear empty. The main parser prepares the full public/deep snapshot in the
-background when `RADAR_DEDICATED_WORKER` is not enabled.
+The parser guarantees that this complete snapshot exists before Telegram starts
+accepting clicks. A normal open is one primary-key settings read and no longer
+waits for the product-list fallback query.
 
-See `RELEASE_4_23_22.md` and `RAILWAY_RADAR_WORKER_RU.txt`.
+No database migration is required. See `RELEASE_4_23_23.md`.

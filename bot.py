@@ -5763,23 +5763,45 @@ async def refresh_radar_analytics_snapshot() -> tuple[str, datetime]:
     return text_value, updated_at
 
 
+async def ensure_initial_radar_analytics_snapshot() -> bool:
+    """Guarantee that the first admin Radar open already has the full screen."""
+    try:
+        text_value, _updated_at = await asyncio.wait_for(
+            load_radar_analytics_snapshot(), timeout=2.0
+        )
+        if text_value:
+            return True
+    except Exception:
+        log.warning("Initial Radar analytics snapshot lookup failed", exc_info=True)
+    try:
+        await asyncio.wait_for(
+            refresh_radar_analytics_snapshot(),
+            timeout=RADAR_ANALYTICS_SNAPSHOT_REFRESH_TIMEOUT_SECONDS,
+        )
+        log.info("Initial full DT Radar analytics snapshot is ready")
+        return True
+    except Exception:
+        log.warning("Initial full DT Radar analytics snapshot failed", exc_info=True)
+        return False
+
+
 async def _radar3_analytics_text() -> str:
-    """Read deep analytics, with a bounded direct-DB home fallback."""
-    text_value = None
-    quick = None
-    snapshot_result, quick_result = await asyncio.gather(
-        asyncio.wait_for(load_radar_analytics_snapshot(), timeout=1.2),
-        _radar_quick_home_db_snapshot(),
-        return_exceptions=True,
-    )
-    if not isinstance(snapshot_result, BaseException):
-        text_value, _updated_at = snapshot_result
-    else:
-        log.warning("DT Radar analytics snapshot read failed: %s", type(snapshot_result).__name__)
-    if not isinstance(quick_result, BaseException):
-        quick = quick_result
+    """Read the complete saved analytics screen with one primary-key lookup.
+
+    The lightweight product query is strictly a last-resort fallback. Running it
+    next to the snapshot read made a healthy complete screen wait for a second DB
+    query, which is exactly the delay the persisted snapshot is meant to avoid.
+    """
+    try:
+        text_value, _updated_at = await asyncio.wait_for(
+            load_radar_analytics_snapshot(), timeout=1.2
+        )
+    except Exception as exc:
+        text_value = None
+        log.warning("DT Radar analytics snapshot read failed: %s", type(exc).__name__)
     if text_value:
         return text_value
+    quick = await _radar_quick_home_db_snapshot()
     return (
         "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\n"
         + _radar_quick_db_text(quick)
@@ -11336,6 +11358,10 @@ def admin_radar_autoscan_keyboard(state: dict, *, live_screen: bool = False) -> 
     rows.append([
         InlineKeyboardButton(text="🔥 Горячие из базы", callback_data="radarlist:hot:0"),
         InlineKeyboardButton(text="🚀 Популярные", callback_data="radarlist:rising:0"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="🔎 Поиск", callback_data="radarsearch"),
+        InlineKeyboardButton(text="🗂 Категории", callback_data="radarcats:0"),
     ])
     refresh_text = "🔄 Обновить Live" if live_screen else "🔄 Обновить статистику"
     refresh_callback = "adminradarauto:live" if live_screen else "adminradarauto"
@@ -17029,6 +17055,17 @@ async def radar_home(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.set_state(None)
     await state.update_data(radar_context_kind="", radar_context_page=0)
+    if _is_admin(callback.from_user.id):
+        autoscan_state, text_value = await asyncio.gather(
+            asyncio.wait_for(load_radar_autoscan_state(), timeout=1.5),
+            asyncio.wait_for(_radar3_analytics_text(), timeout=2.0),
+        )
+        await _edit_or_answer(
+            callback.message,
+            text_value,
+            reply_markup=admin_radar_autoscan_keyboard(autoscan_state),
+        )
+        return
     if free_radar_preview_allowed(callback.from_user.id):
         record_free_radar_event_background(callback.from_user.id, "radar_open", feature="home")
     # Score cooling is maintained hourly in the background. The menu uses a
@@ -17041,6 +17078,17 @@ async def radar_home(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(Command("radar"))
 async def radar_command(message: Message) -> None:
+    if _is_admin(message.from_user.id):
+        autoscan_state, text_value = await asyncio.gather(
+            asyncio.wait_for(load_radar_autoscan_state(), timeout=1.5),
+            asyncio.wait_for(_radar3_analytics_text(), timeout=2.0),
+        )
+        await message.answer(
+            text_value,
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_radar_autoscan_keyboard(autoscan_state),
+        )
+        return
     if free_radar_preview_allowed(message.from_user.id):
         record_free_radar_event_background(message.from_user.id, "radar_open", feature="command")
     await message.answer(
@@ -19073,6 +19121,11 @@ async def main() -> None:
         )
     if archived:
         log.info("v3.3.0 initial scan archive: %s moved", archived)
+
+    # Build the complete admin screen before Telegram starts accepting clicks.
+    # This is a one-time startup fallback; when a dedicated Radar Worker exists,
+    # its persisted snapshot is found above and no aggregate query is repeated.
+    await ensure_initial_radar_analytics_snapshot()
 
     bot = LocalizedBot(BOT_TOKEN)
     try:

@@ -1,4 +1,4 @@
-DT Parser 4.23.22 — HOT и популярные из базы на первом экране
+DT Parser 4.23.23 — полная статистика DT Radar 3.0 сразу
 
 1. Загрузите файлы патча в GitHub.
 2. Сначала добавьте в основной parser: RADAR_DEDICATED_WORKER=1
@@ -16,9 +16,10 @@ DT Parser 4.23.22 — HOT и популярные из базы на перво�
    Dedicated DT Radar Worker online
    Radar Worker deep analytics published
 
-Даже до создания отдельного Radar Worker вход в DT Radar 3.0 сразу показывает
-горячие и популярные/набирающие товары из таблицы radar_products. Основной parser
-сам создаёт полный снимок в фоне, пока RADAR_DEDICATED_WORKER не включён.
+Даже до создания отдельного Radar Worker основной parser до запуска Telegram
+создаёт полный снимок. Поэтому при входе в DT Radar 3.0 сразу видны:
+воронка Radar, Candidate/Early/Strong/HOT, категории с живым спросом,
+контрольные замеры, baseline за 24ч и Fast Sold.
 
 После создания Radar Worker он делает сканирование и сохраняет полную статистику.
 Live-прогресс AutoScan открывается отдельной кнопкой и не заменяет основной экран.
