@@ -1390,9 +1390,7 @@ def radar_home_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     cats_cb = "radarcats:0" if full else "radar_locked:categories"
     favorites_cb = "radarlist:favorites:0" if full else "radar_locked:favorites"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔥 Горячие", callback_data="radarlist:hot:0"),
-         InlineKeyboardButton(text="🚀 Популярные", callback_data="radarlist:rising:0")],
-        [InlineKeyboardButton(text="📊 Лучшие сейчас", callback_data="radarbest"),
+        [InlineKeyboardButton(text="🔥 Лучшие сейчас", callback_data="radarbest"),
          InlineKeyboardButton(text="🔎 Поиск" + ("" if full else " · 🔒"), callback_data=search_cb)],
         [InlineKeyboardButton(text="🗂 Категории" + ("" if full else " · 🔒"), callback_data=cats_cb),
          InlineKeyboardButton(text="⭐ Мой Radar" + ("" if full else " · 🔒"), callback_data=favorites_cb)],
@@ -5786,27 +5784,13 @@ async def ensure_initial_radar_analytics_snapshot() -> bool:
 
 
 async def _radar3_analytics_text() -> str:
-    """Read the complete saved analytics screen with one primary-key lookup.
-
-    The lightweight product query is strictly a last-resort fallback. Running it
-    next to the snapshot read made a healthy complete screen wait for a second DB
-    query, which is exactly the delay the persisted snapshot is meant to avoid.
-    """
-    try:
-        text_value, _updated_at = await asyncio.wait_for(
-            load_radar_analytics_snapshot(), timeout=1.2
-        )
-    except Exception as exc:
-        text_value = None
-        log.warning("DT Radar analytics snapshot read failed: %s", type(exc).__name__)
-    if text_value:
-        return text_value
-    quick = await _radar_quick_home_db_snapshot()
-    return (
-        "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\n"
-        + _radar_quick_db_text(quick)
-        + "\n\n<i>Полный глубокий снимок обновляется в фоне; горячие и набирающие выше читаются сразу из базы.</i>"
+    """v4.23.17 live analytics: calculate the current database state on demand."""
+    radar3, checkpoint_stats = await asyncio.gather(
+        _radar3_dashboard_safe_snapshot(timeout_seconds=3.0),
+        _radar3_checkpoint_safe_snapshot(timeout_seconds=2.0),
     )
+    lifecycle_stats = await _radar_lifecycle_safe_snapshot()
+    return _render_radar3_analytics_text(radar3, checkpoint_stats, lifecycle_stats)
 
 
 async def radar_local_snapshot_scheduler() -> None:
@@ -6036,29 +6020,6 @@ async def _radar_autoscan_finish_round(bot: Bot, state: dict) -> dict:
     state["current_category_key"] = ""
     state["current_category_name"] = ""
     state = await save_radar_autoscan_state(state)
-    # The dedicated worker publishes one exact post-round snapshot. Telegram
-    # screens subsequently read a single AppSetting row and never repeat these
-    # aggregates in the user request path.
-    try:
-        snapshot, _snapshot_at = await asyncio.wait_for(
-            refresh_radar_stats_snapshot(),
-            timeout=RADAR_STATS_SNAPSHOT_REFRESH_TIMEOUT_SECONDS,
-        )
-        log.info(
-            "DT Radar public statistics published after round total=%s hot=%s rising=%s fast_sold=%s",
-            snapshot.total, snapshot.hot, snapshot.rising, snapshot.fast_sold,
-        )
-    except Exception:
-        log.warning("DT Radar post-round statistics snapshot failed", exc_info=True)
-    if RADAR_DEDICATED_WORKER:
-        try:
-            await asyncio.wait_for(
-                refresh_radar_analytics_snapshot(),
-                timeout=RADAR_ANALYTICS_SNAPSHOT_REFRESH_TIMEOUT_SECONDS,
-            )
-            log.info("DT Radar deep analytics published after completed round")
-        except Exception:
-            log.warning("DT Radar post-round deep analytics snapshot failed", exc_info=True)
     start_context_after_fresh = False
     icon = "✅" if failed == 0 else "⚠️"
     if mode == "retry":
@@ -11316,7 +11277,7 @@ def admin_radar_funnel_keyboard(visitors: list[dict], page: int, pages: int) -> 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def admin_radar_autoscan_keyboard(state: dict, *, live_screen: bool = False) -> InlineKeyboardMarkup:
+def admin_radar_autoscan_keyboard(state: dict) -> InlineKeyboardMarkup:
     status = str(state.get("status") or "idle")
     daily_enabled = bool(state.get("daily_enabled"))
     skip_today = bool(state.get("skip_daily_if_completed_today", True))
@@ -11347,26 +11308,9 @@ def admin_radar_autoscan_keyboard(state: dict, *, live_screen: bool = False) -> 
         text=f"✅ Пропускать автокруг после ручного: {'ДА' if skip_today else 'НЕТ'}",
         callback_data="adminradarauto:skipday",
     )])
-    if live_screen:
-        rows.append([InlineKeyboardButton(
-            text="⬅️ Вся статистика Radar 3.0", callback_data="adminradarauto"
-        )])
-    else:
-        rows.append([InlineKeyboardButton(
-            text="🟢 Live-прогресс AutoScan", callback_data="adminradarauto:live"
-        )])
-    rows.append([
-        InlineKeyboardButton(text="🔥 Горячие из базы", callback_data="radarlist:hot:0"),
-        InlineKeyboardButton(text="🚀 Популярные", callback_data="radarlist:rising:0"),
-    ])
-    rows.append([
-        InlineKeyboardButton(text="🔎 Поиск", callback_data="radarsearch"),
-        InlineKeyboardButton(text="🗂 Категории", callback_data="radarcats:0"),
-    ])
-    refresh_text = "🔄 Обновить Live" if live_screen else "🔄 Обновить статистику"
-    refresh_callback = "adminradarauto:live" if live_screen else "adminradarauto"
+    rows.append([InlineKeyboardButton(text="📊 Аналитика Radar", callback_data="adminradarauto:analytics")])
     rows.append([InlineKeyboardButton(text="📜 История кругов", callback_data="adminradarauto:history"),
-                 InlineKeyboardButton(text=refresh_text, callback_data=refresh_callback)])
+                 InlineKeyboardButton(text="🔄 Обновить Live", callback_data="adminradarauto")])
     rows.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adminhome")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -13915,19 +13859,16 @@ async def admin_radar_autoscan_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer()
-    # Radar 3.0 opens as one complete screen. Both reads are primary-key AppSetting
-    # lookups: the worker has already calculated the deep analytics snapshot.
+    # v4.23.17 behavior: the entry screen is the lightweight live AutoScan state.
+    # Deep analytics is calculated from current database rows by its own button.
     try:
-        state, text = await asyncio.gather(
-            asyncio.wait_for(load_radar_autoscan_state(), timeout=1.5),
-            asyncio.wait_for(_radar3_analytics_text(), timeout=1.5),
-        )
+        text, state = await asyncio.wait_for(_radar_autoscan_text(), timeout=2.0)
         await _edit_or_answer(callback.message, text, reply_markup=admin_radar_autoscan_keyboard(state))
     except Exception as exc:
-        log.exception("DT Radar complete screen failed")
+        log.exception("DT Radar live status failed")
         await _edit_or_answer(
             callback.message,
-            "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\n⚠️ Сохранённый снимок временно недоступен. AutoScan продолжает работать в Radar Worker.\n"
+            "<b>📡 DT Radar 3.2 · ADAPTIVE LIVE</b>\n\n⚠️ Live Status временно недоступен. AutoScan продолжает работать в фоне.\n"
             f"Диагностика: <code>{html.escape(type(exc).__name__)}</code>",
             reply_markup=admin_radar_autoscan_loading_keyboard(),
         )
@@ -13939,46 +13880,21 @@ async def admin_radar_analytics_handler(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     await callback.answer()
-    try:
-        state, text = await asyncio.gather(
-            asyncio.wait_for(load_radar_autoscan_state(), timeout=1.5),
-            asyncio.wait_for(_radar3_analytics_text(), timeout=1.5),
-        )
-        await _edit_or_answer(
-            callback.message, text,
-            reply_markup=admin_radar_autoscan_keyboard(state),
-        )
-    except Exception as exc:
-        log.exception("DT Radar saved analytics screen failed")
-        await _edit_or_answer(
-            callback.message,
-            "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\n"
-            "⚠️ Сохранённый снимок временно недоступен. Попробуйте обновить экран.\n"
-            f"Диагностика: <code>{html.escape(type(exc).__name__)}</code>",
-            reply_markup=admin_radar_autoscan_loading_keyboard(),
-        )
-
-
-@dp.callback_query(F.data == "adminradarauto:live")
-async def admin_radar_live_handler(callback: CallbackQuery) -> None:
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    await callback.answer()
-    try:
-        text, state = await asyncio.wait_for(_radar_autoscan_text(), timeout=2.0)
-        markup = admin_radar_autoscan_keyboard(state, live_screen=True)
-    except Exception as exc:
-        log.exception("DT Radar live progress failed")
-        text = (
-            "<b>📡 DT Radar 3.2 · LIVE-ПРОГРЕСС</b>\n\n"
-            "⚠️ Live-прогресс временно недоступен. Полная сохранённая статистика остаётся на главном экране Radar 3.0.\n"
-            f"Диагностика: <code>{html.escape(type(exc).__name__)}</code>"
-        )
-        markup = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="⬅️ Вся статистика Radar 3.0", callback_data="adminradarauto")
-        ]])
-    await _edit_or_answer(callback.message, text, reply_markup=markup)
+    await _edit_or_answer(
+        callback.message,
+        "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\nСчитаю глубокую статистику… ⏳\nLive AutoScan от этого не блокируется.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅️ Live Status", callback_data="adminradarauto")
+        ]]),
+    )
+    text = await _radar3_analytics_text()
+    await _edit_or_answer(
+        callback.message, text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить аналитику", callback_data="adminradarauto:analytics")],
+            [InlineKeyboardButton(text="⬅️ Live Status", callback_data="adminradarauto")],
+        ]),
+    )
 
 
 @dp.callback_query(F.data == "adminradarauto:start")
@@ -16692,20 +16608,15 @@ def _radar_stats_text(stats: RadarStats | None, updated_at: datetime | None) -> 
 
 
 async def _radar_home_text(user_id: int | None = None) -> str:
+    stats = await radar_stats()
     full = bool(user_id is not None and allowed(int(user_id)))
-    stats_result, quick_result = await asyncio.gather(
-        _radar_public_stats_snapshot(), _radar_quick_home_db_snapshot()
-    )
-    stats, updated_at = stats_result
-    quick_text = _radar_quick_db_text(quick_result)
-    stats_line = _radar_stats_text(stats, updated_at)
     if not full:
         return (
             "📡 <b>DT Radar</b>\n\n"
             "Посмотри, как Radar отбирает сильные товары из тысяч объявлений.\n\n"
             f"🎁 <b>Бесплатно:</b> первые {FREE_RADAR_PREVIEW_LIMIT} находок в каждом режиме «Лучшие сейчас».\n"
             "🔒 Поиск, Категории, Мой Radar и полные ленты открываются с подпиской.\n\n"
-            f"{stats_line}\n\n{quick_text}\n"
+            f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих сейчас · 🚀 <b>{stats.rising}</b> набирают · ⚡ <b>{stats.fast_sold}</b> Fast Sold.\n"
             "👁 <b>Observed Score</b> строится только на росте просмотров, который DT увидел после своего baseline."
         )
     return (
@@ -16715,7 +16626,7 @@ async def _radar_home_text(user_id: int | None = None) -> str:
         "🔎 <b>Поиск</b> — если уже знаешь название товара\n"
         "🗂 <b>Категории</b> — если хочешь посмотреть по разделам\n"
         "⭐ <b>Мой Radar</b> — сохранённые товары\n\n"
-        f"{stats_line}\n\n{quick_text}\n"
+        f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих сейчас · 🚀 <b>{stats.rising}</b> набирают · ⚡ <b>{stats.fast_sold}</b> Fast Sold.\n"
         "👁 <b>Observed Score</b>: первый счётчик не оценивается; Radar верит только собственным повторным замерам DT."
     )
 
@@ -16730,12 +16641,12 @@ async def _radar_list_payload(
         page = 0
         rows, total = await list_radar_products(
             mode=mode, category_key=None, page=0, page_size=FREE_RADAR_PREVIEW_LIMIT,
-            user_id=None, exact_total=False,
+            user_id=None,
         )
     else:
         rows, total = await list_radar_products(
             mode=mode, category_key=category_key, page=page, user_id=user_id,
-            price_filter=price_filter if category_key else "any", exact_total=False,
+            price_filter=price_filter if category_key else "any",
         )
     titles = {
         "hot": "🔥 Горячие сейчас",
@@ -16931,7 +16842,7 @@ async def _radar_preview_product_allowed(product_id: int, mode: str) -> bool:
     if mode not in {"hot", "rising", "ai"}:
         return False
     rows, _total = await list_radar_products(
-        mode=mode, page=0, page_size=FREE_RADAR_PREVIEW_LIMIT, exact_total=False
+        mode=mode, page=0, page_size=FREE_RADAR_PREVIEW_LIMIT
     )
     return any(int(product.id) == int(product_id) for product in rows)
 
@@ -16939,7 +16850,7 @@ async def _radar_preview_product_allowed(product_id: int, mode: str) -> bool:
 async def _radar_search_payload(query: str, page: int = 0, *, price_filter: str = "any"):
     clean = " ".join(str(query or "").split())[:80]
     rows, total = await search_radar_products(
-        clean, page=page, price_filter=price_filter, exact_total=False
+        clean, page=page, price_filter=price_filter
     )
     lines = [
         f"🔎 <b>Поиск DT Radar</b>",
@@ -17012,6 +16923,7 @@ async def radar_locked(callback: CallbackQuery) -> None:
             reply_markup=radar_home_keyboard(callback.from_user.id),
         )
         return
+    stats = await radar_stats()
     await callback.answer()
     feature = ""
     if ":" in str(callback.data or ""):
@@ -17024,14 +16936,15 @@ async def radar_locked(callback: CallbackQuery) -> None:
         "fastsold": "⚡ Быстро исчезли",
     }
     if free_radar_preview_allowed(callback.from_user.id):
-        record_free_radar_event_background(callback.from_user.id, "locked_feature", feature=feature)
+        await record_free_radar_event(callback.from_user.id, "locked_feature", feature=feature)
     title = labels.get(feature, "Полный DT Radar")
-    stats, updated_at = await _radar_public_stats_snapshot()
     text = (
         f"🔒 <b>{html.escape(title)}</b>\n\n"
         f"Эта функция доступна в полном DT Radar. Бесплатно можно посмотреть первые <b>{FREE_RADAR_PREVIEW_LIMIT}</b> "
         "реальных находок в каждом режиме «Лучшие сейчас».\n\n"
-        f"{_radar_stats_text(stats, updated_at)}\n\n"
+        f"📦 В Radar уже: <b>{stats.total}</b> товаров\n"
+        f"🔥 Горячих: <b>{stats.hot}</b> · 🚀 Набирают: <b>{stats.rising}</b>\n"
+        f"⚡ Быстро исчезли: <b>{stats.fast_sold}</b>\n\n"
         "💎 Полный доступ открывает все результаты, поиск, категории, сохранения и историю Radar."
     )
     await _edit_or_answer(callback.message, text, reply_markup=radar_locked_keyboard())
@@ -17039,11 +16952,11 @@ async def radar_locked(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "radardaily_open")
 async def radar_daily_open(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
     await state.set_state(None)
     if free_radar_preview_allowed(callback.from_user.id):
-        record_free_radar_event_background(callback.from_user.id, "daily_digest_open", feature="daily_digest")
-        record_free_radar_event_background(callback.from_user.id, "radar_open", feature="daily_digest")
+        await record_free_radar_event(callback.from_user.id, "daily_digest_open", feature="daily_digest")
+        await record_free_radar_event(callback.from_user.id, "radar_open", feature="daily_digest")
+    await callback.answer()
     await _edit_or_answer(
         callback.message, await _radar_home_text(callback.from_user.id),
         reply_markup=radar_home_keyboard(callback.from_user.id),
@@ -17052,24 +16965,12 @@ async def radar_daily_open(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "radar_home")
 async def radar_home(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
     await state.set_state(None)
     await state.update_data(radar_context_kind="", radar_context_page=0)
-    if _is_admin(callback.from_user.id):
-        autoscan_state, text_value = await asyncio.gather(
-            asyncio.wait_for(load_radar_autoscan_state(), timeout=1.5),
-            asyncio.wait_for(_radar3_analytics_text(), timeout=2.0),
-        )
-        await _edit_or_answer(
-            callback.message,
-            text_value,
-            reply_markup=admin_radar_autoscan_keyboard(autoscan_state),
-        )
-        return
     if free_radar_preview_allowed(callback.from_user.id):
-        record_free_radar_event_background(callback.from_user.id, "radar_open", feature="home")
-    # Score cooling is maintained hourly in the background. The menu uses a
-    # short single-flight cache, so a large accumulated base cannot freeze it.
+        await record_free_radar_event(callback.from_user.id, "radar_open", feature="home")
+    await callback.answer()
+    # v4.23.17: the public Radar screen reads the current database counters.
     await _edit_or_answer(
         callback.message, await _radar_home_text(callback.from_user.id),
         reply_markup=radar_home_keyboard(callback.from_user.id),
@@ -17078,19 +16979,8 @@ async def radar_home(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(Command("radar"))
 async def radar_command(message: Message) -> None:
-    if _is_admin(message.from_user.id):
-        autoscan_state, text_value = await asyncio.gather(
-            asyncio.wait_for(load_radar_autoscan_state(), timeout=1.5),
-            asyncio.wait_for(_radar3_analytics_text(), timeout=2.0),
-        )
-        await message.answer(
-            text_value,
-            parse_mode=ParseMode.HTML,
-            reply_markup=admin_radar_autoscan_keyboard(autoscan_state),
-        )
-        return
     if free_radar_preview_allowed(message.from_user.id):
-        record_free_radar_event_background(message.from_user.id, "radar_open", feature="command")
+        await record_free_radar_event(message.from_user.id, "radar_open", feature="command")
     await message.answer(
         await _radar_home_text(message.from_user.id), parse_mode=ParseMode.HTML,
         reply_markup=radar_home_keyboard(message.from_user.id),
@@ -17099,21 +16989,18 @@ async def radar_command(message: Message) -> None:
 
 @dp.callback_query(F.data == "radarbest")
 async def radar_best_handler(callback: CallbackQuery) -> None:
-    await callback.answer()
-    stats, _updated_at = await _radar_public_stats_snapshot()
+    stats = await radar_stats()
     full = allowed(callback.from_user.id)
     if not full and free_radar_preview_allowed(callback.from_user.id):
-        record_free_radar_event_background(callback.from_user.id, "best_open")
-    hot_line = f"🔥 Горячие: <b>{int(stats.hot)}</b>" if stats is not None else "🔥 Горячие — сильный свежий рост"
-    rising_line = f"🚀 Набирают: <b>{int(stats.rising)}</b>" if stats is not None else "🚀 Набирают — подтверждённое ускорение"
-    fast_line = f"⚡ Быстро исчезли: <b>{int(stats.fast_sold)}</b>" if stats is not None else "⚡ Быстро исчезли — проверенная недоступность"
+        await record_free_radar_event(callback.from_user.id, "best_open")
+    await callback.answer()
     if full:
         text = (
             "🔥 <b>Лучшие сейчас</b>\n\n"
             "Выбери, какие сильные товары хочешь посмотреть:\n\n"
-            f"{hot_line}\n"
-            f"{rising_line}\n"
-            f"{fast_line}\n\n"
+            f"🔥 Горячие: <b>{stats.hot}</b>\n"
+            f"🚀 Набирают: <b>{stats.rising}</b>\n"
+            f"⚡ Быстро исчезли: <b>{stats.fast_sold}</b>\n\n"
             "⚡ «Быстро исчезли» — объявления, которые Radar видел активными и затем подтвердил недоступными в первые 3 часа.\n\n"
             "🏆 Рекорды Radar оставлены ниже как дополнительная история."
         )
@@ -17122,9 +17009,9 @@ async def radar_best_handler(callback: CallbackQuery) -> None:
             "🔥 <b>Лучшие сейчас</b>\n\n"
             "Мы уже отобрали сильные товары из DT Radar.\n"
             f"🎁 <b>Бесплатно покажем первые {FREE_RADAR_PREVIEW_LIMIT} находок</b> в выбранном режиме.\n\n"
-            f"{hot_line}\n"
-            f"{rising_line}\n"
-            f"{fast_line} · 🔒\n\n"
+            f"🔥 Горячие: <b>{stats.hot}</b>\n"
+            f"🚀 Набирают: <b>{stats.rising}</b>\n"
+            f"⚡ Быстро исчезли: <b>{stats.fast_sold}</b> · 🔒\n\n"
             "Выбери режим и посмотри реальные результаты Radar."
         )
     await _edit_or_answer(callback.message, text, reply_markup=radar_best_keyboard(callback.from_user.id))
@@ -19122,11 +19009,6 @@ async def main() -> None:
     if archived:
         log.info("v3.3.0 initial scan archive: %s moved", archived)
 
-    # Build the complete admin screen before Telegram starts accepting clicks.
-    # This is a one-time startup fallback; when a dedicated Radar Worker exists,
-    # its persisted snapshot is found above and no aggregate query is repeated.
-    await ensure_initial_radar_analytics_snapshot()
-
     bot = LocalizedBot(BOT_TOKEN)
     try:
         await setup_bot_commands(bot)
@@ -19206,20 +19088,14 @@ async def main() -> None:
     database_retention_task = asyncio.create_task(
         database_retention_scheduler(), name="postgres-retention-scheduler"
     )
-    radar_background_tasks: list[asyncio.Task] = []
-    if RADAR_DEDICATED_WORKER:
-        log.warning(
-            "Dedicated Radar Worker mode: parser serves Telegram UI only; "
-            "AutoScan/checkpoints/maintenance run in radar_worker.py"
-        )
-    else:
-        radar_background_tasks = [
-            asyncio.create_task(radar_local_snapshot_scheduler(), name="dt-radar-snapshots"),
-            asyncio.create_task(radar_maintenance_scheduler(), name="dt-radar-maintenance"),
-            asyncio.create_task(radar_v3_observation_scheduler(), name="dt-radar-v3-observations"),
-            asyncio.create_task(organic_velocity_scheduler(), name="verified-organic-velocity"),
-            asyncio.create_task(radar_autoscan_scheduler(bot), name="dt-radar-autoscan"),
-        ]
+    # v4.23.17 ownership: the main parser runs Radar AutoScan, exact checkpoints,
+    # maintenance and velocity itself. No separate Radar Worker is required.
+    radar_background_tasks: list[asyncio.Task] = [
+        asyncio.create_task(radar_maintenance_scheduler(), name="dt-radar-maintenance"),
+        asyncio.create_task(radar_v3_observation_scheduler(), name="dt-radar-v3-observations"),
+        asyncio.create_task(organic_velocity_scheduler(), name="verified-organic-velocity"),
+        asyncio.create_task(radar_autoscan_scheduler(bot), name="dt-radar-autoscan"),
+    ]
     radar_daily_digest_task = asyncio.create_task(radar_daily_digest_scheduler(bot), name="dt-radar-daily-digest")
     vinted_radar_task = (
         asyncio.create_task(vinted_radar_autoscan_scheduler(), name="vinted-radar-1-autoscan")

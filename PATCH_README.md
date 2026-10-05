@@ -1,12 +1,12 @@
-# v4.23.23 — full DT Radar 3.0 screen restored
+# v4.23.24 — DT Radar restored to the 4.23.17 workflow
 
-Apply over v4.23.22. Opening `DT Radar 3.0` as an administrator now immediately
-shows the complete saved Adaptive Analytics screen: the Radar funnel,
-Candidate/Early/Strong/HOT, live-demand categories, checkpoint coverage,
-baseline funnel and Fast Sold availability checks.
+This release restores the Radar behavior used in v4.23.17:
 
-The parser guarantees that this complete snapshot exists before Telegram starts
-accepting clicks. A normal open is one primary-key settings read and no longer
-waits for the product-list fallback query.
+- the main parser owns AutoScan, checkpoint measurements and Radar maintenance;
+- the Radar admin entry opens the live AutoScan status;
+- `📊 Аналитика Radar` calculates the full current funnel directly from PostgreSQL;
+- the public Radar menu reads current counters directly from the database;
+- no dedicated Radar Worker or saved analytics snapshot is required.
 
-No database migration is required. See `RELEASE_4_23_23.md`.
+Storage retention, Chromium idle shutdown and unrelated project fixes remain.
+No database migration is required. See `RELEASE_4_23_24.md`.
