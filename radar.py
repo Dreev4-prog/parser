@@ -3013,6 +3013,63 @@ async def refresh_radar_stats_snapshot() -> tuple[RadarStats, datetime]:
     return stats, updated_at
 
 
+async def radar_quick_home_snapshot(limit_per_status: int = 3) -> dict:
+    """Return a fast Radar home fallback directly from ``radar_products``.
+
+    This intentionally avoids visibility/lifecycle subqueries. It is used only
+    when the worker-produced exact snapshot is missing, and for the small HOT /
+    Rising preview on the first screen. Organic verification, current signal
+    age and non-historical status still remain mandatory.
+    """
+    now = datetime.utcnow()
+    limit_per_status = max(1, min(5, int(limit_per_status or 3)))
+    active = [
+        RadarProduct.organic_verified_at.is_not(None),
+        RadarProduct.representative_external_id != "",
+        RadarProduct.status != "historical",
+        or_(
+            RadarProduct.latest_source != "radar3_observed",
+            RadarProduct.last_signal_at >= now - timedelta(hours=RADAR_V3_LIVE_RETENTION_HOURS),
+        ),
+    ]
+    fresh = or_(
+        RadarProduct.latest_source != "radar3_observed",
+        func.coalesce(RadarProduct.current_signal_at, RadarProduct.last_signal_at)
+        >= now - timedelta(hours=RADAR_V3_CURRENT_SIGNAL_HOURS),
+    )
+    async with SessionLocal() as session:
+        summary = (await session.execute(select(
+            func.count(RadarProduct.id),
+            func.count(RadarProduct.id).filter(fresh, RadarProduct.status == "hot"),
+            func.count(RadarProduct.id).filter(fresh, RadarProduct.status == "rising"),
+            func.count(func.distinct(RadarProduct.category_key)),
+            func.coalesce(func.sum(RadarProduct.signal_count), 0),
+        ).where(*active))).one()
+        products = list((await session.execute(
+            select(RadarProduct)
+            .where(*active, fresh, RadarProduct.status.in_(["hot", "rising"]))
+            .order_by(
+                case((RadarProduct.status == "hot", 0), else_=1),
+                RadarProduct.radar_rank.desc(),
+                RadarProduct.current_score.desc(),
+                RadarProduct.last_signal_at.desc(),
+            )
+            .limit(limit_per_status * 4)
+        )).scalars().all())
+    hot = [row for row in products if str(row.status or "") == "hot"][:limit_per_status]
+    rising = [row for row in products if str(row.status or "") == "rising"][:limit_per_status]
+    return {
+        "total": int(summary[0] or 0),
+        "hot": int(summary[1] or 0),
+        "rising": int(summary[2] or 0),
+        "categories": int(summary[3] or 0),
+        "signals": int(summary[4] or 0),
+        "hot_items": hot,
+        "rising_items": rising,
+        "updated_at": now,
+    }
+
+
 async def radar_v3_current_product_breakdown() -> tuple[dict[str, int], list[tuple[str, str, int]]]:
     """Return current Radar 3.0 product counts using the public visibility rules."""
     now = datetime.utcnow()

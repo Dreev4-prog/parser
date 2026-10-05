@@ -43,12 +43,13 @@ os.environ["TRAFFIC_RECOVERY_QUIET_SECONDS"] = "10"
 # they keep using Redis exactly as before. Trial and paid scans share these same
 # four FIFO lanes.
 GUARANTEED_LOCAL_PARSER_LANES = 4
-_RADAR_WORKER_BOOTSTRAP = os.getenv("RADAR_DEDICATED_WORKER", "0").strip().lower() in {
+_RADAR_WORKER_BOOTSTRAP = os.getenv("RADAR_WORKER_PROCESS", "0").strip().lower() in {
     "1", "true", "yes", "on",
 }
 if _RADAR_WORKER_BOOTSTRAP:
-    # radar_worker.py sets this marker before importing bot helpers. Keep Redis
-    # coordination enabled and never instantiate the main four user-scan lanes.
+    # Only radar_worker.py sets this process marker before importing bot helpers.
+    # RADAR_DEDICATED_WORKER may safely be set on the main Telegram parser to
+    # disable duplicate Radar loops without changing its four user-scan lanes.
     os.environ["STABLE_SINGLE_SERVICE_MODE"] = "0"
     os.environ["MULTIUSER_STABLE_MODE"] = "0"
 else:
@@ -136,7 +137,7 @@ from radar import (
     RADAR_PAGE_SIZE, RADAR_SCAN_TOP_LIMIT, RadarStats, bump_resurrection_integrity_sweep_once,
     prepare_bump_resurrection_sweep_once, prepare_verified_organic_velocity_once, prepare_unified_48h_ranking_once, get_fast_sold_info, get_fast_sold_infos,
     get_radar_product, is_radar_favorite, list_radar_products, load_radar_stats_snapshot,
-    radar_categories, radar_stats, refresh_radar_stats_snapshot, save_radar_stats_snapshot,
+    radar_categories, radar_quick_home_snapshot, radar_stats, refresh_radar_stats_snapshot, save_radar_stats_snapshot,
     purge_nonorganic_analytics, record_autoscan_hot_detailed, radar_v3_category_allowed,
     record_verified_velocity_signals, refresh_radar_scores, verify_listing_organic_now,
     lifecycle_diagnostics, get_radar_recent_hot_infos, repair_radar_lifecycle_qualification_once,
@@ -1389,7 +1390,9 @@ def radar_home_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     cats_cb = "radarcats:0" if full else "radar_locked:categories"
     favorites_cb = "radarlist:favorites:0" if full else "radar_locked:favorites"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔥 Лучшие сейчас", callback_data="radarbest"),
+        [InlineKeyboardButton(text="🔥 Горячие", callback_data="radarlist:hot:0"),
+         InlineKeyboardButton(text="🚀 Популярные", callback_data="radarlist:rising:0")],
+        [InlineKeyboardButton(text="📊 Лучшие сейчас", callback_data="radarbest"),
          InlineKeyboardButton(text="🔎 Поиск" + ("" if full else " · 🔒"), callback_data=search_cb)],
         [InlineKeyboardButton(text="🗂 Категории" + ("" if full else " · 🔒"), callback_data=cats_cb),
          InlineKeyboardButton(text="⭐ Мой Radar" + ("" if full else " · 🔒"), callback_data=favorites_cb)],
@@ -5761,21 +5764,53 @@ async def refresh_radar_analytics_snapshot() -> tuple[str, datetime]:
 
 
 async def _radar3_analytics_text() -> str:
-    """Read the worker-produced deep snapshot without aggregate queries."""
-    try:
-        text_value, _updated_at = await asyncio.wait_for(
-            load_radar_analytics_snapshot(), timeout=1.5
-        )
-    except Exception:
-        log.warning("DT Radar analytics snapshot read failed", exc_info=True)
-        text_value = None
+    """Read deep analytics, with a bounded direct-DB home fallback."""
+    text_value = None
+    quick = None
+    snapshot_result, quick_result = await asyncio.gather(
+        asyncio.wait_for(load_radar_analytics_snapshot(), timeout=1.2),
+        _radar_quick_home_db_snapshot(),
+        return_exceptions=True,
+    )
+    if not isinstance(snapshot_result, BaseException):
+        text_value, _updated_at = snapshot_result
+    else:
+        log.warning("DT Radar analytics snapshot read failed: %s", type(snapshot_result).__name__)
+    if not isinstance(quick_result, BaseException):
+        quick = quick_result
     if text_value:
         return text_value
     return (
         "<b>📊 DT Radar 3.2 · ADAPTIVE ANALYTICS</b>\n\n"
-        "⏳ Первый полный снимок формирует отдельный Radar Worker.\n"
-        "После запуска сервиса статистика появится здесь автоматически и дальше будет открываться мгновенно."
+        + _radar_quick_db_text(quick)
+        + "\n\n<i>Полный глубокий снимок обновляется в фоне; горячие и набирающие выше читаются сразу из базы.</i>"
     )
+
+
+async def radar_local_snapshot_scheduler() -> None:
+    """Keep saved Radar screens populated when no dedicated worker exists yet."""
+    while True:
+        try:
+            state = await load_radar_autoscan_state()
+            running, queued = await _radar_foreground_counts()
+            if str(state.get("status") or "idle") == "running" or running or queued:
+                await asyncio.sleep(30)
+                continue
+            await asyncio.wait_for(
+                refresh_radar_stats_snapshot(),
+                timeout=RADAR_STATS_SNAPSHOT_REFRESH_TIMEOUT_SECONDS,
+            )
+            await asyncio.wait_for(
+                refresh_radar_analytics_snapshot(),
+                timeout=RADAR_ANALYTICS_SNAPSHOT_REFRESH_TIMEOUT_SECONDS,
+            )
+            log.info("Local parser published Radar public/deep snapshots")
+            await asyncio.sleep(RADAR_STATS_SNAPSHOT_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("Local parser Radar snapshot refresh failed", exc_info=True)
+            await asyncio.sleep(60)
 
 
 def _radar_autoscan_loading_text() -> str:
@@ -11298,6 +11333,10 @@ def admin_radar_autoscan_keyboard(state: dict, *, live_screen: bool = False) -> 
         rows.append([InlineKeyboardButton(
             text="🟢 Live-прогресс AutoScan", callback_data="adminradarauto:live"
         )])
+    rows.append([
+        InlineKeyboardButton(text="🔥 Горячие из базы", callback_data="radarlist:hot:0"),
+        InlineKeyboardButton(text="🚀 Популярные", callback_data="radarlist:rising:0"),
+    ])
     refresh_text = "🔄 Обновить Live" if live_screen else "🔄 Обновить статистику"
     refresh_callback = "adminradarauto:live" if live_screen else "adminradarauto"
     rows.append([InlineKeyboardButton(text="📜 История кругов", callback_data="adminradarauto:history"),
@@ -16533,6 +16572,8 @@ RADAR_PUBLIC_STATS_READ_CACHE_SECONDS = 30.0
 _radar_public_stats_cache: RadarStats | None = None
 _radar_public_stats_updated_at: datetime | None = None
 _radar_public_stats_loaded_at = 0.0
+_radar_quick_home_cache: dict = {}
+_radar_quick_home_loaded_at = 0.0
 
 
 async def _radar_public_stats_snapshot() -> tuple[RadarStats | None, datetime | None]:
@@ -16556,6 +16597,56 @@ async def _radar_public_stats_snapshot() -> tuple[RadarStats | None, datetime | 
     return stats, updated_at
 
 
+async def _radar_quick_home_db_snapshot() -> dict:
+    """Read HOT/Rising rows directly from RadarProduct with a hard UI bound."""
+    global _radar_quick_home_cache, _radar_quick_home_loaded_at
+    now = time.monotonic()
+    if _radar_quick_home_cache and now - _radar_quick_home_loaded_at < 30.0:
+        return dict(_radar_quick_home_cache)
+    try:
+        value = await asyncio.wait_for(radar_quick_home_snapshot(3), timeout=1.2)
+    except Exception:
+        log.warning("DT Radar quick database home snapshot failed", exc_info=True)
+        return dict(_radar_quick_home_cache)
+    _radar_quick_home_cache = dict(value or {})
+    _radar_quick_home_loaded_at = now
+    return dict(_radar_quick_home_cache)
+
+
+def _radar_quick_db_text(snapshot: dict | None) -> str:
+    snapshot = dict(snapshot or {})
+    if not snapshot:
+        return (
+            "📦 База Radar временно занята.\n"
+            "🔥 Горячие и 🚀 Популярные можно открыть кнопками ниже."
+        )
+    lines = [
+        "<b>📦 Актуальные данные из базы</b>",
+        f"Товаров: <b>{int(snapshot.get('total') or 0)}</b> · категорий: <b>{int(snapshot.get('categories') or 0)}</b>",
+        f"🔥 Горячие: <b>{int(snapshot.get('hot') or 0)}</b> · 🚀 Популярные/набирают: <b>{int(snapshot.get('rising') or 0)}</b>",
+        f"📡 Подтверждённых сигналов: <b>{int(snapshot.get('signals') or 0)}</b>",
+    ]
+    hot_items = list(snapshot.get("hot_items") or [])
+    rising_items = list(snapshot.get("rising_items") or [])
+    lines.extend(["", "<b>🔥 Горячие сейчас</b>"])
+    if hot_items:
+        for index, product in enumerate(hot_items, 1):
+            lines.append(
+                f"{index}. {html.escape(str(product.title or 'Товар')[:58])} · Score <b>{int(product.current_score or 0)}</b>"
+            )
+    else:
+        lines.append("Сейчас подтверждённых HOT нет")
+    lines.extend(["", "<b>🚀 Популярные · набирают</b>"])
+    if rising_items:
+        for index, product in enumerate(rising_items, 1):
+            lines.append(
+                f"{index}. {html.escape(str(product.title or 'Товар')[:58])} · Score <b>{int(product.current_score or 0)}</b>"
+            )
+    else:
+        lines.append("Сейчас подтверждённого роста нет")
+    return "\n".join(lines)
+
+
 def _radar_stats_text(stats: RadarStats | None, updated_at: datetime | None) -> str:
     if stats is None:
         return (
@@ -16576,7 +16667,11 @@ def _radar_stats_text(stats: RadarStats | None, updated_at: datetime | None) -> 
 
 async def _radar_home_text(user_id: int | None = None) -> str:
     full = bool(user_id is not None and allowed(int(user_id)))
-    stats, updated_at = await _radar_public_stats_snapshot()
+    stats_result, quick_result = await asyncio.gather(
+        _radar_public_stats_snapshot(), _radar_quick_home_db_snapshot()
+    )
+    stats, updated_at = stats_result
+    quick_text = _radar_quick_db_text(quick_result)
     stats_line = _radar_stats_text(stats, updated_at)
     if not full:
         return (
@@ -16584,7 +16679,7 @@ async def _radar_home_text(user_id: int | None = None) -> str:
             "Посмотри, как Radar отбирает сильные товары из тысяч объявлений.\n\n"
             f"🎁 <b>Бесплатно:</b> первые {FREE_RADAR_PREVIEW_LIMIT} находок в каждом режиме «Лучшие сейчас».\n"
             "🔒 Поиск, Категории, Мой Radar и полные ленты открываются с подпиской.\n\n"
-            f"{stats_line}\n"
+            f"{stats_line}\n\n{quick_text}\n"
             "👁 <b>Observed Score</b> строится только на росте просмотров, который DT увидел после своего baseline."
         )
     return (
@@ -16594,7 +16689,7 @@ async def _radar_home_text(user_id: int | None = None) -> str:
         "🔎 <b>Поиск</b> — если уже знаешь название товара\n"
         "🗂 <b>Категории</b> — если хочешь посмотреть по разделам\n"
         "⭐ <b>Мой Radar</b> — сохранённые товары\n\n"
-        f"{stats_line}\n"
+        f"{stats_line}\n\n{quick_text}\n"
         "👁 <b>Observed Score</b>: первый счётчик не оценивается; Radar верит только собственным повторным замерам DT."
     )
 
@@ -19066,6 +19161,7 @@ async def main() -> None:
         )
     else:
         radar_background_tasks = [
+            asyncio.create_task(radar_local_snapshot_scheduler(), name="dt-radar-snapshots"),
             asyncio.create_task(radar_maintenance_scheduler(), name="dt-radar-maintenance"),
             asyncio.create_task(radar_v3_observation_scheduler(), name="dt-radar-v3-observations"),
             asyncio.create_task(organic_velocity_scheduler(), name="verified-organic-velocity"),

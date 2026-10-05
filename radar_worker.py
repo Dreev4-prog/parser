@@ -6,6 +6,7 @@ import os
 
 # This process owns Radar background work only. It never starts Telegram polling
 # or user scan workers, but it shares PostgreSQL/Redis with the main parser.
+os.environ["RADAR_WORKER_PROCESS"] = "1"
 os.environ["RADAR_DEDICATED_WORKER"] = "1"
 os.environ["STABLE_SINGLE_SERVICE_MODE"] = "0"
 os.environ["FORCE_LOCAL_MODE"] = "0"

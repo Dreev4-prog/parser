@@ -1,11 +1,10 @@
-# v4.23.21 — complete Radar 3.0 first screen
+# v4.23.22 — HOT and popular products on the first screen
 
-Apply over v4.23.20. Create exactly one Railway service with role
-`radar-worker`, then set `RADAR_DEDICATED_WORKER=1` on the main parser service.
+Apply over v4.23.21. The `DT Radar 3.0` entry now immediately reads the current
+HOT and popular/rising summary plus product names from `radar_products`.
 
-The worker owns AutoScan, checkpoint measurements, Radar maintenance and durable
-public/deep analytics snapshots. Telegram reads those saved snapshots instantly;
-it does not calculate analytics in a callback. Opening `DT Radar 3.0` now goes
-straight to the complete saved analytics screen; Live progress is secondary.
+If no dedicated worker snapshot exists, the screen stays useful and does not
+appear empty. The main parser prepares the full public/deep snapshot in the
+background when `RADAR_DEDICATED_WORKER` is not enabled.
 
-See `RELEASE_4_23_21.md` and `RAILWAY_RADAR_WORKER_RU.txt`.
+See `RELEASE_4_23_22.md` and `RAILWAY_RADAR_WORKER_RU.txt`.

@@ -103,6 +103,7 @@ def main() -> None:
     if role == "radar-worker":
         # Exactly one Railway service owns Radar crawling, checkpoints and the
         # persisted public-statistics snapshot. It never starts Telegram polling.
+        os.environ["RADAR_WORKER_PROCESS"] = "1"
         os.environ["RADAR_DEDICATED_WORKER"] = "1"
         os.environ.setdefault("DISTRIBUTED_WORKERS", "1")
     if role == "vinted-probe":
