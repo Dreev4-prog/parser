@@ -1,12 +1,16 @@
-# v4.23.25 — DT Radar seven-day statistics window
+# v4.23.26 — scheduled Telegram promotion posts
 
-Radar keeps the v4.23.17-style workflow from 4.23.24, but user-facing history
-aggregates no longer rescan months of accumulated PostgreSQL rows.
+Apply on v4.23.25. Includes both approved ALF images and captions:
 
-- Signals, Fast Sold and Noise/Weak use the last 7 days.
-- Fast Sold feeds, normal search and category counters use the same week window.
-- HOT/Rising remain stricter: current evidence only (6–48 hours).
-- `🏆 Рекорды Radar`, favorites and product history remain all-time.
-- No rows are deleted and no database migration is required.
+- 12:00 Moscow: DT Parser;
+- 17:00 Moscow: DT Radar;
+- existing Daily Radar at 20:00 remains independent, as requested.
 
-See `RELEASE_4_23_25.md`.
+Admin panel → ⏰ Автопосты controls posts, daily times, captions, images, buttons,
+audiences, previews, individual enabled state, deletion and global pause.
+Defaults target registered users without active subscriptions; admins, banned
+users and users who muted promotions are excluded.
+
+Tables are added automatically through the existing database initialization.
+There are no new dependencies, workers or required Railway variables. Upload
+the entire patch INCLUDING the two files inside assets/. See INSTALL_AUTOPOSTS_RU.txt.

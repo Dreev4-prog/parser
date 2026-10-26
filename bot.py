@@ -74,6 +74,8 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from app_version import APP_VERSION
 from categories import CATEGORIES, GROUPS, categories_for_group, group_root_key
 from db import DATABASE_BACKEND, SessionLocal, init_db
+from promo_posts import initialize_promotions, promotion_scheduler
+from promo_admin import build_promo_router
 from filters import (
     apply_listing_settings,
     base_filter,
@@ -11227,6 +11229,7 @@ def admin_keyboard(ai_unread: int = 0, active_scans: int = 0) -> InlineKeyboardM
         [InlineKeyboardButton(text="🔎 Найти пользователя", callback_data="adminusersearch")],
         [InlineKeyboardButton(text="📨 Daily Radar", callback_data="admindailyradar"),
          InlineKeyboardButton(text="📣 Рассылка", callback_data="adminbroadcast")],
+        [InlineKeyboardButton(text="⏰ Автопосты", callback_data="adminpromo")],
         [InlineKeyboardButton(text="🏠 Меню", callback_data="home")],
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -11627,7 +11630,7 @@ async def _admin_surface_requires_russian(event, data) -> bool:
             raw_state = await state.get_state()
         except Exception:
             raw_state = None
-        if raw_state and str(raw_state).startswith(f"{AdminInput.__name__}:"):
+        if raw_state and str(raw_state).startswith((f"{AdminInput.__name__}:", "PromoInput:")):
             return True
     return False
 
@@ -11659,6 +11662,8 @@ class LanguageContextMiddleware(BaseMiddleware):
                     return None
                 if isinstance(event, CallbackQuery):
                     callback_data = event.data or ""
+                    if callback_data in {"promo_mute", "promo_unmute"}:
+                        return await handler(event, data)
                     if callback_data.startswith("language:") or callback_data == "language_settings":
                         return await handler(event, data)
                     await event.answer()
@@ -11733,6 +11738,8 @@ class ActivityAccessMiddleware(BaseMiddleware):
 
         if isinstance(event, CallbackQuery):
             callback_data = event.data or ""
+            if callback_data in {"promo_mute", "promo_unmute"}:
+                return await handler(event, data)
             public_prefixes = ("buyplan:", "payprovider:", "paycheck:", "mypayments", "language:")
             if callback_data in {"subscription", "language_settings", "referral"} or callback_data.startswith(public_prefixes):
                 return await handler(event, data)
@@ -18992,6 +18999,7 @@ async def main() -> None:
     if stale_distributed:
         log.info("v4.1.7 stale distributed queue cleanup: %s", stale_distributed)
     await initialize_commerce()
+    await initialize_promotions()
     backfilled = await backfill_product_identities()
     if backfilled:
         log.info("v3.0 product identity backfill: %s listings", backfilled)
@@ -19091,6 +19099,9 @@ async def main() -> None:
     subscription_task = asyncio.create_task(
         subscription_lifecycle_scheduler(bot), name="subscription-lifecycle-scheduler"
     )
+    promotion_task = asyncio.create_task(
+        promotion_scheduler(bot, ADMIN_IDS), name="scheduled-promotion-posts"
+    )
     archive_task = asyncio.create_task(scan_archive_scheduler(), name="scan-archive-scheduler")
     database_retention_task = asyncio.create_task(
         database_retention_scheduler(), name="postgres-retention-scheduler"
@@ -19121,6 +19132,7 @@ async def main() -> None:
             distributed_queue_ticker_task.cancel()
         payment_task.cancel()
         subscription_task.cancel()
+        promotion_task.cancel()
         archive_task.cancel()
         database_retention_task.cancel()
         for task in radar_background_tasks:
@@ -19133,7 +19145,7 @@ async def main() -> None:
         for task in worker_tasks:
             task.cancel()
         shutdown_tasks = [
-            payment_task, subscription_task, archive_task, database_retention_task,
+            payment_task, subscription_task, promotion_task, archive_task, database_retention_task,
             radar_daily_digest_task, *radar_background_tasks, *observation_tasks, *worker_tasks,
         ]
         if vinted_radar_task is not None:
@@ -19170,6 +19182,9 @@ async def main() -> None:
         except Exception:
             log.debug("Page Manager Redis shutdown failed", exc_info=True)
         await bot.session.close()
+
+
+dp.include_router(build_promo_router(ADMIN_IDS, _edit_or_answer))
 
 
 if __name__ == "__main__":

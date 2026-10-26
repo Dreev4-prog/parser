@@ -809,6 +809,58 @@ class AppSetting(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
+class PromoPost(Base):
+    """Admin-managed recurring Telegram posts; media is a path or Telegram file_id."""
+
+    __tablename__ = "promo_posts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(100))
+    caption: Mapped[str] = mapped_column(Text, default="")
+    photo: Mapped[str] = mapped_column(Text, default="")
+    time_msk: Mapped[str] = mapped_column(String(5), default="12:00")
+    button_kind: Mapped[str] = mapped_column(String(20), default="subscription")
+    audience: Mapped[str] = mapped_column(String(20), default="unsubscribed")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    not_before: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class PromoRun(Base):
+    """One durable send per post/Moscow day, with an ascending recipient cursor.
+
+    The cursor is committed BEFORE each Telegram send. After an uncertain network
+    result or restart, that user is not replayed. This avoids duplicate ads while
+    keeping only one small run row per post/day instead of per-recipient logs.
+    """
+
+    __tablename__ = "promo_runs"
+    __table_args__ = (
+        UniqueConstraint("post_id", "day_msk", name="uq_promo_run_post_day"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    post_id: Mapped[int] = mapped_column(Integer, index=True)
+    day_msk: Mapped[str] = mapped_column(String(10))
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime)
+    deadline_at: Mapped[datetime] = mapped_column(DateTime)
+    payload: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="running", index=True)
+    lease_owner: Mapped[str] = mapped_column(String(40), default="")
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    cursor_user_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    processed: Mapped[int] = mapped_column(Integer, default=0)
+    sent: Mapped[int] = mapped_column(Integer, default=0)
+    skipped: Mapped[int] = mapped_column(Integer, default=0)
+    blocked: Mapped[int] = mapped_column(Integer, default=0)
+    failed: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str] = mapped_column(String(160), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class VintedScan(Base):
     """Admin-only isolated Vinted parser/Radar test run."""
 
