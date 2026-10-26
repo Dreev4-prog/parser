@@ -1,12 +1,12 @@
-# v4.23.24 — DT Radar restored to the 4.23.17 workflow
+# v4.23.25 — DT Radar seven-day statistics window
 
-This release restores the Radar behavior used in v4.23.17:
+Radar keeps the v4.23.17-style workflow from 4.23.24, but user-facing history
+aggregates no longer rescan months of accumulated PostgreSQL rows.
 
-- the main parser owns AutoScan, checkpoint measurements and Radar maintenance;
-- the Radar admin entry opens the live AutoScan status;
-- `📊 Аналитика Radar` calculates the full current funnel directly from PostgreSQL;
-- the public Radar menu reads current counters directly from the database;
-- no dedicated Radar Worker or saved analytics snapshot is required.
+- Signals, Fast Sold and Noise/Weak use the last 7 days.
+- Fast Sold feeds, normal search and category counters use the same week window.
+- HOT/Rising remain stricter: current evidence only (6–48 hours).
+- `🏆 Рекорды Radar`, favorites and product history remain all-time.
+- No rows are deleted and no database migration is required.
 
-Storage retention, Chromium idle shutdown and unrelated project fixes remain.
-No database migration is required. See `RELEASE_4_23_24.md`.
+See `RELEASE_4_23_25.md`.

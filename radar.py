@@ -76,6 +76,9 @@ RADAR_V3_MAX_OBSERVATION_HOURS = 6
 # the last confirmed demand signal determines the normal Live expiry.
 RADAR_V3_LIVE_RETENTION_HOURS = 48
 RADAR_V3_CURRENT_SIGNAL_HOURS = 6
+# User-facing summary/history aggregates are bounded to one recent week. The
+# underlying Radar history is preserved for Records and individual product pages.
+RADAR_STATS_WINDOW_DAYS = 7
 RADAR_V3_QUALITY_REPAIR_SETTING = "dt_radar_v42312_quality_repair_v1"
 RADAR_V3_LIVE_48H_REPAIR_SETTING = "dt_radar_v42312_live_48h_repair_v1"
 # Radar 3.2: category-adaptive demand. Absolute thresholds are now only a
@@ -2785,7 +2788,9 @@ async def lifecycle_diagnostics() -> dict:
     async with SessionLocal() as session:
         rows=(await session.execute(select(
             RadarLifecycleWatch.enrollment_source, RadarLifecycleWatch.status,
-            func.count(RadarLifecycleWatch.id)).group_by(
+            func.count(RadarLifecycleWatch.id)).where(
+            RadarLifecycleWatch.status.in_(["watching", "confirming"]),
+        ).group_by(
             RadarLifecycleWatch.enrollment_source,RadarLifecycleWatch.status))).all()
         events=(await session.execute(select(RadarLifecycleEvent.event_type,
             func.count(RadarLifecycleEvent.id)).where(RadarLifecycleEvent.created_at>=start).group_by(
@@ -2897,8 +2902,9 @@ async def refresh_radar_scores() -> int:
     return changed
 
 
-async def radar_stats() -> RadarStats:
+async def radar_stats(*, include_signal_history: bool = True) -> RadarStats:
     now = datetime.utcnow()
+    window_start = now - timedelta(days=RADAR_STATS_WINDOW_DAYS)
     async with SessionLocal() as session:
         visible = _visible_product_association_exists(RadarProduct.id)
         active = [visible, _live_radar_product_exists(RadarProduct.id),
@@ -2924,16 +2930,23 @@ async def radar_stats() -> RadarStats:
         ).where(*active))).one()
         total, hot, rising, ai_picks, categories = (int(value or 0) for value in summary)
         visible_ids = select(RadarProduct.id).where(visible)
-        signals = int((await session.execute(select(func.count(RadarSnapshot.id)).where(
-            RadarSnapshot.product_id.in_(visible_ids), _clean_listing_exists(RadarSnapshot.external_id)))).scalar_one() or 0)
-        recent_hot_48h = int((await session.execute(
-            select(func.count(RadarProduct.id)).where(
-                *active, _recent_hot_snapshot_exists(RadarProduct.id, now)
-            )
-        )).scalar_one() or 0)
+        signals = 0
+        recent_hot_48h = 0
+        if include_signal_history:
+            signals = int((await session.execute(select(func.count(RadarSnapshot.id)).where(
+                RadarSnapshot.product_id.in_(visible_ids),
+                RadarSnapshot.recorded_at >= window_start,
+                _clean_listing_exists(RadarSnapshot.external_id),
+            ))).scalar_one() or 0)
+            recent_hot_48h = int((await session.execute(
+                select(func.count(RadarProduct.id)).where(
+                    *active, _recent_hot_snapshot_exists(RadarProduct.id, now)
+                )
+            )).scalar_one() or 0)
         fast_sold = int((await session.execute(select(func.count(func.distinct(RadarLifecycleWatch.product_id))).where(
             RadarLifecycleWatch.product_id.in_(visible_ids),
             RadarLifecycleWatch.status == "disappeared",
+            RadarLifecycleWatch.disappeared_at >= window_start,
             RadarLifecycleWatch.strong_qualified_at.is_not(None),
             RadarLifecycleWatch.strong_qualified_at <= RadarLifecycleWatch.disappeared_at,
             RadarLifecycleWatch.peak_score >= RADAR_LIFECYCLE_MIN_SCORE,
@@ -3198,8 +3211,10 @@ async def list_radar_products(
             ])
             order = (RadarProduct.radar_rank.desc(), RadarProduct.current_score.desc(), RadarProduct.confidence.desc(), RadarProduct.last_signal_at.desc())
         elif mode == "fastsold":
+            fast_window_start = datetime.utcnow() - timedelta(days=RADAR_STATS_WINDOW_DAYS)
             fast_product_ids = select(RadarLifecycleWatch.product_id).where(
                 RadarLifecycleWatch.status == "disappeared",
+                RadarLifecycleWatch.disappeared_at >= fast_window_start,
                 RadarLifecycleWatch.strong_qualified_at.is_not(None),
                 RadarLifecycleWatch.strong_qualified_at <= RadarLifecycleWatch.disappeared_at,
                 RadarLifecycleWatch.peak_score >= RADAR_LIFECYCLE_MIN_SCORE,
@@ -3213,6 +3228,7 @@ async def list_radar_products(
                 .where(
                     RadarLifecycleWatch.product_id == RadarProduct.id,
                     RadarLifecycleWatch.status == "disappeared",
+                    RadarLifecycleWatch.disappeared_at >= fast_window_start,
                     RadarLifecycleWatch.lifetime_seconds.is_not(None),
                     RadarLifecycleWatch.lifetime_seconds <= RADAR_FAST_SOLD_MAX_SECONDS,
                     _clean_listing_exists(RadarLifecycleWatch.external_id),
@@ -3224,6 +3240,7 @@ async def list_radar_products(
                 .where(
                     RadarLifecycleWatch.product_id == RadarProduct.id,
                     RadarLifecycleWatch.status == "disappeared",
+                    RadarLifecycleWatch.disappeared_at >= fast_window_start,
                     RadarLifecycleWatch.lifetime_seconds.is_not(None),
                     RadarLifecycleWatch.lifetime_seconds <= RADAR_FAST_SOLD_MAX_SECONDS,
                     _clean_listing_exists(RadarLifecycleWatch.external_id),
@@ -3285,6 +3302,7 @@ async def search_radar_products(
         conditions = [
             RadarProduct.title.ilike(pattern),
             RadarProduct.status != "historical",
+            RadarProduct.last_signal_at >= datetime.utcnow() - timedelta(days=RADAR_STATS_WINDOW_DAYS),
             _visible_product_association_exists(RadarProduct.id),
         ]
         price_lo, price_hi = price_bounds(price_filter)
@@ -3352,6 +3370,7 @@ async def radar_categories() -> list[tuple[str, int, int, int]]:
             .where(
                 RadarProduct.category_key != "",
                 RadarProduct.status != "historical",
+                RadarProduct.last_signal_at >= datetime.utcnow() - timedelta(days=RADAR_STATS_WINDOW_DAYS),
                 _visible_product_association_exists(RadarProduct.id),
             )
             .group_by(RadarProduct.category_key)

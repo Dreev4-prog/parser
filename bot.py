@@ -134,7 +134,7 @@ from parser import (
 )
 from view_manager import REMOTE_VIEW_MANAGER, REMOTE_VIEW_WORKER_ENABLED
 from radar import (
-    RADAR_PAGE_SIZE, RADAR_SCAN_TOP_LIMIT, RadarStats, bump_resurrection_integrity_sweep_once,
+    RADAR_PAGE_SIZE, RADAR_SCAN_TOP_LIMIT, RADAR_STATS_WINDOW_DAYS, RadarStats, bump_resurrection_integrity_sweep_once,
     prepare_bump_resurrection_sweep_once, prepare_verified_organic_velocity_once, prepare_unified_48h_ranking_once, get_fast_sold_info, get_fast_sold_infos,
     get_radar_product, is_radar_favorite, list_radar_products, load_radar_stats_snapshot,
     radar_categories, radar_quick_home_snapshot, radar_stats, refresh_radar_stats_snapshot, save_radar_stats_snapshot,
@@ -5312,6 +5312,7 @@ def _radar_autoscan_next_run_text(state: dict) -> str:
 async def _radar3_dashboard_snapshot() -> dict:
     """Compact Radar 3.2 control-plane snapshot with bounded DB round-trips."""
     now = datetime.utcnow()
+    window_start = now - timedelta(days=RADAR_STATS_WINDOW_DAYS)
     active_statuses = ["baseline", "candidate", "observed", "confirmed"]
     async with SessionLocal() as session:
         # One aggregate scan replaces the former ~12 sequential COUNT queries.
@@ -5348,7 +5349,10 @@ async def _radar3_dashboard_snapshot() -> dict:
             func.count(RadarObservation.id).filter(
                 RadarObservation.confidence >= 70, RadarObservation.expires_at > now
             ),
-            func.count(RadarObservation.id).filter(RadarObservation.status == "quiet"),
+            func.count(RadarObservation.id).filter(
+                RadarObservation.status == "quiet",
+                RadarObservation.updated_at >= window_start,
+            ),
             func.coalesce(func.sum(RadarObservation.total_delta).filter(
                 RadarObservation.positive_checkpoints >= 1, RadarObservation.expires_at > now
             ), 0),
@@ -5711,7 +5715,7 @@ def _render_radar3_analytics_text(
         f"🔁 Score подтверждён ≥2 раза: <b>{int(radar3.get('persistent') or 0)}</b>\n"
         f"🚀 Ускоряются ≥20%: <b>{int(radar3.get('accelerating') or 0)}</b>\n"
         f"🛡 Confidence ≥70%: <b>{int(radar3.get('high_confidence') or 0)}</b>\n"
-        f"⚫ Noise / Weak: <b>{int(radar3.get('quiet') or 0)}</b>\n"
+        f"⚫ Noise / Weak за {RADAR_STATS_WINDOW_DAYS} дней: <b>{int(radar3.get('quiet') or 0)}</b>\n"
         f"Суммарный DT-observed прирост: <b>+{int(radar3.get('total_delta') or 0)}</b>\n\n"
         f"🟡 Early: <b>{int(radar3.get('early') or 0)}</b> · 📈 Strong: <b>{int(radar3.get('strong') or 0)}</b> · 🔥 Hot: <b>{int(radar3.get('hot') or 0)}</b>\n\n"
         "<b>🗂 Категории с живым спросом</b>\n"
@@ -16601,14 +16605,15 @@ def _radar_stats_text(stats: RadarStats | None, updated_at: datetime | None) -> 
         "📊 <b>Полная статистика DT Radar</b>\n"
         f"📦 Товаров: <b>{number(stats.total)}</b> · 🗂 категорий: <b>{number(stats.categories)}</b>\n"
         f"🔥 HOT: <b>{number(stats.hot)}</b> · 🚀 набирают: <b>{number(stats.rising)}</b>\n"
-        f"⚡ Fast Sold: <b>{number(stats.fast_sold)}</b> · 📡 сигналов: <b>{number(stats.signals)}</b>\n"
+        f"⚡ Fast Sold за {RADAR_STATS_WINDOW_DAYS} дней: <b>{number(stats.fast_sold)}</b> · "
+        f"📡 сигналов за {RADAR_STATS_WINDOW_DAYS} дней: <b>{number(stats.signals)}</b>\n"
         f"🧠 AI Picks: <b>{number(stats.ai_picks)}</b> · 🔥 HOT за 48ч: <b>{number(stats.recent_hot_48h)}</b>\n"
         f"🕒 Снимок обновлён: <b>{html.escape(updated)}</b>"
     )
 
 
 async def _radar_home_text(user_id: int | None = None) -> str:
-    stats = await radar_stats()
+    stats = await radar_stats(include_signal_history=False)
     full = bool(user_id is not None and allowed(int(user_id)))
     if not full:
         return (
@@ -16616,7 +16621,8 @@ async def _radar_home_text(user_id: int | None = None) -> str:
             "Посмотри, как Radar отбирает сильные товары из тысяч объявлений.\n\n"
             f"🎁 <b>Бесплатно:</b> первые {FREE_RADAR_PREVIEW_LIMIT} находок в каждом режиме «Лучшие сейчас».\n"
             "🔒 Поиск, Категории, Мой Radar и полные ленты открываются с подпиской.\n\n"
-            f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих сейчас · 🚀 <b>{stats.rising}</b> набирают · ⚡ <b>{stats.fast_sold}</b> Fast Sold.\n"
+            f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих сейчас · 🚀 <b>{stats.rising}</b> набирают · "
+            f"⚡ <b>{stats.fast_sold}</b> Fast Sold за {RADAR_STATS_WINDOW_DAYS} дней.\n"
             "👁 <b>Observed Score</b> строится только на росте просмотров, который DT увидел после своего baseline."
         )
     return (
@@ -16626,7 +16632,8 @@ async def _radar_home_text(user_id: int | None = None) -> str:
         "🔎 <b>Поиск</b> — если уже знаешь название товара\n"
         "🗂 <b>Категории</b> — если хочешь посмотреть по разделам\n"
         "⭐ <b>Мой Radar</b> — сохранённые товары\n\n"
-        f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих сейчас · 🚀 <b>{stats.rising}</b> набирают · ⚡ <b>{stats.fast_sold}</b> Fast Sold.\n"
+        f"Сейчас в Radar: <b>{stats.total}</b> товаров · 🔥 <b>{stats.hot}</b> горячих сейчас · 🚀 <b>{stats.rising}</b> набирают · "
+        f"⚡ <b>{stats.fast_sold}</b> Fast Sold за {RADAR_STATS_WINDOW_DAYS} дней.\n"
         "👁 <b>Observed Score</b>: первый счётчик не оценивается; Radar верит только собственным повторным замерам DT."
     )
 
@@ -16652,7 +16659,7 @@ async def _radar_list_payload(
         "hot": "🔥 Горячие сейчас",
         "rising": "🚀 Набирают обороты",
         "ai": "🚀 Набирают обороты",
-        "fastsold": "⚡ Быстро исчезли",
+        "fastsold": f"⚡ Быстро исчезли за {RADAR_STATS_WINDOW_DAYS} дней",
         "alltime": "🏆 Рекорды Radar",
         "favorites": "⭐ Мой Radar",
     }
@@ -16923,7 +16930,7 @@ async def radar_locked(callback: CallbackQuery) -> None:
             reply_markup=radar_home_keyboard(callback.from_user.id),
         )
         return
-    stats = await radar_stats()
+    stats = await radar_stats(include_signal_history=False)
     await callback.answer()
     feature = ""
     if ":" in str(callback.data or ""):
@@ -16944,7 +16951,7 @@ async def radar_locked(callback: CallbackQuery) -> None:
         "реальных находок в каждом режиме «Лучшие сейчас».\n\n"
         f"📦 В Radar уже: <b>{stats.total}</b> товаров\n"
         f"🔥 Горячих: <b>{stats.hot}</b> · 🚀 Набирают: <b>{stats.rising}</b>\n"
-        f"⚡ Быстро исчезли: <b>{stats.fast_sold}</b>\n\n"
+        f"⚡ Быстро исчезли за {RADAR_STATS_WINDOW_DAYS} дней: <b>{stats.fast_sold}</b>\n\n"
         "💎 Полный доступ открывает все результаты, поиск, категории, сохранения и историю Radar."
     )
     await _edit_or_answer(callback.message, text, reply_markup=radar_locked_keyboard())
@@ -16989,7 +16996,7 @@ async def radar_command(message: Message) -> None:
 
 @dp.callback_query(F.data == "radarbest")
 async def radar_best_handler(callback: CallbackQuery) -> None:
-    stats = await radar_stats()
+    stats = await radar_stats(include_signal_history=False)
     full = allowed(callback.from_user.id)
     if not full and free_radar_preview_allowed(callback.from_user.id):
         await record_free_radar_event(callback.from_user.id, "best_open")
@@ -17000,7 +17007,7 @@ async def radar_best_handler(callback: CallbackQuery) -> None:
             "Выбери, какие сильные товары хочешь посмотреть:\n\n"
             f"🔥 Горячие: <b>{stats.hot}</b>\n"
             f"🚀 Набирают: <b>{stats.rising}</b>\n"
-            f"⚡ Быстро исчезли: <b>{stats.fast_sold}</b>\n\n"
+            f"⚡ Быстро исчезли за {RADAR_STATS_WINDOW_DAYS} дней: <b>{stats.fast_sold}</b>\n\n"
             "⚡ «Быстро исчезли» — объявления, которые Radar видел активными и затем подтвердил недоступными в первые 3 часа.\n\n"
             "🏆 Рекорды Radar оставлены ниже как дополнительная история."
         )
@@ -17011,7 +17018,7 @@ async def radar_best_handler(callback: CallbackQuery) -> None:
             f"🎁 <b>Бесплатно покажем первые {FREE_RADAR_PREVIEW_LIMIT} находок</b> в выбранном режиме.\n\n"
             f"🔥 Горячие: <b>{stats.hot}</b>\n"
             f"🚀 Набирают: <b>{stats.rising}</b>\n"
-            f"⚡ Быстро исчезли: <b>{stats.fast_sold}</b> · 🔒\n\n"
+            f"⚡ Быстро исчезли за {RADAR_STATS_WINDOW_DAYS} дней: <b>{stats.fast_sold}</b> · 🔒\n\n"
             "Выбери режим и посмотри реальные результаты Radar."
         )
     await _edit_or_answer(callback.message, text, reply_markup=radar_best_keyboard(callback.from_user.id))
