@@ -253,6 +253,12 @@ async def init_db() -> None:
 
         # Lightweight additive migrations so existing PostgreSQL databases can be
         # upgraded in place without destructive schema changes.
+        promo_cols = await conn.run_sync(lambda sync_conn: _table_columns(sync_conn, "promo_posts"))
+        for name in ("caption_en", "photo_en"):
+            if name not in promo_cols:
+                await conn.execute(text(
+                    f"ALTER TABLE promo_posts ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+                ))
 
         # v3.4.2: Telegram user IDs are 64-bit values. Newer accounts can exceed
         # PostgreSQL INTEGER (2,147,483,647), which previously caused /start to

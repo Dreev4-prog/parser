@@ -818,6 +818,8 @@ class PromoPost(Base):
     title: Mapped[str] = mapped_column(String(100))
     caption: Mapped[str] = mapped_column(Text, default="")
     photo: Mapped[str] = mapped_column(Text, default="")
+    caption_en: Mapped[str] = mapped_column(Text, default="", server_default="")
+    photo_en: Mapped[str] = mapped_column(Text, default="", server_default="")
     time_msk: Mapped[str] = mapped_column(String(5), default="12:00")
     button_kind: Mapped[str] = mapped_column(String(20), default="subscription")
     audience: Mapped[str] = mapped_column(String(20), default="all")

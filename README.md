@@ -1,3 +1,94 @@
+# DT Parser v4.23.28 — English interface
+
+Reviewed English copy covers the home screen, onboarding, scanning, Radar,
+subscriptions, referrals, daily messages and exports. Category names and export
+headers are localized; listing titles, user keywords and URLs remain literal.
+Menu and promotion images have English editions with separate Telegram media
+caches. Auto Posts includes English text/photo editing and previews. Existing
+databases receive two additive promotion fields automatically.
+See `INSTALL_ENGLISH_RU.txt` and `RELEASE_4_23_28.md`.
+
+---
+
+# DT Parser v4.23.27 — daily posts for all users
+
+Daily promotion posts now reach subscribers, administrators and previously muted
+users as well. User-facing opt-out buttons and admin audience filtering are
+removed. Existing captions, images, schedules and enabled state are preserved;
+the existing 20:00 Daily Radar remains separate. See `RELEASE_4_23_27.md`.
+
+---
+
+# DT Parser v4.23.26 — editable daily Telegram posts
+
+Approved ALF promotional posts run daily at 12:00 and 17:00 Moscow. The new
+admin Auto Posts section supports creating, previewing, editing, scheduling,
+pausing and deleting posts, including images, captions, buttons and audiences.
+The existing 20:00 Daily Radar stays separate. Configuration and run progress
+are persisted in PostgreSQL, with daily deduplication, subscription/mute checks
+and bounded run-log retention. See `RELEASE_4_23_26.md`.
+
+---
+
+# DT Parser v4.23.25 — seven-day Radar statistics
+
+The live Radar workflow remains compatible with v4.23.17, while expensive
+user-facing history aggregates now use a seven-day indexed window. Signals,
+Fast Sold, Noise/Weak, search and category counts no longer rescan months of
+history on each open. All-time Records, favorites and product history remain
+available and no stored data is deleted. See `RELEASE_4_23_25.md`.
+
+---
+
+# DT Parser v4.23.24 — Radar 4.23.17 workflow restored
+
+Radar once again follows the v4.23.17 runtime model: the main parser owns
+AutoScan/checkpoints, the admin entry opens Live Status, and the Analytics
+button builds the complete current funnel directly from PostgreSQL. Saved Radar
+snapshots and a dedicated Radar Worker are not required. Storage retention and
+the unrelated stability fixes remain. See `RELEASE_4_23_24.md`.
+
+---
+
+# DT Parser v4.23.23 — full Radar analytics on entry
+
+The administrator's `DT Radar 3.0` entry now opens the complete persisted
+Adaptive Analytics screen immediately: funnel, Candidate/Early/Strong/HOT,
+live-demand categories, control measurements, 24h baseline coverage and Fast
+Sold. The initial full snapshot is prepared before Telegram polling starts, and
+normal navigation reads that snapshot without waiting for a second catalogue
+query. See `RELEASE_4_23_23.md`.
+
+---
+
+# DT Parser v4.23.22 — Radar database home restored
+
+Opening `DT Radar 3.0` now immediately shows current HOT and popular/rising
+products read from `radar_products`. If the exact worker snapshot does not exist,
+the screen uses a bounded lightweight database fallback instead of appearing
+empty. The main parser also produces full snapshots in the background until a
+dedicated Radar Worker is configured. See `RELEASE_4_23_22.md`.
+
+---
+
+# DT Parser v4.23.21 — Radar 3.0 one-screen analytics
+
+The first `DT Radar 3.0` screen now displays the complete saved Adaptive
+Analytics snapshot immediately. Live AutoScan progress is an optional secondary
+screen. One Railway `radar-worker` service owns Radar AutoScan, checkpoints and
+the stored analytics snapshots. See `RELEASE_4_23_21.md`.
+
+---
+
+# DT Parser v4.23.19 — balanced Radar navigation
+
+Radar menus and product pages now avoid full-base counter refreshes during user
+navigation. Lists use one look-ahead row instead of a second exact COUNT query,
+and PostgreSQL retention yields to active scan traffic. See
+`RELEASE_4_23_19.md`.
+
+---
+
 # DT Parser v4.23.17 — bounded PostgreSQL storage
 
 This protection release makes Radar AutoScan the only source of shared Radar

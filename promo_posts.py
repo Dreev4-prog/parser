@@ -22,6 +22,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from db import SessionLocal
 from models import AppSetting, BotUser, PromoPost, PromoRun
+from i18n import LANG_EN, LANG_RU, get_user_language, protect_text, translate_text
 
 
 log = logging.getLogger("dt-parser-promotions")
@@ -30,6 +31,7 @@ ROOT = Path(__file__).resolve().parent
 SEED_KEY = "promo_posts_seed_v1"
 ENABLED_KEY = "promo_posts_enabled_v1"
 ALL_USERS_POLICY_KEY = "promo_all_users_policy_v1"
+ENGLISH_SEED_KEY = "promo_english_seed_v1"
 LEASE_SECONDS = 90
 CATCHUP_MINUTES = 15
 RUN_WINDOW_HOURS = 2
@@ -59,6 +61,29 @@ RADAR_CAPTION = (
     "Товарка, мимо которой ты мог бы пролистнуть, уже ждёт твоего внимания в Radar.\n\n"
     "<b>Открой и посмотри, что ты сегодня упускаешь.</b>\n\n"
     "💎 Полная лента находок доступна по подписке."
+)
+PARSER_CAPTION_EN = (
+    "👽 <b>Spend less time searching Kleinanzeigen.</b>\n\n"
+    "Opening categories, scrolling through listings, checking prices and views — sound familiar?\n\n"
+    "<b>Let DT Parser do the searching.</b>\n\n"
+    "🔎 Choose your categories and search filters.\n"
+    "⚙️ The parser collects matching listings.\n"
+    "📦 Get the results in Telegram, with prices, views and links.\n\n"
+    "Less manual work. More time to explore the listings that interest you.\n\n"
+    "<b>Your filters. Your search. Your DT Parser.</b>\n\n"
+    "💎 Subscribe and start your scan."
+)
+RADAR_CAPTION_EN = (
+    "👽 <b>Your next great find might be something you never thought to search for.</b>\n\n"
+    "You came to browse phones. Meanwhile, a coffee machine, a power tool or a product "
+    "in a completely different category is attracting more attention.\n\n"
+    "<b>DT Radar helps you spot those opportunities.</b>\n\n"
+    "📡 Tracks view growth between its own measurements.\n"
+    "🔥 Highlights hot and trending listings.\n"
+    "🗂 Shows which categories are gaining interest.\n\n"
+    "Discover products you might otherwise scroll past.\n\n"
+    "<b>Open Radar and see what you might be missing today.</b>\n\n"
+    "💎 Subscribe to explore the full feed."
 )
 
 
@@ -106,9 +131,11 @@ async def initialize_promotions(now: datetime | None = None) -> None:
         if created:
             session.add_all([
                 PromoPost(title="DT Parser · Альф", caption=PARSER_CAPTION,
+                          caption_en=PARSER_CAPTION_EN, photo_en="asset:promo_parser_alf_en.png",
                           photo="asset:promo_parser_alf.png", time_msk="12:00", button_kind="parser",
                           audience="all", enabled=True, not_before=now, created_at=now, updated_at=now),
                 PromoPost(title="DT Radar · Находки Альфа", caption=RADAR_CAPTION,
+                          caption_en=RADAR_CAPTION_EN, photo_en="asset:promo_radar_alf_en.png",
                           photo="asset:promo_radar_alf.png", time_msk="17:00", button_kind="radar",
                           audience="all", enabled=True, not_before=now, created_at=now, updated_at=now),
             ])
@@ -122,6 +149,21 @@ async def initialize_promotions(now: datetime | None = None) -> None:
             # Preserve captions, photos, enabled state and schedule on upgrade.
             # Historical opt-out rows are not delivery failures and are ignored.
             await session.execute(update(PromoPost).values(audience="all"))
+        english_seeded = (await session.execute(_insert(session, AppSetting).values(
+            key=ENGLISH_SEED_KEY, value="1", updated_at=now,
+        ).on_conflict_do_nothing(index_elements=[AppSetting.key]).returning(AppSetting.key))).scalar_one_or_none()
+        if english_seeded:
+            # Upgrade the two approved defaults only. Preserve custom admin copy.
+            for caption, english, photo, photo_en in (
+                (PARSER_CAPTION, PARSER_CAPTION_EN, "asset:promo_parser_alf.png", "asset:promo_parser_alf_en.png"),
+                (RADAR_CAPTION, RADAR_CAPTION_EN, "asset:promo_radar_alf.png", "asset:promo_radar_alf_en.png"),
+            ):
+                await session.execute(update(PromoPost).where(
+                    PromoPost.caption == caption, PromoPost.caption_en == "",
+                ).values(caption_en=english))
+                await session.execute(update(PromoPost).where(
+                    PromoPost.photo == photo, PromoPost.photo_en == "",
+                ).values(photo_en=photo_en))
         await session.commit()
 
 
@@ -169,7 +211,7 @@ async def create_post(**values) -> PromoPost:
 
 
 async def edit_post(post_id: int, **values) -> PromoPost | None:
-    allowed_fields = {"title", "caption", "photo", "time_msk", "button_kind", "audience", "enabled", "deleted"}
+    allowed_fields = {"title", "caption", "photo", "caption_en", "photo_en", "time_msk", "button_kind", "audience", "enabled", "deleted"}
     if set(values) - allowed_fields:
         raise ValueError("Неизвестное поле поста")
     if "time_msk" in values:
@@ -199,7 +241,7 @@ async def latest_run(post_id: int) -> PromoRun | None:
         ).order_by(PromoRun.id.desc()).limit(1))).scalar_one_or_none()
 
 
-def post_keyboard(kind: str, *, preview: bool = False) -> InlineKeyboardMarkup | None:
+def post_keyboard(kind: str, *, preview: bool = False, language: str = LANG_RU) -> InlineKeyboardMarkup | None:
     buttons = []
     if kind == "parser":
         buttons.append([InlineKeyboardButton(text="🚀 Открыть DT Parser", callback_data="start_scan")])
@@ -207,30 +249,48 @@ def post_keyboard(kind: str, *, preview: bool = False) -> InlineKeyboardMarkup |
         buttons.append([InlineKeyboardButton(text="🔥 Посмотреть находки Radar", callback_data="radar_home")])
     if kind != "none":
         buttons.append([InlineKeyboardButton(text="💎 Открыть подписку", callback_data="subscription")])
+    for row in buttons:
+        for button in row:
+            button.text = translate_text(button.text, language)
     return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
 
-async def send_post(bot: Bot, chat_id: int, payload: dict, *, preview: bool = False):
-    photo = str(payload.get("photo") or "")
-    markup = post_keyboard(payload.get("button_kind", "subscription"), preview=preview)
+async def send_post(bot: Bot, chat_id: int, payload: dict, *, preview: bool = False, language: str | None = None):
+    language = language or (await get_user_language(chat_id)) or LANG_RU
+    english = language == LANG_EN
+    # Custom content is authored separately in each language in the admin panel.
+    caption = payload.get("caption_en") if english else payload.get("caption")
+    if english and not caption:
+        caption = {PARSER_CAPTION: PARSER_CAPTION_EN, RADAR_CAPTION: RADAR_CAPTION_EN}.get(payload.get("caption"))
+    caption = caption or payload.get("caption") or "DT Parser"
+    photo = str((payload.get("photo_en") if english else None) or payload.get("photo") or "")
+    if english and not payload.get("photo_en"):
+        photo = {"asset:promo_parser_alf.png": "asset:promo_parser_alf_en.png",
+                 "asset:promo_radar_alf.png": "asset:promo_radar_alf_en.png"}.get(photo, photo)
+    cache = payload.setdefault("_photo_cache", {})
+    photo_key = photo
+    photo = cache.get(photo_key, photo)
+    markup = post_keyboard(payload.get("button_kind", "subscription"), preview=preview, language=language)
     if photo:
         if photo.startswith("asset:"):
             # Only bundled filenames, never a path received from an admin message.
             name = photo.removeprefix("asset:")
-            if name not in {"promo_parser_alf.png", "promo_radar_alf.png"}:
+            if name not in {"promo_parser_alf.png", "promo_radar_alf.png", "promo_parser_alf_en.png", "promo_radar_alf_en.png"}:
                 raise ValueError("Неизвестная картинка поста")
             path = ROOT / "assets" / name
             if not path.is_file():
                 raise FileNotFoundError(f"Отсутствует assets/{name}")
             photo = FSInputFile(path)
-        return await bot.send_photo(chat_id, photo=photo, caption=payload.get("caption") or None,
-                                    parse_mode="HTML", reply_markup=markup)
-    return await bot.send_message(chat_id, payload.get("caption") or "DT Parser",
-                                  parse_mode="HTML", reply_markup=markup)
+        message = await bot.send_photo(chat_id, photo=photo, caption=protect_text(caption),
+                                       parse_mode="HTML", reply_markup=markup)
+        if getattr(message, "photo", None):
+            cache[photo_key] = message.photo[-1].file_id
+        return message
+    return await bot.send_message(chat_id, protect_text(caption), parse_mode="HTML", reply_markup=markup)
 
 
 def post_payload(post: PromoPost) -> dict:
-    return {key: getattr(post, key) for key in ("title", "caption", "photo", "button_kind", "audience")}
+    return {key: getattr(post, key) for key in ("title", "caption", "photo", "caption_en", "photo_en", "button_kind", "audience")}
 
 
 async def create_due_runs(now: datetime | None = None) -> None:
@@ -415,9 +475,6 @@ async def process_run(bot: Bot, run: PromoRun, owner: str, admin_ids: set[int]) 
                         await _outcome(run.id, owner, "skipped")
                         continue
                     await _outcome(run.id, owner, "sent")
-                    # Reuse Telegram's file_id after the first upload in this run.
-                    if getattr(message, "photo", None):
-                        payload["photo"] = message.photo[-1].file_id
                 except TelegramForbiddenError:
                     await _outcome(run.id, owner, "blocked")
                 except TelegramNetworkError:

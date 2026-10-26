@@ -13,6 +13,20 @@ class FakeRedis:
     async def xlen(self, _stream):
         return self.depth
 
+    def pipeline(self, transaction=False):
+        redis = self
+        class Pipeline:
+            def __init__(self):
+                self.streams = []
+
+            def xlen(self, stream):
+                self.streams.append(stream)
+                return self
+
+            async def execute(self):
+                return [await redis.xlen(stream) for stream in self.streams]
+        return Pipeline()
+
 
 class BrowserIdleShutdownTests(unittest.IsolatedAsyncioTestCase):
     async def test_closes_only_after_full_idle_timeout(self):

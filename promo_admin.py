@@ -77,6 +77,8 @@ async def detail_payload(post_id: int):
         f"Следующий запуск: <b>{next_run_text(post, last_day=run.day_msk if run else '')}</b>\n"
         f"Аудитория: <b>{audience}</b>\n"
         f"Фото: <b>{'есть' if post.photo else 'нет'}</b>\n"
+        f"English: <b>{'текст готов' if post.caption_en else 'текст не добавлен; используется основной'}</b> · "
+        f"<b>{'есть EN-картинка' if post.photo_en else 'основная картинка'}</b>\n"
         f"Кнопки: <b>{buttons}</b>\n\n"
         "«Предпросмотр» отправит пост только тебе.\n"
         "Текст и фото редактируются для следующих запусков; текущая рассылка "
@@ -101,6 +103,8 @@ async def detail_payload(post_id: int):
         [("⏸ Выключить" if post.enabled else "▶️ Включить", f"adminpromo:toggle:{post.id}")],
         [("👁 Предпросмотр", f"adminpromo:preview:{post.id}"), ("🕐 Время", prefix + "time")],
         [("✏️ Текст", prefix + "text"), ("🖼 Картинка", prefix + "photo")],
+        [("🇬🇧 EN-текст", prefix + "text_en"), ("🇬🇧 EN-картинка", prefix + "photo_en")],
+        [("🇬🇧 Предпросмотр EN", f"adminpromo:preview_en:{post.id}")],
         [("🏷 Название", prefix + "title"), ("🔘 Кнопки", f"adminpromo:buttons:{post.id}")],
         [("🗑 Удалить пост", f"adminpromo:delete:{post.id}")],
         [("⬅️ Автопосты", "adminpromo")],
@@ -152,9 +156,10 @@ def build_promo_router(admin_ids: set[int], edit_or_answer) -> Router:
             post = await get_post(post_id)
             if not post:
                 text, markup = "Пост удалён или не найден.", back_keyboard()
-            elif action == "preview":
+            elif action in {"preview", "preview_en"}:
                 try:
-                    await send_post(callback.bot, callback.from_user.id, post_payload(post), preview=True)
+                    await send_post(callback.bot, callback.from_user.id, post_payload(post), preview=True,
+                                    language="en" if action == "preview_en" else "ru")
                     await callback.message.answer("Это предпросмотр. Пользователям ничего не отправлено.",
                                                   reply_markup=back_keyboard(post_id))
                 except (TelegramBadRequest, TelegramForbiddenError, FileNotFoundError, ValueError) as exc:
@@ -186,8 +191,8 @@ def build_promo_router(admin_ids: set[int], edit_or_answer) -> Router:
             elif action == "confirmdelete":
                 await edit_post(post_id, enabled=False, deleted=True)
                 text, markup = await menu_payload()
-            elif action == "removephoto":
-                await edit_post(post_id, photo="")
+            elif action in {"removephoto", "removephoto_en"}:
+                await edit_post(post_id, **{"photo_en" if action.endswith("_en") else "photo": ""})
                 text, markup = await detail_payload(post_id)
             elif action == "edit":
                 field = parts[3]
@@ -196,15 +201,18 @@ def build_promo_router(admin_ids: set[int], edit_or_answer) -> Router:
                     "time": "🕐 Напиши время ежедневной отправки по Москве, например 17:00.",
                     "text": "✏️ Пришли новый текст поста (до 1024 символов). Форматирование Telegram сохраняется. Картинка останется прежней.",
                     "photo": "🖼 Пришли новую картинку как фотографию. Текст поста останется прежним.",
+                    "text_en": "🇬🇧 Пришли английский текст поста (до 1024 символов). Он будет отправляться пользователям с языком English.",
+                    "photo_en": "🇬🇧 Пришли английскую картинку как фотографию. Она будет отправляться пользователям с языком English.",
                 }
                 if field not in prompts:
                     return
                 await state.set_state(PromoInput.value)
                 await state.update_data(promo_field=field, promo_post_id=post_id)
                 markup = back_keyboard(post_id)
-                if field == "photo":
+                if field in {"photo", "photo_en"}:
                     markup = keyboard([
-                        [("Убрать картинку", f"adminpromo:removephoto:{post_id}")],
+                        [("Использовать основную картинку" if field == "photo_en" else "Убрать картинку",
+                          f"adminpromo:removephoto_en:{post_id}" if field == "photo_en" else f"adminpromo:removephoto:{post_id}")],
                         [("⬅️ Отмена", f"adminpromo:post:{post_id}")],
                     ])
                 await callback.message.answer(prompts[field], reply_markup=markup)
@@ -252,14 +260,14 @@ def build_promo_router(admin_ids: set[int], edit_or_answer) -> Router:
                     post_id = post.id
                 else:
                     await edit_post(post_id, time_msk=value)
-            elif field == "text":
+            elif field in {"text", "text_en"}:
                 if not message.text:
                     raise ValueError("Пришли текст; картинка меняется отдельной кнопкой.")
-                await edit_post(post_id, caption=_caption_value(message))
-            elif field == "photo":
+                await edit_post(post_id, **{"caption_en" if field == "text_en" else "caption": _caption_value(message)})
+            elif field in {"photo", "photo_en"}:
                 if not message.photo or message.media_group_id:
                     raise ValueError("Пришли одну картинку как фотографию, без альбома.")
-                await edit_post(post_id, photo=message.photo[-1].file_id)
+                await edit_post(post_id, **{"photo_en" if field == "photo_en" else "photo": message.photo[-1].file_id})
             else:
                 await state.clear()
                 return

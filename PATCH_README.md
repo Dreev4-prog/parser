@@ -1,14 +1,18 @@
-# v4.23.27 — daily posts for all bot users
+# DT Parser 4.23.28 — English UX patch
 
-The user-facing promotion opt-out button is removed. Daily posts target all
-registered bot users, including subscribers, administrators and people with old
-promo_mute settings. Accounts banned by the administrator or unreachable through
-Telegram are skipped. Delivery is independent of the subscription access mode.
+Install over 4.23.27, preserving folder paths. See INSTALL_ENGLISH_RU.txt.
+The patch contains changed source files and three English artwork assets.
 
-Existing post audiences migrate automatically to "all" without resetting text,
-photos, times or enabled state. Newly created posts also target everyone. Old
-admin audience controls and old opt-out callbacks cannot restore filtering.
+Reviewed messages replace word-by-word translation. Listing data, keywords
+and HTML URLs remain literal. Background notifications and exports resolve
+the recipient's language. Home and promotion images have English editions.
+Auto Posts supports separate English text/photo editing and previews.
 
-Includes the full autopost feature and both pictures; install over 4.23.25 or
-4.23.26, preserving the assets/ directory. The 12:00 / 17:00 Moscow schedule
-and separate 20:00 Daily Radar remain. See INSTALL_AUTOPOSTS_RU.txt.
+PostgreSQL adds caption_en and photo_en to promo_posts automatically.
+Existing post schedules and administrator edits are preserved. Delivery
+remains for all users; the separate Daily Radar schedule is unchanged.
+
+Validation: 51 targeted tests passed; release smoke passed. Coverage includes
+English user journeys, sending/admin controls, database upgrade, retention,
+weekly Radar statistics, navigation and Chromium idle behavior. No live
+Telegram messages were sent and no GitHub/Railway deployment was performed.

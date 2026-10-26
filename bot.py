@@ -100,7 +100,10 @@ from organic_velocity import (
     ORGANIC_HIGH_REQUIRED_CHECKPOINTS, apply_organic_measurement,
 )
 from traffic import TRAFFIC
-from i18n import LANG_EN, LANG_RU, get_user_language, language_name, set_user_language, translate_text
+from i18n import (
+    LANG_EN, LANG_RU, export_label, get_user_language, language_name, protect_text,
+    set_user_language, translate_text,
+)
 from distributed import (
     COORDINATOR, DISTRIBUTED_WORKERS, DISTRIBUTED_MODE_SOURCE,
     DISTRIBUTED_CONFIG_ERROR, IS_RAILWAY, REDIS_URL, STABLE_SINGLE_SERVICE_MODE,
@@ -385,6 +388,7 @@ class RadarAutoScanCategoryTimeout(Exception):
 # language-neutral; all outgoing Telegram text/inline-button labels are localized
 # at the Bot API boundary.  Admin chats intentionally stay Russian.
 _UI_LANGUAGE: ContextVar[str | None] = ContextVar("dt_ui_language", default=None)
+_UI_LANGUAGE_USER: ContextVar[int | None] = ContextVar("dt_ui_language_user", default=None)
 
 
 def _copy_model_with_updates(obj, **updates):
@@ -408,7 +412,7 @@ def _copy_model_with_updates(obj, **updates):
 
 
 def _localize_inline_markup(markup, language: str | None):
-    if language != LANG_EN or not isinstance(markup, InlineKeyboardMarkup):
+    if not isinstance(markup, InlineKeyboardMarkup):
         return markup
     changed = False
     rows = []
@@ -426,8 +430,6 @@ def _localize_inline_markup(markup, language: str | None):
 
 
 def _localize_telegram_method(method, language: str | None):
-    if language != LANG_EN:
-        return method
     updates = {}
     text = getattr(method, "text", None)
     if isinstance(text, str):
@@ -462,7 +464,9 @@ class LocalizedBot(Bot):
         # Do not force their entire private chat to Russian here. The language
         # middleware below forces Russian only while an admin is actually inside
         # /admin, admin callbacks or AdminInput FSM screens.
-        if language is None and numeric_chat_id is not None and numeric_chat_id > 0:
+        if numeric_chat_id is not None and numeric_chat_id > 0 and (
+            language is None or _UI_LANGUAGE_USER.get() != numeric_chat_id
+        ):
             try:
                 language = await get_user_language(numeric_chat_id)
             except Exception:
@@ -474,9 +478,10 @@ _PROJECT_DIR = Path(__file__).resolve().parent
 MENU_IMAGE_PATH = _PROJECT_DIR / "dt_parser_menu.png"
 if not MENU_IMAGE_PATH.exists():
     MENU_IMAGE_PATH = _PROJECT_DIR / "assets" / "dt_parser_menu.png"
+MENU_IMAGE_PATH_EN = _PROJECT_DIR / "assets" / "dt_parser_menu_en.png"
 # v4.6.7: after the first upload Telegram gives us a reusable file_id. Reusing
 # it avoids re-uploading the menu image every time the user returns home.
-_MENU_IMAGE_FILE_ID: str | None = None
+_MENU_IMAGE_FILE_IDS: dict[str, str] = {}
 
 BERLIN = ZoneInfo("Europe/Berlin")
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -695,6 +700,9 @@ def price_filter_label(value: str | None) -> str:
 
 def parse_scan_price_input(text: str | None) -> str | None:
     raw = (text or "").strip().lower().replace("€", "").replace("eur", "")
+    raw = re.sub(r"^from\s*(\d{1,7})\s*to\s*(\d{1,7})$", r"\1-\2", raw.strip())
+    raw = re.sub(r"^(?:up\s+to|under|max(?:imum)?)\s*(\d{1,7})$", r"-\1", raw.strip())
+    raw = re.sub(r"^(?:from|over|at\s+least|min(?:imum)?)\s*(\d{1,7})$", r"\1+", raw.strip())
     raw = re.sub(r"\s+", "", raw)
     if not raw:
         return None
@@ -1425,7 +1433,7 @@ def radar_search_keyboard(items, *, page: int, total: int, price_filter: str = "
         if len(title) > 32:
             title = title[:31].rstrip() + "…"
         rows.append([InlineKeyboardButton(
-            text=f"{icon} {int(product.current_score or 0)} · {title}",
+            text=f"{icon} {int(product.current_score or 0)} · {protect_text(title)}",
             callback_data=f"radaritem:{int(product.id)}",
         )])
     nav: list[InlineKeyboardButton] = []
@@ -1461,7 +1469,7 @@ def radar_preview_list_keyboard(
         if len(title) > 32:
             title = title[:31].rstrip() + "…"
         rows.append([InlineKeyboardButton(
-            text=f"{icon} {int(product.current_score or 0)} · {title}",
+            text=f"{icon} {int(product.current_score or 0)} · {protect_text(title)}",
             callback_data=f"radarpreviewitem:{mode}:{int(product.id)}",
         )])
     if total > len(items):
@@ -1492,7 +1500,7 @@ def radar_list_keyboard(
             title = title[:31].rstrip() + "…"
         shown_score = int(product.peak_score or 0) if mode == "alltime" else int(product.current_score or 0)
         rows.append([InlineKeyboardButton(
-            text=f"{icon} {shown_score} · {title}",
+            text=f"{icon} {shown_score} · {protect_text(title)}",
             callback_data=f"radaritem:{int(product.id)}",
         )])
     nav: list[InlineKeyboardButton] = []
@@ -1633,6 +1641,7 @@ class BotChatAdapter:
 
 def _button_text(text: str, limit: int = 62) -> str:
     """Keep long one-row category labels readable in Telegram clients."""
+    text = translate_text(text, _UI_LANGUAGE.get())
     clean = " ".join((text or "").split())
     return clean if len(clean) <= limit else clean[: max(1, limit - 1)].rstrip() + "…"
 
@@ -2738,7 +2747,7 @@ def _scan_list_button(scan: UserScan) -> InlineKeyboardButton:
         else "⚪️"
     )
     target_label = _date_label(scan.target_date) if scan.target_date else _moscow_text(scan.finished_at or scan.created_at)[:10]
-    label = f"{icon} {scan.title[:22]} · {target_label[:5]}"
+    label = f"{icon} {translate_text(scan.title, _UI_LANGUAGE.get())[:22]} · {target_label[:5]}"
     return InlineKeyboardButton(text=label, callback_data=f"scan:{scan.id}")
 
 
@@ -3214,11 +3223,29 @@ async def filtered_rows(user_id: int) -> tuple[UserSettings, list[Listing]]:
     return s, sort_rows(rows, s.sort_mode)
 
 
+class _LocalizedCSVWriter:
+    def __init__(self, writer, language):
+        self.writer = writer
+        self.language = language
+        self.header = True
+
+    def writerow(self, values):
+        if self.header:
+            self.category_columns = [i for i, value in enumerate(values) if value in {"Раздел", "Категория"}]
+            values = [export_label(str(value), self.language) for value in values]
+            self.header = False
+        else:
+            values = list(values)
+            for i in self.category_columns:
+                values[i] = translate_text(values[i], self.language)
+        return self.writer.writerow(values)
+
+
 def _temp_csv(name: str) -> tuple[Path, csv.writer, object]:
     temp_dir = Path(tempfile.mkdtemp(prefix="kleinanzeigen_"))
     path = temp_dir / name
     f = path.open("w", encoding="utf-8-sig", newline="")
-    return path, csv.writer(f, delimiter=";"), f
+    return path, _LocalizedCSVWriter(csv.writer(f, delimiter=";"), _UI_LANGUAGE.get()), f
 
 
 def _price_display(price_text: str | None, price_eur: int | None) -> str:
@@ -3325,6 +3352,7 @@ def _write_universal_xlsx(
     hyperlink_headers: set[str] | None = None,
     integer_headers: set[str] | None = None,
     decimal_headers: set[str] | None = None,
+    language: str | None = None,
 ) -> Path:
     """Create a mobile-friendly XLSX that renders consistently across iOS/Android/desktop."""
     out_dir = Path(tempfile.mkdtemp(prefix="kleinanzeigen_xlsx_"))
@@ -3332,7 +3360,8 @@ def _write_universal_xlsx(
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "Результаты"
+    language = language or _UI_LANGUAGE.get()
+    ws.title = "Results" if language == LANG_EN else "Результаты"
 
     max_col = max(1, len(headers))
     ws.append([title])
@@ -3418,11 +3447,21 @@ def _write_universal_xlsx(
     for row_num in range(3, ws.max_row + 1):
         ws.row_dimensions[row_num].height = 32
 
+    if language == LANG_EN:
+        ws["A1"] = translate_text(title, language)
+        for header in ("Раздел", "Категория"):
+            col = header_to_col.get(header)
+            if col:
+                for row_num in range(3, ws.max_row + 1):
+                    cell = ws.cell(row=row_num, column=col)
+                    cell.value = translate_text(str(cell.value or ""), language)
+        for cell in ws[2]:
+            cell.value = export_label(str(cell.value or ""), language)
     wb.save(path)
     return path
 
 
-def write_listing_xlsx(rows: list[Listing], mode: str) -> Path:
+def write_listing_xlsx(rows: list[Listing], mode: str, *, language: str | None = None) -> Path:
     now = datetime.now(MOSCOW)
     headers = [
         "Раздел", "Категория", "Название", "Цена, €", "👁 Просмотры",
@@ -3438,11 +3477,11 @@ def write_listing_xlsx(rows: list[Listing], mode: str) -> Path:
         f"kleinanzeigen_{mode}_{now:%Y-%m-%d_%H-%M}.xlsx",
         f"Kleinanzeigen · {MODE_LABELS.get(mode, mode)} · {len(rows)} объявлений",
         headers, data,
-        hyperlink_headers={"Ссылка"}, integer_headers={"Цена, €", "👁 Просмотры"},
+        hyperlink_headers={"Ссылка"}, integer_headers={"Цена, €", "👁 Просмотры"}, language=language,
     )
 
 
-def write_frequent_xlsx(rows) -> Path:
+def write_frequent_xlsx(rows, *, language: str | None = None) -> Path:
     now = datetime.now(MOSCOW)
     headers = [
         "Раздел", "Категория", "Группа товара", "Пример названия", "Цена примера",
@@ -3457,12 +3496,12 @@ def write_frequent_xlsx(rows) -> Path:
     return _write_universal_xlsx(
         f"kleinanzeigen_chasto_publikuemye_{now:%Y-%m-%d_%H-%M}.xlsx",
         f"Kleinanzeigen · Часто публикуемые · {len(rows)} групп",
-        headers, data, hyperlink_headers={"Ссылка-пример"},
+        headers, data, hyperlink_headers={"Ссылка-пример"}, language=language,
         integer_headers={"Публикаций", "Мин. цена, €", "Медиана, €", "Макс. цена, €", "Точность группы, %"},
     )
 
 
-def write_market_xlsx(rows) -> Path:
+def write_market_xlsx(rows, *, language: str | None = None) -> Path:
     now = datetime.now(MOSCOW)
     headers = [
         "Раздел", "Категория", "Название", "Цена, €", "👁 Просмотры",
@@ -3478,11 +3517,11 @@ def write_market_xlsx(rows) -> Path:
         f"Kleinanzeigen · Ниже рынка · {len(rows)} объявлений",
         headers, data, hyperlink_headers={"Ссылка"},
         integer_headers={"Цена, €", "👁 Просмотры", "Медиана группы, €", "Образцов", "Точность группы, %"},
-        decimal_headers={"Ниже медианы, %"},
+        decimal_headers={"Ниже медианы, %"}, language=language,
     )
 
 
-def write_disappearing_xlsx(rows) -> Path:
+def write_disappearing_xlsx(rows, *, language: str | None = None) -> Path:
     now = datetime.now(MOSCOW)
     headers = [
         "Раздел", "Категория", "Название", "Цена", "Время жизни, мин",
@@ -3497,11 +3536,11 @@ def write_disappearing_xlsx(rows) -> Path:
         f"kleinanzeigen_bystro_ischezayushchie_{now:%Y-%m-%d_%H-%M}.xlsx",
         f"Kleinanzeigen · Быстро исчезающие · {len(rows)} объявлений",
         headers, data, hyperlink_headers={"Ссылка"},
-        integer_headers={"Время жизни, мин", "Окно проверки, мин"},
+        integer_headers={"Время жизни, мин", "Окно проверки, мин"}, language=language,
     )
 
 
-def write_price_drop_xlsx(rows) -> Path:
+def write_price_drop_xlsx(rows, *, language: str | None = None) -> Path:
     now = datetime.now(MOSCOW)
     headers = [
         "Раздел", "Категория", "Название", "Старая цена, €", "Новая цена, €",
@@ -3516,7 +3555,7 @@ def write_price_drop_xlsx(rows) -> Path:
         f"Kleinanzeigen · Снижение цены · {len(rows)} объявлений",
         headers, data, hyperlink_headers={"Ссылка"},
         integer_headers={"Старая цена, €", "Новая цена, €", "Снижение, €"},
-        decimal_headers={"Снижение, %"},
+        decimal_headers={"Снижение, %"}, language=language,
     )
 
 
@@ -4244,7 +4283,7 @@ async def refresh_view_counts(
                 pct = round(completed / all_total * 100) if eligible else 100
                 title = progress_title or "👁 Собираю просмотры"
                 await status.edit_text(
-                    f"<b>{html.escape(title)}</b>\n\n"
+                    f"<b>{protect_text(html.escape(title))}</b>\n\n"
                     f"{_progress_bar(pct)} <b>{pct}%</b>\n"
                     f"👁 Проверено: <b>{completed}/{len(eligible)}</b>",
                     parse_mode=ParseMode.HTML,
@@ -6776,6 +6815,7 @@ async def send_smart_export(
     rows_override: list[Listing] | None = None,
     price_filter_override: str | None = None,
 ) -> int:
+    export_language = await get_user_language(user_id)
     s = await get_settings(user_id)
     mode = s.output_mode
     effective_price_filter = (price_filter_override or "any").strip()
@@ -6812,7 +6852,7 @@ async def send_smart_export(
             await message.answer("🔥 Пока нет групп минимум с 3 публикациями по текущим фильтрам.", reply_markup=main_keyboard(selected_count))
             return 0
         result = _group_export_rows(result)
-        path = write_frequent_xlsx(result)
+        path = write_frequent_xlsx(result, language=export_language)
         caption = f"🔥 Часто публикуемые группы: {len(result)} · 📊 XLSX"
 
     elif mode == "below_market":
@@ -6821,7 +6861,7 @@ async def send_smart_export(
             await message.answer("💰 Нужны минимум 5 цен в одной уверенной группе; сейчас нет позиций ≥20% ниже медианы похожих объявлений.", reply_markup=main_keyboard(selected_count))
             return 0
         result = _group_export_rows(result)
-        path = write_market_xlsx(result)
+        path = write_market_xlsx(result, language=export_language)
         caption = f"💰 Потенциально ниже рынка: {len(result)} · 📊 XLSX"
 
     elif mode == "fast_disappearing":
@@ -6850,7 +6890,7 @@ async def send_smart_export(
             )
             return 0
         result = _group_export_rows(result)
-        path = write_disappearing_xlsx(result)
+        path = write_disappearing_xlsx(result, language=export_language)
         caption = f"⚡ Быстро исчезающие: {len(result)} · 📊 XLSX"
 
     elif mode == "price_drop":
@@ -6863,7 +6903,7 @@ async def send_smart_export(
             )
             return 0
         result = _group_export_rows(result)
-        path = write_price_drop_xlsx(result)
+        path = write_price_drop_xlsx(result, language=export_language)
         caption = f"📉 Снижение цены: {len(result)} · 📊 XLSX"
 
     else:
@@ -6872,7 +6912,7 @@ async def send_smart_export(
             await message.answer("📦 По текущим фильтрам ничего не найдено.", reply_markup=main_keyboard(selected_count))
             return 0
         result = _group_export_rows(result)
-        path = write_listing_xlsx(result, mode)
+        path = write_listing_xlsx(result, mode, language=export_language)
         caption = f"📦 {MODE_LABELS.get(mode, mode)}: {len(result)} · 📊 XLSX"
 
     try:
@@ -6883,8 +6923,8 @@ async def send_smart_export(
 
 
 def settings_text(s: UserSettings) -> str:
-    include = html.escape(s.include_words) if s.include_words else "—"
-    exclude = html.escape(s.exclude_words) if s.exclude_words else "—"
+    include = protect_text(html.escape(s.include_words)) if s.include_words else "—"
+    exclude = protect_text(html.escape(s.exclude_words)) if s.exclude_words else "—"
     return (
         "<b>⚙️ Настройки результата</b>\n\n"
         "Эти параметры определяют, <b>какие объявления попадут в XLSX и TOP</b> после сбора.\n\n"
@@ -11650,6 +11690,7 @@ class LanguageContextMiddleware(BaseMiddleware):
             log.exception("Could not load UI language user=%s", tg_user.id)
             language = LANG_RU if force_admin_ru else None
         token = _UI_LANGUAGE.set(language)
+        owner_token = _UI_LANGUAGE_USER.set(uid)
         try:
             # Existing users from pre-v4.6.5 are gated once, too, so nobody gets
             # a half-Russian/half-English experience after upgrade.
@@ -11672,6 +11713,7 @@ class LanguageContextMiddleware(BaseMiddleware):
                     return None
             return await handler(event, data)
         finally:
+            _UI_LANGUAGE_USER.reset(owner_token)
             _UI_LANGUAGE.reset(token)
 
 
@@ -12112,6 +12154,8 @@ async def _referral_screen(user_id: int, bot: Bot) -> tuple[str, InlineKeyboardM
         )
         progress_text = "🎯 Бонусный зачёт временно остановлен."
         share_text = "DT Parser для Kleinanzeigen 👇"
+
+    share_text = translate_text(share_text, await get_user_language(user_id))
 
     text = (
         "<b>🎁 Получить день бесплатно</b>\n\n"
@@ -15774,12 +15818,12 @@ def home_text(
 
 async def _send_home_message(message: Message, user_id: int, *, intro: bool = False) -> None:
     """Send the branded DT PARSER home card with low-latency navigation."""
-    global _MENU_IMAGE_FILE_ID
-    selected, user_settings, trial, referral_enabled = await asyncio.gather(
+    selected, user_settings, trial, referral_enabled, language = await asyncio.gather(
         get_selected(user_id),
         get_settings(user_id),
         get_trial_status(user_id),
         referral_promo_enabled(),
+        get_user_language(user_id),
     )
     auto_enabled = bool(getattr(user_settings, "auto_observations", False))
     access_active = allowed(user_id)
@@ -15793,10 +15837,12 @@ async def _send_home_message(message: Message, user_id: int, *, intro: bool = Fa
         len(selected), auto_enabled, access_active=access_active, trial_remaining=trial_remaining
     )
 
-    if _MENU_IMAGE_FILE_ID:
+    image_key = LANG_EN if language == LANG_EN else LANG_RU
+    image_path = MENU_IMAGE_PATH_EN if image_key == LANG_EN else MENU_IMAGE_PATH
+    if image_key in _MENU_IMAGE_FILE_IDS:
         try:
             await message.answer_photo(
-                photo=_MENU_IMAGE_FILE_ID,
+                photo=_MENU_IMAGE_FILE_IDS[image_key],
                 caption=caption,
                 reply_markup=markup,
                 parse_mode=ParseMode.HTML,
@@ -15805,24 +15851,24 @@ async def _send_home_message(message: Message, user_id: int, *, intro: bool = Fa
         except Exception:
             # File IDs can theoretically become unusable after a bot/token
             # replacement. Drop the cache and upload the local asset once.
-            _MENU_IMAGE_FILE_ID = None
+            _MENU_IMAGE_FILE_IDS.pop(image_key, None)
 
-    if MENU_IMAGE_PATH.exists():
+    if image_path.exists():
         sent = await message.answer_photo(
-            photo=FSInputFile(MENU_IMAGE_PATH),
+            photo=FSInputFile(image_path),
             caption=caption,
             reply_markup=markup,
             parse_mode=ParseMode.HTML,
         )
         if getattr(sent, "photo", None):
             try:
-                _MENU_IMAGE_FILE_ID = sent.photo[-1].file_id
+                _MENU_IMAGE_FILE_IDS[image_key] = sent.photo[-1].file_id
             except Exception:
                 pass
         return
 
     # Safe fallback if the asset was accidentally omitted from a deployment.
-    log.error("Main menu image is missing: %s", MENU_IMAGE_PATH)
+    log.error("Main menu image is missing: %s", image_path)
     await message.answer(caption, reply_markup=markup, parse_mode=ParseMode.HTML)
 
 
@@ -16585,7 +16631,7 @@ def _radar_quick_db_text(snapshot: dict | None) -> str:
     if hot_items:
         for index, product in enumerate(hot_items, 1):
             lines.append(
-                f"{index}. {html.escape(str(product.title or 'Товар')[:58])} · Score <b>{int(product.current_score or 0)}</b>"
+                f"{index}. {protect_text(html.escape(str(product.title or 'Товар')[:58]))} · Score <b>{int(product.current_score or 0)}</b>"
             )
     else:
         lines.append("Сейчас подтверждённых HOT нет")
@@ -16593,7 +16639,7 @@ def _radar_quick_db_text(snapshot: dict | None) -> str:
     if rising_items:
         for index, product in enumerate(rising_items, 1):
             lines.append(
-                f"{index}. {html.escape(str(product.title or 'Товар')[:58])} · Score <b>{int(product.current_score or 0)}</b>"
+                f"{index}. {protect_text(html.escape(str(product.title or 'Товар')[:58]))} · Score <b>{int(product.current_score or 0)}</b>"
             )
     else:
         lines.append("Сейчас подтверждённого роста нет")
@@ -16737,7 +16783,7 @@ async def _radar_list_payload(
                     price = f"{int(info.last_price_eur)} €" if info.last_price_eur is not None else "—"
                     views = str(int(info.last_views)) if info.last_views is not None else "—"
                     lines.append(
-                        f"⚡ <b>{index}. {html.escape(str(product.title or info.title or 'Товар')[:70])}</b>\n"
+                        f"⚡ <b>{index}. {protect_text(html.escape(str(product.title or info.title or 'Товар')[:70]))}</b>\n"
                         f"⏱ Исчезло за <b>{html.escape(_fast_sold_lifetime_text(info.lifetime_seconds))}</b> · "
                         f"🕐 {html.escape(_moscow_text(info.disappeared_at))}\n"
                         f"💶 <b>{html.escape(price)}</b> · 👀 последний замер <b>{views}</b> · "
@@ -16751,7 +16797,7 @@ async def _radar_list_payload(
                 else f"⭐ <b>{int(product.current_score or 0)}</b>/100 · Peak <b>{int(product.peak_score or 0)}</b> · "
             )
             lines.append(
-                f"{icon} <b>{index}. {html.escape(str(product.title or 'Товар')[:70])}</b>\n"
+                f"{icon} <b>{index}. {protect_text(html.escape(str(product.title or 'Товар')[:70]))}</b>\n"
                 + score_line
                 + f"📂 {html.escape(cat_name)}\n"
                 + f"💶 <b>{html.escape(_radar_product_price_text(product))}</b> · 🕐 <b>{html.escape(freshness)}</b> · "
@@ -16799,7 +16845,7 @@ async def _radar_product_payload(
         else:
             price = f"{int(product.min_price_eur)}–{int(product.max_price_eur)} €"
     lines = [
-        f"📡 <b>{html.escape(str(product.title or 'Товар'))}</b>",
+        f"📡 <b>{protect_text(html.escape(str(product.title or 'Товар')))}</b>",
         "",
         f"{status_icon} Статус: <b>{html.escape(status)}</b>",
         (f"🕒 Последний подтверждённый Score: <b>{int(product.current_score or 0)}/100</b> · Peak <b>{int(product.peak_score or 0)}</b>" if str(product.status or "") == "historical" else f"⭐ Observed Score: <b>{int(product.current_score or 0)}/100</b> · Peak <b>{int(product.peak_score or 0)}</b>"),
@@ -16868,7 +16914,7 @@ async def _radar_search_payload(query: str, page: int = 0, *, price_filter: str 
     )
     lines = [
         f"🔎 <b>Поиск DT Radar</b>",
-        f"Запрос: <b>{html.escape(clean)}</b>",
+        f"Запрос: <b>{protect_text(html.escape(clean))}</b>",
         f"💶 Цена: <b>{html.escape(price_filter_label(price_filter))}</b>",
         "",
     ]
@@ -16881,7 +16927,7 @@ async def _radar_search_payload(query: str, page: int = 0, *, price_filter: str 
             cat = CATEGORIES.get(str(product.category_key or ""))
             cat_name = cat.name if cat is not None else str(product.category_key or "—")
             lines.append(
-                f"{icon} <b>{index}. {html.escape(str(product.title or 'Товар')[:70])}</b>\n"
+                f"{icon} <b>{index}. {protect_text(html.escape(str(product.title or 'Товар')[:70]))}</b>\n"
                 f"⭐ <b>{int(product.current_score or 0)}</b>/100 · 💶 <b>{html.escape(_radar_product_price_text(product))}</b> · "
                 f"📂 {html.escape(cat_name)}\n"
                 f"🕐 <b>{html.escape(_radar_freshness(product.last_signal_at))}</b>"
@@ -17446,7 +17492,7 @@ async def popular_category_views(callback: CallbackQuery) -> None:
         ]
         for i, row in enumerate(rows[:GROWTH_TELEGRAM_LIMIT], 1):
             lines.append(
-                f"<b>{i}. {html.escape(row.title[:60])}</b>\n"
+                f"<b>{i}. {protect_text(html.escape(row.title[:60]))}</b>\n"
                 f"📅 {_date_label(row.posted_date_msk)} · 👁 <b>{row.view_count}</b> · "
                 f"💶 {html.escape(_price_display(row.price_text, row.price_eur))}\n"
                 f'<a href="{html.escape(row.url)}">Открыть</a>'
@@ -17502,7 +17548,7 @@ async def popular_category_growth(callback: CallbackQuery) -> None:
         for i, item in enumerate(growth[:GROWTH_TELEGRAM_LIMIT], 1):
             row = item.listing
             lines.append(
-                f"<b>{i}. {html.escape(row.title[:60])}</b>\n"
+                f"<b>{i}. {protect_text(html.escape(row.title[:60]))}</b>\n"
                 f"📅 {_date_label(row.posted_date_msk)} · 👁 {item.base_views} → <b>{item.current_views}</b> · "
                 f"🚀 <b>+{item.delta}</b> · ⚡ {item.per_hour:.1f}/ч\n"
                 f"💶 {html.escape(_price_display(row.price_text, row.price_eur))} · "
@@ -17738,7 +17784,7 @@ def _top_entry(index: int, row: Listing, snap: ScanListing) -> str:
     delta = (row.view_count - snap.initial_view_count) if snap.initial_view_count is not None else None
     growth = f" · 🚀 +{delta}" if delta is not None and delta > 0 else ""
     return (
-        f"<b>{index}. {html.escape(row.title[:55])}</b>\n"
+        f"<b>{index}. {protect_text(html.escape(row.title[:55]))}</b>\n"
         f"👁 {row.view_count}{growth} · 💶 {html.escape(_price_display(row.price_text, row.price_eur))}\n"
         f'<a href="{html.escape(row.url)}">Открыть</a>'
     )
@@ -17870,7 +17916,7 @@ async def scan_growth(callback: CallbackQuery) -> None:
         for i, item in enumerate(growth[:GROWTH_TELEGRAM_LIMIT], 1):
             row = item.listing
             lines.append(
-                f"<b>{i}. {html.escape(row.title[:60])}</b>\n"
+                f"<b>{i}. {protect_text(html.escape(row.title[:60]))}</b>\n"
                                 f"👁 {item.base_views} → <b>{item.current_views}</b> · "
                 f"🚀 <b>+{item.delta}</b> · ⚡ {item.per_hour:.1f}/ч\n"
                 f"💶 {html.escape(_price_display(row.price_text, row.price_eur))} · "
@@ -17885,7 +17931,8 @@ async def scan_growth(callback: CallbackQuery) -> None:
 
 
 def build_growth_top_xlsx(
-    scan: UserScan, period_hours: int, growth: list[GrowthMetric], category_key: str | None = None
+    scan: UserScan, period_hours: int, growth: list[GrowthMetric], category_key: str | None = None,
+    *, language: str | None = None,
 ) -> Path:
     """Build the downloadable TOP-50 table."""
     cat = CATEGORIES.get(category_key) if category_key else None
@@ -17942,6 +17989,13 @@ def build_growth_top_xlsx(
     out_dir = Path(tempfile.mkdtemp(prefix="growth_top_"))
     safe_cat = re.sub(r"[^A-Za-z0-9_-]+", "_", category_key or "scan")
     out = out_dir / f"TOP50_{safe_cat}_{period_hours}h_scan_{scan.id}.xlsx"
+    language = language or _UI_LANGUAGE.get()
+    ws["A1"] = translate_text(str(ws["A1"].value), language)
+    if language == LANG_EN:
+        for row_num in range(3, ws.max_row + 1):
+            ws.cell(row=row_num, column=3).value = translate_text(ws.cell(row=row_num, column=3).value, language)
+    for cell in ws[2]:
+        cell.value = export_label(str(cell.value), language)
     wb.save(out)
     return out
 
@@ -17962,7 +18016,8 @@ async def send_growth_xlsx(
             "контрольный замер ещё не готов или прироста нет."
         )
         return
-    path = build_growth_top_xlsx(scan, period_hours, growth, category_key=category_key)
+    path = build_growth_top_xlsx(scan, period_hours, growth, category_key=category_key,
+                                 language=await get_user_language(scan.user_id))
     try:
         cat = CATEGORIES.get(category_key) if category_key else None
         suffix = f" · {cat.name}" if cat else ""
@@ -17999,7 +18054,8 @@ async def send_category_growth_xlsx(
         )
         return
     path = build_growth_top_xlsx(
-        representative, period_hours, growth, category_key=category_key
+        representative, period_hours, growth, category_key=category_key,
+        language=await get_user_language(user_id),
     )
     try:
         cat = CATEGORIES.get(category_key)
@@ -18683,8 +18739,8 @@ async def _show_scan_depth_choice(
         return
 
     scan_settings = await get_settings(user_id)
-    include = html.escape(scan_settings.include_words) if scan_settings.include_words else ""
-    exclude = html.escape(scan_settings.exclude_words) if scan_settings.exclude_words else ""
+    include = protect_text(html.escape(scan_settings.include_words)) if scan_settings.include_words else ""
+    exclude = protect_text(html.escape(scan_settings.exclude_words)) if scan_settings.exclude_words else ""
     extra_lines = []
     if include:
         extra_lines.append(f"🔎 Ключевые: <b>{include}</b>")

@@ -1,0 +1,20 @@
+# English artwork — built-in image_gen, text-localization edits
+
+## assets/dt_parser_menu_en.png
+
+Source: assets/dt_parser_menu.png
+
+Use case: text-localization. Edit target: the supplied DT Parser main menu artwork. Create the English edition in the exact same dark forest-green/neon lime/ivory branding, with ALF in the black DT hoodie, product cards and analytics. Preserve composition, ALF, objects, colors and quality. Replace ALL Russian copy with clear English. Keep title DT PARSER. Dashboard heading MARKET ANALYTICS, labels LISTINGS SCANNED / NEW LISTINGS / AVERAGE PRICE / VIEW GROWTH, chart LISTING ACTIVITY, categories POPULAR CATEGORIES, Electronics / Vehicles / Home & Garden / Fashion / Other, TOP LISTINGS. Left search What are you looking for?, category icons Electronics / Vehicles / Home & Garden / Fashion / Sports. Badge TOP PICK. Product sofa label Sofa. Tablet headline SCAN. ANALYZE. DISCOVER. list Fast / Detailed / Automated, button START SCAN. Export heading EXPORTS & REPORTS, small Your data. Your search. Your edge. Center footer Kleinanzeigen Analytics / DISCOVER LISTINGS THAT MATTER. Feature blocks SMART SCANS / Find listings with your filters. TREND TRACKING / Spot growing interest. DATA INSIGHTS / Compare prices and views. Bottom DT PARSER BOT / Your Telegram assistant for Kleinanzeigen. AUTOMATIC SCANS / Scheduled market discovery. YOUR FILTERS / Search your way. EASY TO USE / Scan, compare and explore. Remove the decorative QR code area and replace it with a simple Telegram icon and OPEN THE BOT. Box stamp SCAN COMPLETE. No Russian or Cyrillic letters anywhere. Do not add accuracy or legal compliance claims. All words readable.
+
+## assets/promo_parser_alf_en.png
+
+Source: assets/promo_parser_alf.png
+
+Use case: text-localization. Edit target: supplied DT Parser promotional poster. Change ONLY Russian lettering to English, preserving ALF, black DT hoodie, scanning machine, product cards, composition, rich dark green/neon lime/ivory-white palette and bold type. Keep DT PARSER title unchanged. Replace large headline with two lines exactly "YOU CHOOSE." (ivory) and "PARSER FINDS." (lime). Bottom feature strip exactly "FILTERS • PRICES • VIEWS". Telegram CTA exactly "START YOUR SCAN". No other copy; no Cyrillic. Maintain crisp readable lettering and premium poster quality.
+
+## assets/promo_radar_alf_en.png
+
+Source: assets/promo_radar_alf.png
+
+Use case: text-localization. Edit target: supplied DT Radar 3.0 promotional poster. Change ONLY Russian lettering to English, preserving ALF in black DT hoodie, coffee machine card, neon radar, other product cards, composition and dark green/neon lime/ivory color style. Keep DT RADAR 3.0 title unchanged. Replace headline with three lines exactly "PRODUCTS" / "YOU MIGHT" / "HAVE MISSED", first two ivory, third lime. Bottom feature strip exactly "HOT • TRENDING • CATEGORIES". CTA exactly "EXPLORE RADAR FINDS". No other copy; no Cyrillic. Maintain crisp readable lettering and premium poster quality.
+

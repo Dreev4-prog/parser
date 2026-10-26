@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import ast
+import json
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def check(condition: bool, message: str) -> None:
@@ -15,7 +18,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.23.17", "VERSION=4.23.17")
+    check((ROOT / "VERSION").read_text().strip() == "4.23.28", "VERSION=4.23.28")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -153,7 +156,8 @@ def main() -> int:
     check('item.page == expected_page' in date_manager, "Date Worker hint is bound to requested page")
     check('_category_feed_identity_matches(requested_url, final_url)' in parser_source, "category redirects preserve requested feed identity")
     check('for item in targets:' in bot and 'vr = results.get(url)' in bot, "partial exact-view maps cannot preserve stale counters")
-    check(not list(ROOT.glob('DEPLOY_V4_*.md')), "historical deploy files removed from root")
+    railway_start = json.loads((ROOT / "railway.json").read_text())["deploy"]["startCommand"]
+    check(railway_start == "python service_launcher.py", "Railway uses the current service launcher")
     check((ROOT / "vinted_probe.py").is_file() and (ROOT / "vinted_probe_worker.py").is_file(), "isolated Vinted Probe worker present")
     check('"vinted-probe": "vinted_probe_worker.py"' in launcher, "service launcher routes Vinted Probe separately")
     vinted = (ROOT / "vinted_probe.py").read_text(encoding="utf-8")
@@ -211,7 +215,14 @@ def main() -> int:
     check('RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES = _radar_env_int("RADAR_AUTOSCAN_IDLE_PREFETCH_PAGES", 16' in bot,
           "idle page prefetch is capped below the full 20-page category burst")
 
-    print("\nDT Parser 4.23.17 bounded PostgreSQL storage: PASS")
+    from i18n import protect_text, translate_text
+    check(translate_text("🔥 Лучшие сейчас", "en") == "🔥 Best right now"
+          and translate_text(protect_text("новые"), "en") == "новые",
+          "English UI copy and literal user data are separated")
+    check(all((ROOT / "assets" / name).is_file() for name in (
+        "dt_parser_menu_en.png", "promo_parser_alf_en.png", "promo_radar_alf_en.png")),
+        "English home and promotion assets are bundled")
+    print("\nDT Parser 4.23.28 English UX: PASS")
     return 0
 
 
