@@ -11,7 +11,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from promo_posts import (
     BUTTON_KINDS, create_post, edit_post, get_post, latest_run, list_posts,
-    mute_promotions, next_run_text, normalize_time, post_payload, promotions_enabled,
+    next_run_text, normalize_time, post_payload, promotions_enabled,
     send_post, set_promotions_enabled,
 )
 
@@ -39,9 +39,9 @@ async def menu_payload(page: int = 0):
         "<b>⏰ Автопосты</b>\n\n"
         f"Отправка: <b>{'ВКЛ' if enabled else 'ПАУЗА'}</b>\n"
         "Часовой пояс: <b>Москва (МСК, UTC+3)</b>.\n"
-        "Посты повторяются ежедневно. Получатели — пользователи бота; "
-        "по умолчанию без действующей подписки.\n\n"
-        "Открой пост, чтобы изменить время, текст, фото, кнопки или аудиторию.\n"
+        "Посты повторяются ежедневно. Получатели — все пользователи бота, "
+        "включая подписчиков и администраторов.\n\n"
+        "Открой пост, чтобы изменить время, текст, фото или кнопки.\n"
         "Новый пост сохраняется выключенным."
     )
     rows = [[("⏸ Приостановить всё" if enabled else "▶️ Включить отправку", "adminpromo:global")],
@@ -66,7 +66,7 @@ async def detail_payload(post_id: int):
     post = await get_post(post_id)
     if post is None:
         return "Пост удалён или не найден.", back_keyboard()
-    audience = "без активной подписки" if post.audience == "unsubscribed" else "все пользователи"
+    audience = "все пользователи, включая подписчиков"
     buttons = {"parser": "Парсер + Подписка", "radar": "Radar + Подписка",
                "subscription": "Подписка", "none": "без рекламных кнопок"}[post.button_kind]
     run = await latest_run(post_id)
@@ -102,7 +102,6 @@ async def detail_payload(post_id: int):
         [("👁 Предпросмотр", f"adminpromo:preview:{post.id}"), ("🕐 Время", prefix + "time")],
         [("✏️ Текст", prefix + "text"), ("🖼 Картинка", prefix + "photo")],
         [("🏷 Название", prefix + "title"), ("🔘 Кнопки", f"adminpromo:buttons:{post.id}")],
-        [("👥 Аудитория", f"adminpromo:audience:{post.id}")],
         [("🗑 Удалить пост", f"adminpromo:delete:{post.id}")],
         [("⬅️ Автопосты", "adminpromo")],
     ])
@@ -122,15 +121,8 @@ def build_promo_router(admin_ids: set[int], edit_or_answer) -> Router:
 
     @router.callback_query(F.data.in_({"promo_mute", "promo_unmute"}))
     async def preference(callback: CallbackQuery):
-        muted = callback.data == "promo_mute"
-        await mute_promotions(callback.from_user.id, muted)
-        await callback.answer("Промопосты отключены" if muted else "Промопосты включены")
-        text = ("🔕 Промопосты отключены. Сообщения о твоих сканах и подписке продолжат приходить."
-                if muted else "🔔 Ежедневные промопосты снова включены.")
-        await callback.message.answer(text, reply_markup=keyboard([[
-            ("🔔 Включить промопосты" if muted else "🔕 Отключить промопосты",
-             "promo_unmute" if muted else "promo_mute")
-        ]]))
+        # Stale buttons on messages sent by 4.23.26 must not recreate opt-outs.
+        await callback.answer("Расписанием публикаций управляет администратор.", show_alert=True)
 
     @router.callback_query(F.data.startswith("adminpromo"))
     async def controls(callback: CallbackQuery, state: FSMContext):
@@ -172,18 +164,11 @@ def build_promo_router(admin_ids: set[int], edit_or_answer) -> Router:
             elif action == "toggle":
                 await edit_post(post_id, enabled=not post.enabled)
                 text, markup = await detail_payload(post_id)
-            elif action == "audience":
-                text = "👥 Кто должен получать этот пост? Администраторы, заблокированные и отключившие промопосты всегда пропускаются."
-                markup = keyboard([
-                    [("Без активной подписки", f"adminpromo:setaudience:{post_id}:unsubscribed")],
-                    [("Все пользователи", f"adminpromo:setaudience:{post_id}:all")],
-                    [("⬅️ К посту", f"adminpromo:post:{post_id}")],
-                ])
-            elif action == "setaudience":
-                await edit_post(post_id, audience=parts[3])
+            elif action in {"audience", "setaudience"}:
+                # Compatibility with old admin messages: audience is now fixed.
                 text, markup = await detail_payload(post_id)
             elif action == "buttons":
-                text = "🔘 Выбери кнопки под постом. Кнопка отключения промопостов добавляется автоматически."
+                text = "🔘 Выбери кнопки под постом."
                 markup = keyboard([
                     [(label, f"adminpromo:setbuttons:{post_id}:{kind}")]
                     for label, kind in (("🚀 Парсер + Подписка", "parser"), ("📡 Radar + Подписка", "radar"),

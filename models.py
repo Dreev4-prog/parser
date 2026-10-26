@@ -820,7 +820,7 @@ class PromoPost(Base):
     photo: Mapped[str] = mapped_column(Text, default="")
     time_msk: Mapped[str] = mapped_column(String(5), default="12:00")
     button_kind: Mapped[str] = mapped_column(String(20), default="subscription")
-    audience: Mapped[str] = mapped_column(String(20), default="unsubscribed")
+    audience: Mapped[str] = mapped_column(String(20), default="all")
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     not_before: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

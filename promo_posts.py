@@ -16,11 +16,10 @@ from aiogram.exceptions import (
     TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter,
 )
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import String, delete, exists, func, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from commerce import current_access_mode
 from db import SessionLocal
 from models import AppSetting, BotUser, PromoPost, PromoRun
 
@@ -30,13 +29,13 @@ MOSCOW = ZoneInfo("Europe/Moscow")
 ROOT = Path(__file__).resolve().parent
 SEED_KEY = "promo_posts_seed_v1"
 ENABLED_KEY = "promo_posts_enabled_v1"
-MUTE_PREFIX = "promo_mute:"
+ALL_USERS_POLICY_KEY = "promo_all_users_policy_v1"
 LEASE_SECONDS = 90
 CATCHUP_MINUTES = 15
 RUN_WINDOW_HOURS = 2
 SEND_INTERVAL_SECONDS = 0.08
 BUTTON_KINDS = {"parser", "radar", "subscription", "none"}
-AUDIENCES = {"unsubscribed", "all"}
+AUDIENCES = {"all"}
 
 PARSER_CAPTION = (
     "👽 <b>Хватит жить в поиске Kleinanzeigen.</b>\n\n"
@@ -108,14 +107,21 @@ async def initialize_promotions(now: datetime | None = None) -> None:
             session.add_all([
                 PromoPost(title="DT Parser · Альф", caption=PARSER_CAPTION,
                           photo="asset:promo_parser_alf.png", time_msk="12:00", button_kind="parser",
-                          enabled=True, not_before=now, created_at=now, updated_at=now),
+                          audience="all", enabled=True, not_before=now, created_at=now, updated_at=now),
                 PromoPost(title="DT Radar · Находки Альфа", caption=RADAR_CAPTION,
                           photo="asset:promo_radar_alf.png", time_msk="17:00", button_kind="radar",
-                          enabled=True, not_before=now, created_at=now, updated_at=now),
+                          audience="all", enabled=True, not_before=now, created_at=now, updated_at=now),
             ])
             await session.execute(_insert(session, AppSetting).values(
                 key=ENABLED_KEY, value="1", updated_at=now,
             ).on_conflict_do_nothing(index_elements=[AppSetting.key]))
+        migrated = (await session.execute(_insert(session, AppSetting).values(
+            key=ALL_USERS_POLICY_KEY, value="1", updated_at=now,
+        ).on_conflict_do_nothing(index_elements=[AppSetting.key]).returning(AppSetting.key))).scalar_one_or_none()
+        if migrated:
+            # Preserve captions, photos, enabled state and schedule on upgrade.
+            # Historical opt-out rows are not delivery failures and are ignored.
+            await session.execute(update(PromoPost).values(audience="all"))
         await session.commit()
 
 
@@ -154,6 +160,7 @@ async def get_post(post_id: int) -> PromoPost | None:
 
 async def create_post(**values) -> PromoPost:
     values["time_msk"] = normalize_time(values.get("time_msk", "12:00"))
+    values["audience"] = "all"
     post = PromoPost(**values, enabled=False, not_before=utcnow())
     async with SessionLocal() as session:
         session.add(post)
@@ -192,18 +199,6 @@ async def latest_run(post_id: int) -> PromoRun | None:
         ).order_by(PromoRun.id.desc()).limit(1))).scalar_one_or_none()
 
 
-async def mute_promotions(user_id: int, muted: bool = True) -> None:
-    async with SessionLocal() as session:
-        key = f"{MUTE_PREFIX}{int(user_id)}"
-        if muted:
-            await session.execute(_insert(session, AppSetting).values(
-                key=key, value="1", updated_at=utcnow(),
-            ).on_conflict_do_nothing(index_elements=[AppSetting.key]))
-        else:
-            await session.execute(delete(AppSetting).where(AppSetting.key == key))
-        await session.commit()
-
-
 def post_keyboard(kind: str, *, preview: bool = False) -> InlineKeyboardMarkup | None:
     buttons = []
     if kind == "parser":
@@ -212,8 +207,6 @@ def post_keyboard(kind: str, *, preview: bool = False) -> InlineKeyboardMarkup |
         buttons.append([InlineKeyboardButton(text="🔥 Посмотреть находки Radar", callback_data="radar_home")])
     if kind != "none":
         buttons.append([InlineKeyboardButton(text="💎 Открыть подписку", callback_data="subscription")])
-    if not preview:
-        buttons.append([InlineKeyboardButton(text="🔕 Не присылать промопосты", callback_data="promo_mute")])
     return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
 
@@ -309,13 +302,9 @@ async def reserve_recipient(run_id: int, owner: str, user_id: int) -> bool:
 
 
 def _eligible(audience: str, now: datetime, admin_ids: set[int]):
-    conditions = [BotUser.user_id > 0, BotUser.is_banned.is_(False),
-                  ~exists().where(AppSetting.key == MUTE_PREFIX + BotUser.user_id.cast(String))]
-    if admin_ids:
-        conditions.append(BotUser.user_id.notin_(sorted(admin_ids)))
-    if audience == "unsubscribed":
-        conditions.append(or_(BotUser.access_until.is_(None), BotUser.access_until <= now))
-    return conditions
+    # Existing running jobs can carry the old "unsubscribed" audience in their
+    # frozen payload. Apply the all-users rule to those jobs as well.
+    return [BotUser.user_id > 0, BotUser.is_banned.is_(False)]
 
 
 async def recipients_after(run: PromoRun, payload: dict, after: int, admin_ids: set[int]) -> list[int]:
@@ -375,7 +364,7 @@ async def process_run(bot: Bot, run: PromoRun, owner: str, admin_ids: set[int]) 
             if not post:
                 await _finish(run.id, owner, "cancelled")
                 return
-            if not post.enabled or not await promotions_enabled() or current_access_mode() != "subscription":
+            if not post.enabled or not await promotions_enabled():
                 await _finish(run.id, owner, "running")
                 return
             if utcnow() >= run.deadline_at:
@@ -390,10 +379,9 @@ async def process_run(bot: Bot, run: PromoRun, owner: str, admin_ids: set[int]) 
                 if lease_lost.is_set() or utcnow() >= run.deadline_at:
                     return
                 # Disabling/deleting a post or globally pausing takes effect before
-                # the next recipient. Subscription/mute checks are also fresh.
+                # the next recipient. Delivery eligibility is also checked fresh.
                 post = await get_post(run.post_id)
-                if (not post or not post.enabled or not await promotions_enabled()
-                        or current_access_mode() != "subscription"):
+                if not post or not post.enabled or not await promotions_enabled():
                     await _finish(run.id, owner, "running" if post else "cancelled")
                     return
                 if not await reserve_recipient(run.id, owner, user_id):
@@ -416,8 +404,7 @@ async def process_run(bot: Bot, run: PromoRun, owner: str, admin_ids: set[int]) 
                             if lease_lost.is_set():
                                 return
                             post = await get_post(run.post_id)
-                            if (not post or not post.enabled or not await promotions_enabled()
-                                    or current_access_mode() != "subscription"):
+                            if not post or not post.enabled or not await promotions_enabled():
                                 await _outcome(run.id, owner, "skipped")
                                 await _finish(run.id, owner, "running" if post else "cancelled")
                                 return
@@ -433,7 +420,6 @@ async def process_run(bot: Bot, run: PromoRun, owner: str, admin_ids: set[int]) 
                         payload["photo"] = message.photo[-1].file_id
                 except TelegramForbiddenError:
                     await _outcome(run.id, owner, "blocked")
-                    await mute_promotions(user_id)
                 except TelegramNetworkError:
                     # Telegram may have accepted the message before the connection
                     # was lost. Do not replay it; processed - outcomes exposes this.
@@ -441,9 +427,7 @@ async def process_run(bot: Bot, run: PromoRun, owner: str, admin_ids: set[int]) 
                 except TelegramBadRequest as exc:
                     await _outcome(run.id, owner, "failed")
                     reason = str(exc).lower()
-                    if "chat not found" in reason or "user is deactivated" in reason:
-                        await mute_promotions(user_id)
-                    else:
+                    if "chat not found" not in reason and "user is deactivated" not in reason:
                         await _finish(run.id, owner, "error", type(exc).__name__ + ": " + str(exc))
                         return
                 except (FileNotFoundError, ValueError) as exc:
@@ -488,7 +472,7 @@ async def promotion_scheduler(bot: Bot, admin_ids: set[int]) -> None:
                     except Exception:
                         log.exception("Promotion send task failed")
                     active = None
-                if await promotions_enabled() and current_access_mode() == "subscription":
+                if await promotions_enabled():
                     # Keep recording due slots even while a previous post is
                     # broadcasting, so adjacent admin-selected times aren't lost.
                     await create_due_runs()
