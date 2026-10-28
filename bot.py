@@ -701,6 +701,7 @@ def price_filter_label(value: str | None) -> str:
 def parse_scan_price_input(text: str | None) -> str | None:
     raw = (text or "").strip().lower().replace("€", "").replace("eur", "")
     raw = re.sub(r"^from\s*(\d{1,7})\s*to\s*(\d{1,7})$", r"\1-\2", raw.strip())
+    raw = re.sub(r"^от\s*(\d{1,7})\s*до\s*(\d{1,7})$", r"\1-\2", raw.strip())
     raw = re.sub(r"^(?:up\s+to|under|max(?:imum)?)\s*(\d{1,7})$", r"-\1", raw.strip())
     raw = re.sub(r"^(?:from|over|at\s+least|min(?:imum)?)\s*(\d{1,7})$", r"\1+", raw.strip())
     raw = re.sub(r"\s+", "", raw)
@@ -1341,8 +1342,15 @@ RADAR_TYPE_LABEL = {
 }
 
 
+def _radar_price_state_key(data: dict | None) -> str:
+    data = data or {}
+    if data.get("radar_context_kind") == "list" and data.get("radar_context_mode") in {"alltime", "hot48"}:
+        return "radar_records_price_filter"
+    return "radar_price_filter"
+
+
 def _radar_price_filter(data: dict | None) -> str:
-    value = str((data or {}).get("radar_price_filter") or "any").strip()
+    value = str((data or {}).get(_radar_price_state_key(data)) or "any").strip()
     return value or "any"
 
 
@@ -1534,6 +1542,10 @@ def radar_list_keyboard(
     else:
         back_callback = "radarbest" if mode in {"hot", "rising", "ai", "fastsold", "alltime"} else "radar_home"
         back_text = "⬅️ Лучшие сейчас" if back_callback == "radarbest" else "⬅️ DT Radar"
+        if mode == "alltime":
+            rows.append([InlineKeyboardButton(
+                text=f"💶 Цена: {price_filter_label(price_filter)}", callback_data="radarprice:open"
+            )])
         rows.append([InlineKeyboardButton(text=back_text, callback_data=back_callback)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -16706,7 +16718,7 @@ async def _radar_list_payload(
     else:
         rows, total = await list_radar_products(
             mode=mode, category_key=category_key, page=page, user_id=user_id,
-            price_filter=price_filter if category_key else "any",
+            price_filter=price_filter if category_key or mode == "alltime" else "any",
         )
     titles = {
         "hot": "🔥 Горячие сейчас",
@@ -16731,6 +16743,7 @@ async def _radar_list_payload(
         lines += [
             "Здесь хранится история сильных сигналов. Истёкший live-сигнал не обнуляет доказанный Score.",
             "В кнопке показывается 🏆 Peak Score; live-категории и поиск историю не смешивают.",
+            f"💶 Цена: <b>{html.escape(price_filter_label(price_filter))}</b>.",
             "",
         ]
     fast_infos = {}
@@ -16764,7 +16777,9 @@ async def _radar_list_payload(
                 "В списке — только <b>актуальные live-сигналы</b>; история не засоряет категорию.",
                 "",
             ]
-    if not rows:
+    if not rows and mode == "alltime" and price_filter != "any":
+        lines.append("В этом диапазоне цен товаров нет. Измени границы или выбери «Любая».")
+    elif not rows:
         lines.append("Пока здесь нет товаров. База пополняется автоматически после завершённых сканов и AI-анализа.")
     else:
         start_index = 0 if preview else page * RADAR_PAGE_SIZE
@@ -16966,7 +16981,7 @@ async def _render_radar_context(message: Message, user_id: int, state: FSMContex
         if mode == "hot48":
             mode = "alltime"
         if mode in {"hot", "rising", "ai", "fastsold", "alltime", "favorites"}:
-            text, markup = await _radar_list_payload(user_id, mode, page)
+            text, markup = await _radar_list_payload(user_id, mode, page, price_filter=price_filter)
             await _edit_or_answer(message, text, reply_markup=markup)
             return
     await _edit_or_answer(
@@ -17129,8 +17144,10 @@ async def radar_price_open(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Доступно в полном DT Radar", show_alert=True)
         return
     data = await state.get_data()
-    if str(data.get("radar_context_kind") or "") not in {"category", "search"}:
-        await callback.answer("Открой категорию или результаты поиска", show_alert=True)
+    kind = str(data.get("radar_context_kind") or "")
+    records = kind == "list" and data.get("radar_context_mode") in {"alltime", "hot48"}
+    if kind not in {"category", "search"} and not records:
+        await callback.answer("Открой категорию, результаты поиска или Рекорды Radar", show_alert=True)
         return
     current = _radar_price_filter(data)
     await state.set_state(None)
@@ -17154,8 +17171,9 @@ async def radar_price_set(callback: CallbackQuery, state: FSMContext) -> None:
     if value not in allowed_values:
         await callback.answer("Неизвестный диапазон", show_alert=True)
         return
+    data = await state.get_data()
     await state.set_state(None)
-    await state.update_data(radar_price_filter=value, radar_context_page=0)
+    await state.update_data(**{_radar_price_state_key(data): value, "radar_context_page": 0})
     await callback.answer(f"Цена: {price_filter_label(value)}")
     await _render_radar_context(callback.message, callback.from_user.id, state)
 
@@ -17182,6 +17200,10 @@ async def radar_price_custom(callback: CallbackQuery, state: FSMContext) -> None
 
 @dp.message(RadarInput.price)
 async def radar_price_custom_message(message: Message, state: FSMContext) -> None:
+    if not allowed(message.from_user.id):
+        await state.set_state(None)
+        await message.answer("Доступно в полном DT Radar", reply_markup=radar_locked_keyboard())
+        return
     value = parse_scan_price_input(message.text)
     if value is None:
         await message.answer(
@@ -17189,7 +17211,8 @@ async def radar_price_custom_message(message: Message, state: FSMContext) -> Non
             parse_mode=ParseMode.HTML,
         )
         return
-    await state.update_data(radar_price_filter=value, radar_context_page=0)
+    data = await state.get_data()
+    await state.update_data(**{_radar_price_state_key(data): value, "radar_context_page": 0})
     await state.set_state(None)
     data = await state.get_data()
     kind = str(data.get("radar_context_kind") or "")
@@ -17203,6 +17226,10 @@ async def radar_price_custom_message(message: Message, state: FSMContext) -> Non
     elif kind == "search" and str(data.get("radar_search_query") or "").strip():
         text, markup = await _radar_search_payload(
             str(data.get("radar_search_query") or ""), 0, price_filter=price_filter
+        )
+    elif kind == "list" and data.get("radar_context_mode") in {"alltime", "hot48"}:
+        text, markup = await _radar_list_payload(
+            message.from_user.id, "alltime", 0, price_filter=price_filter
         )
     else:
         text, markup = await _radar_home_text(message.from_user.id), radar_home_keyboard(message.from_user.id)
@@ -17250,12 +17277,16 @@ async def radar_list_handler(callback: CallbackQuery, state: FSMContext) -> None
         await record_free_radar_event(callback.from_user.id, "mode_open", mode=mode, item_count=FREE_RADAR_PREVIEW_LIMIT)
         await _edit_or_answer(callback.message, text, reply_markup=markup)
         return
+    await state.set_state(None)
     await state.update_data(
         radar_context_kind="list", radar_context_mode=mode, radar_context_page=page,
         radar_context_category="",
     )
+    data = await state.get_data()
     await callback.answer()
-    text, markup = await _radar_list_payload(callback.from_user.id, mode, page)
+    text, markup = await _radar_list_payload(
+        callback.from_user.id, mode, page, price_filter=_radar_price_filter(data)
+    )
     await _edit_or_answer(callback.message, text, reply_markup=markup)
 
 

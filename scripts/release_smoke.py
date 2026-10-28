@@ -18,7 +18,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    check((ROOT / "VERSION").read_text().strip() == "4.23.28", "VERSION=4.23.28")
+    check((ROOT / "VERSION").read_text().strip() == "4.23.29", "VERSION=4.23.29")
     for path in sorted(ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
@@ -222,7 +222,7 @@ def main() -> int:
     check(all((ROOT / "assets" / name).is_file() for name in (
         "dt_parser_menu_en.png", "promo_parser_alf_en.png", "promo_radar_alf_en.png")),
         "English home and promotion assets are bundled")
-    print("\nDT Parser 4.23.28 English UX: PASS")
+    print("\nDT Parser 4.23.29 Radar records price filter: PASS")
     return 0
 
 

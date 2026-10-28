@@ -1,18 +1,15 @@
-# DT Parser 4.23.28 — English UX patch
+# DT Parser 4.23.29 — price range in Radar Records
 
-Install over 4.23.27, preserving folder paths. See INSTALL_ENGLISH_RU.txt.
-The patch contains changed source files and three English artwork assets.
+Small patch for 4.23.28. Upload the included files with replacement, preserving
+their paths. See INSTALL_RADAR_RECORDS_PRICE_RU.txt.
 
-Reviewed messages replace word-by-word translation. Listing data, keywords
-and HTML URLs remain literal. Background notifications and exports resolve
-the recipient's language. Home and promotion images have English editions.
-Auto Posts supports separate English text/photo editing and previews.
+Open Radar → Best right now → Records → Price → Custom range.
+Enter 100-500, от 100 до 500, up to 100 or 500+. Any price clears the range.
+Records has its own budget and retains it through pages and product-card returns.
+Filtering uses observed listing prices before counting and pagination. Historical
+records retain their Peak Score order. No migration, worker or variable is needed.
 
-PostgreSQL adds caption_en and photo_en to promo_posts automatically.
-Existing post schedules and administrator edits are preserved. Delivery
-remains for all users; the separate Daily Radar schedule is unchanged.
-
-Validation: 51 targeted tests passed; release smoke passed. Coverage includes
-English user journeys, sending/admin controls, database upgrade, retention,
-weekly Radar statistics, navigation and Chromium idle behavior. No live
-Telegram messages were sent and no GitHub/Railway deployment was performed.
+Validation: 62 targeted tests passed and release smoke passed. Database tests
+cover inclusive bounds, unknown prices, real family prices, counts and pagination.
+Telegram updates cover input, reset, navigation and separate filter settings.
+No live Telegram messages were sent and no GitHub/Railway deployment was performed.

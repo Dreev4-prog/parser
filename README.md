@@ -1,3 +1,13 @@
+# DT Parser v4.23.29 — Radar records price range
+
+Radar Records now includes a price selector with presets and custom lower/upper
+limits. Its budget is independent of Search and Categories, survives pagination
+and opening product cards, and can be reset with Any price. The existing SQL
+query filters by observed listing prices before counting and pagination; records
+keep their historical Peak Score order. See `INSTALL_RADAR_RECORDS_PRICE_RU.txt`.
+
+---
+
 # DT Parser v4.23.28 — English interface
 
 Reviewed English copy covers the home screen, onboarding, scanning, Radar,

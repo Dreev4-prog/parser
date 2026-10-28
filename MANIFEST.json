@@ -1,34 +1,27 @@
 {
-  "base": "4.23.27",
-  "target": "4.23.28",
-  "scope": "English public UI, literal listing data, localized exports and bilingual artwork/promotions",
-  "database_migration": "automatic additive caption_en/photo_en fields on promo_posts",
+  "base": "4.23.28",
+  "target": "4.23.29",
+  "scope": "Custom price range in Radar Records; independent session budget, pagination and card return",
+  "database_migration": false,
   "verification": {
-    "targeted_pytest": "51 passed",
+    "targeted_pytest": "62 passed",
     "release_smoke": "PASS",
     "live_deploy": "not performed"
   },
-  "files": {
+  "base_sha256": {
     "bot.py": "1209076bc620c91b63e0bac14f50dcb290344a802bacafddac0efab0c2e70857",
-    "db.py": "1c58e9de679de6a993b344886c43ec32283093b17d1cf4d3a05e77f397ad673f",
-    "models.py": "168389e757f9e8561df776d7c9d8be5299c251a72790fd00eecdb7c05f18abca",
-    "i18n.py": "7c25a31bf91287bbf45776664647da151980e72de6ef8e547ee51d6edbfc0267",
     "i18n_en.py": "4ccc97f570816f761275f09968476f51e8ce62b6a37f3dbdf4e25065d9935395",
-    "promo_posts.py": "1d7bb4cc7e016ea523bf9391bf84773da0a3d7f541390ed5cc621c504f77d871",
-    "promo_admin.py": "20e7d89434586ce313fd091009ac9190d3851562cb4e11d4a06d96ff597597be",
-    "VERSION": "e97bccca42dd51c311ffd2203ff17b07500e489ed5b56b71493e65298b0bb535",
-    "README.md": "61990d58ed5e90249d8e9b91b8de9aaf67526ffd5797b25f5e40e5917a4e4cc6",
-    "PATCH_README.md": "549e232335473a255ab250367b56d3456eadb6e926b696cc96504b2530b56624",
-    "INSTALL_ENGLISH_RU.txt": "ef889ca993ba2d12cf4284ad6acdca48a22d4e3f5082b676a8ce50b7d0a08e7e",
-    "RELEASE_4_23_28.md": "ce971909b88ceb41a4f7503933b7997b0c500dae5bcd9598e64cc1a1f27f2f86",
-    "ENGLISH_ARTWORK_PROMPTS.txt": "6a10613180d2f0128547d4baf7e7b573bf9a9c743d6c664db45ddb99d3fa7756",
-    "scripts/release_smoke.py": "0c502d37e8b0c8e759e08dd1ea725d4eb27455c24d2dfb582141532b44faadcf",
-    "tests/test_i18n_english.py": "6a619957219af3c39d692688c42c8d3a39fb91d1b232c9f11b90e3c4778be8d4",
-    "tests/test_promo_posts.py": "4448507f129f8637d238d1d202eb39d391ab462883242277b72eac54bd0d0684",
-    "tests/test_promo_admin.py": "a4e5547c89b511a3ed5f612d4444f5ed3ed712e46cf9322096701487bc106c93",
-    "tests/test_browser_idle.py": "242140090930307d9571deb7fecb6f9fe3b0ffeee9d7ae1a7559aa0a5d28893b",
-    "assets/dt_parser_menu_en.png": "8ad6759f421efa2adae7ee97677beaaccf78930afec5cca6840c18cbd6a3d717",
-    "assets/promo_parser_alf_en.png": "a2377c08166461f0575ce1ba69dc8133685b56432e4e94a7a148b37eb6f822f8",
-    "assets/promo_radar_alf_en.png": "bc2f4b10e4f896e2718fff84b1518075b9e9cbdeafa9ef7660e993c18b113cff"
+    "VERSION": "e97bccca42dd51c311ffd2203ff17b07500e489ed5b56b71493e65298b0bb535"
+  },
+  "files": {
+    "bot.py": "f1d146dc4c92d6f827be5efe4551833af0c6373420516e9a325cd3f8026a9fcb",
+    "i18n_en.py": "6d069b0c1087f08aa64a1ce53ab34ece5bea89ebeae945f8fceea6f0223f1a76",
+    "VERSION": "4a08cd32e861e82852730c864a8d9a9825edaef1c39214a74c0bccac4dd92c19",
+    "README.md": "bc5a99a76e8b99c414a095e2165d1a66b1743b5cf3b111c639fe94634734b535",
+    "PATCH_README.md": "18bb2088ae3f8f1da4b7af664112c68d89f7d46f11843082e755f1d5e8cf2b7c",
+    "INSTALL_RADAR_RECORDS_PRICE_RU.txt": "df81897f32c0a6e6c83e767b40284ce3172f18409f2a333e16adf7bdcf31caad",
+    "RELEASE_4_23_29.md": "deb118b78b9e7189f62265aa67b2e070304913355603a1e86037d0408d50ee2f",
+    "scripts/release_smoke.py": "09fe7a41288709db38b39896cd540c63c4008bd1c1f584753beb346642a8109d",
+    "tests/test_radar_records_price.py": "6d5a48b7da64af21aeaf69c0777730d697d16310947a0794d01567813dda2c71"
   }
 }

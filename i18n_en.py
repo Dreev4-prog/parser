@@ -59,6 +59,10 @@ EN_CATEGORY_NAMES = {
 }
 
 EN_MESSAGES = {
+    "В этом диапазоне цен товаров нет. Измени границы или выбери «Любая».":
+        "No products in this price range. Change the limits or select Any price.",
+    "Открой категорию, результаты поиска или Рекорды Radar":
+        "Open a category, search results or Radar records",
     "1 категория": "1 category",
     "бесплатных скан(а)": "free scan credits",
     "💎 Открыть подписку": "💎 View subscription plans",
