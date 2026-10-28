@@ -1,15 +1,15 @@
-# DT Parser 4.23.29 — price range in Radar Records
+# DT Parser 4.23.30 — category and price in Radar Records
 
-Small patch for 4.23.28. Upload the included files with replacement, preserving
-their paths. See INSTALL_RADAR_RECORDS_PRICE_RU.txt.
+Install over 4.23.28 or 4.23.29 with file replacement. This archive includes
+the previous price filter; installing the 4.23.29 archive first is unnecessary.
+See INSTALL_RADAR_RECORDS_FILTERS_RU.txt.
 
-Open Radar → Best right now → Records → Price → Custom range.
-Enter 100-500, от 100 до 500, up to 100 or 500+. Any price clears the range.
-Records has its own budget and retains it through pages and product-card returns.
-Filtering uses observed listing prices before counting and pagination. Historical
-records retain their Peak Score order. No migration, worker or variable is needed.
+Records → All categories opens section/category selection. Category and price
+work together and survive pagination and product-card returns. Resetting one
+filter preserves the other. Historical Records retain Peak Score order instead
+of switching to the live category feed. RU and EN labels are included.
 
-Validation: 62 targeted tests passed and release smoke passed. Database tests
-cover inclusive bounds, unknown prices, real family prices, counts and pagination.
-Telegram updates cover input, reset, navigation and separate filter settings.
-No live Telegram messages were sent and no GitHub/Railway deployment was performed.
+Validation: 71 targeted tests and release smoke passed. Combined SQL filters,
+counts, pagination, UI transitions, resets, English labels and access denial
+were checked locally. No migration, dependency, worker or variable is required.
+No live Telegram messages or GitHub/Railway deployment were performed.

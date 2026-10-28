@@ -1354,6 +1354,47 @@ def _radar_price_filter(data: dict | None) -> str:
     return value or "any"
 
 
+def _radar_records_category_key(data: dict | None) -> str | None:
+    key = str((data or {}).get("radar_records_category") or "")
+    cat = CATEGORIES.get(key)
+    return key if cat is not None and not cat.is_group else None
+
+
+def radar_records_categories_payload(data: dict, group_key: str | None = None):
+    """Static category picker for historical Records; no live-feed counts."""
+    selected_key = _radar_records_category_key(data)
+    selected = CATEGORIES.get(selected_key)
+    category_label = selected.name if selected is not None else "Все категории"
+    page = max(0, int(data.get("radar_context_page") or 0))
+    lines = ["🗂 <b>Категория в Рекордах Radar</b>", ""]
+    rows = [[InlineKeyboardButton(
+        text=("✅ " if selected is None else "") + "🗂 Все категории",
+        callback_data="radarrecords:all",
+    )]]
+    if group_key is None:
+        lines.append("Выбери раздел, затем категорию. Фильтр цены сохранится.")
+        for group in GROUPS.values():
+            rows.append([InlineKeyboardButton(
+                text=_button_text(f"{group.icon} {group.name}"),
+                callback_data=f"radarrecords:group:{group.key}",
+            )])
+    else:
+        group = GROUPS[group_key]
+        lines += [f"{group.icon} <b>{html.escape(group.name)}</b>",
+                  "Выбери категорию. Фильтр цены сохранится."]
+        for cat in categories_for_group(group_key):
+            if not cat.is_group:
+                rows.append([InlineKeyboardButton(
+                    text=_button_text(f"{'✅' if cat.key == selected_key else '📂'} {cat.name}"),
+                    callback_data=f"radarrecords:set:{cat.key}",
+                )])
+        rows.append([InlineKeyboardButton(text="⬅️ Все разделы", callback_data="radarrecords:categories")])
+    lines += ["", f"🗂 Категория: <b>{html.escape(category_label)}</b>",
+              f"💶 Цена: <b>{html.escape(price_filter_label(_radar_price_filter(data)))}</b>"]
+    rows.append([InlineKeyboardButton(text="⬅️ К Рекордам Radar", callback_data=f"radarlist:alltime:{page}")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def _radar_product_price_text(product) -> str:
     lo = getattr(product, "min_price_eur", None)
     hi = getattr(product, "max_price_eur", None)
@@ -1514,18 +1555,18 @@ def radar_list_keyboard(
     nav: list[InlineKeyboardButton] = []
     category_prefix = "radarcatbest" if mode == "category_best" else "radarcat"
     if page > 0:
-        if category_key:
+        if category_key and mode != "alltime":
             nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"{category_prefix}:{category_key}:{page-1}"))
         else:
             nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"radarlist:{mode}:{page-1}"))
     if (page + 1) * RADAR_PAGE_SIZE < total:
-        if category_key:
+        if category_key and mode != "alltime":
             nav.append(InlineKeyboardButton(text="➡️", callback_data=f"{category_prefix}:{category_key}:{page+1}"))
         else:
             nav.append(InlineKeyboardButton(text="➡️", callback_data=f"radarlist:{mode}:{page+1}"))
     if nav:
         rows.append(nav)
-    if category_key:
+    if category_key and mode != "alltime":
         if mode == "category_best":
             rows.append([InlineKeyboardButton(text="🆕 Сначала новые", callback_data=f"radarcat:{category_key}:0")])
         else:
@@ -1543,6 +1584,11 @@ def radar_list_keyboard(
         back_callback = "radarbest" if mode in {"hot", "rising", "ai", "fastsold", "alltime"} else "radar_home"
         back_text = "⬅️ Лучшие сейчас" if back_callback == "radarbest" else "⬅️ DT Radar"
         if mode == "alltime":
+            selected = CATEGORIES.get(category_key)
+            rows.append([InlineKeyboardButton(
+                text=_button_text(f"🗂 Категория: {selected.name}") if selected is not None else "🗂 Все категории",
+                callback_data="radarrecords:categories",
+            )])
             rows.append([InlineKeyboardButton(
                 text=f"💶 Цена: {price_filter_label(price_filter)}", callback_data="radarprice:open"
             )])
@@ -16728,8 +16774,8 @@ async def _radar_list_payload(
         "alltime": "🏆 Рекорды Radar",
         "favorites": "⭐ Мой Radar",
     }
-    lines_hint = mode == "alltime" and not category_key and not preview
-    if category_key:
+    lines_hint = mode == "alltime" and not preview
+    if category_key and mode != "alltime":
         cat = CATEGORIES.get(category_key)
         if cat is not None and cat.group in GROUPS:
             group = GROUPS[cat.group]
@@ -16740,9 +16786,12 @@ async def _radar_list_payload(
         heading = titles.get(mode, "📡 DT Radar")
     lines = [f"<b>{html.escape(heading)}</b>", ""]
     if lines_hint:
+        selected = CATEGORIES.get(category_key)
+        category_label = selected.name if selected is not None else "Все категории"
         lines += [
             "Здесь хранится история сильных сигналов. Истёкший live-сигнал не обнуляет доказанный Score.",
             "В кнопке показывается 🏆 Peak Score; live-категории и поиск историю не смешивают.",
+            f"🗂 Категория: <b>{html.escape(category_label)}</b>.",
             f"💶 Цена: <b>{html.escape(price_filter_label(price_filter))}</b>.",
             "",
         ]
@@ -16762,7 +16811,7 @@ async def _radar_list_payload(
             "Это реальные актуальные находки из полной базы DT Radar.",
             "",
         ]
-    elif category_key:
+    elif category_key and mode != "alltime":
         if mode == "category_best":
             lines += [
                 "🔥 Сортировка: <b>сначала самые сильные подтверждённые сигналы</b>.",
@@ -16777,7 +16826,9 @@ async def _radar_list_payload(
                 "В списке — только <b>актуальные live-сигналы</b>; история не засоряет категорию.",
                 "",
             ]
-    if not rows and mode == "alltime" and price_filter != "any":
+    if not rows and mode == "alltime" and category_key:
+        lines.append("По выбранной категории и цене товаров нет. Измени фильтры.")
+    elif not rows and mode == "alltime" and price_filter != "any":
         lines.append("В этом диапазоне цен товаров нет. Измени границы или выбери «Любая».")
     elif not rows:
         lines.append("Пока здесь нет товаров. База пополняется автоматически после завершённых сканов и AI-анализа.")
@@ -16981,7 +17032,10 @@ async def _render_radar_context(message: Message, user_id: int, state: FSMContex
         if mode == "hot48":
             mode = "alltime"
         if mode in {"hot", "rising", "ai", "fastsold", "alltime", "favorites"}:
-            text, markup = await _radar_list_payload(user_id, mode, page, price_filter=price_filter)
+            text, markup = await _radar_list_payload(
+                user_id, mode, page, price_filter=price_filter,
+                category_key=_radar_records_category_key(data) if mode == "alltime" else None,
+            )
             await _edit_or_answer(message, text, reply_markup=markup)
             return
     await _edit_or_answer(
@@ -17229,7 +17283,8 @@ async def radar_price_custom_message(message: Message, state: FSMContext) -> Non
         )
     elif kind == "list" and data.get("radar_context_mode") in {"alltime", "hot48"}:
         text, markup = await _radar_list_payload(
-            message.from_user.id, "alltime", 0, price_filter=price_filter
+            message.from_user.id, "alltime", 0, price_filter=price_filter,
+            category_key=_radar_records_category_key(data),
         )
     else:
         text, markup = await _radar_home_text(message.from_user.id), radar_home_keyboard(message.from_user.id)
@@ -17285,9 +17340,46 @@ async def radar_list_handler(callback: CallbackQuery, state: FSMContext) -> None
     data = await state.get_data()
     await callback.answer()
     text, markup = await _radar_list_payload(
-        callback.from_user.id, mode, page, price_filter=_radar_price_filter(data)
+        callback.from_user.id, mode, page, price_filter=_radar_price_filter(data),
+        category_key=_radar_records_category_key(data) if mode == "alltime" else None,
     )
     await _edit_or_answer(callback.message, text, reply_markup=markup)
+
+
+@dp.callback_query(F.data.startswith("radarrecords:"))
+async def radar_records_category_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    if not allowed(callback.from_user.id):
+        await callback.answer("Доступно в полном DT Radar", show_alert=True)
+        return
+    parts = str(callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    key = parts[2] if len(parts) == 3 else ""
+    if action == "group":
+        if key not in GROUPS:
+            await callback.answer("Раздел не найден", show_alert=True)
+            return
+    elif action == "set":
+        cat = CATEGORIES.get(key)
+        if cat is None or cat.is_group:
+            await callback.answer("Категория не найдена", show_alert=True)
+            return
+    elif action not in {"categories", "all"} or len(parts) != 2:
+        await callback.answer("Категория не найдена", show_alert=True)
+        return
+    data = await state.get_data()
+    in_records = data.get("radar_context_kind") == "list" and data.get("radar_context_mode") in {"alltime", "hot48"}
+    page = max(0, int(data.get("radar_context_page") or 0)) if in_records else 0
+    await state.set_state(None)
+    await state.update_data(radar_context_kind="list", radar_context_mode="alltime",
+                            radar_context_category="", radar_context_page=page)
+    await callback.answer()
+    if action in {"set", "all"}:
+        await state.update_data(radar_records_category=key if action == "set" else "", radar_context_page=0)
+        await _render_radar_context(callback.message, callback.from_user.id, state)
+    else:
+        data = await state.get_data()
+        text, markup = radar_records_categories_payload(data, key if action == "group" else None)
+        await _edit_or_answer(callback.message, text, reply_markup=markup)
 
 
 @dp.callback_query(F.data.startswith("radarpreviewitem:"))

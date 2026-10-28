@@ -59,6 +59,14 @@ EN_CATEGORY_NAMES = {
 }
 
 EN_MESSAGES = {
+    "Все категории": "All categories",
+    "Категория в Рекордах Radar": "Category in Radar records",
+    "Выбери раздел, затем категорию. Фильтр цены сохранится.":
+        "Choose a section, then a category. Your price filter will be kept.",
+    "Выбери категорию. Фильтр цены сохранится.": "Choose a category. Your price filter will be kept.",
+    "⬅️ К Рекордам Radar": "⬅️ Back to Radar records",
+    "По выбранной категории и цене товаров нет. Измени фильтры.":
+        "No products match this category and price. Try changing the filters.",
     "В этом диапазоне цен товаров нет. Измени границы или выбери «Любая».":
         "No products in this price range. Change the limits or select Any price.",
     "Открой категорию, результаты поиска или Рекорды Radar":

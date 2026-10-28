@@ -35,7 +35,7 @@ def test_records_query_filters_real_prices_inclusively_before_count_and_paginati
                 for product_id, values in prices.items():
                     known = [value for value in values if value is not None]
                     session.add(RadarProduct(id=product_id,product_key=f"records-{product_id}",
-                        title=f"Record {product_id}",category_key="hg_kueche",status="historical",
+                        title=f"Record {product_id}",category_key="el_konsolen" if product_id in {3,7,8} else "hg_kueche",status="historical",
                         organic_verified_at=now,last_signal_at=now-timedelta(days=90),
                         peak_score=100-product_id,current_score=50,
                         min_price_eur=min(known) if known else None,
@@ -52,6 +52,17 @@ def test_records_query_filters_real_prices_inclusively_before_count_and_paginati
             rows,total = await radar.list_radar_products(mode="alltime",price_filter="custom:100:500",page_size=2,page=1)
             assert [r.id for r in rows] == [4,8] and total == 4
             assert all(r.status == "historical" for r in rows)
+            for page, expected_id in ((0,2),(1,4)):
+                rows,total = await radar.list_radar_products(mode="alltime",category_key="hg_kueche",
+                    price_filter="custom:100:500",page_size=1,page=page)
+                assert [r.id for r in rows] == [expected_id] and total == 2
+                assert rows[0].status == "historical"
+            rows,total = await radar.list_radar_products(mode="alltime",category_key="el_konsolen",
+                price_filter="custom:100:500",page_size=20)
+            assert [r.id for r in rows] == [3,8] and total == 2
+            rows,total = await radar.list_radar_products(mode="alltime",category_key="hg_kueche",
+                price_filter="custom:300:499",page_size=20)
+            assert rows == [] and total == 0
             for price_filter, expected in (("custom::100",[1,2,7,8]),
                                             ("custom:500:",[4,5,7,8]),
                                             ("custom:100:100",[2]),

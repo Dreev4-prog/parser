@@ -1,3 +1,15 @@
+# DT Parser v4.23.30 — Radar records category and price filters
+
+Records now has its own section/category picker alongside the price selector.
+Both filters compose before counting and pagination and survive product-card
+returns. Selecting a category keeps historical Records in Peak Score order;
+it does not switch to the live category feed. All categories resets only the
+category, keeping the budget. RU/EN labels are included. This small patch also
+contains the 4.23.29 price feature and installs over 4.23.28 or 4.23.29.
+See `INSTALL_RADAR_RECORDS_FILTERS_RU.txt`.
+
+---
+
 # DT Parser v4.23.29 — Radar records price range
 
 Radar Records now includes a price selector with presets and custom lower/upper

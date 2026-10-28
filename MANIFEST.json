@@ -1,27 +1,39 @@
 {
   "base": "4.23.28",
-  "target": "4.23.29",
-  "scope": "Custom price range in Radar Records; independent session budget, pagination and card return",
+  "compatible_bases": [
+    "4.23.28",
+    "4.23.29"
+  ],
+  "target": "4.23.30",
+  "scope": "Category and price filters together in historical Radar Records, with independent state and preserved navigation",
   "database_migration": false,
   "verification": {
-    "targeted_pytest": "62 passed",
+    "targeted_pytest": "71 passed",
     "release_smoke": "PASS",
     "live_deploy": "not performed"
   },
   "base_sha256": {
-    "bot.py": "1209076bc620c91b63e0bac14f50dcb290344a802bacafddac0efab0c2e70857",
-    "i18n_en.py": "4ccc97f570816f761275f09968476f51e8ce62b6a37f3dbdf4e25065d9935395",
-    "VERSION": "e97bccca42dd51c311ffd2203ff17b07500e489ed5b56b71493e65298b0bb535"
+    "4.23.28": {
+      "bot.py": "1209076bc620c91b63e0bac14f50dcb290344a802bacafddac0efab0c2e70857",
+      "i18n_en.py": "4ccc97f570816f761275f09968476f51e8ce62b6a37f3dbdf4e25065d9935395",
+      "VERSION": "e97bccca42dd51c311ffd2203ff17b07500e489ed5b56b71493e65298b0bb535"
+    },
+    "4.23.29": {
+      "bot.py": "f1d146dc4c92d6f827be5efe4551833af0c6373420516e9a325cd3f8026a9fcb",
+      "i18n_en.py": "6d069b0c1087f08aa64a1ce53ab34ece5bea89ebeae945f8fceea6f0223f1a76",
+      "VERSION": "4a08cd32e861e82852730c864a8d9a9825edaef1c39214a74c0bccac4dd92c19"
+    }
   },
   "files": {
-    "bot.py": "f1d146dc4c92d6f827be5efe4551833af0c6373420516e9a325cd3f8026a9fcb",
-    "i18n_en.py": "6d069b0c1087f08aa64a1ce53ab34ece5bea89ebeae945f8fceea6f0223f1a76",
-    "VERSION": "4a08cd32e861e82852730c864a8d9a9825edaef1c39214a74c0bccac4dd92c19",
-    "README.md": "bc5a99a76e8b99c414a095e2165d1a66b1743b5cf3b111c639fe94634734b535",
-    "PATCH_README.md": "18bb2088ae3f8f1da4b7af664112c68d89f7d46f11843082e755f1d5e8cf2b7c",
-    "INSTALL_RADAR_RECORDS_PRICE_RU.txt": "df81897f32c0a6e6c83e767b40284ce3172f18409f2a333e16adf7bdcf31caad",
-    "RELEASE_4_23_29.md": "deb118b78b9e7189f62265aa67b2e070304913355603a1e86037d0408d50ee2f",
-    "scripts/release_smoke.py": "09fe7a41288709db38b39896cd540c63c4008bd1c1f584753beb346642a8109d",
-    "tests/test_radar_records_price.py": "6d5a48b7da64af21aeaf69c0777730d697d16310947a0794d01567813dda2c71"
+    "bot.py": "184001059cbbd9085adf9d9db690b5baa0fe3831f917edeedd8bbf73b3cb2ae3",
+    "i18n_en.py": "66c9167d77e25d90840f80107e46bd4e559ae77de5d4422adf14df8e2b8c6672",
+    "VERSION": "e69605a1d182cec06f7e20752eb27fd8fce5c30a0574d33304281e253952d876",
+    "README.md": "247a728421c36db4878fcc38bc1dfad4d861e1a5efda3415b74813c1274338b8",
+    "PATCH_README.md": "2f30d02ae7efb126b2f7f3f1b732d38974debdc15f9b4dbbcdb886e3d9977142",
+    "INSTALL_RADAR_RECORDS_FILTERS_RU.txt": "aaa5976e9875c84f5e5f30e22a517ec76c304cde8473a92f27c526a8de756a93",
+    "RELEASE_4_23_30.md": "1c1ddb9045624f7ff3276079b47fff5394c8757dac89ddb641867550ff474e0c",
+    "scripts/release_smoke.py": "8bdf320b3ce6bd0c1b93d12e7bc54eb6992d701f6966f7e83243bd427997c243",
+    "tests/test_radar_records_price.py": "3540bdd072bac99569cb592c0b9660c8fe79d33107dd751d31bc0197a698a866",
+    "tests/test_radar_records_categories.py": "e2bc6d03932be42b58a7e6ddac0aa9824e75b8f8c78508231723cb828012bf21"
   }
 }
